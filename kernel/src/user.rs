@@ -183,6 +183,15 @@ enum WaitOn {
     /// the user epoll_event array, `wait_len` maxevents. Any
     /// fd-state change re-scans the interest set like Poll.
     Epoll(usize),
+    /// eventfd read on a zero counter — the waker deposits the
+    /// u64 value through the sleeper's tables like PipeRead.
+    EventfdR(usize),
+    /// eventfd write that would overflow EFD_MAX — wait_len is the
+    /// value to add, re-evaluated at wake like PipeWrite's fit.
+    EventfdW(usize),
+    /// timerfd read before expiry — woken by timerfd_expire at the
+    /// deadline tick (10 ms granularity, the kernel's resolution).
+    Timerfd(usize),
 }
 
 /// Max fds per task — a hard bound so a hostile process cannot
@@ -241,6 +250,10 @@ enum FdKind {
     /// An epoll instance — the interest set lives in EPOLLS[id];
     /// dup'd fds share it like socket endpoints.
     Epoll(usize),
+    /// An eventfd counter — the semaphore lives in EVENTFDS[id].
+    Eventfd(usize),
+    /// A timerfd — arming/expiry state lives in TIMERFDS[id].
+    Timerfd(usize),
 }
 
 /// Max concurrent pipes — a hard bound on kernel frame pressure,
@@ -296,6 +309,43 @@ struct Epoll {
 }
 
 static mut EPOLLS: [Option<Epoll>; MAX_EPOLLS] = [const { None }; MAX_EPOLLS];
+
+/// Max eventfd instances — same fixed-table discipline; ENFILE
+/// is the honest answer past the bound.
+const MAX_EVENTFDS: usize = 8;
+/// The semaphore ceiling: a write may add while count + v fits
+/// below 2^64-1 — u64::MAX itself is EINVAL outright (Linux).
+const EFD_MAX: u64 = u64::MAX - 1;
+
+/// An eventfd: a u64 kernel semaphore. read returns the count and
+/// drains it (1 and decrements under EFD_SEMAPHORE); write adds.
+/// `nonblock` is per-INSTANCE like the rest of our fd flags —
+/// dup'd fds share it, matching Linux's file-status flags.
+struct Eventfd {
+    count: u64,
+    sema: bool,
+    nonblock: bool,
+}
+
+static mut EVENTFDS: [Option<Eventfd>; MAX_EVENTFDS] =
+    [const { None }; MAX_EVENTFDS];
+
+/// Max timerfd instances.
+const MAX_TIMERFDS: usize = 8;
+
+/// A timerfd: one armed deadline in TICKS (100 Hz — 10 ms is the
+/// timer resolution) plus an optional periodic interval. read()
+/// collects the unread expiry count.
+struct Timerfd {
+    armed: bool,
+    deadline: u64,
+    interval: u64,
+    expirations: u64,
+    nonblock: bool,
+}
+
+static mut TIMERFDS: [Option<Timerfd>; MAX_TIMERFDS] =
+    [const { None }; MAX_TIMERFDS];
 
 /// The 512-byte fxsave64 image — per-task FPU/SSE state. 16-aligned
 /// per the instruction's contract. Every context switch does
@@ -3126,6 +3176,30 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 // An epoll fd has no readable stream — same EINVAL
                 // Linux gives read-side ioctls on it.
                 FdKind::Epoll(_) => return EINVAL,
+                // FIONREAD on eventfd/timerfd is sizeof(u64) once
+                // they're readable, 0 before (Linux's answer).
+                FdKind::Eventfd(i) => {
+                    let evs = unsafe { &*core::ptr::addr_of!(EVENTFDS) };
+                    evs.get(*i)
+                        .and_then(|s| s.as_ref())
+                        .map_or(0, |e| if e.count > 0 { 8 } else { 0 })
+                }
+                FdKind::Timerfd(i) => {
+                    let tfs = unsafe { &*core::ptr::addr_of!(TIMERFDS) };
+                    let now = crate::apic::TICKS
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    tfs.get(*i)
+                        .and_then(|s| s.as_ref())
+                        .map_or(0, |tf| {
+                            if tf.expirations > 0
+                                || (tf.armed && tf.deadline <= now)
+                            {
+                                8
+                            } else {
+                                0
+                            }
+                        })
+                }
             };
             // SAFETY: arg validated writable for 4 bytes.
             unsafe {
@@ -3509,7 +3583,9 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         FdKind::Udp(_) | FdKind::Tcp(_) => (0o140777, 0, 0), // S_IFSOCK
         // anon_inodefs objects stat as a chrdev — Linux shows
         // S_IFCHR|0600 for epoll/eventfd/timerfd alike.
-        FdKind::Epoll(_) => (0o20600, 0, 0),
+        FdKind::Epoll(_) | FdKind::Eventfd(_) | FdKind::Timerfd(_) => {
+            (0o20600, 0, 0)
+        }
     };
     let mut st = [0u64; 18];
     st[1] = ino;
@@ -4145,6 +4221,8 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         // read() on an epoll fd has no stream to read — EINVAL like
         // Linux, not EBADF (the fd is real).
         FdKind::Epoll(_) => EINVAL,
+        FdKind::Eventfd(i) => eventfd_read(ctx, *i, buf, len),
+        FdKind::Timerfd(i) => timerfd_read(ctx, *i, buf, len),
         FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, 0),
         FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, 0),
         FdKind::File(data) => {
@@ -4258,6 +4336,12 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     let Some(o) = ofd(t, fd) else { return EBADF };
     if let FdKind::Tcp(i) = &o.kind {
         return tcp_send(*i, buf, len);
+    }
+    if let FdKind::Eventfd(i) = &o.kind {
+        return eventfd_write(ctx, *i, buf, len);
+    }
+    if let FdKind::Timerfd(_) = &o.kind {
+        return EINVAL; // timerfds aren't writable — Linux's answer
     }
     if let FdKind::Ram(i) = &o.kind {
         if o.accmode == 0 {
@@ -5251,6 +5335,12 @@ fn ofd_release(oi: usize) {
     if let FdKind::Epoll(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(EPOLLS))[i] = None };
     }
+    if let FdKind::Eventfd(i) = kind {
+        unsafe { (*core::ptr::addr_of_mut!(EVENTFDS))[i] = None };
+    }
+    if let FdKind::Timerfd(i) = kind {
+        unsafe { (*core::ptr::addr_of_mut!(TIMERFDS))[i] = None };
+    }
     if let FdKind::Pipe { id, write } = kind {
         pipe_end_closed(id, write);
     }
@@ -5598,6 +5688,42 @@ fn ofd_revents(oi: u8, events: u16) -> u16 {
                 }
             }
             r
+        }
+        // eventfd: readable when the counter is nonzero, writable
+        // while an add of at least 1 still fits under the ceiling.
+        FdKind::Eventfd(i) => {
+            let evs = unsafe { &*core::ptr::addr_of!(EVENTFDS) };
+            match evs.get(*i).and_then(|s| s.as_ref()) {
+                None => POLLNVAL,
+                Some(e) => {
+                    let mut r = 0;
+                    if e.count > 0 {
+                        r |= POLLIN;
+                    }
+                    if e.count < EFD_MAX {
+                        r |= POLLOUT;
+                    }
+                    r
+                }
+            }
+        }
+        // timerfd: readable once expirations are pending — or the
+        // deadline already passed and the tick hasn't folded it in
+        // yet (a poll right at the boundary must not report cold).
+        FdKind::Timerfd(i) => {
+            let tfs = unsafe { &*core::ptr::addr_of!(TIMERFDS) };
+            match tfs.get(*i).and_then(|s| s.as_ref()) {
+                None => POLLNVAL,
+                Some(tf) => {
+                    let now = crate::apic::TICKS
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    if tf.expirations > 0 || (tf.armed && tf.deadline <= now) {
+                        POLLIN
+                    } else {
+                        0
+                    }
+                }
+            }
         }
     };
     (r & events) | (r & (POLLERR | POLLHUP | POLLNVAL))
@@ -6180,6 +6306,431 @@ pub fn fd_epoll_wait(
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
+}
+
+// --- eventfd + timerfd -------------------------------------------
+// The anon-inode fd family: a u64 semaphore and a tick-deadline
+// clock behind OFDs. read/write are exactly-8-byte ops; nonblock
+// is per-instance like Linux file-status flags (dup'd fds share).
+
+/// Shared OFD+fd-slot claim for the anon-inode family — EMFILE if
+/// either table is full, like the socket alloc preamble.
+fn anon_fd(kind: FdKind, cloexec: bool) -> u64 {
+    let Some(t) = cur_mut() else { return EBADF };
+    let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+    let (Some(oi), Some(fi)) = (
+        ofds.iter().position(Option::is_none),
+        fdt(t).fds.iter().position(Option::is_none),
+    ) else {
+        return EMFILE;
+    };
+    ofds[oi] = Some(OpenFile {
+        kind,
+        pos: 0,
+        refs: 1,
+        append: false,
+        accmode: 2,
+    });
+    fdt(t).fds[fi] = Some(oi as u8);
+    cloexec_set(t, fi, cloexec);
+    fi as u64
+}
+
+/// eventfd(initval)/eventfd2(initval, flags): a u64 kernel
+/// semaphore behind an OFD. Flags are EFD_SEMAPHORE|EFD_NONBLOCK|
+/// EFD_CLOEXEC; the legacy call is just flags==0.
+pub fn fd_eventfd(initval: u64, flags: u64) -> u64 {
+    const ENFILE_: u64 = (-23i64) as u64;
+    const EFD_NONBLOCK: u64 = 0o4000;
+    const EFD_CLOEXEC: u64 = 0o2000000;
+    const EFD_SEMAPHORE: u64 = 1;
+    if flags & !(EFD_NONBLOCK | EFD_CLOEXEC | EFD_SEMAPHORE) != 0 {
+        return EINVAL;
+    }
+    let evs = unsafe { &mut *core::ptr::addr_of_mut!(EVENTFDS) };
+    let Some(i) = evs.iter().position(Option::is_none) else {
+        return ENFILE_;
+    };
+    evs[i] = Some(Eventfd {
+        count: initval,
+        sema: flags & EFD_SEMAPHORE != 0,
+        nonblock: flags & EFD_NONBLOCK != 0,
+    });
+    let fd = anon_fd(FdKind::Eventfd(i), flags & EFD_CLOEXEC != 0);
+    if (fd as i64) < 0 {
+        evs[i] = None; // fd table full — don't leak the instance
+    }
+    fd
+}
+
+/// The read side of eventfd: drain the counter (or decrement by 1
+/// under EFD_SEMAPHORE). Zero counter: EAGAIN when nonblock, else
+/// WaitOn::EventfdR — the waker deposits through our tables.
+fn eventfd_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
+    const EAGAIN: u64 = (-11i64) as u64;
+    const EINTR: u64 = (-4i64) as u64;
+    if len < 8 {
+        return EINVAL;
+    }
+    if !range_ok_w(buf, 8) {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let evs = unsafe { &mut *core::ptr::addr_of_mut!(EVENTFDS) };
+    let Some(e) = evs.get_mut(i).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    if e.count == 0 {
+        if e.nonblock {
+            return EAGAIN;
+        }
+        if deliverable(t) {
+            return EINTR;
+        }
+        t.wait_on = WaitOn::EventfdR(i);
+        t.wait_ptr = buf;
+        t.wait_len = 8;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+        block_switch()
+    }
+    let v = if e.sema { 1 } else { e.count };
+    e.count -= v;
+    // SAFETY: buf validated writable for 8 bytes under cur cr3.
+    unsafe { (buf as *mut u64).write_unaligned(v) };
+    eventfd_wake_writers(i); // the drain may now fit a blocked add
+    8
+}
+
+/// The write side: add v to the counter — u64::MAX itself is
+/// EINVAL, and an add that would pass 2^64-2 blocks (EAGAIN when
+/// nonblock) until a read drains room.
+fn eventfd_write(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
+    const EAGAIN: u64 = (-11i64) as u64;
+    const EINTR: u64 = (-4i64) as u64;
+    if len < 8 {
+        return EINVAL;
+    }
+    if !range_ok(buf, 8) {
+        return EFAULT;
+    }
+    // SAFETY: validated user u64 under cur cr3.
+    let v = unsafe { (buf as *const u64).read_unaligned() };
+    if v == u64::MAX {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let evs = unsafe { &mut *core::ptr::addr_of_mut!(EVENTFDS) };
+    let Some(e) = evs.get_mut(i).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    if v > EFD_MAX - e.count {
+        if e.nonblock {
+            return EAGAIN;
+        }
+        if deliverable(t) {
+            return EINTR;
+        }
+        t.wait_on = WaitOn::EventfdW(i);
+        t.wait_len = v; // re-checked at wake, like PipeWrite's fit
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+        block_switch()
+    }
+    e.count += v;
+    eventfd_wake_readers(i);
+    8
+}
+
+/// A write added count: wake EventfdR waiters FIFO — each gets
+/// its share (sema: 1; else the whole count) through its tables.
+fn eventfd_wake_readers(i: usize) {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let evs = unsafe { &mut *core::ptr::addr_of_mut!(EVENTFDS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked || t.wait_on != WaitOn::EventfdR(i) {
+            continue;
+        }
+        let Some(e) = evs.get_mut(i).and_then(|s| s.as_mut()) else {
+            return;
+        };
+        if e.count == 0 {
+            return; // drained — later readers keep sleeping
+        }
+        let v = if e.sema { 1 } else { e.count };
+        e.count -= v;
+        write_task_u64(t.pml4, t.wait_ptr, v);
+        t.ctx.rax = 8;
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
+    }
+}
+
+/// A read freed count space: wake EventfdW waiters whose add now
+/// fits under EFD_MAX — same re-check-at-wake shape as PipeWrite.
+fn eventfd_wake_writers(i: usize) {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let evs = unsafe { &mut *core::ptr::addr_of_mut!(EVENTFDS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked || t.wait_on != WaitOn::EventfdW(i) {
+            continue;
+        }
+        let Some(e) = evs.get_mut(i).and_then(|s| s.as_mut()) else {
+            return;
+        };
+        if t.wait_len > EFD_MAX - e.count {
+            continue; // still can't fit — next writer might
+        }
+        e.count += t.wait_len;
+        t.ctx.rax = 8;
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
+    }
+}
+
+/// timerfd_create(clockid, flags): a tick-deadline timer behind an
+/// OFD. CLOCK_REALTIME(0) and CLOCK_MONOTONIC(1) both ride TICKS —
+/// we have one clock; the split is a documented divergence.
+pub fn fd_timerfd_create(clockid: u64, flags: u64) -> u64 {
+    const ENFILE_: u64 = (-23i64) as u64;
+    const TFD_NONBLOCK: u64 = 0o4000;
+    const TFD_CLOEXEC: u64 = 0o2000000;
+    if clockid > 1 {
+        return EINVAL;
+    }
+    if flags & !(TFD_NONBLOCK | TFD_CLOEXEC) != 0 {
+        return EINVAL;
+    }
+    let tfs = unsafe { &mut *core::ptr::addr_of_mut!(TIMERFDS) };
+    let Some(i) = tfs.iter().position(Option::is_none) else {
+        return ENFILE_;
+    };
+    tfs[i] = Some(Timerfd {
+        armed: false,
+        deadline: 0,
+        interval: 0,
+        expirations: 0,
+        nonblock: flags & TFD_NONBLOCK != 0,
+    });
+    let fd = anon_fd(FdKind::Timerfd(i), flags & TFD_CLOEXEC != 0);
+    if (fd as i64) < 0 {
+        tfs[i] = None;
+    }
+    fd
+}
+
+/// Resolve an fd to a TIMERFDS index — EBADF for a bad/missing fd,
+/// EINVAL for a valid fd that isn't a timerfd (Linux's answer).
+fn timerfd_idx(fd: u64) -> Result<usize, u64> {
+    let Some(t) = cur_mut() else { return Err(EBADF) };
+    let Some(oi) = fdt(t).fds.get(fd as usize).copied().flatten() else {
+        return Err(EBADF);
+    };
+    let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
+    match ofds.get(oi as usize).and_then(|s| s.as_ref()) {
+        Some(o) => match o.kind {
+            FdKind::Timerfd(i) => Ok(i),
+            _ => Err(EINVAL),
+        },
+        None => Err(EBADF),
+    }
+}
+
+/// ns -> ticks at 100 Hz, rounding up like Linux's tick-boundary
+/// timers (a sub-tick request must not fire early).
+fn ns_to_ticks(sec: i64, nsec: i64) -> u64 {
+    (sec.max(0) as u64)
+        .saturating_mul(100)
+        .saturating_add((nsec.max(0) as u64).div_ceil(10_000_000))
+}
+
+/// timerfd_settime(fd, flags, new, old): arm/disarm + report the
+/// prior state. itimerspec is {it_interval, it_value} — two
+/// timespecs, 32 bytes. TFD_TIMER_ABSTIME(1) makes it_value an
+/// absolute ns-since-boot deadline.
+pub fn fd_timerfd_settime(fd: u64, flags: u64, new: u64, old: u64) -> u64 {
+    const TFD_ABSTIME: u64 = 1;
+    if flags & !TFD_ABSTIME != 0 {
+        return EINVAL;
+    }
+    if new == 0 {
+        return EFAULT;
+    }
+    if !range_ok(new, 32) {
+        return EFAULT;
+    }
+    if old != 0 && !range_ok_w(old, 32) {
+        return EFAULT;
+    }
+    let i = match timerfd_idx(fd) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    // SAFETY: validated itimerspec under cur cr3.
+    let (isec, insec, vsec, vnsec) = unsafe {
+        (
+            (new as *const i64).read_unaligned(),
+            ((new + 8) as *const i64).read_unaligned(),
+            ((new + 16) as *const i64).read_unaligned(),
+            ((new + 24) as *const i64).read_unaligned(),
+        )
+    };
+    if isec < 0 || vsec < 0 || !(0..1_000_000_000).contains(&insec)
+        || !(0..1_000_000_000).contains(&vnsec)
+    {
+        return EINVAL;
+    }
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let tfs = unsafe { &mut *core::ptr::addr_of_mut!(TIMERFDS) };
+    let Some(tf) = tfs.get_mut(i).and_then(|s| s.as_mut()) else {
+        return EINVAL;
+    };
+    if old != 0 {
+        // Prior interval + remaining time to the old deadline.
+        let rem = if tf.armed { tf.deadline.saturating_sub(now) } else { 0 };
+        // SAFETY: old validated writable for 32 bytes under cur cr3.
+        unsafe {
+            (old as *mut i64).write_unaligned((tf.interval / 100) as i64);
+            ((old + 8) as *mut i64)
+                .write_unaligned(((tf.interval % 100) * 10_000_000) as i64);
+            ((old + 16) as *mut i64).write_unaligned((rem / 100) as i64);
+            ((old + 24) as *mut i64)
+                .write_unaligned(((rem % 100) * 10_000_000) as i64);
+        }
+    }
+    tf.interval = ns_to_ticks(isec, insec);
+    if vsec == 0 && vnsec == 0 {
+        tf.armed = false; // disarm — pending expirations survive
+    } else {
+        let v = ns_to_ticks(vsec, vnsec).max(1);
+        tf.deadline = if flags & TFD_ABSTIME != 0 {
+            v
+        } else {
+            now.saturating_add(v)
+        };
+        tf.armed = true;
+    }
+    timerfd_expire(); // a past/now deadline may fire immediately
+    0
+}
+
+/// timerfd_gettime(fd, cur): report {interval, remaining}. The
+/// same ticks->timespec shape settime writes for `old`.
+pub fn fd_timerfd_gettime(fd: u64, cur: u64) -> u64 {
+    if cur == 0 || !range_ok_w(cur, 32) {
+        return EFAULT;
+    }
+    let i = match timerfd_idx(fd) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    timerfd_expire(); // the report must be as-of-now
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let tfs = unsafe { &*core::ptr::addr_of!(TIMERFDS) };
+    let Some(tf) = tfs.get(i).and_then(|s| s.as_ref()) else {
+        return EINVAL;
+    };
+    let rem = if tf.armed { tf.deadline.saturating_sub(now) } else { 0 };
+    // SAFETY: cur validated writable for 32 bytes under cur cr3.
+    unsafe {
+        (cur as *mut i64).write_unaligned((tf.interval / 100) as i64);
+        ((cur + 8) as *mut i64)
+            .write_unaligned(((tf.interval % 100) * 10_000_000) as i64);
+        ((cur + 16) as *mut i64).write_unaligned((rem / 100) as i64);
+        ((cur + 24) as *mut i64)
+            .write_unaligned(((rem % 100) * 10_000_000) as i64);
+    }
+    0
+}
+
+/// The read side: collect the unread expiry count. Before expiry:
+/// EAGAIN when nonblock, else WaitOn::Timerfd — timerfd_expire
+/// deposits through the sleeper's tables at the deadline tick.
+fn timerfd_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
+    const EAGAIN: u64 = (-11i64) as u64;
+    const EINTR: u64 = (-4i64) as u64;
+    if len < 8 {
+        return EINVAL;
+    }
+    if !range_ok_w(buf, 8) {
+        return EFAULT;
+    }
+    timerfd_expire(); // a deadline that passed may not have ticked
+    let Some(t) = cur_mut() else { return EBADF };
+    let tfs = unsafe { &mut *core::ptr::addr_of_mut!(TIMERFDS) };
+    let Some(tf) = tfs.get_mut(i).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    if tf.expirations == 0 {
+        if tf.nonblock {
+            return EAGAIN;
+        }
+        if deliverable(t) {
+            return EINTR;
+        }
+        t.wait_on = WaitOn::Timerfd(i);
+        t.wait_ptr = buf;
+        t.wait_len = 8;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+        block_switch()
+    }
+    let n = tf.expirations;
+    tf.expirations = 0;
+    // SAFETY: buf validated writable for 8 bytes under cur cr3.
+    unsafe { (buf as *mut u64).write_unaligned(n) };
+    8
+}
+
+/// Service elapsed timerfd deadlines — one-shots expire once and
+/// disarm; periodics fold missed cycles into the count (Linux's
+/// overruns) and re-arm forward. Then wake blocked readers.
+/// Runs from the timer tick and lazily at timerfd syscall entry.
+pub fn timerfd_expire() {
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    {
+        let tfs = unsafe { &mut *core::ptr::addr_of_mut!(TIMERFDS) };
+        for tf in tfs.iter_mut().flatten() {
+            if !tf.armed || tf.deadline > now {
+                continue;
+            }
+            if tf.interval == 0 {
+                tf.expirations = tf.expirations.saturating_add(1);
+                tf.armed = false;
+            } else {
+                let missed = 1 + (now - tf.deadline) / tf.interval;
+                tf.expirations = tf.expirations.saturating_add(missed);
+                tf.deadline += tf.interval * missed;
+            }
+        }
+    }
+    // Unread expirations wake WaitOn::Timerfd sleepers — deposit
+    // the count through the sleeper's tables like a pipe read.
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let tfs = unsafe { &mut *core::ptr::addr_of_mut!(TIMERFDS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked {
+            continue;
+        }
+        let WaitOn::Timerfd(i) = t.wait_on else {
+            continue;
+        };
+        let Some(tf) = tfs.get_mut(i).and_then(|s| s.as_mut()) else {
+            continue;
+        };
+        if tf.expirations == 0 {
+            continue;
+        }
+        let n = tf.expirations;
+        tf.expirations = 0;
+        write_task_u64(t.pml4, t.wait_ptr, n);
+        t.ctx.rax = 8;
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
+    }
 }
 
 /// Scan one task's three pselect fd_sets through ITS page tables,
@@ -8431,6 +8982,7 @@ pub fn tick(img: &mut UCtx) -> *const UCtx {
     // kernel-CS frames the hlt-idle loops take, where skipping them
     // would freeze every Blocked task's deadline and input feed.
     poll_expire(); // timed poll waits age one tick
+    timerfd_expire(); // armed timerfds fire + wake their readers
     crate::e1000::rx_drain(); // feed socket queues from the live ring
     stdin_pump(); // feed the tty input queue from the scancode ring
     if img.cs & 3 != 3 {

@@ -20,6 +20,8 @@
 #include <sys/epoll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <time.h>
 
 static int fails;
@@ -273,6 +275,122 @@ int main(void) {
         struct stat est;
         check(fstat(ep, &est) == 0 && S_ISCHR(est.st_mode),
               "epoll fstat chrdev");
+
+        /* eventfd + timerfd — the anon-inode fd family glibc's
+           event loop wants. eventfd is a u64 semaphore: write
+           adds, read drains (or decrements under EFD_SEMAPHORE),
+           zero-counter reads block or EAGAIN. */
+        int efd = eventfd(0, EFD_NONBLOCK);
+        check(efd >= 0, "eventfd create");
+        uint64_t ev = 0;
+        errno = 0;
+        check(efd >= 0 && read(efd, &ev, 8) < 0 && errno == EAGAIN,
+              "eventfd empty -> EAGAIN");
+        ev = 5;
+        check(write(efd, &ev, 8) == 8, "eventfd write 5");
+        struct pollfd epf = { .fd = efd, .events = POLLIN };
+        check(poll(&epf, 1, 0) == 1 && (epf.revents & POLLIN),
+              "eventfd poll ready");
+        ev = 0;
+        check(read(efd, &ev, 8) == 8 && ev == 5, "eventfd drain 5");
+        errno = 0;
+        check(read(efd, &ev, 8) < 0 && errno == EAGAIN,
+              "eventfd drained -> EAGAIN");
+        ev = ~0ULL;
+        errno = 0;
+        check(write(efd, &ev, 8) < 0 && errno == EINVAL,
+              "eventfd write MAX -> EINVAL");
+        errno = 0;
+        check(write(efd, &ev, 4) < 0 && errno == EINVAL,
+              "eventfd short write EINVAL");
+        check(fstat(efd, &est) == 0 && S_ISCHR(est.st_mode),
+              "eventfd fstat chrdev");
+
+        /* EFD_SEMAPHORE: each read returns 1 and decrements. */
+        int sefd = eventfd(2, EFD_SEMAPHORE | EFD_NONBLOCK);
+        ev = 0;
+        check(sefd >= 0 &&
+              read(sefd, &ev, 8) == 8 && ev == 1 &&
+              read(sefd, &ev, 8) == 8 && ev == 1 &&
+              (errno = 0, read(sefd, &ev, 8) < 0 && errno == EAGAIN),
+              "eventfd semaphore count");
+        if (sefd >= 0) close(sefd);
+
+        /* epoll watching an eventfd — the composition real event
+           loops build on. */
+        check(epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ee) == 0,
+              "epoll ADD eventfd");
+        ev = 7;
+        check(write(efd, &ev, 8) == 8 &&
+              epoll_wait(ep, out, 4, 0) == 1 &&
+              (out[0].events & EPOLLIN),
+              "epoll sees eventfd");
+        ev = 0;
+        read(efd, &ev, 8);
+        close(efd);
+
+        /* Blocked eventfd read: a forking writer delivers while
+           the parent sleeps — the wake deposits the value, not a
+           spurious EAGAIN or zero. */
+        int befd = eventfd(0, 0);
+        check(befd >= 0, "blocking eventfd create");
+        pid_t ekid = befd >= 0 ? fork() : -1;
+        if (ekid == 0) {
+            struct timespec d = {0, 40000000};
+            nanosleep(&d, NULL);
+            uint64_t one = 9;
+            write(befd, &one, 8);
+            _exit(0);
+        }
+        if (ekid > 0) {
+            ev = 0;
+            check(read(befd, &ev, 8) == 8 && ev == 9,
+                  "eventfd blocked read wake");
+            waitpid(ekid, NULL, 0);
+        }
+        if (befd >= 0) close(befd);
+
+        /* timerfd: arm a one-shot, block for it, then a periodic
+           and the overrun count. */
+        int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+        check(tfd >= 0, "timerfd_create");
+        struct itimerspec its;
+        memset(&its, 0, sizeof(its));
+        its.it_value.tv_nsec = 30000000; /* 30 ms */
+        check(tfd >= 0 &&
+              timerfd_settime(tfd, 0, &its, NULL) == 0,
+              "timerfd arm 30ms");
+        ev = 0;
+        check(read(tfd, &ev, 8) == 8 && ev == 1,
+              "timerfd read expires");
+        check(fstat(tfd, &est) == 0 && S_ISCHR(est.st_mode),
+              "timerfd fstat chrdev");
+
+        /* Periodic: 20ms value + 20ms interval; ~75ms of suite
+           time later the count must be >=2 (overruns fold in). */
+        its.it_interval.tv_nsec = 20000000;
+        its.it_value.tv_nsec = 20000000;
+        check(timerfd_settime(tfd, 0, &its, NULL) == 0,
+              "timerfd arm periodic");
+        struct timespec nap = {0, 75000000};
+        nanosleep(&nap, NULL);
+        ev = 0;
+        check(read(tfd, &ev, 8) == 8 && ev >= 2,
+              "timerfd periodic >=2");
+
+        /* Disarm via zero it_value; gettime then reports zeros;
+           settime on a non-timerfd is EINVAL. */
+        memset(&its, 0, sizeof(its));
+        check(timerfd_settime(tfd, 0, &its, NULL) == 0,
+              "timerfd disarm");
+        struct itimerspec cur;
+        check(timerfd_gettime(tfd, &cur) == 0 &&
+              cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec == 0,
+              "timerfd gettime disarmed");
+        errno = 0;
+        check(timerfd_settime(epfd[1], 0, &its, NULL) < 0 &&
+              errno == EINVAL, "settime non-timerfd EINVAL");
+        close(tfd);
         errno = 0;
         check(read(ep, &ec, 1) < 0 && errno == EINVAL,
               "epoll read -> EINVAL");

@@ -341,6 +341,12 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         233 => user::fd_epoll_ctl(a1, a2, a3, a4),
         232 => user::fd_epoll_wait(ctx, a1, a2, a3, a4 as i64, 0, 0),
         281 => user::fd_epoll_wait(ctx, a1, a2, a3, a4 as i64, a5, a6),
+        // anon-inode semaphores + tick timers.
+        284 => user::fd_eventfd(a1, 0),  // eventfd: no flags
+        290 => user::fd_eventfd(a1, a2), // eventfd2
+        283 => user::fd_timerfd_create(a1, a2),
+        286 => user::fd_timerfd_settime(a1, a2, a3, a4),
+        287 => user::fd_timerfd_gettime(a1, a2),
         NR_SOCKET => user::fd_socket(a1, a2, a3),
         NR_CONNECT => user::fd_connect(ctx, a1, a2, a3),
         NR_ACCEPT => user::fd_accept(ctx, a1, a2, a3, 0),
