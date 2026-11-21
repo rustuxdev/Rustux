@@ -66,18 +66,21 @@ IPv8 path above.
 
 On top of that sits a growing Linux-ABI userspace: ring-3 tasks running
 ELFs from a cpio initrd — static-PIE binaries and dynamically linked
-ones via `PT_INTERP`/ld.so — a 100+-call syscall surface covering
+ones via `PT_INTERP`/ld.so — a 120+-call syscall surface covering
 `fork`/`execve`/`waitpid`, real signals with a sigreturn restorer
-trampoline, `brk`/anonymous and file-backed `mmap`/`munmap`/`mprotect`,
+trampoline — including queued signals (`sigqueue`/`sigqueueinfo`,
+`SA_SIGINFO` siginfo_t with real `si_code`/`si_pid`/`si_value`),
+`brk`/anonymous and file-backed `mmap`/`munmap`/`mprotect`,
 a hierarchical VFS with a generated `/proc` (per-pid
 `stat`/`status`/`comm`/`cmdline`/`statm`/`fd`/`fdinfo`, the
 `exe`/`cwd`/`root`/`self` links, real utime/stime accounting,
 `uptime`/`meminfo`/`loadavg`/`stat`/`cpuinfo`/`mounts`),
 pipes, sockets (`socket`/`bind`/
 `listen`/`accept`/`connect`, `poll`/`ppoll`/`pselect6`, `epoll`,
-`eventfd`, `timerfd`, `signalfd`, `inotify`, queued
-signals (`sigqueue`/`sigqueueinfo`, `SA_SIGINFO` siginfo_t), `getsockname`/
-`getpeername`, `sendfile`), `rseq`, a keyboard- and UART-driven terminal
+`eventfd`, `timerfd`, `signalfd`, `inotify`, `getsockname`/
+`getpeername`, `sendfile`), real `statfs`/`fstatfs` capacity
+(`df` prints the frame allocator's numbers), `rseq`, a keyboard- and
+UART-driven terminal
 with a canonical/raw line discipline and full termios, real process
 groups, sessions and a controlling tty (`/dev/tty`, `tcsetpgrp`,
 SIGTTIN, SIGTTOU with TOSTOP — the whole job-control model), `clone`
