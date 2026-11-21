@@ -1523,3 +1523,50 @@ refcount-under-lock), CVE-2025-39881 (epitem outliving released
 file — n/a, OFD-index pins purged at teardown), CVE-2013-7446
 (epoll_ctl UAF — n/a, no heap epitem), CVE-2023-54019 (per-file
 waitqueue UAF — n/a, none exist). CVE ledger: 102.
+
+
+run-95 — anon-inode semaphores: eventfd(284)/eventfd2(290),
+timerfd_create(283)/settime(286)/gettime(287)
+---------------------------------------------------------------------
+
+The rest of glibc's event-loop toolkit. eventfd is a u64 kernel
+semaphore behind a new FdKind::Eventfd: write adds (u64::MAX is
+EINVAL, overflow past 2^64-2 blocks or EAGAINs), read drains —
+or decrements by 1 under EFD_SEMAPHORE. Both sides block:
+WaitOn::EventfdR readers are deposited their value through the
+sleeper's tables by eventfd_wake_readers; WaitOn::EventfdW
+writers re-check fit at wake like PipeWrite. nonblock lives
+per-instance like Linux file-status flags.
+
+timerfd is one armed TICKS deadline plus a periodic interval in
+TIMERFDS. timerfd_expire() runs from the timer tick and lazily at
+every timerfd syscall: one-shots expire once and disarm,
+periodics fold missed cycles into expirations (Linux's overruns)
+and re-arm forward. WaitOn::Timerfd readers get the count
+deposited by the same translate-write wake. settime reports the
+prior {interval, remaining} through `old`, gettime the current
+one; ABSTIME reads as absolute ticks — our single clock is the
+documented divergence (CLOCK_REALTIME aliases MONOTONIC).
+
+poll/epoll integrate via ofd_revents arms: eventfd is POLLIN on
+nonzero count and POLLOUT under the ceiling; timerfd is POLLIN on
+pending expirations OR a passed-but-unfolded deadline — computed
+read-only so scans never mutate inside a TASKS iteration.
+ofd_release frees both instance slots; a blocked waiter's own fd
+pins its instance alive (same OFD-refcount argument as epoll).
+
+Tests: iotest +22 (create, empty EAGAIN, write/drain round-trip,
+poll ready, MAX/short-write EINVAL, fstat chrdev, semaphore
+decrement, epoll-watches-eventfd composition, blocked read wake
+via forking writer, timerfd arm/expire/periodic-overruns/disarm/
+gettime/non-timerfd EINVAL). Full suite green, 42 tasks, frames
+zero leak, boot PASS WSL.
+
+Audit run-69 scoped to the diff: 0 confirmed (instances can't be
+freed under a waiter — fd pins the OFD; expire never runs inside
+a TASKS iteration — ofd_revents reads deadline state without
+folding; the EFD_MAX check can't wrap since v<=EFD_MAX is proven
+first; sub-tick requests round UP not early). cve.now: no
+eventfd/timerfd CVEs on record — the class folds into run-68's
+anon-inode lifetime findings (no refcount-under-lock, no per-
+object waitqueues to dangle). CVE ledger: 102.
