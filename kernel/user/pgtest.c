@@ -15,12 +15,32 @@
 #include <termios.h>
 #include <poll.h>
 #include <sys/signalfd.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <sched.h>
 
 static int fails;
 static volatile sig_atomic_t got_usr1;
+static volatile sig_atomic_t q_signo, q_code, q_pid, q_val,
+    q_status, q_u1_inh, q_u2_inh;
+static void info_hit(int s, siginfo_t *i, void *u) {
+    (void)s; (void)u;
+    q_signo = i->si_signo; q_code = i->si_code;
+    q_pid = i->si_pid; q_val = i->si_value.sival_int;
+    q_status = i->si_status;
+    sigset_t cur; sigemptyset(&cur);
+    sigprocmask(0, NULL, &cur);
+    q_u1_inh = sigismember(&cur, SIGUSR1);
+    q_u2_inh = sigismember(&cur, SIGUSR2);
+    got_usr1 = 1;
+}
 static void usr1_hit(int s) { (void)s; got_usr1 = 1; }
+static volatile void *fv_expect;
+static void segv_hit(int s, siginfo_t *i, void *u) {
+    (void)s; (void)u;
+    _exit(i->si_code == SEGV_ACCERR && i->si_addr == fv_expect
+              ? 42 : 43);
+}
 static void check(int ok, const char *what) {
     printf("  %-46s %s\n", what, ok ? "ok" : "FAIL");
     if (!ok) fails++;
@@ -424,6 +444,153 @@ int main(void) {
     check(sc > 0 && pause() == -1 && errno == EINTR && got_usr1,
           "pause() interrupted by SIGUSR1 -> EINTR");
     waitpid(sc, &st, 0);
+
+
+    /* --- run-101: queued signals, SA_SIGINFO, si fields -------- */
+    q_signo = q_code = q_pid = q_val = 0;
+    got_usr1 = 0;
+    {
+        struct sigaction si3 = {0};
+        si3.sa_sigaction = info_hit;
+        si3.sa_flags = SA_SIGINFO;
+        sigaddset(&si3.sa_mask, SIGUSR2);
+        check(sigaction(SIGUSR1, &si3, NULL) == 0,
+              "SA_SIGINFO SIGUSR1 arms");
+    }
+    check(kill(getpid(), SIGUSR1) == 0 && got_usr1,
+          "kill -> 3-arg handler ran");
+    check(q_signo == SIGUSR1 && q_code == SI_USER &&
+          q_pid == getpid(), "kill si_code=SI_USER si_pid=self");
+    check(q_u1_inh && q_u2_inh,
+          "handler mask = self|sa_mask applied");
+
+    /* sigqueue(): value + SI_QUEUE code reach the handler. */
+    got_usr1 = q_signo = q_code = q_pid = q_val = 0;
+    union sigval sv = {.sival_int = 0x5a5a};
+    check(sigqueue(getpid(), SIGUSR1, sv) == 0 && got_usr1,
+          "sigqueue self -> handler ran");
+    check(q_code == SI_QUEUE && q_val == 0x5a5a &&
+          q_pid == getpid(), "sigqueue si_value+SI_QUEUE+si_pid");
+
+    /* rt_sigqueueinfo rejects kernel/provenance-forging codes. */
+    {
+        siginfo_t bad;
+        memset(&bad, 0, sizeof(bad));
+        bad.si_signo = SIGUSR1; bad.si_code = 42;
+        errno = 0;
+        check(syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, &bad)
+                  == -1 && errno == EPERM,
+              "sigqueueinfo positive si_code -> EPERM");
+        bad.si_code = SI_TKILL;
+        errno = 0;
+        check(syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, &bad)
+                  == -1 && errno == EPERM,
+              "sigqueueinfo SI_TKILL -> EPERM");
+        /* wrong tgid -> ESRCH on rt_tgsigqueueinfo */
+        bad.si_code = SI_QUEUE; bad.si_value.sival_int = 7;
+        errno = 0;
+        check(syscall(SYS_rt_tgsigqueueinfo, getpid() + 9999,
+                      getpid(), SIGUSR1, &bad) == -1 &&
+                  errno == ESRCH,
+              "tgsigqueueinfo wrong tgid -> ESRCH");
+        errno = 0;
+        q_val = 0; got_usr1 = 0;
+        check(syscall(SYS_rt_tgsigqueueinfo, getpid(), getpid(),
+                      SIGUSR1, &bad) == 0 && got_usr1 && q_val == 7,
+              "tgsigqueueinfo right tgid delivers value");
+    }
+
+    /* SIGCHLD: si_code=CLD_EXITED, si_pid=kid, si_status=exit code. */
+    q_signo = q_code = q_pid = q_status = 0;
+    {
+        struct sigaction sc_act = {0};
+        sc_act.sa_sigaction = info_hit;
+        sc_act.sa_flags = SA_SIGINFO;
+        check(sigaction(SIGCHLD, &sc_act, NULL) == 0,
+              "SA_SIGINFO SIGCHLD arms");
+        pid_t ck = fork();
+        if (ck == 0) _exit(7);
+        waitpid(ck, NULL, 0);
+        check(q_signo == SIGCHLD && q_code == CLD_EXITED &&
+              q_pid == ck && q_status == 7,
+              "SIGCHLD si: CLD_EXITED+pid+status");
+        sc_act.sa_handler = SIG_DFL;
+        sigaction(SIGCHLD, &sc_act, NULL);
+    }
+
+    /* A queued signal also fills the signalfd record. */
+    {
+        sigset_t sm; sigemptyset(&sm); sigaddset(&sm, SIGUSR1);
+        check(sigprocmask(SIG_BLOCK, &sm, NULL) == 0,
+              "block USR1 for queued signalfd");
+        int sfd = signalfd(-1, &sm, 0);
+        check(sfd >= 0, "signalfd for queued sig");
+        union sigval v2 = {.sival_int = 0x1234};
+        check(sigqueue(getpid(), SIGUSR1, v2) == 0,
+              "sigqueue while blocked");
+        struct signalfd_siginfo fsi;
+        int nr = read(sfd, &fsi, sizeof(fsi));
+        check(nr == (int)sizeof(fsi) && fsi.ssi_signo == SIGUSR1 &&
+              fsi.ssi_code == SI_QUEUE && fsi.ssi_int == 0x1234 &&
+              fsi.ssi_pid == getpid(),
+              "signalfd ssi_code+ssi_int+ssi_pid");
+        close(sfd);
+        sigprocmask(SIG_UNBLOCK, &sm, NULL);
+        struct sigaction dfl = {0};
+        dfl.sa_handler = SIG_DFL;
+        sigaction(SIGUSR1, &dfl, NULL);
+    }
+
+    /* A caught SIGSEGV carries si_code=SEGV_ACCERR + si_addr —
+       a PROT_NONE page is a present-but-inaccessible mapping. */
+    {
+        void *guard = mmap(NULL, 4096, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        check(guard != MAP_FAILED, "PROT_NONE mmap for fault check");
+        fv_expect = guard;
+        pid_t fk = fork();
+        if (fk == 0) {
+            struct sigaction fa = {0};
+            fa.sa_sigaction = segv_hit;
+            fa.sa_flags = SA_SIGINFO;
+            sigaction(SIGSEGV, &fa, NULL);
+            *(volatile int *)guard = 1;
+            _exit(44);
+        }
+        int fst = 0;
+        waitpid(fk, &fst, 0);
+        check(WIFEXITED(fst) && WEXITSTATUS(fst) == 42,
+              "SIGSEGV si_code+si_addr reach handler");
+        munmap(guard, 4096);
+    }
+
+    /* A queued payload is per-task: a pending queued signal in the
+       parent is not visible to a forked child. */
+    {
+        sigset_t sm2; sigemptyset(&sm2); sigaddset(&sm2, SIGUSR2);
+        check(sigprocmask(SIG_BLOCK, &sm2, NULL) == 0,
+              "block USR2 for inherit check");
+        union sigval v3 = {.sival_int = 0x99};
+        check(sigqueue(getpid(), SIGUSR2, v3) == 0,
+              "queue USR2 for inherit check");
+        pid_t ik = fork();
+        if (ik == 0) {
+            sigset_t pend;
+            sigpending(&pend);
+            _exit(sigismember(&pend, SIGUSR2) ? 1 : 0);
+        }
+        int ist = 0;
+        waitpid(ik, &ist, 0);
+        check(WIFEXITED(ist) && WEXITSTATUS(ist) == 0,
+              "queued signal not inherited");
+        siginfo_t wi;
+        memset(&wi, 0, sizeof(wi));
+        check(sigwaitinfo(&sm2, &wi) == SIGUSR2 &&
+              wi.si_code == SI_QUEUE &&
+              wi.si_value.sival_int == 0x99,
+              "queued payload stays with parent");
+        sigprocmask(SIG_UNBLOCK, &sm2, NULL);
+    }
 
     printf("pgtest: %d failures, done\n", fails);
     return fails;

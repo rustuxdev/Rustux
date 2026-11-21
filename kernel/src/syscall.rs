@@ -335,6 +335,8 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         130 => user::sys_sigsuspend(ctx, a1, a2),
         // rt_sigtimedwait(set,info,ts,sigsize): glibc sigwaitinfo
         // reaches it with ts=NULL — there is no nr-129 sigwaitinfo.
+        129 => user::rt_sigqueueinfo(a1 as i64, a2, a3),
+        297 => user::rt_tgsigqueueinfo(a1, a2 as i64, a3, a4),
         128 => user::sys_rt_sigtimedwait(ctx, a1, a2, a3, a4),
         270 => user::fd_pselect(ctx, a1, a2, a3, a4, a5, a6),
         271 => user::fd_ppoll(ctx, a1, a2, a3, a4, a5),
@@ -380,7 +382,7 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         // off arrives as u64; the fd layer interprets it as i64 —
         // negative seeks are how SEEK_CUR/END move backwards.
         NR_LSEEK => user::fd_lseek(a1, a2 as i64, a3),
-        NR_SIGACTION => user::sigaction(a1, a2, a3),
+        NR_SIGACTION => user::sigaction(a1, a2, a3, a4),
         NR_SIGRETURN => user::sigreturn(ctx),
         NR_DUP => user::fd_dup(a1),
         NR_DUP2 => user::fd_dup2(a1, a2),

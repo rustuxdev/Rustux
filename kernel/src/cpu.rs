@@ -269,13 +269,33 @@ extern "C" fn report_frame(f: &mut TrapFrame, regs: *mut SavedRegs) {
                     // default/ignored/failed disposition — the
                     // callee-saved GPRs never left the registers, so
                     // the pops below resume the handler cleanly.
-                    let (rip, rsp, rdi) = crate::user::fault_signal(signo, &mut ctx);
+                    // si_code/si_addr for an SA_SIGINFO handler:
+                    // #PF err bit0 picks MAPERR vs ACCERR, si_addr is
+                    // cr2 for a page fault and the faulting rip for
+                    // the rest (matching Linux's fill_sig_fault).
+                    let (code, addr) = match signo {
+                        11 if v == 14 => {
+                            (if f.err & 1 != 0 { 2 } else { 1 }, cr2)
+                        }
+                        4 => (2, f.rip),  // ILL_ILLOPC
+                        5 => (2, f.rip),  // TRAP_BRKPT/TRACE
+                        8 => (1, f.rip),  // FPE_INTDIV
+                        7 => (1, f.rip),  // BUS_ADRALN
+                        _ => (0x80, f.rip), // SI_KERNEL
+                    };
+                    let (rip, rsp, rdi) =
+                        crate::user::fault_signal(signo, code, addr, &mut ctx);
                     f.rip = rip;
                     f.rsp = rsp;
                     // SAFETY: regs names the dispatch-saved block on
                     // the live kstack; rdi's slot is what `pop rdi`
-                    // hands the handler.
-                    unsafe { (*regs).rdi = rdi };
+                    // hands the handler, rsi/rdx its siginfo and
+                    // ucontext args.
+                    unsafe {
+                        (*regs).rdi = rdi;
+                        (*regs).rsi = ctx.rsi;
+                        (*regs).rdx = ctx.rdx;
+                    }
                     return;
                 }
             }

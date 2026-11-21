@@ -485,14 +485,48 @@ const SIGCONT: usize = 18;
 const SIGKILL: usize = 9;
 const SIGSTOP: usize = 19;
 const SIGSEGV: usize = 11;
+/// si_code values — negative codes are user/queued, SI_KERNEL is
+/// the kernel's own (Linux reserves positives for kernel events;
+/// userspace pends only <= 0).
+const SI_USER: i32 = 0;
+const SI_KERNEL: i32 = 0x80;
+const SI_TKILL: i32 = -6;
+/// SIGCHLD si_code (CLD_*) — mapped from the child's wstatus.
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
+const CLD_DUMPED: i32 = 3;
+const CLD_STOPPED: i32 = 5;
+const CLD_CONTINUED: i32 = 6;
+/// sigaction sa_flags bits we honor.
+const SA_NODEFER: u32 = 0x4000_0000;
+const SA_RESETHAND: u32 = 0x8000_0000;
+/// The si fields attached to a pending bit. Standard signals
+/// coalesce — a second pend while the bit is set drops its info
+/// like Linux's standard-signal merge, so one record per bit is
+/// the exact model. aux is si_value for SI_QUEUE, si_status for
+/// SIGCHLD, si_addr for fault signals.
+#[derive(Clone, Copy)]
+struct SigSrc {
+    code: i32,
+    pid: u32,
+    uid: u32,
+    aux: u64,
+}
+const SIGSRC_NONE: SigSrc = SigSrc {
+    code: SI_KERNEL,
+    pid: 0,
+    uid: 0,
+    aux: 0,
+};
 /// wait4 option bits (Linux ABI): don't block, report stopped
 /// children, report continued children.
 const WNOHANG: u64 = 1;
 const WUNTRACED: u64 = 2;
 const WCONTINUED: u64 = 8;
 /// Bytes pushed on the task's user stack per delivered signal:
-/// restorer (8) + signo (8) + the interrupted UCtx (160).
-const SIGFRAME_SIZE: u64 = 176;
+/// restorer (8) + signo (8) + the interrupted UCtx (160) +
+/// siginfo_t (128) + the pre-delivery sigmask (8).
+const SIGFRAME_SIZE: u64 = 312;
 // The frame layout is only sound while UCtx stays 20 u64s — a size
 // change must grow the frame and both copy sites with it.
 const _: () = assert!(core::mem::size_of::<UCtx>() == 160);
@@ -573,10 +607,48 @@ fn sig_ignored(t: &Task, sig: u64) -> bool {
     h == SIG_IGN || (h == SIG_DFL && sig_default_ignore(sig as usize))
 }
 
+/// Render a SigSrc into the 128-byte siginfo_t (fd=false) or
+/// signalfd_siginfo (fd=true) record. The union fields land at
+/// their layout offsets: pid/uid, then si_status (SIGCHLD) /
+/// si_value (queued) / si_addr (fault).
+fn fill_sig_rec(sig: u64, si: SigSrc, fd: bool) -> [u8; 128] {
+    let mut rec = [0u8; 128];
+    rec[..4].copy_from_slice(&(sig as u32).to_le_bytes());
+    rec[8..12].copy_from_slice(&si.code.to_le_bytes());
+    let (pio, uio) = if fd { (12usize, 16usize) } else { (16, 20) };
+    rec[pio..pio + 4].copy_from_slice(&si.pid.to_le_bytes());
+    rec[uio..uio + 4].copy_from_slice(&si.uid.to_le_bytes());
+    if matches!(sig as usize, 4 | 5 | 7 | 8 | 11) {
+        // si_addr — siginfo@16 / signalfd@72.
+        let fo = if fd { 72 } else { 16 };
+        rec[fo..fo + 8].copy_from_slice(&si.aux.to_le_bytes());
+    } else if sig == SIGCHLD as u64 {
+        // si_status — siginfo@24 / signalfd@40.
+        let so = if fd { 40 } else { 24 };
+        rec[so..so + 4].copy_from_slice(&(si.aux as u32).to_le_bytes());
+    } else {
+        // si_value — siginfo@24; signalfd fills ssi_int@44 + ssi_ptr@48.
+        if fd {
+            rec[44..48].copy_from_slice(&(si.aux as u32).to_le_bytes());
+            rec[48..56].copy_from_slice(&si.aux.to_le_bytes());
+        } else {
+            rec[24..32].copy_from_slice(&si.aux.to_le_bytes());
+        }
+    }
+    rec
+}
+
+/// Consume the pend_src behind `sig` into a record — used by the
+/// dequeue paths that pop a pending bit themselves.
+fn sig_record(t: &mut Task, sig: u64, fd: bool) -> [u8; 128] {
+    let si = core::mem::replace(&mut t.pend_src[sig as usize - 1], SIGSRC_NONE);
+    fill_sig_rec(sig, si, fd)
+}
+
 fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
     while let Some(sig) = unmasked_pending(t) {
         t.pending &= !(1u32 << (sig - 1));
-        t.pending &= !(1u32 << (sig - 1));
+        let src = core::mem::replace(&mut t.pend_src[sig - 1], SIGSRC_NONE);
         match sigt(t).handlers.get(sig - 1).copied().unwrap_or(SIG_DFL) {
             SIG_IGN => {}
             SIG_DFL => {
@@ -585,6 +657,7 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                     // to Stopped, and tells the parent via the
                     // WUNTRACED machinery + SIGCHLD.
                     t.pending &= !(1u32 << (SIGCONT as u8 - 1));
+                    t.pend_src[SIGCONT - 1] = SIGSRC_NONE;
                     t.state = TaskState::Stopped;
                     t.stop_sig = sig as u8;
                     let (cp, cg, cpp) = (t.pid, t.pgid, t.ppid);
@@ -599,28 +672,69 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                 return;
             }
             handler => {
-                // [restorer][signo][UCtx]: a C handler that returns
-                // pops the restorer — SIGTRAMP_VA's `mov $15; syscall`
-                // stub — so ret IS rt_sigreturn (the handler runs at
-                // rsp=frame; the stub sees the UCtx at rsp+8).
+                // [restorer][signo][UCtx][siginfo_t][saved sigmask]:
+                // a C handler that returns pops the restorer —
+                // SIGTRAMP_VA's `mov $15; syscall` stub — so ret IS
+                // rt_sigreturn (the handler runs at rsp=frame; the
+                // stub sees the UCtx at rsp+8).
                 let frame = (ctx.rsp.wrapping_sub(SIGFRAME_SIZE)) & !15;
                 let sig64 = sig as u64;
+                let i = sig - 1;
+                let (fl, hm) = {
+                    let s = sigt(t);
+                    (
+                        s.flags.get(i).copied().unwrap_or(0),
+                        s.masks.get(i).copied().unwrap_or(0),
+                    )
+                };
+                // siginfo_t for an SA_SIGINFO handler — the union
+                // fields land at their layout offsets.
+                let info = fill_sig_rec(sig64, src, false);
                 // SAFETY: reinterprets the UCtx as its repr(C) bytes —
                 // written verbatim into the task's own stack.
                 let raw = unsafe {
                     core::slice::from_raw_parts(ctx as *const UCtx as *const u8, 160)
                 };
+                // The mask the frame restores on sigreturn: normally
+                // the pre-delivery sigmask, but an in-wake delivery
+                // with an owed psel restore rides the ORIGINAL mask —
+                // the handler's sigreturn is the suspend's return.
+                let saved_mask = if t.frame_mask != u64::MAX {
+                    t.frame_mask as u32
+                } else {
+                    t.sigmask
+                };
+                t.frame_mask = u64::MAX;
                 let ok = write_task_bytes(t.pml4, frame, &SIGTRAMP_VA.to_le_bytes())
                     && write_task_bytes(t.pml4, frame + 8, &sig64.to_le_bytes())
-                    && write_task_bytes(t.pml4, frame + 16, raw);
+                    && write_task_bytes(t.pml4, frame + 16, raw)
+                    && write_task_bytes(t.pml4, frame + 176, &info)
+                    && write_task_bytes(
+                        t.pml4,
+                        frame + 304,
+                        &(saved_mask as u64).to_le_bytes(),
+                    );
                 if !ok {
                     t.state = TaskState::Exited;
                     t.exit_status = SIGSEGV as u64;
                     return;
                 }
+                // SA_RESETHAND resets to default at entry; the
+                // handler runs under oldmask | sa_mask | self unless
+                // SA_NODEFER — sigreturn restores the saved mask.
+                if fl & SA_RESETHAND != 0 {
+                    sigt(t).handlers[i] = SIG_DFL;
+                }
+                let mut add = hm;
+                if fl & SA_NODEFER == 0 {
+                    add |= 1u32 << i;
+                }
+                t.sigmask |= add;
                 ctx.rsp = frame;
                 ctx.rip = handler;
                 ctx.rdi = sig64;
+                ctx.rsi = frame + 176; // &siginfo_t
+                ctx.rdx = frame + 16; // &ucontext (the saved UCtx)
                 return; // one signal per resume, Linux-style
             }
         }
@@ -636,7 +750,7 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
 /// the fault-time context (re-faulting if unfixed, exactly like
 /// Linux). A default or ignored disposition dies synchronously —
 /// IGN on a synchronous fault can't resume (Linux force_sig).
-pub fn fault_signal(signo: u64, ctx: &mut UCtx) -> (u64, u64, u64) {
+pub fn fault_signal(signo: u64, code: i32, addr: u64, ctx: &mut UCtx) -> (u64, u64, u64) {
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
     if let Some(t) = tasks.get_mut(cur).and_then(|s| s.as_mut()) {
@@ -647,7 +761,16 @@ pub fn fault_signal(signo: u64, ctx: &mut UCtx) -> (u64, u64, u64) {
             .unwrap_or(SIG_DFL)
             > SIG_IGN;
         if caught {
-            t.pending |= 1u32 << (signo - 1).min(31);
+            let i = (signo - 1).min(31) as usize;
+            if t.pending & (1u32 << i) == 0 {
+                t.pend_src[i] = SigSrc {
+                    code,
+                    pid: 0,
+                    uid: 0,
+                    aux: addr,
+                };
+            }
+            t.pending |= 1u32 << i;
             maybe_deliver(t, ctx);
             if t.state == TaskState::Runnable {
                 return (ctx.rip, ctx.rsp, ctx.rdi);
@@ -744,7 +867,7 @@ pub fn deliver_current(ctx: &mut UCtx) {
 /// Returns Some((pid, pgid, ppid)) when it resumed a Stopped task —
 /// the caller reports the WCONTINUED event to the parent after the
 /// iteration (re-walking TASKS mid-loop would alias the borrow).
-fn pend_one(t: &mut Task, sig: u64) -> Option<(u64, u64, u64)> {
+fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
     if t.state == TaskState::Exited {
         return None;
     }
@@ -753,6 +876,12 @@ fn pend_one(t: &mut Task, sig: u64) -> Option<(u64, u64, u64)> {
         // CONT dequeues pending stops, resumes a stopped task, and
         // still pends itself — a caught handler wants the event.
         t.pending &= !(0xfu32 << (SIGSTOP - 1)); // sigs 19..22
+        for i in SIGSTOP - 1..SIGSTOP + 3 {
+            t.pend_src[i] = SIGSRC_NONE;
+        }
+        if t.pending & (1u32 << (SIGCONT - 1)) == 0 {
+            t.pend_src[SIGCONT - 1] = src;
+        }
         t.pending |= 1u32 << (SIGCONT - 1);
         if t.state == TaskState::Stopped {
             t.state = TaskState::Runnable;
@@ -762,6 +891,10 @@ fn pend_one(t: &mut Task, sig: u64) -> Option<(u64, u64, u64)> {
     } else {
         if sig as usize == SIGSTOP {
             t.pending &= !(1u32 << (SIGCONT - 1)); // STOP drops CONT
+            t.pend_src[SIGCONT - 1] = SIGSRC_NONE;
+        }
+        if t.pending & (1u32 << (sig - 1)) == 0 {
+            t.pend_src[sig as usize - 1] = src;
         }
         t.pending |= 1u32 << (sig - 1);
         if t.state == TaskState::Stopped && sig as usize == SIGKILL {
@@ -781,12 +914,14 @@ fn pend_one(t: &mut Task, sig: u64) -> Option<(u64, u64, u64)> {
     if t.state == TaskState::Blocked && matches!(t.wait_on, WaitOn::SigTimed) {
         if !ignored && t.wait_len & (1u64 << (sig - 1)) != 0 {
             t.pending &= !(1u32 << (sig - 1));
+            let fd_shape = t.wait_ptr2 != 0;
             if t.wait_ptr != 0 {
                 // siginfo_t and signalfd_siginfo share s[i]_signo@0;
-                // Linux zero-fills the 128-byte record either way.
-                let mut rec = [0u8; 128];
-                rec[..4].copy_from_slice(&(sig as u32).to_le_bytes());
+                // the union fields land at their layout offsets.
+                let rec = sig_record(t, sig, fd_shape);
                 write_task_bytes(t.pml4, t.wait_ptr, &rec);
+            } else {
+                t.pend_src[sig as usize - 1] = SIGSRC_NONE;
             }
             // sigwait* returns the signo; signalfd-read returns 128.
             t.ctx.rax = if t.wait_ptr2 != 0 { 128 } else { sig };
@@ -828,9 +963,20 @@ fn pend_one(t: &mut Task, sig: u64) -> Option<(u64, u64, u64)> {
         // handler would never run. SigTimed wakes this way only on
         // an out-of-set signal — in-set ones were consumed above.
         if matches!(t.wait_on, WaitOn::SigWait | WaitOn::SigTimed) {
+            // If a psel/sigsuspend mask restore is owed and a handler
+            // frame gets pushed, the restore rides IN THE FRAME —
+            // the handler's sigreturn is the suspend's return point.
+            // Handler runs under temp|sa_mask|self meanwhile.
+            t.frame_mask = t.psel_mask;
             let mut c = t.ctx;
             maybe_deliver(t, &mut c);
             t.ctx = c;
+            if t.frame_mask == u64::MAX && t.psel_mask != u64::MAX {
+                // A frame consumed the owed restore — nothing left
+                // for psel_restore to do below.
+                t.psel_mask = u64::MAX;
+            }
+            t.frame_mask = u64::MAX;
         }
         t.wait_on = WaitOn::None;
         t.wait_ptr = 0;
@@ -892,7 +1038,27 @@ fn child_change(cpid: u64, cpgid: u64, cppid: u64, status: u64, flag: u64) {
             }
         }
     }
-    kill(cppid as i64, SIGCHLD as u64);
+    // SIGCHLD carries the real CLD_* si_code + si_status: the stop
+    // signal for CLD_STOPPED, SIGCONT for CLD_CONTINUED.
+    let (code, st) = if flag == WUNTRACED {
+        (CLD_STOPPED, ((status >> 8) & 0xff) as i32)
+    } else if flag == WCONTINUED {
+        (CLD_CONTINUED, SIGCONT as i32)
+    } else {
+        cld_code(status)
+    };
+    if let Some(p) = tasks.iter_mut().flatten().find(|t| t.pid == cppid) {
+        pend_one(
+            p,
+            SIGCHLD as u64,
+            SigSrc {
+                code,
+                pid: cpid as u32,
+                uid: 0,
+                aux: st as u64,
+            },
+        );
+    }
 }
 
 /// Signal every member of a process group — shared by kill(-pgid),
@@ -904,7 +1070,7 @@ fn kill_pgrp(pgid: u64, sig: u64) {
     for s in tasks.iter_mut() {
         let Some(t) = s else { continue };
         if t.pgid == pgid {
-            if let Some(c) = pend_one(t, sig) {
+            if let Some(c) = pend_one(t, sig, SIGSRC_NONE) {
                 conts[ncont] = c;
                 ncont += 1;
             }
@@ -953,11 +1119,17 @@ pub fn kill(pid: i64, sig: u64) -> u64 {
     let mut conts = [(0u64, 0u64, 0u64); MAX_TASKS];
     let mut ncont = 0usize;
     let mut found = false;
+    let src = SigSrc {
+        code: SI_USER,
+        pid: my_pid as u32,
+        uid: 0,
+        aux: 0,
+    };
     for s in tasks.iter_mut() {
         let Some(t) = s else { continue };
         if hits(t) {
             found = true;
-            if let Some(c) = pend_one(t, sig) {
+            if let Some(c) = pend_one(t, sig, src) {
                 conts[ncont] = c;
                 ncont += 1;
             }
@@ -972,34 +1144,59 @@ pub fn kill(pid: i64, sig: u64) -> u64 {
     0
 }
 
-/// rt_sigaction(sig, act, oldact): read/swap the disposition word —
-/// 0=SIG_DFL, 1=SIG_IGN, else a user handler VA (validated at
-/// delivery, like Linux). SIGKILL/SIGSTOP stay uncatchable.
-pub fn sigaction(sig: u64, act: u64, oldact: u64) -> u64 {
-    if sig == 0 || sig > 31 {
+/// rt_sigaction(sig, act, oldact, sigsetsize): read/swap the kernel
+/// sigaction {handler@0, flags@8, restorer@16, mask@24} — handler is
+/// 0=SIG_DFL, 1=SIG_IGN, else a user VA (validated at delivery, like
+/// Linux). The restorer field is accepted but ignored — delivery
+/// always returns through SIGTRAMP_VA. SIGKILL/SIGSTOP stay
+/// uncatchable.
+pub fn sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
+    if sig == 0 || sig > 31 || sigsetsize != 8 {
         return EINVAL;
     }
     let Some(t) = cur_mut() else { return EINVAL };
     let i = (sig - 1) as usize;
     if oldact != 0 {
-        if !range_ok_w(oldact, 8) {
+        if !range_ok_w(oldact, 32) {
             return EFAULT;
         }
+        let (h, f, m) = {
+            let s = sigt(t);
+            (
+                s.handlers[i],
+                s.flags.get(i).copied().unwrap_or(0) as u64,
+                s.masks.get(i).copied().unwrap_or(0) as u64,
+            )
+        };
         // SAFETY: validated writable user range.
-        unsafe { (oldact as *mut u64).write_unaligned(sigt(t).handlers[i]) };
+        unsafe {
+            (oldact as *mut u64).write_unaligned(h);
+            (oldact as *mut u64).add(1).write_unaligned(f);
+            (oldact as *mut u64).add(2).write_unaligned(0);
+            (oldact as *mut u64).add(3).write_unaligned(m);
+        }
     }
     if act != 0 {
-        if !range_ok(act, 8) {
+        if !range_ok(act, 32) {
             return EFAULT;
         }
         // SAFETY: validated readable user range.
-        let h = unsafe { (act as *const u64).read_unaligned() };
+        let (h, f, m) = unsafe {
+            (
+                (act as *const u64).read_unaligned(),
+                (act as *const u64).add(1).read_unaligned(),
+                (act as *const u64).add(3).read_unaligned(),
+            )
+        };
         // SIGKILL/SIGSTOP refuse every disposition change — a task
         // that could ignore SIGKILL would be unkillable by signal.
         if sig as usize == SIGKILL || sig as usize == SIGSTOP {
             return EINVAL;
         }
-        sigt(t).handlers[i] = h;
+        let s = sigt(t);
+        s.handlers[i] = h;
+        s.flags[i] = f as u32;
+        s.masks[i] = m as u32;
     }
     0
 }
@@ -1037,6 +1234,15 @@ pub fn sigreturn(ctx: &mut UCtx) -> u64 {
         || !range_ok_w(saved.rsp.wrapping_sub(1), 1)
     {
         die_signal(SIGSEGV as u64);
+    }
+    // The pre-delivery sigmask sits at frame+304 (rsp+296): delivery
+    // saved it before applying sa_mask|self; restoring it is both
+    // the handler-scope block and Linux's let-user-edit-uc_sigmask
+    // semantic in one.
+    if let Some(t) = cur_mut() {
+        // SAFETY: validated user range in the caller's space.
+        let m = unsafe { ((frame + 296) as *const u64).read_unaligned() };
+        t.sigmask = m as u32;
     }
     *ctx = saved;
     ctx.rax // restored rax IS the return value
@@ -1114,10 +1320,20 @@ pub struct Task {
     /// The syscall applies the caller's set for the sleep and the
     /// wake paths restore this one before userspace resumes.
     psel_mask: u64,
+    /// Mask a delivered signal frame should restore on sigreturn
+    /// when it differs from t.sigmask at push time — set for
+    /// in-wake deliveries where a psel restore is owed (the
+    /// handler's sigreturn IS the suspend's return point), cleared
+    /// by the frame push. u64::MAX when no override is set.
+    frame_mask: u64,
     /// apic::TICKS deadline for a timed Poll wait — 0 means none.
     wait_deadline: u64,
     /// Pending signal bitmask — bit (sig-1), sigs 1..=31.
     pending: u32,
+    /// si_code/pid/uid/aux behind each pending bit — written on the
+    /// 0->1 transition so first-pend info wins the standard-signal
+    /// merge, consumed at delivery into the siginfo record.
+    pend_src: [SigSrc; 31],
     /// rt_sigprocmask mask — set bits block delivery of the matching
     /// pending signal (masked-pending stays pending for later). Fork
     /// inherits it, exec preserves it. The mask may contain SIGKILL's
@@ -1274,8 +1490,20 @@ fn fdtab_release(i: u8) {
 struct SigTab {
     users: u8,
     handlers: [u64; 31],
+    /// rt_sigaction sa_flags per signal (SA_SIGINFO/NODEFER/
+    /// RESETHAND are the honored bits).
+    flags: [u32; 31],
+    /// rt_sigaction sa_mask per signal — extra signals blocked
+    /// while the handler runs (the sig bit itself joins unless
+    /// SA_NODEFER).
+    masks: [u32; 31],
 }
-const SIGH_EMPTY: SigTab = SigTab { users: 0, handlers: [0; 31] };
+const SIGH_EMPTY: SigTab = SigTab {
+    users: 0,
+    handlers: [0; 31],
+    flags: [0; 31],
+    masks: [0; 31],
+};
 const MAX_SIGTABS: usize = 64;
 /// Task.sigh sentinel after release — second release is a no-op.
 const SIGH_NONE: u8 = u8::MAX;
@@ -1966,9 +2194,11 @@ fn load(img: &[u8]) -> Option<Task> {
         wait_ptr2: 0,
         wait_ptr3: 0,
         psel_mask: u64::MAX,
+        frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
         pending: 0,
+        pend_src: [SIGSRC_NONE; 31],
         sigmask: 0,
         // SAFETY: read of the init-time capture.
         fx: unsafe { *core::ptr::addr_of!(INIT_FX) },
@@ -3605,6 +3835,79 @@ pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> u64 {
     // With threads, tid names the target task; a bare tgid hits the
     // leader (tgid == leader pid), matching Linux tgkill semantics.
     kill(if tid != 0 { tid } else { tgid } as i64, sig)
+}
+
+/// Shared rt_sigqueueinfo/rt_tgsigqueueinfo body: pend `sig` on the
+/// target with the user's si_code + si_value. Linux lets userspace
+/// send only negative si_codes (except SI_TKILL, which would fake a
+/// tkill's provenance) — anything else is EPERM, so a caller can't
+/// impersonate kernel-sourced or other-task-sourced siginfo.
+fn sigqueue_one(pid: i64, tgid: u64, sig: u64, uinfo: u64) -> u64 {
+    const ESRCH: u64 = (-3i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    if sig == 0 || sig > 31 {
+        return EINVAL;
+    }
+    if !range_ok(uinfo, 128) {
+        return EFAULT;
+    }
+    // SAFETY: validated readable user range; the fields we need are
+    // si_code@8 and si_value@24.
+    let (code, val) = unsafe {
+        (
+            (uinfo as *const i32).add(2).read_unaligned(),
+            ((uinfo + 24) as *const u64).read_unaligned(),
+        )
+    };
+    if code >= 0 || code == SI_TKILL {
+        return EPERM_;
+    }
+    let sender = cur_mut().map(|t| t.pid).unwrap_or(0) as u32;
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let hits = |t: &Task| {
+        t.pid == pid as u64 && (tgid == u64::MAX || t.tgid == tgid)
+    };
+    let mut conts = [(0u64, 0u64, 0u64); MAX_TASKS];
+    let mut ncont = 0usize;
+    let mut found = false;
+    for s in tasks.iter_mut() {
+        let Some(t) = s else { continue };
+        if hits(t) {
+            found = true;
+            if let Some(c) = pend_one(
+                t,
+                sig,
+                SigSrc {
+                    code,
+                    pid: sender,
+                    uid: 0,
+                    aux: val,
+                },
+            ) {
+                conts[ncont] = c;
+                ncont += 1;
+            }
+        }
+    }
+    if !found {
+        return ESRCH;
+    }
+    for c in conts.iter().take(ncont) {
+        child_change(c.0, c.1, c.2, 0xffff, WCONTINUED);
+    }
+    0
+}
+
+/// rt_sigqueueinfo(pid, sig, uinfo): glibc's sigqueue() — a queued
+/// signal carrying a siginfo_t whose si_value rides to the handler.
+pub fn rt_sigqueueinfo(pid: i64, sig: u64, uinfo: u64) -> u64 {
+    sigqueue_one(pid, u64::MAX, sig, uinfo)
+}
+
+/// rt_tgsigqueueinfo(tgid, pid, sig, uinfo): the same but addressed
+/// to a thread inside a group — target must match both ids.
+pub fn rt_tgsigqueueinfo(tgid: u64, pid: i64, sig: u64, uinfo: u64) -> u64 {
+    sigqueue_one(pid, tgid, sig, uinfo)
 }
 
 /// rt_sigprocmask(how, set, oldset, sigsetsize): the per-task signal
@@ -7229,7 +7532,12 @@ pub fn sys_sigsuspend(ctx: &mut UCtx, mask: u64, sigsize: u64) -> u64 {
         // restore. The syscall's own return also yields -EINTR if no
         // handler frame redirected the resume path.
         ctx.rax = EINTR;
+        // Same frame-mask rule as the blocked wake: the frame's
+        // saved mask is the ORIGINAL, not the temporary suspend
+        // mask — the handler's sigreturn is the suspend's return.
+        t.frame_mask = saved as u64;
         maybe_deliver(t, ctx);
+        t.frame_mask = u64::MAX;
         t.sigmask = saved;
         return EINTR;
     }
@@ -7309,8 +7617,7 @@ fn sig_wait(ctx: &mut UCtx, set: u64, info: u64, ts: u64, timed: bool) -> u64 {
         }
         t.pending &= !(1u32 << (sig - 1));
         if info != 0 {
-            let mut rec = [0u8; 128];
-            rec[..4].copy_from_slice(&(sig as u32).to_le_bytes());
+            let rec = sig_record(t, sig, false);
             // SAFETY: info validated writable for 128 bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -7319,6 +7626,8 @@ fn sig_wait(ctx: &mut UCtx, set: u64, info: u64, ts: u64, timed: bool) -> u64 {
                     128,
                 )
             };
+        } else {
+            t.pend_src[sig as usize - 1] = SIGSRC_NONE;
         }
         return sig;
     }
@@ -7370,7 +7679,11 @@ pub fn fd_signalfd4(fd: u64, mask_ptr: u64, sigsize: u64, flags: u64) -> u64 {
         return EFAULT;
     }
     // SAFETY: validated user sigset under cur cr3.
-    let mask = unsafe { (mask_ptr as *const u64).read_unaligned() } as u32;
+    // SIGKILL/SIGSTOP can't be caught — strip them like Linux's
+    // dequeue_signal sig_kernel_only skip, or a parked reader could
+    // swallow a fatal signal and become unkillable.
+    let mask = unsafe { (mask_ptr as *const u64).read_unaligned() } as u32
+        & !((1u32 << (SIGKILL - 1)) | (1u32 << (SIGSTOP - 1)));
     let Some(t) = cur_mut() else { return EINVAL };
     // fd is an int: user space's -1 arrives zero-extended as
     // 0xFFFFFFFF, not u64::MAX — compare the low word.
@@ -7436,8 +7749,7 @@ fn signalfd_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
             continue;
         }
         t.pending &= !(1u32 << (sig - 1));
-        let mut rec = [0u8; 128];
-        rec[..4].copy_from_slice(&(sig as u32).to_le_bytes());
+        let rec = sig_record(t, sig, true);
         // SAFETY: buf validated writable for 128 bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(rec.as_ptr(), buf as *mut u8, 128)
@@ -10729,8 +11041,33 @@ fn exit_bookkeeping(n: usize) {
     // ignores it; a handler sees it on the parent's next resume.
     if cppid != 0 {
         if let Some(p) = tasks.iter_mut().flatten().find(|t| t.pid == cppid) {
-            pend_one(p, SIGCHLD as u64);
+            let (code, st) = cld_code(wstatus);
+            pend_one(
+                p,
+                SIGCHLD as u64,
+                SigSrc {
+                    code,
+                    pid: cpid as u32,
+                    uid: 0,
+                    aux: st as u64,
+                },
+            );
         }
+    }
+}
+
+/// Map a child wstatus to (CLD_* si_code, si_status): a low byte of
+/// 0 is a clean exit (status in the high byte), a core-dump bit in
+/// the low byte is CLD_DUMPED, otherwise the low byte is the killing
+/// signal (CLD_KILLED).
+fn cld_code(wstatus: u64) -> (i32, i32) {
+    let lo = wstatus & 0x7f;
+    if lo == 0 {
+        (CLD_EXITED, ((wstatus >> 8) & 0xff) as i32)
+    } else if wstatus & 0x80 != 0 {
+        (CLD_DUMPED, lo as i32)
+    } else {
+        (CLD_KILLED, lo as i32)
     }
 }
 
@@ -11079,11 +11416,13 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         wait_ptr2: 0,
         wait_ptr3: 0,
         psel_mask: u64::MAX,
+        frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
         // Dispositions inherit across fork (the Linux semantic);
         // the pending set does not.
         pending: 0,
+        pend_src: [SIGSRC_NONE; 31],
         sigmask: p.sigmask,
         fx: p.fx,
         name: p.name,
@@ -11240,9 +11579,11 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         wait_ptr2: 0,
         wait_ptr3: 0,
         psel_mask: u64::MAX,
+        frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
         pending: 0,
+        pend_src: [SIGSRC_NONE; 31],
         sigmask: p.sigmask,
         fx: p.fx,
         name: p.name,
