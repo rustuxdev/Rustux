@@ -335,6 +335,12 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         130 => user::sys_sigsuspend(ctx, a1, a2),
         270 => user::fd_pselect(ctx, a1, a2, a3, a4, a5, a6),
         271 => user::fd_ppoll(ctx, a1, a2, a3, a4, a5),
+        // epoll: create(213) is legacy-size, create1(291) is flags.
+        213 => user::fd_epoll_create(a1, true),
+        291 => user::fd_epoll_create(a1, false),
+        233 => user::fd_epoll_ctl(a1, a2, a3, a4),
+        232 => user::fd_epoll_wait(ctx, a1, a2, a3, a4 as i64, 0, 0),
+        281 => user::fd_epoll_wait(ctx, a1, a2, a3, a4 as i64, a5, a6),
         NR_SOCKET => user::fd_socket(a1, a2, a3),
         NR_CONNECT => user::fd_connect(ctx, a1, a2, a3),
         NR_ACCEPT => user::fd_accept(ctx, a1, a2, a3, 0),

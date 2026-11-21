@@ -17,6 +17,10 @@
 #include <termios.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/epoll.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
 
 static int fails;
 
@@ -165,6 +169,115 @@ int main(void) {
         check(ppoll(&pf, 1, &bad, NULL) < 0 && errno == EINVAL,
               "ppoll bad nsec -> EINVAL");
         close(p[0]); close(p[1]);
+    }
+
+    /* epoll(7) — create1/ctl/wait/pwait, the readiness-multiplexing
+       family real daemons prefer. Interest sets pin the file
+       description, report the caller's data cookie, and level-
+       trigger like the defaults say. */
+    int ep = epoll_create1(0);
+    check(ep >= 0, "epoll_create1");
+    int epfd[2] = {-1, -1};
+    check(pipe(epfd) == 0, "pipe for epoll");
+    if (ep >= 0 && epfd[0] >= 0 && epfd[1] >= 0) {
+        struct epoll_event ee, out[4];
+        memset(&ee, 0, sizeof(ee));
+        ee.events = EPOLLIN;
+        ee.data.u64 = 0x5ca1ab1eULL;
+        check(epoll_ctl(ep, EPOLL_CTL_ADD, epfd[0], &ee) == 0,
+              "epoll_ctl ADD");
+        check(write(epfd[1], "e", 1) == 1, "epoll pipe write");
+        memset(out, 0, sizeof(out));
+        int nw = epoll_wait(ep, out, 4, 0);
+        check(nw == 1 && (out[0].events & EPOLLIN) &&
+              out[0].data.u64 == 0x5ca1ab1eULL,
+              "epoll_wait ready+cookie");
+        char ec;
+        check(read(epfd[0], &ec, 1) == 1, "drain epoll byte");
+        check(epoll_wait(ep, out, 4, 0) == 0, "epoll idle -> 0");
+        check(epoll_wait(ep, out, 4, 30) == 0, "epoll timeout -> 0");
+
+        /* ctl errors: dup ADD -> EEXIST, MOD missing -> ENOENT,
+           DEL twice -> ENOENT, ctl on a non-epoll fd -> EINVAL,
+           self-watch -> EINVAL, bad op -> EINVAL. */
+        errno = 0;
+        check(epoll_ctl(ep, EPOLL_CTL_ADD, epfd[0], &ee) < 0 &&
+              errno == EEXIST, "epoll dup ADD -> EEXIST");
+        errno = 0;
+        check(epoll_ctl(ep, EPOLL_CTL_MOD, epfd[1], &ee) < 0 &&
+              errno == ENOENT, "epoll MOD missing -> ENOENT");
+        check(epoll_ctl(ep, EPOLL_CTL_DEL, epfd[0], NULL) == 0,
+              "epoll_ctl DEL");
+        errno = 0;
+        check(epoll_ctl(ep, EPOLL_CTL_DEL, epfd[0], NULL) < 0 &&
+              errno == ENOENT, "epoll DEL twice -> ENOENT");
+        errno = 0;
+        check(epoll_ctl(epfd[0], EPOLL_CTL_ADD, epfd[0], &ee) < 0 &&
+              errno == EINVAL, "ctl non-epoll -> EINVAL");
+        errno = 0;
+        check(epoll_ctl(ep, EPOLL_CTL_ADD, ep, &ee) < 0,
+              "epoll self-watch refused");
+        errno = 0;
+        check(epoll_ctl(ep, 99, epfd[0], &ee) < 0 && errno == EINVAL,
+              "epoll bad op -> EINVAL");
+
+        /* MOD actually changes the mask: EPOLLOUT on a pipe read
+           end never fires — a queued byte stays invisible until
+           MOD back to EPOLLIN reports it. */
+        check(epoll_ctl(ep, EPOLL_CTL_ADD, epfd[0], &ee) == 0,
+              "epoll_ctl re-ADD");
+        ee.events = EPOLLOUT;
+        check(epoll_ctl(ep, EPOLL_CTL_MOD, epfd[0], &ee) == 0,
+              "epoll_ctl MOD");
+        check(write(epfd[1], "f", 1) == 1 &&
+              epoll_wait(ep, out, 4, 0) == 0,
+              "MOD'd mask hides the byte");
+        ee.events = EPOLLIN;
+        check(epoll_ctl(ep, EPOLL_CTL_MOD, epfd[0], &ee) == 0 &&
+              epoll_wait(ep, out, 4, 0) == 1,
+              "MOD back reports it");
+        char ec2;
+        read(epfd[0], &ec2, 1);
+
+        /* epoll_pwait(281): the mask swap restores on return, same
+           discipline as ppoll. */
+        sigset_t eblk, eprev;
+        sigemptyset(&eblk); sigaddset(&eblk, SIGUSR1);
+        check(sigprocmask(SIG_SETMASK, NULL, &eprev) == 0 &&
+              epoll_pwait(ep, out, 4, 0, &eblk) == 0 &&
+              sigprocmask(SIG_SETMASK, NULL, &eblk) == 0 &&
+              !sigismember(&eblk, SIGUSR1),
+              "epoll_pwait mask restored");
+
+        /* The blocked-wait wake path: a forking writer delivers a
+           byte while the parent sleeps in epoll_wait — the rescan
+           must report it, not time out. */
+        pid_t kid = fork();
+        check(kid >= 0, "epoll wake fork");
+        if (kid == 0) {
+            struct timespec d = {0, 40000000};
+            nanosleep(&d, NULL);
+            write(epfd[1], "w", 1);
+            _exit(0);
+        }
+        if (kid > 0) {
+            int nw2 = epoll_wait(ep, out, 4, 2000);
+            check(nw2 == 1 && (out[0].events & EPOLLIN),
+                  "epoll_wait blocked wake");
+            char ec3;
+            read(epfd[0], &ec3, 1);
+            waitpid(kid, NULL, 0);
+        }
+
+        /* fstat type + the read-side EINVAL Linux gives epoll fds. */
+        struct stat est;
+        check(fstat(ep, &est) == 0 && S_ISCHR(est.st_mode),
+              "epoll fstat chrdev");
+        errno = 0;
+        check(read(ep, &ec, 1) < 0 && errno == EINVAL,
+              "epoll read -> EINVAL");
+        close(epfd[0]); close(epfd[1]);
+        close(ep);
     }
 
     int n = snprintf(buf, sizeof(buf), "iotest: %d failures, done\n", fails);

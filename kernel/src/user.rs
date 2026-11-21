@@ -179,6 +179,10 @@ enum WaitOn {
     /// deadline, no resource to poll. The generic signal-wake path
     /// supplies the -EINTR these calls always return.
     SigWait,
+    /// epoll_wait(): the payload is the EPOLLS index; `wait_ptr` is
+    /// the user epoll_event array, `wait_len` maxevents. Any
+    /// fd-state change re-scans the interest set like Poll.
+    Epoll(usize),
 }
 
 /// Max fds per task — a hard bound so a hostile process cannot
@@ -234,6 +238,9 @@ enum FdKind {
     /// An AF_INET/SOCK_STREAM endpoint — listener or connection —
     /// the state machine lives in TCPSOCKS[id].
     Tcp(usize),
+    /// An epoll instance — the interest set lives in EPOLLS[id];
+    /// dup'd fds share it like socket endpoints.
+    Epoll(usize),
 }
 
 /// Max concurrent pipes — a hard bound on kernel frame pressure,
@@ -261,6 +268,34 @@ struct Pipe {
 }
 
 static mut PIPES: [Option<Pipe>; MAX_PIPES] = [const { None }; MAX_PIPES];
+
+/// Max concurrent epoll instances — same fixed-table discipline as
+/// pipes/sockets; ENFILE is the honest answer past the bound.
+const MAX_EPOLLS: usize = 8;
+/// Max interests per epoll set. Linux's rbtree is unbounded; our
+/// fixed array returns ENOMEM (E12) when full — an honest refusal,
+/// never a silent drop.
+const MAX_EPOLL_FDS: usize = 16;
+
+/// One registered interest: `ofd` pins the OPEN FILE DESCRIPTION
+/// (Linux's epitem → file, surviving fd close if a dup lives on);
+/// `fd` is the registered number for ctl lookup only. `events` is
+/// the EPOLL* mask (low bits alias POLL*); `data` is the user cookie
+/// returned verbatim in epoll_event.
+#[derive(Clone, Copy)]
+struct EpollEnt {
+    fd: i32,
+    ofd: u8,
+    events: u32,
+    data: u64,
+}
+
+/// An epoll instance's interest set — a bounded array, not a tree.
+struct Epoll {
+    ents: [Option<EpollEnt>; MAX_EPOLL_FDS],
+}
+
+static mut EPOLLS: [Option<Epoll>; MAX_EPOLLS] = [const { None }; MAX_EPOLLS];
 
 /// The 512-byte fxsave64 image — per-task FPU/SSE state. 16-aligned
 /// per the instruction's contract. Every context switch does
@@ -3088,6 +3123,9 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                         })
                 }
                 FdKind::Dir(_) => return EINVAL,
+                // An epoll fd has no readable stream — same EINVAL
+                // Linux gives read-side ioctls on it.
+                FdKind::Epoll(_) => return EINVAL,
             };
             // SAFETY: arg validated writable for 4 bytes.
             unsafe {
@@ -3469,6 +3507,9 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         }
         FdKind::Pipe { .. } => (0o10644, 0, 0), // S_IFIFO
         FdKind::Udp(_) | FdKind::Tcp(_) => (0o140777, 0, 0), // S_IFSOCK
+        // anon_inodefs objects stat as a chrdev — Linux shows
+        // S_IFCHR|0600 for epoll/eventfd/timerfd alike.
+        FdKind::Epoll(_) => (0o20600, 0, 0),
     };
     let mut st = [0u64; 18];
     st[1] = ino;
@@ -4101,6 +4142,9 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         }
         FdKind::Console => EBADF,
         FdKind::Dir(_) => EISDIR,
+        // read() on an epoll fd has no stream to read — EINVAL like
+        // Linux, not EBADF (the fd is real).
+        FdKind::Epoll(_) => EINVAL,
         FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, 0),
         FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, 0),
         FdKind::File(data) => {
@@ -5192,6 +5236,21 @@ fn ofd_release(oi: usize) {
     // after the OFD is already gone.
     let kind = core::mem::replace(&mut o.kind, FdKind::Stdin);
     ofds[oi] = None;
+    // An OFD's death retires every epoll interest pinning it —
+    // Linux drops the epitem on file teardown the same way.
+    {
+        let eps = unsafe { &mut *core::ptr::addr_of_mut!(EPOLLS) };
+        for inst in eps.iter_mut().flatten() {
+            for e in inst.ents.iter_mut() {
+                if e.is_some_and(|x| x.ofd == oi as u8) {
+                    *e = None;
+                }
+            }
+        }
+    }
+    if let FdKind::Epoll(i) = kind {
+        unsafe { (*core::ptr::addr_of_mut!(EPOLLS))[i] = None };
+    }
     if let FdKind::Pipe { id, write } = kind {
         pipe_end_closed(id, write);
     }
@@ -5402,6 +5461,16 @@ fn write_task_u16(pml4: u64, va: u64, v: u16) {
     }
 }
 
+/// Write one u32 into another space (epoll_event.events).
+fn write_task_u32(pml4: u64, va: u64, v: u32) {
+    for i in 0..4u64 {
+        if let Some(pa) = translate(pml4, va + i) {
+            // SAFETY: pa is a present user frame in pml4.
+            unsafe { (pa as *mut u8).write((v >> (i * 8)) as u8) };
+        }
+    }
+}
+
 /// Write one u64 into another space (pselect6 fd_set words).
 fn write_task_u64(pml4: u64, va: u64, v: u64) {
     for i in 0..8u64 {
@@ -5422,6 +5491,13 @@ fn poll_revents(t: &Task, fd: i32, events: u16) -> u16 {
     let Some(oi) = fdt(t).fds[fd as usize] else {
         return POLLNVAL;
     };
+    ofd_revents(oi, events)
+}
+
+/// The task-free core: revents of an OPEN FILE DESCRIPTION. epoll
+/// pins the OFD, so its scan evaluates this directly — the fd
+/// number only matters at ctl time.
+fn ofd_revents(oi: u8, events: u16) -> u16 {
     let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
     let Some(o) = ofds.get(oi as usize).and_then(|s| s.as_ref()) else {
         return POLLNVAL;
@@ -5506,6 +5582,23 @@ fn poll_revents(t: &Task, fd: i32, events: u16) -> u16 {
                 }
             }
         }
+        // poll() on an epoll fd: readable when any interest is.
+        // ctl rejects epoll-kind members (ELOOP), so this arm can
+        // never recurse into itself.
+        FdKind::Epoll(ei) => {
+            let eps = unsafe { &*core::ptr::addr_of!(EPOLLS) };
+            let mut r = 0;
+            if let Some(inst) = eps.get(*ei).and_then(|s| s.as_ref()) {
+                for e in inst.ents.iter().flatten() {
+                    let x = ofd_revents(e.ofd, e.events as u16);
+                    if x != 0 && x & POLLNVAL == 0 {
+                        r = POLLIN;
+                        break;
+                    }
+                }
+            }
+            r
+        }
     };
     (r & events) | (r & (POLLERR | POLLHUP | POLLNVAL))
 }
@@ -5552,6 +5645,7 @@ fn wake_pollers() {
             WaitOn::Pselect => {
                 pselect_scan(t, t.wait_ptr, t.wait_ptr2, t.wait_ptr3, t.wait_len)
             }
+            WaitOn::Epoll(ei) => epoll_scan(t, ei, t.wait_ptr, t.wait_len),
             _ => continue,
         };
         if n > 0 {
@@ -5697,6 +5791,12 @@ fn poll_expire() {
                     t.ctx.rax = 0;
                     psel_restore(t);
                 }
+                WaitOn::Epoll(_) => {
+                    // Timed out: 0 events, buffer untouched, and a
+                    // pwait temporary mask still owed back.
+                    t.ctx.rax = 0;
+                    psel_restore(t);
+                }
                 WaitOn::TcpConn(si) => {
                     // connect() timed out: ETIMEDOUT, the socket
                     // marked dead so further io fails fast.
@@ -5829,6 +5929,257 @@ fn psel_restore(t: &mut Task) {
         t.sigmask = t.psel_mask as u32;
         t.psel_mask = u64::MAX;
     }
+}
+
+// --- epoll -----------------------------------------------------------
+// Interest sets pin the OFD (Linux's file*), so readiness survives
+// the registering fd closing while a dup lives on; ofd_release
+// purges interests whose OFD dies, like Linux's file teardown.
+// Divergence: EPOLLET/EPOLLONESHOT accepted but level-triggered;
+// no nested epoll fds (ctl ELOOPs epoll-kind members).
+
+/// Scan one epoll instance's interest set, writing epoll_event
+/// records ({u32 events, u64 data} — 12 packed bytes) through t's
+/// tables. Works on the current task or a blocked one. Stale
+/// entries (a reused OFD slot can't exist — purge runs at free —
+/// so staleness only means "evaluate", never "trust").
+fn epoll_scan(t: &Task, ei: usize, out: u64, max: u64) -> u64 {
+    let eps = unsafe { &*core::ptr::addr_of!(EPOLLS) };
+    let Some(inst) = eps.get(ei).and_then(|s| s.as_ref()) else {
+        return 0;
+    };
+    let mut n = 0u64;
+    for e in inst.ents.iter().flatten() {
+        if n == max {
+            break;
+        }
+        let r = ofd_revents(e.ofd, e.events as u16);
+        // NVAL means the interest's OFD is dead — the purge in
+        // ofd_release normally beats this; either way Linux would
+        // never report EPOLLNVAL to epoll_wait.
+        if r == 0 || r & POLLNVAL != 0 {
+            continue;
+        }
+        write_task_u32(t.pml4, out + n * 12, r as u32);
+        write_task_u64(t.pml4, out + n * 12 + 4, e.data);
+        n += 1;
+    }
+    n
+}
+
+/// epoll_create(size)/epoll_create1(flags): a bounded interest set
+/// behind an OFD. size only guards the legacy >0 contract; flags
+/// takes EPOLL_CLOEXEC (O_CLOEXEC) alone.
+pub fn fd_epoll_create(flags: u64, legacy_size: bool) -> u64 {
+    const ENFILE_: u64 = (-23i64) as u64;
+    if legacy_size {
+        if flags == 0 {
+            return EINVAL;
+        }
+    } else if flags & !0o2000000 != 0 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+    let (Some(oi), Some(fi)) = (
+        ofds.iter().position(Option::is_none),
+        fdt(t).fds.iter().position(Option::is_none),
+    ) else {
+        return EMFILE;
+    };
+    let eps = unsafe { &mut *core::ptr::addr_of_mut!(EPOLLS) };
+    let Some(ei) = eps.iter().position(Option::is_none) else {
+        return ENFILE_;
+    };
+    eps[ei] = Some(Epoll {
+        ents: [None; MAX_EPOLL_FDS],
+    });
+    ofds[oi] = Some(OpenFile {
+        kind: FdKind::Epoll(ei),
+        pos: 0,
+        refs: 1,
+        append: false,
+        accmode: 2,
+    });
+    fdt(t).fds[fi] = Some(oi as u8);
+    if !legacy_size {
+        cloexec_set(t, fi, flags != 0);
+    }
+    fi as u64
+}
+
+/// epoll_ctl(epfd, op, fd, event): manage the interest set. Ops are
+/// ADD=1 DEL=2 MOD=3 like Linux. The interest keys on fd but pins
+/// the OFD it resolves to right now — a later close() can't make
+/// the entry point at a recycled slot.
+pub fn fd_epoll_ctl(epfd: u64, op: u64, fd: u64, ev: u64) -> u64 {
+    const EEXIST: u64 = (-17i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const EPERM: u64 = (-1i64) as u64;
+    const ELOOP: u64 = (-40i64) as u64;
+    const ENOMEM_: u64 = (-12i64) as u64;
+    if !(1..=3).contains(&op) {
+        return EINVAL;
+    }
+    if fd as usize >= MAX_FDS {
+        return EBADF;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    // epfd must be an epoll instance; the target must be a live fd.
+    let Some(epoi) = fdt(t).fds.get(epfd as usize).copied().flatten() else {
+        return EBADF;
+    };
+    let Some(foi) = fdt(t).fds[fd as usize] else {
+        return EBADF;
+    };
+    let eps = unsafe { &mut *core::ptr::addr_of_mut!(EPOLLS) };
+    let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+    let Some(ei) = (match ofds.get(epoi as usize).and_then(|s| s.as_ref()) {
+        Some(o) => match o.kind {
+            FdKind::Epoll(i) => Some(i),
+            _ => None,
+        },
+        None => None,
+    }) else {
+        return EINVAL; // epfd isn't an epoll fd — Linux's answer
+    };
+    if fd as u64 == epfd {
+        return EINVAL; // can't watch itself
+    }
+    let Some(inst) = eps.get_mut(ei).and_then(|s| s.as_mut()) else {
+        return EINVAL;
+    };
+    // Reject targets poll can't evaluate: directories (EPERM like
+    // Linux) and epoll fds themselves — nesting would let a cycle
+    // recurse ofd_revents forever, so ELOOP is the honest no.
+    match ofds.get(foi as usize).and_then(|s| s.as_ref()) {
+        Some(o) => match o.kind {
+            FdKind::Dir(_) => return EPERM,
+            FdKind::Epoll(_) => return ELOOP,
+            _ => {}
+        },
+        None => return EBADF,
+    }
+    let slot = inst
+        .ents
+        .iter()
+        .position(|e| e.is_some_and(|x| x.fd == fd as i32));
+    // ADD/MOD read the 12-byte packed epoll_event; DEL ignores it.
+    let (events, data) = if op == 2 {
+        (0, 0)
+    } else {
+        if ev == 0 || !range_ok(ev, 12) {
+            return EFAULT;
+        }
+        // SAFETY: validated user record under cur cr3.
+        unsafe {
+            (
+                (ev as *const u32).read_unaligned(),
+                ((ev + 4) as *const u64).read_unaligned(),
+            )
+        }
+    };
+    match op {
+        1 => {
+            if slot.is_some() {
+                return EEXIST;
+            }
+            let Some(free) = inst.ents.iter().position(Option::is_none) else {
+                return ENOMEM_;
+            };
+            inst.ents[free] = Some(EpollEnt {
+                fd: fd as i32,
+                ofd: foi,
+                events,
+                data,
+            });
+            0
+        }
+        3 => {
+            let Some(i) = slot else { return ENOENT_ };
+            inst.ents[i] = Some(EpollEnt {
+                fd: fd as i32,
+                ofd: foi,
+                events,
+                data,
+            });
+            0
+        }
+        _ => {
+            let Some(i) = slot else { return ENOENT_ };
+            inst.ents[i] = None;
+            0
+        }
+    }
+}
+
+/// epoll_wait(epfd, events, maxevents, timeout_ms) — and
+/// epoll_pwait when sigmask != 0: scan the interest set now; block
+/// on WaitOn::Epoll when empty. The temporary mask rides psel_mask
+/// exactly like ppoll — restored on every wake path.
+pub fn fd_epoll_wait(
+    ctx: &mut UCtx,
+    epfd: u64,
+    events: u64,
+    maxevents: u64,
+    timeout_ms: i64,
+    sigmask: u64,
+    sigsize: u64,
+) -> u64 {
+    const EINTR: u64 = (-4i64) as u64;
+    if maxevents == 0 || maxevents > MAX_EPOLL_FDS as u64 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(ei) = (match ofd(t, epfd).map(|o| &o.kind) {
+        Some(FdKind::Epoll(i)) => Some(*i),
+        _ => None,
+    }) else {
+        // A valid fd that isn't epoll gets EINVAL; no fd gets EBADF.
+        return if fdt(t).fds.get(epfd as usize).is_some_and(|s| s.is_some()) {
+            EINVAL
+        } else {
+            EBADF
+        };
+    };
+    if !range_ok_w(events, maxevents * 12) {
+        return EFAULT;
+    }
+    let saved_mask = t.sigmask;
+    if sigmask != 0 {
+        if sigsize != 8 || !range_ok(sigmask, 8) {
+            return EINVAL;
+        }
+        // SAFETY: validated user sigset under cur cr3.
+        t.sigmask = unsafe { (sigmask as *const u64).read_unaligned() } as u32;
+    }
+    let ready = epoll_scan(t, ei, events, maxevents);
+    if ready > 0 {
+        t.sigmask = saved_mask;
+        return ready;
+    }
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let deadline = if timeout_ms < 0 {
+        0
+    } else {
+        now + (timeout_ms as u64).div_ceil(10)
+    };
+    if timeout_ms == 0 || (deadline != 0 && deadline <= now) {
+        t.sigmask = saved_mask;
+        return 0;
+    }
+    if deliverable(t) {
+        t.sigmask = saved_mask;
+        return EINTR;
+    }
+    t.psel_mask = saved_mask as u64;
+    t.wait_on = WaitOn::Epoll(ei);
+    t.wait_ptr = events;
+    t.wait_len = maxevents;
+    t.wait_deadline = deadline;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
 }
 
 /// Scan one task's three pselect fd_sets through ITS page tables,
@@ -8026,7 +8377,10 @@ fn run_over(tasks: &[Option<Task>]) -> bool {
     tasks.iter().flatten().all(|t| {
         t.state == TaskState::Exited
             || (t.state == TaskState::Blocked
-                && matches!(t.wait_on, WaitOn::Stdin | WaitOn::Poll | WaitOn::Pselect))
+                && matches!(
+                    t.wait_on,
+                    WaitOn::Stdin | WaitOn::Poll | WaitOn::Pselect | WaitOn::Epoll(_)
+                ))
     })
 }
 
