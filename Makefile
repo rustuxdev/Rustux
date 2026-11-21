@@ -35,7 +35,7 @@ demo: $(ESP_IMG)
 FORCE:
 
 # Ring-3 milestone images: static ELF64s loaded by kernel/src/elf.rs.
-USER_ELFS := kernel/user/hello.elf kernel/user/selftest.elf kernel/user/fstest.elf kernel/user/lstest.elf kernel/user/exectest.elf kernel/user/spinA.elf kernel/user/spinB.elf kernel/user/forktest.elf kernel/user/pipetest.elf kernel/user/sigtest.elf kernel/user/faulttest.elf kernel/user/fputest.elf kernel/user/sigfault.elf kernel/user/polltest.elf kernel/user/udptest.elf kernel/user/tcptest.elf kernel/user/mmtest.elf kernel/user/realbin.elf kernel/user/parent.elf kernel/user/iotest.elf kernel/user/shelltest.elf kernel/user/wiotest.elf kernel/user/termtest.elf kernel/user/kbdtest.elf kernel/user/rsh.elf kernel/user/rshtest.elf kernel/user/vmtest.elf kernel/user/fxtest.elf kernel/user/ftest.elf kernel/user/thrtest.elf kernel/user/aptest.elf kernel/user/clftest.elf kernel/user/dtest.elf kernel/user/fmaptest.elf kernel/user/bbtest.elf kernel/user/vtest.elf kernel/user/dyntest.elf kernel/user/dashtest.elf kernel/user/rtest.elf kernel/user/bashtest.elf kernel/user/pgtest.elf
+USER_ELFS := kernel/user/hello.elf kernel/user/selftest.elf kernel/user/fstest.elf kernel/user/lstest.elf kernel/user/exectest.elf kernel/user/spinA.elf kernel/user/spinB.elf kernel/user/forktest.elf kernel/user/pipetest.elf kernel/user/sigtest.elf kernel/user/faulttest.elf kernel/user/fputest.elf kernel/user/sigfault.elf kernel/user/polltest.elf kernel/user/udptest.elf kernel/user/tcptest.elf kernel/user/mmtest.elf kernel/user/realbin.elf kernel/user/parent.elf kernel/user/iotest.elf kernel/user/shelltest.elf kernel/user/wiotest.elf kernel/user/termtest.elf kernel/user/kbdtest.elf kernel/user/rsh.elf kernel/user/rshtest.elf kernel/user/vmtest.elf kernel/user/fxtest.elf kernel/user/ftest.elf kernel/user/thrtest.elf kernel/user/aptest.elf kernel/user/clftest.elf kernel/user/dtest.elf kernel/user/fmaptest.elf kernel/user/bbtest.elf kernel/user/vtest.elf kernel/user/dyntest.elf kernel/user/dashtest.elf kernel/user/rtest.elf kernel/user/bashtest.elf kernel/user/pgtest.elf kernel/user/ttoutest.elf
 INITRD    := initrd.cpio
 
 kernel/user/%.elf: kernel/user/%.S
@@ -115,6 +115,39 @@ run-bash: $(ESP_BASH)
 		-serial stdio -display none \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 		-no-reboot
+
+INITRD_TOUT := initrd-ttout.cpio
+ESP_TOUT    := esp-ttout.img
+
+# TOSTOP/SIGTTOU gate test: a SOLO initrd — with TOSTOP armed, every
+# task of the console's session writing from a background pgrp is
+# stopped for good (nobody job-controls it back), so ttoutest must
+# own the whole run rather than sharing the standard suite.
+$(INITRD_TOUT): kernel/user/ttoutest.elf tools/mkinitrd.py
+	python3 tools/mkinitrd.py kernel/user/ttoutest.elf ttoutest > $@
+
+$(ESP_TOUT): $(KERNEL) $(INITRD_TOUT)
+	dd if=/dev/zero of=$@ bs=1M count=64
+	mformat -i $@ ::
+	mmd -i $@ ::/EFI
+	mmd -i $@ ::/EFI/BOOT
+	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(INITRD_TOUT) ::/initrd.cpio
+
+run-ttout: $(ESP_TOUT)
+	$(QEMU) \
+		-machine q35 \
+		-m 512M \
+		-cpu qemu64,+rdrand \
+		-bios $(OVMF) \
+		-drive file=$(ESP_TOUT),format=raw,if=ide \
+		-snapshot \
+		-serial stdio -display none \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		-no-reboot; \
+	status=$$?; \
+	if [ $$status -eq 33 ]; then echo "ttout test: PASS (qemu exit 33)"; \
+	else echo "ttout test: FAIL (qemu exit $$status)"; exit 1; fi
 
 clean:
 	cargo clean

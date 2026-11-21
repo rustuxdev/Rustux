@@ -1,6 +1,10 @@
 /target
 /esp
 /esp.img
+/esp-bash.img
+/esp-ttout.img
+/initrd-bash.cpio
+/initrd-ttout.cpio
 **/.rust-anything/
 
 __pycache__/

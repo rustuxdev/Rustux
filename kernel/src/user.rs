@@ -8619,6 +8619,46 @@ fn pgrp_orphaned(pgid: u64, sid: u64) -> bool {
         })
 }
 
+/// TOSTOP write gate — the write-side mirror of fd_read's SIGTTIN
+/// check (Linux's tty_check_change(SIGTTOU) under O_TOSTOP). When a
+/// task of the console's own session writes to the tty from a
+/// background pgrp, the group is SIGTTOU'd unless the signal is
+/// blocked or ignored; an orphaned group gets EIO. Returns 0 when
+/// the write may proceed, else a negated errno.
+pub fn tty_tostop_gate() -> u64 {
+    const TOSTOP: u32 = 0x100; // c_lflag bit — asm-generic 000400
+    if t_lflag() & TOSTOP == 0 {
+        return 0;
+    }
+    let Some(t) = cur_mut() else { return 0 };
+    let (fg, csid) = unsafe { (FG_PGID, CONSOLE_SID) };
+    let fg_live = fg != 0
+        && unsafe { &*core::ptr::addr_of!(TASKS) }
+            .iter()
+            .flatten()
+            .any(|x| x.pgid == fg);
+    if t.sid != csid || !fg_live || t.pgid == fg {
+        return 0;
+    }
+    let h = sigt(t)
+        .handlers
+        .get(21) // SIGTTOU - 1
+        .copied()
+        .unwrap_or(SIG_DFL);
+    let bypass = h == SIG_IGN || t.sigmask & (1 << 21) != 0;
+    if bypass {
+        return 0;
+    }
+    if pgrp_orphaned(t.pgid, t.sid) {
+        return (-5i64) as u64; // EIO
+    }
+    kill_pgrp(t.pgid, 22); // SIGTTOU
+    if deliverable(t) {
+        return (-4i64) as u64; // EINTR: the stop lands first
+    }
+    0
+}
+
 /// End of the scheduling run: reap whatever tasks remain — the last
 /// Exited task and anything left unrunnable by a failed spawn.
 pub fn reap_all() {

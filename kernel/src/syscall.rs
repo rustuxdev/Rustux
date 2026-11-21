@@ -738,6 +738,12 @@ fn sys_write(ctx: &mut user::UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     if !user::fd_is_console(fd) {
         return user::fd_write(ctx, fd, buf, len);
     }
+    // Job control: with TOSTOP set, a background pgrp writing the
+    // tty is SIGTTOU'd (or EIO when orphaned) before a byte moves.
+    let gate = user::tty_tostop_gate();
+    if gate != 0 {
+        return gate;
+    }
     if len == 0 {
         return 0;
     }
