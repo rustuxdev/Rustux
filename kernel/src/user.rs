@@ -3000,6 +3000,14 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             if t.sid != unsafe { CONSOLE_SID } {
                 return ENOTTY_;
             }
+            // Linux's tiocspgrp checks tty_check_change(SIGTTOU)
+            // before touching arg: a background pgrp asking to move
+            // the foreground is stopped (or EIO when orphaned),
+            // never silently allowed.
+            let gate = tty_spgrp_gate();
+            if gate != 0 {
+                return gate;
+            }
             if !range_ok(arg, 4) {
                 return EFAULT;
             }
@@ -8620,16 +8628,27 @@ fn pgrp_orphaned(pgid: u64, sid: u64) -> bool {
 }
 
 /// TOSTOP write gate — the write-side mirror of fd_read's SIGTTIN
-/// check (Linux's tty_check_change(SIGTTOU) under O_TOSTOP). When a
-/// task of the console's own session writes to the tty from a
-/// background pgrp, the group is SIGTTOU'd unless the signal is
-/// blocked or ignored; an orphaned group gets EIO. Returns 0 when
-/// the write may proceed, else a negated errno.
+/// check (Linux's tty_check_change(SIGTTOU) under O_TOSTOP).
 pub fn tty_tostop_gate() -> u64 {
     const TOSTOP: u32 = 0x100; // c_lflag bit — asm-generic 000400
     if t_lflag() & TOSTOP == 0 {
         return 0;
     }
+    ttou_gate()
+}
+
+/// tcsetpgrp gate — Linux's tiocspgrp runs tty_check_change(SIGTTOU)
+/// unconditionally: a background pgrp may not move the tty's
+/// foreground without a job-control signal landing first.
+pub fn tty_spgrp_gate() -> u64 {
+    ttou_gate()
+}
+
+/// Shared SIGTTOU check: a task of the console's session operating
+/// on the tty from a background pgrp gets its group SIGTTOU'd unless
+/// the signal is blocked or ignored; an orphaned group gets EIO.
+/// Returns 0 when the operation may proceed, else a negated errno.
+fn ttou_gate() -> u64 {
     let Some(t) = cur_mut() else { return 0 };
     let (fg, csid) = unsafe { (FG_PGID, CONSOLE_SID) };
     let fg_live = fg != 0

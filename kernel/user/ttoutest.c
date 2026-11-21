@@ -182,6 +182,104 @@ int main(void) {
     check(cres == 0, "no TOSTOP: background write succeeds");
     waitpid(e, &st, 0);
 
+    /* --- background tcsetpgrp -> SIGTTOU --------------------------
+       TOSTOP is clear here — Linux's tiocspgrp runs
+       tty_check_change(SIGTTOU) unconditionally, so the ioctl arm
+       fires with the flag off. */
+    int sp4[2];
+    check(pipe(sp4) == 0, "spgrp gate pipe");
+    pid_t f = fork();
+    if (f == 0) {
+        char g;
+        if (read(sp4[0], &g, 1) < 0) {
+        }
+        tcsetpgrp(0, getpgrp()); /* any fg move from bg is gated */
+        _exit(0);
+    }
+    check(setpgid(f, f) == 0, "spgrp child moved behind fg");
+    close(sp4[0]);
+    check(write(sp4[1], "x", 1) == 1, "spgrp child released");
+    sig = wait_stop(f);
+    check(sig == SIGTTOU, "background tcsetpgrp -> SIGTTOU stop");
+    kill(f, SIGKILL);
+    waitpid(f, &st, 0);
+
+    /* --- SIG_IGN: background tcsetpgrp succeeds and moves fg ----- */
+    int sp5[2], rp5[2];
+    check(pipe(sp5) == 0 && pipe(rp5) == 0, "ign-spgrp pipes");
+    pid_t h = fork();
+    if (h == 0) {
+        signal(SIGTTOU, SIG_IGN);
+        char g;
+        if (read(sp5[0], &g, 1) < 0) {
+        }
+        errno = 0;
+        int r = tcsetpgrp(0, getpgrp());
+        char sres = r == 0 ? 0 : (char)errno;
+        if (write(rp5[1], &sres, 1) != 1)
+            _exit(96);
+        _exit(0);
+    }
+    check(setpgid(h, h) == 0, "ign-spgrp child behind fg");
+    close(sp5[0]);
+    close(rp5[1]);
+    check(write(sp5[1], "x", 1) == 1, "ign-spgrp child released");
+    char sres = 66;
+    check(read(rp5[0], &sres, 1) == 1, "ign-spgrp child reported");
+    check(sres == 0, "SIG_IGN: background tcsetpgrp succeeds");
+    waitpid(h, &st, 0);
+    check(tcgetpgrp(0) == h, "fg actually moved to the child pgrp");
+    tcsetpgrp(0, getpgrp()); /* restore for the orphan check */
+
+    /* --- orphaned group: tcsetpgrp -> EIO --------------------------
+       G passes its own pgrp — a VALID arg — so EIO proves the gate
+       fires before arg validation, like Linux. */
+    int p3[2];
+    check(pipe(p3) == 0, "spgrp orphan report pipe");
+    pid_t a2 = fork();
+    if (a2 == 0) {
+        close(p3[0]);
+        pid_t g = fork();
+        if (g == 0) {
+            for (long i = 0; i < 800000 && getppid() != 0; i++)
+                sched_yield();
+            if (getppid() != 0)
+                _exit(97);
+            unsigned short gp = (unsigned short)getpid();
+            if (write(p3[1], &gp, 2) != 2)
+                _exit(96);
+            errno = 0;
+            int r = tcsetpgrp(0, getpid());
+            char pres = r < 0 ? (char)errno : 99;
+            if (write(p3[1], &pres, 1) != 1)
+                _exit(98);
+            _exit(0);
+        }
+        setpgid(g, g); /* G's own group; A's exit orphans it */
+        _exit(0);
+    }
+    close(p3[1]);
+    check(a2 > 0 && waitpid(a2, &st, 0) == a2 && WIFEXITED(st),
+          "spgrp orphan bridge parent exits");
+    char pres = 0;
+    unsigned short gpid2 = 0;
+    int got2 = 0;
+    for (int i = 0; i < 4000 && !got2; i++) {
+        waitpid(-1, NULL, WNOHANG);
+        struct pollfd pf = {.fd = p3[0], .events = POLLIN};
+        if (poll(&pf, 1, 5) <= 0)
+            continue;
+        if (gpid2 == 0) {
+            if (read(p3[0], &gpid2, 2) == 2)
+                continue;
+        }
+        if (read(p3[0], &pres, 1) == 1)
+            got2 = 1;
+    }
+    if (!got2 && gpid2 != 0)
+        kill(gpid2, SIGKILL);
+    check(got2 && pres == EIO, "orphaned-group tcsetpgrp -> EIO");
+
     printf("ttoutest: %d failures, done\n", fails);
     return fails;
 }
