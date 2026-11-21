@@ -1433,3 +1433,40 @@ and pgrp/sid/FG_PGID are plain integers moved inside one critical
 section, so there is no lifetime to race.
 run-ttout: 0 failures; full suite all 21 suite lines green, 42 tasks,
 frames zero leak, boot PASS WSL. CVE ledger: 99.
+## run-93 — signal waits: pause(34), sigpending(127), sigsuspend(130), ppoll(271)
+
+The sleeping-signal family on top of run-90's mask-swap machinery.
+pause blocks on the new signal-only WaitOn::SigWait and always
+returns -EINTR; sigsuspend atomically swaps the sigmask for the
+wait's duration (saved mask rides psel_mask, restored on every
+exit); sigpending copies the pending bitmask; ppoll is poll +
+timespec deadline + atomic mask swap sharing the same poll_scan
+substrate — its {sigmask,size} pair is two separate args, unlike
+pselect6's struct-wrapped one, and glibc passes size=8.
+
+The subtle part is delivery ORDER inside sigsuspend: Linux runs
+the handler while the temporary mask is installed, then restores
+the mask on the -EINTR return. The shared signal-wake path now
+calls maybe_deliver for SigWait waits BEFORE psel_restore —
+restoring first would re-mask the just-arrived signal and the
+handler would never run (caught by the pgtest check on first run).
+The same inline delivery covers a signal that was already pending
+at syscall entry. maybe_deliver can exit or stop the task via a
+default disposition, so the post-deliver resume is conditional on
+the task still being Blocked.
+
+Tests: iotest +5 (ppoll ready pipe, idle timeout with revents
+zeroed, mask restored after wait, bad-nsec EINVAL, pselect-byte
+drain harness fix); pgtest +7 (handler arm, block, self-kill,
+sigpending sees blocked SIGUSR1, sigsuspend EINTR + mask restore,
+pause interrupted by child SIGUSR1). Full suite green, 42 tasks,
+frames zero leak, boot PASS WSL.
+
+Audit run-67 scoped to the diff: 0 confirmed (SigWait wake can't
+resurrect a killed task — resume guarded on state==Blocked; ppoll
+mask restore covered on all four exits; the check-then-sleep race
+these calls exist to close is one uninterrupted stretch in a
+single-threaded kernel — structurally atomic). cve.now: no
+sigsuspend/ppoll/sigpending CVEs on record — the class is the
+signal-check-then-sleep race itself, which the atomic
+swap-check-block section eliminates. CVE ledger: 99.
