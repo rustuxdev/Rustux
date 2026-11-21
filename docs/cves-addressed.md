@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**95 unique CVEs recorded.**
+**98 unique CVEs recorded.**
 
 ## klib ports
 
@@ -49,6 +49,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2009-1385 | `e1000` RX | **mitigated** — device-written `sta`/`len` now validated (EOP required, `14 <= len <= RX_BUF`) before any buffer read; repost-and-drop on violation |
 | CVE-2009-2848 | process lifecycle: clone(56) fork-subset + SETTID writes, rt_sigprocmask(14) real sigmask… | RUN-TIME BUG CAUGHT BY REVIEW: translate/translate_r walked ANY va through the task pml4 -- which shares kernel upper-half slots by reference -- so a user-controlled VA reached ke… |
 | CVE-2010-5328 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
+| CVE-2014-0196 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
 | CVE-2014-9322 | busybox real-binary rootfs rung: signal-restorer sigframe (SIGTRAMP user-RX page + [resto… | RUN-TIME BUG CAUGHT BY REAL BINARY: the old [signo][UCtx] frame made a normal-returning C handler ret into signo=17 (SIGCHLD) -> rip=0x11 crash in every busybox pipeline child — g… |
 | CVE-2014-9322 | fault-driven signals (catchable SIGSEGV/SIGILL/SIGFPE/SIGBUS/SIGTRAP) | interrupted UCtx is CPU/stub-captured, never user-shaped; the sigframe is the same [signo][UCtx] format sigreturn already treats as hostile (cs/ss pinned, TF/NT/IOPL cleared, rip/… |
 | CVE-2014-9322 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
@@ -105,9 +106,11 @@ by hand; append to the matrix and regenerate.
 | CVE-2025-68814 | fd table + initrd-as-rootfs (read/open/close) | 16-slot table bounded EMFILE; pathname copied byte-wise under range_ok, 256B cap ENAMETOOLONG (getname class); read target must be user-writable range; File borrows immortal LOADE… |
 | CVE-2025-68814 | file-I/O ABI: openat(257)+dirfd int32 semantics, pread64(17), fcntl(72) FD flags, dup(32)… | RUN-TIME BUG CAUGHT BY THE REAL BINARY: glibc passes dirfd as a 32-bit int (mov edi,-100 zero-extends to 0xffffff9c) so a u64 compare vs sign-extended AT_FDCWD never matched -- ev… |
 | CVE-2026-102068 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
+| CVE-2026-23115 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
 | CVE-2026-23374 | preemptive round-robin scheduler | every switch is a UCtx resume (15 GPRs + iret frame) — launch/preemption/exit share one path; dedicated 0xf0 stub saves the FULL register file; cs&3==0 ticks never switch (58090 c… |
 | CVE-2026-31495 | tcp/ipv4 (mini) | exact seq+ack required on every transition (no blind RST/state jumps — 63913 class out); option walk bounded, wscale never shifted (31495); seq state fully initialized (72020); do… |
 | CVE-2026-43445 | `e1000` TX | **design note** — no multi-buffer skb mapping yet; when TX gains error paths, unmap exactly the buffers mapped |
+| CVE-2026-45866 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
 | CVE-2026-46063 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
 | CVE-2026-52937 | real GNU bash 5.2 (dynamic, +libtinfo second DT_NEEDED — ld.so's first multi-library reso… | sockaddr-leak class structurally absent: sock_name copies min(*addrlen,16) bytes of a sockaddr_in built by sockaddr_in() which zero-fills all 16 before writing fields — every copi… |
 | CVE-2026-63910 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |

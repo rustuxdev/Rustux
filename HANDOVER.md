@@ -1374,3 +1374,39 @@ interactive shells get their own image instead.
 
 Audit run-64 scoped to the diff: 0 confirmed. CVE ledger: 95.
 42 tasks, zero leak, boot PASS WSL + interactive socket-driven proof.
+
+## run-91 — TOSTOP + SIGTTOU: the tty write-side job-control gate
+
+The write-side mirror of run-89s
+
+## run-91 — TOSTOP + SIGTTOU: the tty write-side job-control gate
+
+The write-side mirror of run-89's SIGTTIN read gate — Linux's
+tty_check_change(SIGTTOU) under O_TOSTOP. With TOSTOP armed on the
+console termios (c_lflag 0x100), a task of the console's session
+writing the tty from a non-foreground pgrp gets its whole group
+SIGTTOU'd; the write returns EINTR before a byte moves when the stop
+is deliverable. SIGTTOU blocked or SIG_IGN writes through; an
+orphaned group gets EIO — the same pgrp_orphaned POSIX test the
+read gate uses. Gate ordering matches Linux: the access check runs
+before len/range validation, so a bad-buffer background write still
+stops on the signal. Cleared TOSTOP (the default), a dead
+foreground pgrp, a foreign session, or being fg all bypass.
+
+New ttoutest binary + `make run-ttout` solo image: the test MUST
+own the machine — every spawned task shares CONSOLE_SID 1, so with
+TOSTOP armed any other suite task's console write stops it
+permanently (nobody fg's it back; run_over counts Stopped as
+revivable -> hang). Linux semantics are correct; the shared suite
+is the hostile environment. 18 checks: TOSTOP default-clear +
+set/round-trip, fg write passes, bg write SIGTTOU stop, SIG_IGN
+write-through, orphaned-group EIO, cleared-TOSTOP ungated.
+
+Audit run-65 scoped to the diff: 0 confirmed (TOCTOU rejected —
+single-threaded irq_save critical section; SIGTTOU-storm DoS
+bounded; writev per-iovec gating noted as acceptable divergence).
+Follow-up noted: Linux also SIGTTOU's a background tcsetpgrp
+(TIOCSPGRP) — the ioctl arm is not wired yet. cve.now tty class:
+CVE-2014-0196 (n_tty_write LECHO race, KEV) n/a by construction —
+synchronous single-threaded console write, no shared ldisc buffer.
+42 tasks, frames zero leak, boot PASS x3 WSL. CVE ledger: 98.
