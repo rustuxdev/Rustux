@@ -69,8 +69,11 @@ ELFs from a cpio initrd — static-PIE binaries and dynamically linked
 ones via `PT_INTERP`/ld.so — a 100+-call syscall surface covering
 `fork`/`execve`/`waitpid`, real signals with a sigreturn restorer
 trampoline, `brk`/anonymous and file-backed `mmap`/`munmap`/`mprotect`,
-a hierarchical VFS with `/proc`, pipes, sockets (`socket`/`bind`/
-`listen`/`accept`/`connect`, `poll`/`pselect6`, `getsockname`/
+a hierarchical VFS with a generated `/proc` (per-pid
+`stat`/`status`/`comm`/`cmdline`/`exe`, `uptime`/`meminfo`/`loadavg`),
+pipes, sockets (`socket`/`bind`/
+`listen`/`accept`/`connect`, `poll`/`ppoll`/`pselect6`, `epoll`,
+`eventfd`, `timerfd`, `getsockname`/
 `getpeername`, `sendfile`), `rseq`, a keyboard- and UART-driven terminal
 with a canonical/raw line discipline and full termios, real process
 groups, sessions and a controlling tty (`/dev/tty`, `tcsetpgrp`,
@@ -87,7 +90,7 @@ Every rung is also security-reviewed: a scoped audit of the diff plus a
 check of that subsystem's published kernel CVEs — each gets a written
 verdict in [docs/cve-matrix.md](docs/cve-matrix.md) (structurally
 absent, explicitly mitigated, or a documented divergence), gathered
-into a flat ledger of ~100 vulnerability classes so far.
+into a flat ledger of 100+ vulnerability classes so far.
 
 ## Acknowledgements
 

@@ -1570,3 +1570,60 @@ first; sub-tick requests round UP not early). cve.now: no
 eventfd/timerfd CVEs on record — the class folds into run-68's
 anon-inode lifetime findings (no refcount-under-lock, no per-
 object waitqueues to dangle). CVE ledger: 102.
+
+### run-96 — /proc breadth: generated procfs for real ps
+
+/proc grows from the lone proc/self/exe link into a real (if
+small) procfs. Global files: uptime (100Hz ticks -> sec.cent),
+meminfo (MemTotal/MemFree/MemAvailable from the new
+kalloc::total_frames + free_frames), loadavg (live-task counts +
+last pid, honest 0.00 loads — no load accounting yet), version,
+stat (cpu line with idle ticks + process counts). Per-task:
+proc/<pid> exists for every TASKS slot — Exited zombies included,
+matching Linux's pre-reap visibility — with stat (the full
+52-field Linux layout), status, comm, cmdline, and the exe link.
+
+The model is seq_file: open() renders the file into one kernel
+frame the OFD owns, so a reader sees a consistent open-time
+image even if the described task exits mid-read, and poll/read/
+pread/lseek/FIONREAD/fstat all ride the regular-file arms.
+stat's real fields: pid/comm/state(R,S,T,Z)/ppid/pgrp/session/
+tpgid/num_threads(same-tgid count)/starttime (new Task.
+start_ticks, set at spawn+clone)/vsize=brk_cur/rss — and rss is
+the HONEST number, a bounded walk of the task's user-half page
+leaves (the page table is the allocation ledger). signal(31)
+and blocked(32) report the real pending/sigmask u64s. exe is not
+generated: it resolves to the task's initrd image for open,
+stat (target's real size), and readlink — proc/self/exe is now
+just the pid=self case of the general proc/<pid>/exe rule, and
+fs_lookup generalized to match so exec("proc/<pid>/exe") works.
+
+Enumeration: getdents on "proc" emits the global files, "self",
+and every live pid rendered into a stack buffer; getdents on
+"proc/<pid>" and "proc/self" emits the five leaf names.
+dir_exists knows live pid dirs; is_file knows the leaves;
+newfstatat reports Linux's 0444/size-0 proc shape (exe stats its
+target). O_CREAT under proc/ is EROFS even though pid dirs read
+as directories — nothing synthetic may be created there.
+
+One real bug the suite caught: the snapshot frame was allocated
+inside proc_open BEFORE the EROFS/O_DIRECTORY/EMFILE checks — an
+O_WRONLY open leaked one frame (108619 -> 108618). Fixed by
+parse-check-render ordering plus explicit free_frame on every
+post-render early return; frames now 108619 -> 108619 zero leak.
+
+Tests: iotest +26 — self stat parse (pid/comm/R/ppid=0),
+comm/cmdline content, readlink+stat exe, uptime/meminfo/version,
+0444 fstat, lseek+pread, /proc and /proc/self listings (own pid
+present, stat+exe leaves), a forked child's stat under its own
+pid, post-reap ENOENT for dir and stat, O_WRONLY EROFS,
+O_CREAT-under-proc EROFS. All green; 42 tasks, zero leak.
+
+Audit run-70 scoped to the diff: 0 confirmed. Snapshot model
+kills the task-lifetime class (frozen at open; dead-pid dir
+ENOENTs while an open snapshot still reads). The pre-fix frame
+leak was the only real finding — closed. cve.now: CVE-2026-64371
+(procfs do_task_stat vs exec_update_lock race) recorded
+n/a-by-construction — single-CPU syscall context means no
+stat-vs-exec interleave, and reads sample a frozen image, not a
+live task. CVE ledger: 103.
