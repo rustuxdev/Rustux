@@ -3854,15 +3854,22 @@ pub fn sys_sysinfo(buf: u64) -> u64 {
         return EFAULT;
     }
     let up = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed) / 100;
-    let free = kalloc::free_frames();
-    // SAFETY: buf validated writable for the 64-bit header fields.
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    let procs = tasks.iter().flatten().count() as u16;
+    // Zero the whole struct first — callers multiply totalram by
+    // mem_unit, so an uninitialized tail field becomes a garbage
+    // multiplier (busybox free printed ~2^54 once).
+    // SAFETY: buf validated writable for 112 bytes.
     unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, 112);
         (buf as *mut u64).write_unaligned(up); // uptime secs
-        (buf as *mut u64).add(1).write_unaligned(0); // loads[0]
-        (buf as *mut u64).add(2).write_unaligned(0); // loads[1]
-        (buf as *mut u64).add(3).write_unaligned(0); // loads[2]
-        (buf as *mut u64).add(4).write_unaligned(0); // totalram (0=unknown)
-        (buf as *mut u64).add(5).write_unaligned(free * 4096); // freeram
+        // loads[0..3] stay 0 — no load accounting, same as loadavg.
+        (buf as *mut u64).add(4)
+            .write_unaligned(kalloc::total_frames() * 4096); // totalram
+        (buf as *mut u64).add(5)
+            .write_unaligned(kalloc::free_frames() * 4096); // freeram
+        (buf as *mut u16).add(40).write_unaligned(procs); // procs@80
+        (buf as *mut u32).add(26).write_unaligned(1); // mem_unit@104
     }
     0
 }
@@ -4691,12 +4698,43 @@ pub fn fd_pipe(fdptr: u64, flags: u64) -> u64 {
 /// synthesized (S_IFREG|0644, S_IFDIR|0755 for "."), sizes come
 /// from the member header. dirfd/flags are accepted for ABI shape —
 /// a flat archive has no symlinks or per-dirfd namespaces to honor.
-pub fn newfstatat(path: &[u8], statbuf: u64) -> u64 {
+pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
     const STAT_LEN: u64 = 144;
     if !range_ok_w(statbuf, STAT_LEN) {
         return EFAULT;
     }
     let mut st = [0u64; 18];
+    // lstat: proc link paths report S_IFLNK|0777 with the target
+    // length — self, exe, cwd, root, and every fd/<n> are links on
+    // Linux; stat (follow) resolves them instead. No other symlinks
+    // exist in either namespace.
+    if nofollow {
+        let is_link = path == b"proc/self"
+            || match proc_parse(path) {
+                Some(ProcEnt::Task(_, l)) => {
+                    l == b"exe" || l == b"cwd" || l == b"root"
+                }
+                Some(ProcEnt::TaskFd(..)) => true,
+                _ => false,
+            };
+        if is_link {
+            let mut scratch = [0u8; 160];
+            let n = proc_link_target(path, &mut scratch).unwrap_or(0);
+            st[2] = 1;
+            st[3] = 0o120777; // S_IFLNK | 0777 — magic proc links
+            st[6] = n as u64; // st_size = target length
+            st[7] = 4096;
+            // SAFETY: range_ok_w proved statbuf writable.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    st.as_ptr() as *const u8,
+                    statbuf as *mut u8,
+                    STAT_LEN as usize,
+                )
+            };
+            return 0;
+        }
+    }
     if !is_file(path) && dir_exists(path) {
         // Any directory — root, VDIRS, implicit prefix, virtual proc.
         st[2] = 2; // st_nlink

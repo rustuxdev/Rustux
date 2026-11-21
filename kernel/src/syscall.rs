@@ -382,9 +382,9 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_KILL => user::kill(a1 as i32 as i64, a2),
         NR_GETPPID => user::getppid(),
         NR_GETDENTS => user::fd_getdents(a1, a2, a3),
-        // newfstatat(dirfd, path, buf, flags): the archive is flat —
-        // dirfd and flags are ABI-shape only.
-        NR_NEWFSTATAT => sys_newfstatat(a1, a2, a3),
+        // newfstatat(dirfd, path, buf, flags): dirfd is ABI-shape
+        // only; flags carry AT_SYMLINK_NOFOLLOW (0x100).
+        NR_NEWFSTATAT => sys_newfstatat(a1, a2, a3, a4),
         NR_EXECVE => sys_execve(ctx, a1, a2, a3),
         NR_READV => user::fd_readv(ctx, a1, a2, a3),
         NR_WRITEV => sys_writev(ctx, a1, a2, a3),
@@ -407,8 +407,9 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_CLONE => user::sys_clone(ctx, a1, a2, a3, a4, a5),
         NR_TGKILL => user::sys_tgkill(a1, a2, a3),
         NR_GETCWD => user::sys_getcwd(a1, a2),
-        // No symlinks exist — stat and lstat are the same lookup.
-        NR_STAT | NR_LSTAT => sys_stat_path(a1, a2),
+        // stat follows; lstat is nofollow — proc links exist now.
+        NR_STAT => sys_stat_path(a1, a2, false),
+        NR_LSTAT => sys_stat_path(a1, a2, true),
         NR_FSTAT => user::sys_fstat(a1, a2),
         NR_ACCESS => sys_access(u64::MAX, a1),
         NR_FACCESSAT => sys_access(a1, a2),
@@ -494,7 +495,7 @@ fn copy_user_path(path: u64, name: &mut [u8; 257]) -> Result<usize, u64> {
 
 /// newfstatat(dirfd, path, statbuf, flags): same getname discipline
 /// as open, then a fixed 144-byte stat write into user space.
-fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64) -> u64 {
+fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
     let mut name = [0u8; 257];
     let n = match copy_user_path(path, &mut name) {
         Ok(n) => n,
@@ -504,7 +505,7 @@ fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    user::newfstatat(&cb[..cn], statbuf)
+    user::newfstatat(&cb[..cn], statbuf, flags & 0x100 != 0)
 }
 
 fn sys_open(path: u64, flags: u64, mode: u64) -> u64 {
@@ -578,9 +579,10 @@ fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
     0 // unreachable on success — sysret lands in the new image
 }
 
-/// stat/lstat(path, statbuf): no symlinks exist in the archive, so
-/// lstat is stat — same lookup and writer as newfstatat.
-fn sys_stat_path(path: u64, statbuf: u64) -> u64 {
+/// stat/lstat(path, statbuf): same lookup and writer as newfstatat;
+/// `nofollow` makes lstat report links themselves where they exist
+/// (the proc link family — the flat archive has none).
+fn sys_stat_path(path: u64, statbuf: u64, nofollow: bool) -> u64 {
     let mut name = [0u8; 257];
     let n = match copy_user_path(path, &mut name) {
         Ok(n) => n,
@@ -590,7 +592,7 @@ fn sys_stat_path(path: u64, statbuf: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    user::newfstatat(&cb[..cn], statbuf)
+    user::newfstatat(&cb[..cn], statbuf, nofollow)
 }
 
 /// access/faccessat(path, mode): a flat namespace only has

@@ -126,6 +126,53 @@ int main(void) {
     check(n > 0 && strstr(out, "bb-pipe2") != NULL,
           "sh pipe: echo | cat (re-exec via /proc/self/exe)");
 
+    /* run-98: the real procfs consumers — busybox's own tools.
+       ps walks /proc pid dirs and parses each stat; free reads
+       meminfo; uptime reads sysinfo+loadavg; df pairs
+       /proc/mounts with statfs; top reads /proc/stat plus every
+       task's utime/stime for its %CPU column. */
+    char *a11[] = {"ps", NULL};
+    n = bb_run(a11, out, sizeof(out), &code);
+    fprintf(stderr, "==ps==\n%.*s\n", n > 0 ? n : 0, out);
+    check(code == 0 && strstr(out, "PID") != NULL &&
+          strstr(out, "bbtest") != NULL, "busybox ps lists us");
+
+    char *a12[] = {"free", NULL};
+    n = bb_run(a12, out, sizeof(out), &code);
+    fprintf(stderr, "==free==\n%.*s\n", n > 0 ? n : 0, out);
+    check(code == 0 && strstr(out, "Mem:") != NULL,
+          "busybox free reads meminfo");
+
+    char *a13[] = {"uptime", NULL};
+    n = bb_run(a13, out, sizeof(out), &code);
+    fprintf(stderr, "==uptime==\n%.*s\n", n > 0 ? n : 0, out);
+    check(code == 0 && strstr(out, "load average") != NULL,
+          "busybox uptime + loadavg");
+
+    char *a14[] = {"df", "/", NULL};
+    n = bb_run(a14, out, sizeof(out), &code);
+    fprintf(stderr, "==df==\n%.*s\n", n > 0 ? n : 0, out);
+    check(code == 0 && strstr(out, "Filesystem") != NULL,
+          "busybox df via /proc/mounts");
+
+    char *a15[] = {"top", "-b", "-n1", NULL};
+    n = bb_run(a15, out, sizeof(out), &code);
+    fprintf(stderr, "==top==\n%.*s\n", n > 0 ? n : 0, out);
+    check(code == 0 && strstr(out, "CPU:") != NULL &&
+          strstr(out, "PID") != NULL,
+          "busybox top batch cpu+tasks");
+
+    char *a16[] = {"ls", "-l", "/proc/self/fd", NULL};
+    n = bb_run(a16, out, sizeof(out), &code);
+    fprintf(stderr, "==fdls==\n%.*s\n", n > 0 ? n : 0, out);
+    check(code == 0 && strstr(out, "console") != NULL,
+          "ls -l fd dir shows link targets");
+
+    char *a17[] = {"cat", "/proc/cpuinfo", NULL};
+    n = bb_run(a17, out, sizeof(out), &code);
+    check(code == 0 && strstr(out, "vendor_id") != NULL,
+          "cat /proc/cpuinfo");
+
     printf("bbtest: %d failure%s, done\n", fails, fails == 1 ? "" : "s");
     return fails;
 }
