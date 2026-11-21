@@ -17,6 +17,8 @@
 #include <sched.h>
 
 static int fails;
+static volatile sig_atomic_t got_usr1;
+static void usr1_hit(int s) { (void)s; got_usr1 = 1; }
 static void check(int ok, const char *what) {
     printf("  %-46s %s\n", what, ok ? "ok" : "FAIL");
     if (!ok) fails++;
@@ -299,6 +301,44 @@ int main(void) {
     if (!(got_res && res == EIO))
         printf("    debug: got_res=%d res=%d\n", got_res, res);
     check(got_res && res == EIO, "orphaned-group tty read -> EIO");
+
+    /* --- signal waits: sigpending(127), sigsuspend(130), pause(34) - */
+    struct sigaction hu = {.sa_handler = usr1_hit};
+    check(sigaction(SIGUSR1, &hu, NULL) == 0, "SIGUSR1 handler arms");
+
+    sigset_t blk1, empty, pend, pprev;
+    sigemptyset(&blk1); sigaddset(&blk1, SIGUSR1);
+    sigemptyset(&empty);
+    check(sigprocmask(SIG_BLOCK, &blk1, &pprev) == 0,
+          "block SIGUSR1 for pending test");
+    check(kill(getpid(), SIGUSR1) == 0, "self-kill SIGUSR1");
+    check(sigpending(&pend) == 0 && sigismember(&pend, SIGUSR1),
+          "sigpending sees blocked SIGUSR1");
+
+    /* sigsuspend with SIGUSR1 unmasked delivers it — and the block
+       mask must be restored on the way out. */
+    got_usr1 = 0;
+    errno = 0;
+    check(sigsuspend(&empty) == -1 && errno == EINTR && got_usr1,
+          "sigsuspend wakes on pending SIGUSR1 -> EINTR");
+    check(sigprocmask(SIG_SETMASK, NULL, &pend) == 0 &&
+          sigismember(&pend, SIGUSR1),
+          "sigsuspend restored the block mask");
+    sigprocmask(SIG_SETMASK, &pprev, NULL);
+
+    /* pause(34): a child's signal interrupts the sleep with EINTR. */
+    got_usr1 = 0;
+    pid_t sc = fork();
+    if (sc == 0) {
+        struct timespec ts = {0, 20000000}; /* 20ms */
+        nanosleep(&ts, NULL);
+        kill(getppid(), SIGUSR1);
+        _exit(0);
+    }
+    errno = 0;
+    check(sc > 0 && pause() == -1 && errno == EINTR && got_usr1,
+          "pause() interrupted by SIGUSR1 -> EINTR");
+    waitpid(sc, &st, 0);
 
     printf("pgtest: %d failures, done\n", fails);
     return fails;

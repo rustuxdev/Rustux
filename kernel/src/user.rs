@@ -175,6 +175,10 @@ enum WaitOn {
     /// fd_set VAs, `wait_len` the nfds; wait_deadline bounds it like
     /// Poll. Ready bits are rewritten through the sleeper's tables.
     Pselect,
+    /// pause()/sigsuspend(): wake on signal delivery only — no
+    /// deadline, no resource to poll. The generic signal-wake path
+    /// supplies the -EINTR these calls always return.
+    SigWait,
 }
 
 /// Max fds per task — a hard bound so a hostile process cannot
@@ -599,13 +603,28 @@ fn pend_one(t: &mut Task, sig: u64) -> Option<(u64, u64, u64)> {
             }
         }
         t.ctx.rax = rax;
+        // SigWait (pause/sigsuspend) ordering matters: the waking
+        // signal must be DELIVERED while the temporary mask is still
+        // installed — Linux runs the handler inside the suspend, then
+        // restores the mask on the -EINTR return. Delivering after
+        // psel_restore would re-mask the pending signal and the
+        // handler would never run.
+        if matches!(t.wait_on, WaitOn::SigWait) {
+            let mut c = t.ctx;
+            maybe_deliver(t, &mut c);
+            t.ctx = c;
+        }
         t.wait_on = WaitOn::None;
         t.wait_ptr = 0;
         t.wait_len = 0;
         t.wait_deadline = 0;
         t.wait_ptr2 = 0;
         psel_restore(t);
-        t.state = TaskState::Runnable;
+        // maybe_deliver can take the task straight to Exited or
+        // Stopped (fatal/stop default) — only resume the survivors.
+        if t.state == TaskState::Blocked {
+            t.state = TaskState::Runnable;
+        }
     }
     contd
 }
@@ -5662,6 +5681,7 @@ fn poll_expire() {
                         write_task_u16(t.pml4, t.wait_ptr + i * 8 + 6, 0);
                     }
                     t.ctx.rax = 0;
+                    psel_restore(t); // no-op for plain poll
                 }
                 WaitOn::Pselect => {
                     // Timed out: every output word reads zero — the
@@ -5729,6 +5749,73 @@ pub fn fd_poll(ctx: &mut UCtx, fds: u64, nfds: u64, timeout_ms: i64) -> u64 {
         crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed)
             + (timeout_ms as u64).div_ceil(10)
     };
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
+/// sigpending(set, sigsetsize): report the pending-signal bitmask.
+/// Linux returns the full sigset_t; our signal space is 32 so the
+/// mask is exact.
+pub fn sys_sigpending(set: u64, sigsize: u64) -> u64 {
+    if sigsize != 8 {
+        return EINVAL;
+    }
+    if !range_ok_w(set, 8) {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    // SAFETY: validated user VA under cur cr3.
+    unsafe { (set as *mut u64).write_unaligned(t.pending as u64) };
+    0
+}
+
+/// pause(): sleep until any signal arrives — always -EINTR to user.
+/// SigWait carries no deadline or resource; the generic signal-wake
+/// path clears it and supplies the return value.
+pub fn sys_pause(ctx: &mut UCtx) -> u64 {
+    const EINTR: u64 = (-4i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL };
+    if deliverable(t) {
+        return EINTR;
+    }
+    t.wait_on = WaitOn::SigWait;
+    t.wait_deadline = 0;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
+/// sigsuspend(mask, sigsetsize): atomically swap the sigmask and
+/// sleep until a signal — Linux's primitive for race-free signal
+/// waits. The saved mask rides psel_mask so the shared restore path
+/// puts it back on the signal wake; the return is always -EINTR.
+pub fn sys_sigsuspend(ctx: &mut UCtx, mask: u64, sigsize: u64) -> u64 {
+    const EINTR: u64 = (-4i64) as u64;
+    if sigsize != 8 {
+        return EINVAL;
+    }
+    if !range_ok(mask, 8) {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    // SAFETY: validated user sigset under cur cr3.
+    let newmask = unsafe { (mask as *const u64).read_unaligned() } as u32;
+    let saved = t.sigmask;
+    t.sigmask = newmask;
+    if deliverable(t) {
+        // Linux runs the handler inside the suspend: deliver under
+        // the temporary mask (the frame captures rax=-EINTR), then
+        // restore. The syscall's own return also yields -EINTR if no
+        // handler frame redirected the resume path.
+        ctx.rax = EINTR;
+        maybe_deliver(t, ctx);
+        t.sigmask = saved;
+        return EINTR;
+    }
+    t.psel_mask = saved as u64;
+    t.wait_on = WaitOn::SigWait;
+    t.wait_deadline = 0;
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
@@ -5886,6 +5973,90 @@ pub fn fd_pselect(
     t.wait_ptr2 = wfd;
     t.wait_ptr3 = efd;
     t.wait_len = nwords;
+    t.wait_deadline = deadline;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
+/// Parse a user timespec {sec, nsec} into a tick deadline — shared
+/// by ppoll and any future timespec wait. 0 means wait forever;
+/// any positive wait rounds up to at least one tick.
+fn ts_deadline(ts: u64) -> Option<u64> {
+    if ts == 0 {
+        return Some(0);
+    }
+    if !range_ok(ts, 16) {
+        return None;
+    }
+    // SAFETY: validated user timespec under cur cr3.
+    let (sec, nsec) = unsafe {
+        (
+            (ts as *const i64).read_unaligned(),
+            (ts as *const i64).add(1).read_unaligned(),
+        )
+    };
+    if nsec < 0 || nsec >= 1_000_000_000 {
+        return None;
+    }
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let mut d = now
+        .saturating_add((sec.max(0) as u64).saturating_mul(100))
+        .saturating_add((nsec as u64) / 10_000_000);
+    if d == now && (sec > 0 || nsec > 0) {
+        d += 1;
+    }
+    Some(d)
+}
+
+/// ppoll(fds, nfds, tmo_p, sigmask, sigsetsize): poll with a
+/// timespec deadline and an atomic mask swap — pselect6's sibling
+/// over pollfd records. The mask swap rides psel_mask like pselect;
+/// every wake path restores it before userspace resumes.
+pub fn fd_ppoll(
+    ctx: &mut UCtx,
+    fds: u64,
+    nfds: u64,
+    ts: u64,
+    sigmask: u64,
+    sigsize: u64,
+) -> u64 {
+    const EINTR: u64 = (-4i64) as u64;
+    if nfds > MAX_POLL {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    if nfds > 0 && !range_ok_w(fds, nfds * 8) {
+        return EFAULT;
+    }
+    let Some(deadline) = ts_deadline(ts) else {
+        return if ts != 0 && range_ok(ts, 16) { EINVAL } else { EFAULT };
+    };
+    let saved_mask = t.sigmask;
+    if sigmask != 0 {
+        if sigsize != 8 || !range_ok(sigmask, 8) {
+            return EINVAL;
+        }
+        // SAFETY: validated user sigset under cur cr3.
+        t.sigmask = unsafe { (sigmask as *const u64).read_unaligned() } as u32;
+    }
+    let ready = if nfds == 0 { 0 } else { poll_scan(t, fds, nfds) };
+    if ready > 0 {
+        t.sigmask = saved_mask;
+        return ready;
+    }
+    if ts != 0 && deadline <= crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed) {
+        t.sigmask = saved_mask;
+        return 0;
+    }
+    if deliverable(t) {
+        t.sigmask = saved_mask;
+        return EINTR;
+    }
+    t.psel_mask = saved_mask as u64;
+    t.wait_on = WaitOn::Poll;
+    t.wait_ptr = fds;
+    t.wait_len = nfds;
     t.wait_deadline = deadline;
     t.ctx = *ctx;
     t.state = TaskState::Blocked;

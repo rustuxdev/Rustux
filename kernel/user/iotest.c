@@ -15,6 +15,8 @@
 #include <sys/select.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <poll.h>
+#include <signal.h>
 
 static int fails;
 
@@ -131,6 +133,37 @@ int main(void) {
         errno = 0;
         check(pselect(9999, &rs, NULL, NULL, &zt, NULL) < 0 &&
               errno == EINVAL, "pselect huge nfds");
+
+        /* ppoll(271) — poll + timespec + atomic mask swap. A ready
+           pipe reports POLLIN, an idle one times out with revents
+           zeroed, and a sigmask swap restores on return. The pselect
+           block left one byte queued — drain it for the idle cases. */
+        char c;
+        check(read(p[0], &c, 1) == 1 && c == 'x', "drain pselect byte");
+        struct pollfd pf = { .fd = p[0], .events = POLLIN };
+        pf.revents = 0xffff;
+        if (write(p[1], "y", 1) == 1) {
+            errno = 0;
+            check(ppoll(&pf, 1, &zt, NULL) == 1 && (pf.revents & POLLIN),
+                  "ppoll ready pipe");
+            char c2;
+            read(p[0], &c2, 1);
+        }
+        pf.revents = 0xffff;
+        check(ppoll(&pf, 1, &zt, NULL) == 0 && pf.revents == 0,
+              "ppoll idle pipe timeout");
+        sigset_t blk, prev;
+        sigemptyset(&blk); sigaddset(&blk, SIGUSR1);
+        check(sigprocmask(SIG_SETMASK, NULL, &prev) == 0 &&
+              ppoll(&pf, 1, &zt, &blk) == 0 &&
+              sigprocmask(SIG_SETMASK, NULL, &blk) == 0 &&
+              !sigismember(&blk, SIGUSR1),
+              "ppoll sigmask restored after wait");
+        sigprocmask(SIG_SETMASK, &prev, NULL);
+        struct timespec bad = {0, -1};
+        errno = 0;
+        check(ppoll(&pf, 1, &bad, NULL) < 0 && errno == EINVAL,
+              "ppoll bad nsec -> EINVAL");
         close(p[0]); close(p[1]);
     }
 
