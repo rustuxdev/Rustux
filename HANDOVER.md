@@ -1470,3 +1470,56 @@ single-threaded kernel — structurally atomic). cve.now: no
 sigsuspend/ppoll/sigpending CVEs on record — the class is the
 signal-check-then-sleep race itself, which the atomic
 swap-check-block section eliminates. CVE ledger: 99.
+
+
+run-94 — epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281)
+---------------------------------------------------------------------
+
+The readiness-multiplexing family real daemons prefer. A new
+FdKind::Epoll OFD kind: the interest set lives in a fixed EPOLLS
+table (MAX_EPOLLS=8, MAX_EPOLL_FDS=16 — ENFILE/ENOMEM are the
+honest answers past the bounds, never a silent drop). Interest
+entries key on the caller's fd number for ctl lookup but pin the
+OFD index — Linux's epitem -> file mapping — so a closed-then-
+reused fd number can't redirect an interest, and dup'd fds share
+the set. ofd_release purges interests whose OFD dies (Linux drops
+the epitem at file teardown) and frees the instance slot when the
+epoll fd's refs reach 0.
+
+poll_revents split: the task-free core is now ofd_revents(oi,
+mask) — epoll evaluates OFDs directly; poll resolves fd -> ofd
+first. The Epoll poll arm reports POLLIN when any interest is
+ready; ctl rejects epoll-kind members with ELOOP so that arm can
+never recurse (nested epoll is a documented divergence, as are
+EPOLLET/EPOLLONESHOT — accepted but level-triggered).
+
+epoll_wait/pwait block on WaitOn::Epoll(ei): wake_pollers rescans
+via epoll_scan (12-byte packed epoll_event records written through
+the sleeper's tables), poll_expire returns 0, the signal path gets
+the shared -EINTR, and pwait's temporary mask rides psel_mask on
+every exit — the same discipline as ppoll. run_over parks Epoll
+waiters like Poll/Pselect.
+
+errno fidelity: ctl non-epoll fd -> EINVAL, bad op -> EINVAL,
+self-watch -> EINVAL, dir fd -> EPERM, dup ADD -> EEXIST, missing
+MOD/DEL -> ENOENT; wait on non-epoll fd -> EINVAL, bad epfd ->
+EBADF, maxevents 0 -> EINVAL; read() on an epoll fd -> EINVAL
+(stream-less fd, not EBADF); fstat reports S_IFCHR|0600 like
+Linux's anon_inodefs.
+
+Tests: iotest +22 (create1, ADD, ready+cookie, idle, timeout,
+EEXIST/ENOENT/EINVAL ctl errors, MOD mask semantics both ways,
+pwait mask restore, blocked-wait wake via a forking writer, fstat
+chrdev, read EINVAL). Full suite green, 42 tasks, frames zero
+leak, boot PASS WSL.
+
+Audit run-68 scoped to the diff: 0 confirmed (stale-OFD interests
+purged at teardown and never trusted; instance can't be freed
+under a waiter — its fd pins the OFD; ELOOP rejection makes the
+poll arm's recursion depth structurally 1; fixed-slot tables mean
+no user-sized kernel allocation). cve.now: CVE-2025-38349
+(eventpoll refcount-under-mutex UAF — n/a, single-threaded, no
+refcount-under-lock), CVE-2025-39881 (epitem outliving released
+file — n/a, OFD-index pins purged at teardown), CVE-2013-7446
+(epoll_ctl UAF — n/a, no heap epitem), CVE-2023-54019 (per-file
+waitqueue UAF — n/a, none exist). CVE ledger: 102.

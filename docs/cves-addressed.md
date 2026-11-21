@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**99 unique CVEs recorded.**
+**102 unique CVEs recorded.**
 
 ## klib ports
 
@@ -49,6 +49,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2009-1385 | `e1000` RX | **mitigated** — device-written `sta`/`len` now validated (EOP required, `14 <= len <= RX_BUF`) before any buffer read; repost-and-drop on violation |
 | CVE-2009-2848 | process lifecycle: clone(56) fork-subset + SETTID writes, rt_sigprocmask(14) real sigmask… | RUN-TIME BUG CAUGHT BY REVIEW: translate/translate_r walked ANY va through the task pml4 -- which shares kernel upper-half slots by reference -- so a user-controlled VA reached ke… |
 | CVE-2010-5328 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
+| CVE-2013-7446 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) — interest pins OFD index (… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
 | CVE-2014-0196 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
 | CVE-2014-9322 | busybox real-binary rootfs rung: signal-restorer sigframe (SIGTRAMP user-RX page + [resto… | RUN-TIME BUG CAUGHT BY REAL BINARY: the old [signo][UCtx] frame made a normal-returning C handler ret into signo=17 (SIGCHLD) -> rip=0x11 crash in every busybox pipeline child — g… |
 | CVE-2014-9322 | fault-driven signals (catchable SIGSEGV/SIGILL/SIGFPE/SIGBUS/SIGTRAP) | interrupted UCtx is CPU/stub-captured, never user-shaped; the sigframe is the same [signo][UCtx] format sigreturn already treats as hostile (cs/ss pinned, TF/NT/IOPL cleared, rip/… |
@@ -85,6 +86,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-50661 | task abstraction + frame reclaim | per-task page tables + kmalloc'd syscall stack, initrd iterates as process table; teardown freeing designed-in: reap walks user PML4 slots 128-255 only, PHYS_MASK strips NX/flags… |
 | CVE-2023-52791 | preemptive round-robin scheduler | every switch is a UCtx resume (15 GPRs + iret frame) — launch/preemption/exit share one path; dedicated 0xf0 stub saves the FULL register file; cs&3==0 ticks never switch (58090 c… |
 | CVE-2023-54019 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
+| CVE-2023-54019 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) — interest pins OFD index (… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
 | CVE-2023-54019 | poll(2): pollfd readiness + timeout wait | poller-vs-polled lifetime class structurally absent: no waitqueue pointers -- wait state is (wait_ptr,wait_len) into the sleeper's OWN address space and every wake re-derives read… |
 | CVE-2023-54166 | `e1000`/IRQ | **design note** — no TX timeout/reset path yet; ordering rules apply when added |
 | CVE-2024-35875 | csprng (rand.rs) | RDRAND-seeded ChaCha20 (256b key, per-block counter, key block burned after isn_key draw); weak-seed fallback reported honestly not hidden; per-boot ISN key closes NV-44-1; random… |
@@ -95,6 +97,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2024-58090 | preemptive round-robin scheduler | every switch is a UCtx resume (15 GPRs + iret frame) — launch/preemption/exit share one path; dedicated 0xf0 stub saves the FULL register file; cs&3==0 ticks never switch (58090 c… |
 | CVE-2025-21887 | writable file layer: VFile/Ram OFDs (O_CREAT/O_EXCL/O_TRUNC/O_APPEND), write/read/pread/l… | self-review catches FIXED pre-commit: write(fd,buf,0) at pos>len allocated+extended the file (now early-0 like Linux); fd_pread on an empty VFile took null.add(0) (now n==0 early… |
 | CVE-2025-23161 | `pci` | **n/a to mechanism** — our CF8/CFC access has no save/restore arrays; reminder: all config ops must stay IRQ-safe (they are — port I/O only) |
+| CVE-2025-38349 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) — interest pins OFD index (… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
 | CVE-2025-38432 | udp/dhcp (ipv4) | csum field zeroed before csum4 (CVE-2025-38432 fix shape); no MSG_PEEK/socket layer — 2016-10229 n/a; malformed csums dropped-and-reposted not error-looped (2015-5364/66 class abs… |
 | CVE-2025-38432 | udp/dhcp (ipv4) | csum field zeroed before csum4 (CVE-2025-38432 fix shape); no MSG_PEEK/socket layer — 2016-10229 n/a; malformed csums dropped-and-reposted not error-looped (2015-5364/66 class abs… |
 | CVE-2025-38595 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
@@ -102,6 +105,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2025-38722 | exit-time fd release (exit_files ordering) + shell-pipeline proof | CONFIRMED-BY-TEST kernel bug: task fds were only released in reap(), so a dying pipe writer OFD stayed alive and blocked readers starved for EOF forever -- the shell-shaped test (… |
 | CVE-2025-39756 | open-file descriptions (lseek/dup/dup2) | fds index a shared OFD table (kind/pos/refs) — Linux files_struct split; dup shares offset (proven M/O/T byte reads across fd3/fd4/fd9); fixed 16-slot bound kills the 39756 class… |
 | CVE-2025-39813 | real shell + oversized-read clamp: rsh static-pie binary (prompt/parse/fork/execve/waitpi… | CONFIRMED-BY-TEST userspace-visible divergence, not a ref bug: rshtest read(out[0], buf, 8191) crossed the 4096 MAX_COPY gate and got EINVAL -> break -> close(out[0]) -> the out-p… |
+| CVE-2025-39881 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) — interest pins OFD index (… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
 | CVE-2025-39966 | exit-time fd release (exit_files ordering) + shell-pipeline proof | CONFIRMED-BY-TEST kernel bug: task fds were only released in reap(), so a dying pipe writer OFD stayed alive and blocked readers starved for EOF forever -- the shell-shaped test (… |
 | CVE-2025-39977 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
 | CVE-2025-68814 | fd table + initrd-as-rootfs (read/open/close) | 16-slot table bounded EMFILE; pathname copied byte-wise under range_ok, 256B cap ENAMETOOLONG (getname class); read target must be user-writable range; File borrows immortal LOADE… |
