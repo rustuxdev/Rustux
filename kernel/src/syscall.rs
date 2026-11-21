@@ -455,7 +455,8 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_TIMES => user::sys_times(a1),
         NR_TIME => user::sys_time(a1),
         NR_GETRUSAGE => user::sys_getrusage(a1, a2),
-        NR_STATFS | NR_FSTATFS => user::sys_statfs(a2),
+        NR_STATFS => sys_statfs(a1, a2),
+        NR_FSTATFS => user::sys_fstatfs(a1, a2),
         NR_PRCTL => user::sys_prctl(a1, a2),
         NR_GETGROUPS => user::sys_getgroups(a1, a2),
         NR_SCHED_GETAFFINITY => user::sys_sched_getaffinity(a1, a2, a3),
@@ -622,6 +623,21 @@ fn sys_stat_path(path: u64, statbuf: u64, nofollow: bool) -> u64 {
         Err(e) => return e,
     };
     user::newfstatat(&cb[..cn], statbuf, nofollow)
+}
+
+/// statfs(path, buf): canon the path, ENOENT on a miss, then the
+/// per-fs fill — /proc reports procfs, everything else ramfs.
+fn sys_statfs(path: u64, buf: u64) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let (cb, cn) = match user::canon_path(u64::MAX, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::statfs_path(&cb[..cn], buf)
 }
 
 /// access/faccessat(path, mode): a flat namespace only has

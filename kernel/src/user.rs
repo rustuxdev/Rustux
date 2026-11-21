@@ -4389,22 +4389,72 @@ pub fn sys_getrusage(who: u64, ru: u64) -> u64 {
     0
 }
 
-/// statfs(path, buf) / fstatfs(fd, buf): one filesystem — the cpio
-/// initrd + ram layer — so a fixed honest answer: RAMFS_MAGIC,
-/// 4KiB blocks, no persistent capacity claims.
-pub fn sys_statfs(buf: u64) -> u64 {
+/// Shared statfs body: honest numbers. The root fs is memory-backed
+/// — capacity IS the frame allocator (4KiB blocks, total/free frames)
+/// and the inode count is the dynamic vfile table. /proc reports its
+/// own superblock: PROC_SUPER_MAGIC, read-only, no storage. struct
+/// statfs: type@0 bsize@8 blocks@16 bfree@24 bavail@32 files@40
+/// ffree@48 fsid@56 namelen@64 frsize@72 flags@80 spare@88.
+fn fill_statfs(buf: u64, proc: bool) {
+    // SAFETY: buf validated writable for 120 bytes by the caller.
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, 120);
+        let w = |i: usize, v: u64| (buf as *mut u64).add(i).write_unaligned(v);
+        if proc {
+            w(0, 0x9fa0); // PROC_SUPER_MAGIC
+            w(1, 4096);
+            w(8, 255);
+            // ST_RDONLY | ST_NOSUID | ST_NODEV | ST_NOEXEC
+            w(10, 0x1 | 0x2 | 0x4 | 0x8);
+        } else {
+            let vfree = (*core::ptr::addr_of!(VFILES))
+                .iter()
+                .filter(|s| s.is_none())
+                .count() as u64;
+            let free = kalloc::free_frames();
+            w(0, 0x8584_58f6); // RAMFS_MAGIC
+            w(1, 4096); // f_bsize
+            w(2, kalloc::total_frames());
+            w(3, free);
+            w(4, free); // no root-reserved blocks
+            w(5, MAX_VFILES as u64);
+            w(6, vfree);
+            w(8, 255);
+            w(9, 4096); // f_frsize
+        }
+    }
+}
+
+/// statfs(path, buf): cpath is the canonical path — ENOENT on a
+/// miss like Linux, proc paths report the procfs superblock.
+pub fn statfs_path(cpath: &[u8], buf: u64) -> u64 {
+    if !fs_exists(cpath) {
+        return ENOENT;
+    }
     if !range_ok_w(buf, 120) {
         return EFAULT;
     }
-    // SAFETY: buf validated writable; zero the struct then fill the
-    // fields we can honestly report (fsid/spare stay 0).
-    unsafe {
-        core::ptr::write_bytes(buf as *mut u8, 0, 120);
-        (buf as *mut u64).write_unaligned(0x8584_58f6); // RAMFS_MAGIC
-        (buf as *mut u64).add(1).write_unaligned(4096); // f_bsize
-        (buf as *mut u64).add(10).write_unaligned(255); // f_namelen
-        (buf as *mut u64).add(11).write_unaligned(4096); // f_frsize
+    fill_statfs(buf, cpath == b"proc" || cpath.starts_with(b"proc/"));
+    0
+}
+
+/// fstatfs(fd, buf): the fs backing the fd — Proc OFDs and Dir OFDs
+/// that name /proc report procfs, everything else the ramfs.
+pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
+    if !range_ok_w(buf, 120) {
+        return EFAULT;
     }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let proc = match &o.kind {
+        FdKind::Proc { .. } => true,
+        FdKind::Dir(d) => {
+            let b = d.bytes();
+            b == b"proc" || b.starts_with(b"proc/")
+        }
+        _ => false,
+    };
+    fill_statfs(buf, proc);
     0
 }
 

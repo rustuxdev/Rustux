@@ -21,6 +21,7 @@
 #include <sys/inotify.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <sys/syscall.h>
@@ -864,6 +865,47 @@ int main(void) {
         waitpid(ic, NULL, 0);
         close(bifd);
         unlink(ip);
+    }
+
+    /* run-102: real statfs/fstatfs — capacity is the frame
+       allocator, inodes are the vfile table; /proc is its own
+       read-only superblock. */
+    {
+        struct statfs sf;
+        memset(&sf, 0xa5, sizeof(sf));
+        check(statfs("/", &sf) == 0 &&
+              (unsigned long)sf.f_type == 0x858458f6UL &&
+              sf.f_bsize == 4096 &&
+              sf.f_blocks > 0 && sf.f_bfree > 0 &&
+              sf.f_bfree <= sf.f_blocks &&
+              sf.f_bavail <= sf.f_bfree &&
+              sf.f_files > 0 && sf.f_ffree <= sf.f_files &&
+              sf.f_namelen == 255 && sf.f_frsize == 4096,
+              "statfs / reports real capacity+inodes");
+        memset(&sf, 0xa5, sizeof(sf));
+        check(statfs("/proc", &sf) == 0 &&
+              (unsigned long)sf.f_type == 0x9fa0UL &&
+              (sf.f_flags & 0x1) /* ST_RDONLY */ &&
+              sf.f_blocks == 0 && sf.f_files == 0,
+              "statfs /proc -> PROC_SUPER_MAGIC+RDONLY");
+        int pfd = open("/proc/uptime", O_RDONLY);
+        check(pfd >= 0, "open proc file for fstatfs");
+        memset(&sf, 0xa5, sizeof(sf));
+        check(fstatfs(pfd, &sf) == 0 &&
+              (unsigned long)sf.f_type == 0x9fa0UL,
+              "fstatfs proc fd -> procfs magic");
+        close(pfd);
+        int rfd = open("/", O_RDONLY | O_DIRECTORY);
+        check(rfd >= 0, "open / for fstatfs");
+        memset(&sf, 0xa5, sizeof(sf));
+        check(fstatfs(rfd, &sf) == 0 &&
+              (unsigned long)sf.f_type == 0x858458f6UL,
+              "fstatfs / -> ramfs magic");
+        close(rfd);
+        errno = 0;
+        check(statfs("/definitely-not-here", &sf) == -1 &&
+              errno == ENOENT,
+              "statfs nonexistent -> ENOENT");
     }
 
     int n = snprintf(buf, sizeof(buf), "iotest: %d failures, done\n", fails);
