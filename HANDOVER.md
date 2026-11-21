@@ -1771,3 +1771,37 @@ scoped): 0 confirmed; inotify CVE class cross-checked. Ledger: 110.
 Known divergences: path-keyed watches (a self-watch on a renamed
 file dies with MOVE_SELF+IGNORED rather than following the inode);
 one record per read; F_SETFL can't toggle instance nonblock.
+
+run-101 — queued signals: rt_sigqueueinfo(129)/rt_tgsigqueueinfo(297)
+plus real siginfo_t provenance end-to-end. Per-pending-bit SigSrc
+records (pend_src) carry si_code/si_pid/si_uid + aux (si_value for
+SI_QUEUE, si_status for SIGCHLD, si_addr for faults); standard
+signals coalesce first-pend-wins exactly like Linux's merge. The
+extended sigframe [restorer][signo][UCtx][siginfo_t][saved mask]
+hands SA_SIGINFO handlers rsi=&siginfo_t + rdx=&ucontext, and
+sigreturn now restores the saved mask. sigaction honors the kernel
+32-byte {handler,flags,restorer,mask} layout — sa_mask + SA_NODEFER/
+SA_RESETHAND applied at delivery. sigqueue_one enforces the Linux
+provenance rule (si_code>=0 or SI_TKILL -> EPERM); negative pid/tgid
+collapse to ESRCH. SIGCHLD reports CLD_EXITED/KILLED/DUMPED/STOPPED/
+CONTINUED + child pid + si_status; fault delivery passes real
+si_code (MAPERR vs ACCERR from #PF err bit0) + si_addr=cr2.
+Three bugs found en route, all real: (1) signalfd_read and sig_wait
+dequeued pending bits directly and saw no provenance — all record
+writers now share sig_record/fill_sig_rec; (2) the sigsuspend mask
+fix needed the frame_mask mechanism — a signal delivered inside the
+suspend must carry the ORIGINAL mask in its frame because the
+handler's sigreturn is the suspend's return point (both the blocked
+wake arm and the immediate-deliverable path); (3) the fault-delivery
+splice updated rdi but never rsi/rdx — a caught SEGV handler read
+siginfo through a stale pointer. Audit also caught a REAL
+evasion bug: signalfd masks weren't stripped of SIGKILL/SIGSTOP, so
+a parked signalfd_read could swallow a fatal signal — an
+unkillable task; stripped at mask write like dequeue_signal's
+sig_kernel_only skip. pgtest +18 checks: SI_USER/SI_QUEUE codes,
+si_value, EPERM paths, tgsigqueueinfo wrong/right tgid, CLD_EXITED
+metadata, signalfd ssi_* fields, SIGSEGV ACCERR+si_addr on a
+PROT_NONE page, non-inheritance of queued payloads. 42 tasks,
+frames 108588 -> 108588 zero leak, exit 33. Audit run-75 (quick,
+scoped): 0 confirmed unresolved (the evasion defect fixed
+pre-commit). Ledger: 110.

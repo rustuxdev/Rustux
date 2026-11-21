@@ -75,7 +75,8 @@ a hierarchical VFS with a generated `/proc` (per-pid
 `uptime`/`meminfo`/`loadavg`/`stat`/`cpuinfo`/`mounts`),
 pipes, sockets (`socket`/`bind`/
 `listen`/`accept`/`connect`, `poll`/`ppoll`/`pselect6`, `epoll`,
-`eventfd`, `timerfd`, `signalfd`, `inotify`, `getsockname`/
+`eventfd`, `timerfd`, `signalfd`, `inotify`, queued
+signals (`sigqueue`/`sigqueueinfo`, `SA_SIGINFO` siginfo_t), `getsockname`/
 `getpeername`, `sendfile`), `rseq`, a keyboard- and UART-driven terminal
 with a canonical/raw line discipline and full termios, real process
 groups, sessions and a controlling tty (`/dev/tty`, `tcsetpgrp`,
