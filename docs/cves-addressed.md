@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**103 unique CVEs recorded.**
+**104 unique CVEs recorded.**
 
 ## klib ports
 
@@ -49,6 +49,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2009-1385 | `e1000` RX | **mitigated** — device-written `sta`/`len` now validated (EOP required, `14 <= len <= RX_BUF`) before any buffer read; repost-and-drop on violation |
 | CVE-2009-2848 | process lifecycle: clone(56) fork-subset + SETTID writes, rt_sigprocmask(14) real sigmask… | RUN-TIME BUG CAUGHT BY REVIEW: translate/translate_r walked ANY va through the task pml4 -- which shares kernel upper-half slots by reference -- so a user-controlled VA reached ke… |
 | CVE-2010-5328 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
+| CVE-2011-1020 | procfs breadth 2: fd/fdinfo dirs + fd-link share-open, exe/cwd/root links, statm/environ/… | 1020 n/a by construction: Rustux has no uids/setuid/credentials — no privilege boundary exists for the missing check to cross; single-tenant, all tasks already see all files. Shar… |
 | CVE-2013-7446 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) — interest pins OFD index (… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
 | CVE-2014-0196 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
 | CVE-2014-9322 | busybox real-binary rootfs rung: signal-restorer sigframe (SIGTRAMP user-RX page + [resto… | RUN-TIME BUG CAUGHT BY REAL BINARY: the old [signo][UCtx] frame made a normal-returning C handler ret into signo=17 (SIGCHLD) -> rip=0x11 crash in every busybox pipeline child — g… |

@@ -1627,3 +1627,63 @@ leak was the only real finding — closed. cve.now: CVE-2026-64371
 n/a-by-construction — single-CPU syscall context means no
 stat-vs-exec interleave, and reads sample a frozen image, not a
 live task. CVE ledger: 103.
+
+--- run-97 (procfs breadth 2: links, fd view, real accounting) ---
+
+/proc/<pid> grows the full three-level shape real tools expect:
+new leaves statm (vsize/RSS in pages), environ (empty — envp is
+honest zero), wchan ("0"), io (zeroed counters), plus the link
+leaves exe/cwd/root and the fd/ + fdinfo/ directories that
+enumerate the target task's live fd table. proc_parse is now
+three-level: proc/<pid>/{fd,fdinfo}/<n> resolves against the
+FdTab — closed numbers and zombie tasks (fdi=FDI_NONE after
+release_fds) are ENOENT, and getdents on fd/fdinfo emits decimal
+fd names rendered like the pid enumeration.
+
+fd links are real links: readlink names the OFD — "/dev/console",
+"/"+archive/vfile path (File resolved by pointer-compare against
+the cpio member list, Ram by VFILES name, Dir by its path),
+"pipe:[id]", "socket:[id]", "anon_inode:[eventpoll|eventfd|
+timerfd|proc]". open() of an fd link SHARES the open description —
+cross-task dup, same OFD refs+1 — with Linux's gates: ENXIO for
+sockets, EACCES when the requested accmode exceeds the OFD's,
+EEXIST under O_CREAT|O_EXCL, O_DIRECTORY honored. execve through
+the link runs archive-backed File OFDs. fdinfo renders
+pos/flags/mnt_id (flags = accmode + O_APPEND + O_CLOEXEC, octal
+like Linux). stat on an fd link follows to the OFD's own shape —
+ofd_stat_shape() factored out of sys_fstat so both paths agree.
+
+cmdline is now the REAL argv: exec() snapshots the NUL-joined
+argv into Task.cmdline (256 B cap — an arg that won't fit drops
+whole, Linux caps the page too); spawn seeds argv0; fork/clone
+inherit. environ stays empty — envp is collected at exec but not
+kept; an honest 0-byte file beats a fake one.
+
+Accounting became real: Task.utime/stime bill the preempted frame
+in tick() — kernel-CS means inside a syscall (stime), CPL3 means
+user (utime). /proc/<pid>/stat fields 14/15 report them; the
+/proc/stat cpu lines sum per-task counters (idle is the
+remainder), ctxt counts resume_ctx switches, processes counts
+task-table insertions, procs_running/procs_blocked count live
+states. cpuinfo renders CPUID vendor/family/model/stepping plus
+the 48-byte brand string when leaf 0x80000004 exists.
+filesystems/mounts describe the actual flat rustux+proc VFS.
+/proc/self readlink resolves to the caller's decimal pid.
+
+Tests: iotest +24 — /proc/stat cpu+processes+ctxt, cpuinfo fields,
+filesystems/mounts content, statm parse (rss>0), environ empty,
+io counters, cmdline argv0, readlink self->pid + cwd/root->'/',
+self/fd dir + getdents sees fds 0/2, fd/1->/dev/console link,
+fdinfo pos+flags, and the key semantic: open("/proc/self/fd/<r>")
+of a pipe read-end shares the OFD and reads the byte. Plus utime
+actually ticked (stat field 14 > 0). All green; 42 tasks,
+frames 108611 -> 108611 zero leak, exit 33.
+
+Audit run-71 scoped to the diff: 0 confirmed. The share path's
+ref bump/rollback verified against EMFILE; parse-then-share runs
+in one critical section so no stale-fd interleave exists; EACCES
+direction matches Linux (wronly on rdonly refused). cve.now:
+CVE-2011-1020 (procfs tree access not restricted after setuid
+exec, public exploit) recorded n/a-by-construction — Rustux has
+no uids or privilege boundary for the missing check to cross.
+CVE ledger: 104.

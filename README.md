@@ -70,7 +70,9 @@ ones via `PT_INTERP`/ld.so — a 100+-call syscall surface covering
 `fork`/`execve`/`waitpid`, real signals with a sigreturn restorer
 trampoline, `brk`/anonymous and file-backed `mmap`/`munmap`/`mprotect`,
 a hierarchical VFS with a generated `/proc` (per-pid
-`stat`/`status`/`comm`/`cmdline`/`exe`, `uptime`/`meminfo`/`loadavg`),
+`stat`/`status`/`comm`/`cmdline`/`statm`/`fd`/`fdinfo`, the
+`exe`/`cwd`/`root`/`self` links, real utime/stime accounting,
+`uptime`/`meminfo`/`loadavg`/`stat`/`cpuinfo`/`mounts`),
 pipes, sockets (`socket`/`bind`/
 `listen`/`accept`/`connect`, `poll`/`ppoll`/`pselect6`, `epoll`,
 `eventfd`, `timerfd`, `getsockname`/
