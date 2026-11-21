@@ -1711,3 +1711,29 @@ confirmed findings. cve.now: no directly-applicable sysinfo/stat
 entries; the copyout-uninit infoleak class (CVE-2022-50531,
 CVE-2024-35849, CVE-2023-53798 — unrelated drivers) is the
 defensive pattern the new zero-fill already follows. Ledger: 104.
+
+## run-99: synchronous signals — sigtimedwait + signalfd
+
+Completes the signal family: rt_sigtimedwait(128) — which IS
+glibc's sigwaitinfo (no separate nr on x86_64; NULL ts = infinite)
+— plus signalfd(282)/signalfd4(289). New WaitOn::SigTimed waits on
+a set: pend_one collects an in-set arrival (dequeues the bit,
+writes the 128B siginfo_t/signalfd_siginfo record through the
+sleeper's own tables, rax = signo or 128), lets an out-of-set
+deliverable signal take the normal -EINTR+handler path, and leaves
+the sleeper down for masked/ignored noise. poll_expire answers
+EAGAIN on the timedwait deadline. signalfd is FdKind::Signalfd
+over a bounded SIGNALFDS mask table — read dequeues the READER's
+pending in-mask signals (single 128B record per read, Linux-valid
+minimum), poll/epoll-ready when pending&mask, mask-update on an
+existing fd, EINVAL on a non-signalfd fd.
+Three ABI traps fixed en route: nr128 is rt_sigtimedwait(4-arg,
+glibc sigwaitinfo calls it with ts=NULL), signalfd4 passes
+sigsetsize in a3 (flags is a4), and fd is an int — user -1 arrives
+as 0xFFFFFFFF not u64::MAX.
+pgtest +11 checks: EAGAIN empty window, blocked-pending collect,
+mid-wait arrival, nonblock empty read, poll POLLIN, 128B record
+with ssi_signo, blocked-read wake via child kill, mask update,
+EINVAL on foreign fd. 42 tasks, frames 108610 -> 108610 zero
+leak, exit 33 WSL + VM. Audit run-73 (quick, scoped): 0 confirmed;
+cve.now has no signalfd/sigtimedwait-class entries. Ledger: 104.
