@@ -1377,10 +1377,6 @@ Audit run-64 scoped to the diff: 0 confirmed. CVE ledger: 95.
 
 ## run-91 — TOSTOP + SIGTTOU: the tty write-side job-control gate
 
-The write-side mirror of run-89s
-
-## run-91 — TOSTOP + SIGTTOU: the tty write-side job-control gate
-
 The write-side mirror of run-89's SIGTTIN read gate — Linux's
 tty_check_change(SIGTTOU) under O_TOSTOP. With TOSTOP armed on the
 console termios (c_lflag 0x100), a task of the console's session
@@ -1410,3 +1406,30 @@ Follow-up noted: Linux also SIGTTOU's a background tcsetpgrp
 CVE-2014-0196 (n_tty_write LECHO race, KEV) n/a by construction —
 synchronous single-threaded console write, no shared ldisc buffer.
 42 tasks, frames zero leak, boot PASS x3 WSL. CVE ledger: 98.
+## run-92 — SIGTTOU on background TIOCSPGRP: the ioctl-side job-control gate
+
+Completes the job-control gate set: Linux's tiocspgrp runs
+tty_check_change(SIGTTOU) unconditionally — a background pgrp may not
+move the tty's foreground without a job-control signal landing first.
+The run-91 gate's core is factored into shared ttou_gate();
+tty_tostop_gate() keeps its TOSTOP precondition and the new
+tty_spgrp_gate() runs the check unconditionally. Placement matches
+Linux: after the fd-is-console and caller-session checks (ENOTTY),
+before range_ok(arg) — the signal check precedes argument validation.
+
+ttoutest gains six checks: background tcsetpgrp -> SIGTTOU stop
+(WUNTRACED/WSTOPSIG), SIG_IGN tcsetpgrp succeeds and provably moves
+FG_PGID (verified via tcgetpgrp), orphaned-group tcsetpgrp -> EIO.
+The gate is exercised with TOSTOP clear, proving it is unconditional
+on the ioctl path unlike the write path.
+
+Audit run-66 scoped to the diff: 0 confirmed (no TOCTOU — gate and
+FG_PGID store live in the same single-threaded critical section;
+gate-before-arg ordering leaks nothing beyond what tcgetpgrp already
+reveals). cve.now: CVE-2020-29661 — the canonical TIOCSPGRP CVE,
+tty_jobctrl.c locking/UAF with a public exploit — n/a by
+construction: no refcounted tty object exists; the console is static
+and pgrp/sid/FG_PGID are plain integers moved inside one critical
+section, so there is no lifetime to race.
+run-ttout: 0 failures; full suite all 21 suite lines green, 42 tasks,
+frames zero leak, boot PASS WSL. CVE ledger: 99.

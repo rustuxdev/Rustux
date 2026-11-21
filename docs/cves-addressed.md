@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**98 unique CVEs recorded.**
+**99 unique CVEs recorded.**
 
 ## klib ports
 
@@ -67,6 +67,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2018-3665 | real-binary ABI: fs_base+arch_prctl, exec initial stack (argc/argv/envp/auxv), writev/rea… | argv==NULL discipline applied (49264): argc==0 gets the binary name as argv0 (stronger than upstream's empty string -- same "never argc<1" contract glibc relies on); exec argv/env… |
 | CVE-2018-8897 | per-task fault isolation (user exceptions kill the task) | a CPL3 exception on the task's own kstack (interrupt gate -> IF clear, no nested timer) kills the task with the bare-signo wstatus instead of halting the kernel — maps #BP/#DB->TR… |
 | CVE-2020-29369 | brk/mmap/munmap/mprotect: per-task VMA table + eager zeroed pages | VMA == ranges[] entry: gate, first-fit, and teardown share one truth, so a mapped page can never escape the syscall pointer gate; first-fit scans holes between entries (freed VA i… |
+| CVE-2020-29661 | unconditional SIGTTOU gate on background TIOCSPGRP: run-91 gate core factored into shared… | 29661 n/a by construction: the Linux bug is a missing lock around a refcounted tty freed mid-jobctl-op; Rustux's console is a static singleton and pgrp/sid/FG_PGID are plain integ… |
 | CVE-2021-4440 | syscall reg preservation + boundary selftest | stub now saves/restores the full Windows-volatile set (rdx/rsi/r8-r10) so syscall clobbers only rax/rcx/r11 per Linux ABI; sysret rcx is CPU-saved rip, canonical by construction (… |
 | CVE-2021-4440 | task abstraction + frame reclaim | per-task page tables + kmalloc'd syscall stack, initrd iterates as process table; teardown freeing designed-in: reap walks user PML4 slots 128-255 only, PHYS_MASK strips NX/flags… |
 | CVE-2021-47597 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
