@@ -18,8 +18,9 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/epoll.h>
-#include <sys/stat.h>
+#include <sys/inotify.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <sys/syscall.h>
@@ -737,6 +738,132 @@ int main(void) {
             check(fc >= 12 && fv[11] > 0, "utime ticked");
         }
         if (fd >= 0) close(fd);
+    }
+
+
+    /* run-100: inotify — watch/add/report/rm around a ram file. */
+    {
+        const char *ip = "inotest.txt";
+        unlink(ip);
+        int ifd = inotify_init1(IN_NONBLOCK);
+        check(ifd >= 0, "inotify_init1 create");
+        char evbuf[512];
+        errno = 0;
+        check(read(ifd, evbuf, sizeof(evbuf)) == -1 && errno == EAGAIN,
+              "inotify empty read -> EAGAIN");
+        check(inotify_add_watch(ifd, "/nonexistent-xyz", IN_ALL_EVENTS)
+              == -1 && errno == ENOENT,
+              "add_watch missing path -> ENOENT");
+        check(inotify_add_watch(0, ip, IN_ALL_EVENTS) == -1 &&
+              errno == EINVAL,
+              "add_watch non-inotify fd -> EINVAL");
+
+        /* file watch: open/modify/close events on the object. */
+        int wd = inotify_add_watch(ifd, ip, 0);
+        check(wd == -1 && errno == ENOENT,
+              "add_watch before create -> ENOENT");
+        int f = open(ip, O_CREAT | O_RDWR, 0644);
+        check(f >= 0, "inotest file create");
+        close(f);
+        wd = inotify_add_watch(ifd, ip, IN_ALL_EVENTS);
+        check(wd >= 1, "add_watch returns wd");
+
+        f = open(ip, O_WRONLY);
+        write(f, "x", 1);
+        close(f);
+        struct pollfd ipf = {ifd, POLLIN, 0};
+        check(poll(&ipf, 1, 0) == 1 && (ipf.revents & POLLIN),
+              "inotify poll POLLIN after modify");
+        struct inotify_event *ev;
+        int n1 = read(ifd, evbuf, sizeof(evbuf));
+        check(n1 == 16, "first event is a 16B record");
+        ev = (struct inotify_event *)evbuf;
+        check(ev->wd == wd && (ev->mask & IN_OPEN),
+              "event 1: IN_OPEN on our wd");
+        n1 = read(ifd, evbuf, sizeof(evbuf));
+        ev = (struct inotify_event *)evbuf;
+        check(n1 == 16 && (ev->mask & IN_MODIFY),
+              "event 2: IN_MODIFY");
+        n1 = read(ifd, evbuf, sizeof(evbuf));
+        ev = (struct inotify_event *)evbuf;
+        check(n1 == 16 && (ev->mask & IN_CLOSE_WRITE),
+              "event 3: IN_CLOSE_WRITE");
+
+        /* rm_watch -> IN_IGNORED is the wd's last word. */
+        check(inotify_rm_watch(ifd, wd) == 0, "rm_watch ok");
+        n1 = read(ifd, evbuf, sizeof(evbuf));
+        ev = (struct inotify_event *)evbuf;
+        check(n1 == 16 && (ev->mask & IN_IGNORED) && ev->wd == wd,
+              "rm_watch yields IN_IGNORED");
+
+        /* dir watch on /: child create+delete arrive named. */
+        wd = inotify_add_watch(ifd, "/", IN_CREATE | IN_DELETE |
+                                 IN_MOVED_FROM | IN_MOVED_TO |
+                                 IN_MODIFY | IN_OPEN |
+                                 IN_CLOSE_WRITE | IN_CLOSE_NOWRITE |
+                                 IN_ACCESS | IN_ATTRIB |
+                                 IN_DELETE_SELF | IN_MOVE_SELF);
+        check(wd >= 1, "dir watch on /");
+        f = open("inochild.tmp", O_CREAT | O_WRONLY, 0644);
+        close(f);
+        n1 = read(ifd, evbuf, sizeof(evbuf));
+        ev = (struct inotify_event *)evbuf;
+        check(n1 > 16 && (ev->mask & IN_CREATE) &&
+              ev->len > 0 && strcmp(ev->name, "inochild.tmp") == 0,
+              "dir watch: IN_CREATE named inochild.tmp");
+        /* drain any extra events from the open+close (OPEN,
+           CLOSE_NOWRITE) before the delete check. */
+        while (read(ifd, evbuf, sizeof(evbuf)) > 0) {}
+        check(rename("inochild.tmp", "inochild2.tmp") == 0,
+              "rename for cookie pair");
+        n1 = read(ifd, evbuf, sizeof(evbuf));
+        ev = (struct inotify_event *)evbuf;
+        unsigned ck = ev->cookie;
+        check(n1 > 16 && (ev->mask & IN_MOVED_FROM) &&
+              strcmp(ev->name, "inochild.tmp") == 0,
+              "rename: IN_MOVED_FROM named old");
+        n1 = read(ifd, evbuf, sizeof(evbuf));
+        ev = (struct inotify_event *)evbuf;
+        check(n1 > 16 && (ev->mask & IN_MOVED_TO) &&
+              strcmp(ev->name, "inochild2.tmp") == 0 &&
+              ev->cookie == ck && ck != 0,
+              "rename: IN_MOVED_TO same cookie");
+        unlink("inochild2.tmp");
+        /* drain to the DELETE record */
+        int seen_del = 0;
+        for (int i = 0; i < 8; i++) {
+            n1 = read(ifd, evbuf, sizeof(evbuf));
+            if (n1 <= 0) break;
+            ev = (struct inotify_event *)evbuf;
+            if (ev->mask & IN_DELETE) {
+                seen_del = 1;
+                break;
+            }
+        }
+        check(seen_del, "dir watch: IN_DELETE arrives");
+        close(ifd);
+
+        /* blocked-read wake: a child's write wakes the sleeper. */
+        int bifd = inotify_init1(0);
+        check(bifd >= 0, "blocking inotify create");
+        inotify_add_watch(bifd, ip, IN_ALL_EVENTS);
+        pid_t ic = fork();
+        if (ic == 0) {
+            struct timespec ts = {0, 20000000};
+            nanosleep(&ts, NULL);
+            int cf = open(ip, O_WRONLY);
+            write(cf, "y", 1);
+            close(cf);
+            _exit(0);
+        }
+        int bn = read(bifd, evbuf, sizeof(evbuf));
+        ev = (struct inotify_event *)evbuf;
+        check(bn >= 16 && (ev->mask & (IN_MODIFY | IN_CLOSE_WRITE |
+                                     IN_OPEN)),
+              "inotify blocked read wakes on child write");
+        waitpid(ic, NULL, 0);
+        close(bifd);
+        unlink(ip);
     }
 
     int n = snprintf(buf, sizeof(buf), "iotest: %d failures, done\n", fails);

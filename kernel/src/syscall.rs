@@ -351,6 +351,12 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         // fd<0 creates a new instance, fd>=0 updates the mask.
         282 => user::fd_signalfd(a1, a2, a3),
         289 => user::fd_signalfd4(a1, a2, a3, a4),
+        // inotify: init/init1 create; add_watch needs a canon path
+        // like the open family; rm_watch is wd-by-number.
+        253 => user::fd_inotify_init1(0),
+        294 => user::fd_inotify_init1(a1),
+        254 => sys_inotify_add(a1, a2, a3),
+        255 => user::inotify_rm_watch(a1, a2),
         283 => user::fd_timerfd_create(a1, a2),
         286 => user::fd_timerfd_settime(a1, a2, a3, a4),
         287 => user::fd_timerfd_gettime(a1, a2),
@@ -513,6 +519,20 @@ fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
         Err(e) => return e,
     };
     user::newfstatat(&cb[..cn], statbuf, flags & 0x100 != 0)
+}
+
+/// inotify_add_watch(fd, path, mask): canon like open's getname.
+fn sys_inotify_add(fd: u64, path: u64, mask: u64) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let (cb, cn) = match user::canon_path(u64::MAX, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::inotify_add_watch(fd, &cb[..cn], mask as u32)
 }
 
 fn sys_open(path: u64, flags: u64, mode: u64) -> u64 {

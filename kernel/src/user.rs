@@ -198,6 +198,9 @@ enum WaitOn {
     /// timerfd read before expiry — woken by timerfd_expire at the
     /// deadline tick (10 ms granularity, the kernel's resolution).
     Timerfd(usize),
+    /// inotify read on an empty queue — ino_report wakes the sleeper
+    /// by depositing the head event's record like PipeRead.
+    Inotify(usize),
 }
 
 /// Max fds per task — a hard bound so a hostile process cannot
@@ -261,6 +264,8 @@ enum FdKind {
     /// A signalfd — the wait mask lives in SIGNALFDS[id]; reads
     /// dequeue the READER's pending signals in that mask.
     Signalfd(usize),
+    /// An inotify instance — watches + event queue in INOTIFY[id].
+    Inotify(usize),
     /// A timerfd — arming/expiry state lives in TIMERFDS[id].
     Timerfd(usize),
     /// A generated /proc file — contents are rendered into a
@@ -374,6 +379,65 @@ struct Signalfd {
 
 static mut SIGNALFDS: [Option<Signalfd>; MAX_SIGNALFDS] =
     [const { None }; MAX_SIGNALFDS];
+
+/// Max inotify instances / watches per instance / queued events.
+const MAX_INOTIFY: usize = 4;
+const MAX_IWATCHES: usize = 16;
+const MAX_IEVS: usize = 8;
+
+/// inotify event bits (Linux uapi values).
+const IN_ACCESS: u32 = 0x1;
+const IN_MODIFY: u32 = 0x2;
+const IN_CLOSE_WRITE: u32 = 0x8;
+const IN_CLOSE_NOWRITE: u32 = 0x10;
+const IN_OPEN: u32 = 0x20;
+const IN_MOVED_FROM: u32 = 0x40;
+const IN_MOVED_TO: u32 = 0x80;
+const IN_CREATE: u32 = 0x100;
+const IN_DELETE: u32 = 0x200;
+const IN_DELETE_SELF: u32 = 0x400;
+const IN_MOVE_SELF: u32 = 0x800;
+const IN_ALL_EVENTS: u32 = 0xfff;
+const IN_Q_OVERFLOW: u32 = 0x4000;
+const IN_IGNORED: u32 = 0x8000;
+const IN_ISDIR: u32 = 0x4000_0000;
+
+/// A watch on a canonical path. dir=true means the path is a
+/// directory and the watch also receives events for its children
+/// (named in the event record); a file watch sees self events only.
+/// Watches are path-keyed, not inode-keyed — a rename emits
+/// IN_MOVE_SELF + IN_IGNORED and drops the watch (divergence: Linux
+/// keeps the watch on the moved inode).
+#[derive(Clone, Copy)]
+struct IWatch {
+    path: [u8; 128],
+    nlen: u8,
+    dir: bool,
+    mask: u32,
+}
+
+/// A queued event record — the name is the CHILD component for
+/// dir-watch events, empty for self events.
+#[derive(Clone, Copy)]
+struct InoEv {
+    wd: i32,
+    mask: u32,
+    cookie: u32,
+    name: [u8; 128],
+    nlen: u8,
+}
+
+/// An inotify instance: fixed watch table + event ring. `overflow`
+/// folds the Linux IN_Q_OVERFLOW record into the next drain.
+struct Inotify {
+    watches: [Option<IWatch>; MAX_IWATCHES],
+    q: [Option<InoEv>; MAX_IEVS],
+    overflow: bool,
+    nonblock: bool,
+}
+
+static mut INOTIFY: [Option<Inotify>; MAX_INOTIFY] =
+    [const { None }; MAX_INOTIFY];
 
 /// The 512-byte fxsave64 image — per-task FPU/SSE state. 16-aligned
 /// per the instruction's contract. Every context switch does
@@ -3331,6 +3395,28 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                             if pend & s.mask != 0 { 128 } else { 0 }
                         })
                 }
+                // inotify: Linux sums every queued record's size
+                // (16 + padded name), plus 16 for a pending
+                // overflow record.
+                FdKind::Inotify(i) => {
+                    let ins = unsafe { &*core::ptr::addr_of!(INOTIFY) };
+                    ins.get(*i)
+                        .and_then(|s| s.as_ref())
+                        .map_or(0, |s| {
+                            let mut n = 0u64;
+                            for e in s.q.iter().flatten() {
+                                n += if e.nlen == 0 {
+                                    16
+                                } else {
+                                    16 + ((e.nlen as u64 + 1 + 15) & !15)
+                                };
+                            }
+                            if s.overflow {
+                                n += 16;
+                            }
+                            n
+                        })
+                }
             };
             // SAFETY: arg validated writable for 4 bytes.
             unsafe {
@@ -3692,7 +3778,8 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         FdKind::Epoll(_)
         | FdKind::Eventfd(_)
         | FdKind::Timerfd(_)
-        | FdKind::Signalfd(_) => (0o20600, 0, 0),
+        | FdKind::Signalfd(_)
+        | FdKind::Inotify(_) => (0o20600, 0, 0),
     }
 }
 
@@ -3808,6 +3895,7 @@ pub fn fs_mkdir(dfd: u64, path: &[u8]) -> u64 {
     let mut d = VDir { path: [0; 128], nlen: p.len() };
     d.path[..p.len()].copy_from_slice(p);
     ds[i] = Some(d);
+    ino_report(p, IN_CREATE | IN_ISDIR, 0);
     0
 }
 
@@ -3851,6 +3939,8 @@ pub fn fs_rmdir(dfd: u64, path: &[u8]) -> u64 {
     match vdir_find(p) {
         Some(i) => {
             vdir_remove(i);
+            ino_report(p, IN_DELETE | IN_ISDIR, 0);
+            ino_report_self_loss(p, IN_DELETE_SELF, 0);
             0
         }
         None => ENOTEMPTY_, // implicit dir still has children
@@ -4355,6 +4445,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Eventfd(i) => eventfd_read(ctx, *i, buf, len),
         FdKind::Timerfd(i) => timerfd_read(ctx, *i, buf, len),
         FdKind::Signalfd(i) => signalfd_read(ctx, *i, buf, len),
+        FdKind::Inotify(i) => inotify_read(ctx, *i, buf, len),
         FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, 0),
         FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, 0),
         FdKind::File(data) => {
@@ -4429,6 +4520,9 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                 )
             };
             o.pos += n;
+            let mut nm = [0u8; 128];
+            nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+            ino_report(&nm[..v.nlen], IN_ACCESS, 0);
             n as u64
         }
         FdKind::Pipe { id, write } => {
@@ -4502,6 +4596,9 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     if let FdKind::Signalfd(_) = &o.kind {
         return EINVAL; // signalfds aren't writable either
     }
+    if let FdKind::Inotify(_) = &o.kind {
+        return EINVAL;
+    }
     if let FdKind::Ram(i) = &o.kind {
         if o.accmode == 0 {
             return EBADF; // O_RDONLY
@@ -4537,6 +4634,9 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         };
         v.len = v.len.max(need);
         o.pos = need;
+        let mut nm = [0u8; 128];
+        nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+        ino_report(&nm[..v.nlen], IN_MODIFY, 0);
         return len;
     }
     if matches!(o.kind, FdKind::File(_)) {
@@ -5114,11 +5214,28 @@ enum ProcEnt {
     TaskFdi(usize, usize),
 }
 
+/// A zombie nobody can still wait4 — collected via a wait4 wake
+/// (ppid zeroed) or orphaned of a dead parent — is dead to /proc
+/// even though its slot lingers until the next pick_next reap (the
+/// exiting task can't free its own kstack mid-pick). Mirrors
+/// pick_next's reapability test exactly.
+fn proc_dead(t: &Task, tasks: &[Option<Task>; MAX_TASKS]) -> bool {
+    t.state == TaskState::Exited
+        && (t.ppid == 0
+            || !tasks
+                .iter()
+                .flatten()
+                .any(|p| p.pid == t.ppid && p.state != TaskState::Exited))
+}
+
 /// The task slot holding `pid`, zombies included (see the /proc note).
 fn task_slot_by_pid(pid: u64) -> Option<usize> {
     let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
-    (0..tasks.len())
-        .find(|&i| tasks[i].as_ref().is_some_and(|t| t.pid == pid))
+    (0..tasks.len()).find(|&i| {
+        tasks[i]
+            .as_ref()
+            .is_some_and(|t| t.pid == pid && !proc_dead(t, tasks))
+    })
 }
 
 /// Resolve a pid-dir component — decimal pid or "self" (the caller) —
@@ -5700,6 +5817,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         FdKind::Signalfd(_) => {
             s.puts(b"anon_inode:[signalfd]");
         }
+        FdKind::Inotify(_) => {
+            s.puts(b"anon_inode:[inotify]");
+        }
         FdKind::Proc { .. } => {
             s.puts(b"anon_inode:[proc]");
         }
@@ -5837,6 +5957,7 @@ pub fn fd_open(path: &[u8], flags: u64) -> u64 {
         if flags & O_TRUNC != 0 && writing {
             let Some(v) = vfile(i) else { return ENOENT };
             v.len = 0;
+            ino_report(path, IN_MODIFY, 0);
         }
         FdKind::Ram(i)
     } else if (unsafe { *core::ptr::addr_of!(INITRD) })
@@ -5904,6 +6025,7 @@ pub fn fd_open(path: &[u8], flags: u64) -> u64 {
         if (r as i64) < 0 {
             return r;
         }
+        ino_report(path, IN_CREATE, 0);
         FdKind::Ram(r as usize)
     } else {
         // Miss — ENOTDIR when a path component names a file.
@@ -5942,6 +6064,7 @@ pub fn fd_open(path: &[u8], flags: u64) -> u64 {
     });
     fdt(t).fds[fi] = Some(oi as u8);
     cloexec_set(t, fi, flags & O_CLOEXEC != 0);
+    ino_report(path, IN_OPEN, 0);
     fi as u64
 }
 
@@ -5955,11 +6078,15 @@ pub fn fs_exists(path: &[u8]) -> bool {
 /// references it; otherwise ofd_release frees it at last close —
 /// Linux's open-unlink-keep-working semantics.
 fn vfile_remove(i: usize) {
-    let data = {
+    let (data, nm, nlen) = {
         let Some(v) = vfile(i) else { return };
         v.unlinked = true;
-        v.data
+        let mut n = [0u8; 128];
+        n[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+        (v.data, n, v.nlen)
     };
+    ino_report(&nm[..nlen], IN_DELETE, 0);
+    ino_report_self_loss(&nm[..nlen], IN_DELETE_SELF, 0);
     let live = unsafe { &*core::ptr::addr_of!(OFDS) }
         .iter()
         .flatten()
@@ -6016,8 +6143,18 @@ pub fn fs_rename(old: &[u8], new: &[u8]) -> u64 {
     v.name = [0; 128];
     v.name[..new.len()].copy_from_slice(new);
     v.nlen = new.len();
+    let cookie = INO_COOKIE
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u32;
+    ino_report_self_loss(old, IN_MOVE_SELF, cookie);
+    ino_report(old, IN_MOVED_FROM, cookie);
+    ino_report(new, IN_MOVED_TO, cookie);
     0
 }
+
+/// Move/close pairing counter — Linux inotify cookies correlate
+/// FROM and TO halves of one rename.
+static INO_COOKIE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
 
 /// Shared truncate core: shrink drops len; grow zero-fills the gap
 /// (vfile_grow's fresh capacity is pre-zeroed; same-cap regrow is
@@ -6051,7 +6188,11 @@ pub fn fs_truncate(path: &[u8], len: u64) -> u64 {
         return if fs_lookup(path).is_some() { EROFS_ } else { ENOENT };
     };
     let Some(v) = vfile(i) else { return ENOENT };
-    vfile_truncate(v, len)
+    let r = vfile_truncate(v, len);
+    if r == 0 {
+        ino_report(path, IN_MODIFY, 0);
+    }
+    r
 }
 
 /// ftruncate(fd, len): writable Ram OFD only. Linux's fmode check
@@ -6065,7 +6206,13 @@ pub fn fd_ftruncate(fd: u64, len: u64) -> u64 {
     }
     let FdKind::Ram(i) = o.kind else { return EINVAL };
     let Some(v) = vfile(i) else { return EBADF };
-    vfile_truncate(v, len)
+    let mut nm = [0u8; 128];
+    nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+    let r = vfile_truncate(v, len);
+    if r == 0 {
+        ino_report(&nm[..v.nlen], IN_MODIFY, 0);
+    }
+    r
 }
 
 /// fsync/fdatasync(fd): RAM files have nothing to flush and archive
@@ -6313,7 +6460,8 @@ fn ofd_release(oi: usize) {
         return;
     }
     // Take the kind out before clearing so endpoint teardown runs
-    // after the OFD is already gone.
+    // after the OFD is already gone; accmode feeds close events.
+    let accmode = o.accmode;
     let kind = core::mem::replace(&mut o.kind, FdKind::Stdin);
     ofds[oi] = None;
     // An OFD's death retires every epoll interest pinning it —
@@ -6340,6 +6488,9 @@ fn ofd_release(oi: usize) {
     if let FdKind::Signalfd(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(SIGNALFDS))[i] = None };
     }
+    if let FdKind::Inotify(i) = kind {
+        unsafe { (*core::ptr::addr_of_mut!(INOTIFY))[i] = None };
+    }
     if let FdKind::Pipe { id, write } = kind {
         pipe_end_closed(id, write);
     }
@@ -6357,6 +6508,16 @@ fn ofd_release(oi: usize) {
         kalloc::free_frame(buf);
     }
     if let FdKind::Ram(i) = kind {
+        // inotify close events: CLOSE_WRITE iff the file was opened
+        // for writing, CLOSE_NOWRITE otherwise (Linux's rule).
+        if let Some(v) = vfile(i) {
+            let mut nm = [0u8; 128];
+            nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+            let m = if accmode != 0 { IN_CLOSE_WRITE } else {
+                IN_CLOSE_NOWRITE
+            };
+            ino_report(&nm[..v.nlen], m, 0);
+        }
         // unlinked-while-open storage dies with its last OFD; a
         // still-linked file is owned by the VFS slot and stays.
         if let Some(v) = vfile(i) {
@@ -6737,6 +6898,21 @@ fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
                 None => POLLNVAL,
                 Some(s) => {
                     if pend & s.mask != 0 { POLLIN } else { 0 }
+                }
+            }
+        }
+        // inotify: readable with a queued event (or a pending
+        // overflow record that drains as one).
+        FdKind::Inotify(i) => {
+            let ins = unsafe { &*core::ptr::addr_of!(INOTIFY) };
+            match ins.get(*i).and_then(|s| s.as_ref()) {
+                None => POLLNVAL,
+                Some(s) => {
+                    if s.q.iter().any(|e| e.is_some()) || s.overflow {
+                        POLLIN
+                    } else {
+                        0
+                    }
                 }
             }
         }
@@ -7282,6 +7458,332 @@ fn signalfd_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
     t.wait_len = mask as u64;
     t.wait_ptr = buf;
     t.wait_ptr2 = 1; // signalfd_siginfo shape — rax = 128 at wake
+    t.wait_deadline = 0;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
+// --- inotify ----------------------------------------------------------
+// Watch table keyed on canonical path; events route to self watchers
+// (nameless) and parent-dir watchers (named). The queue is bounded —
+// overflow folds into one IN_Q_OVERFLOW record at next drain, the
+// same shape Linux reports under event pressure.
+
+/// Queue one event on an instance; overflow marks the flag rather
+/// than dropping silently.
+fn ino_q_push(i: usize, ev: InoEv) {
+    let Some(inst) = (unsafe { &mut *core::ptr::addr_of_mut!(INOTIFY) })
+        .get_mut(i)
+        .and_then(|s| s.as_mut())
+    else {
+        return;
+    };
+    if let Some(s) = inst.q.iter_mut().find(|s| s.is_none()) {
+        *s = Some(ev);
+    } else {
+        inst.overflow = true;
+    }
+}
+
+/// Emit a filesystem event: `path` is canonical (no leading '/').
+/// Self watchers on the path get a nameless record; watchers on the
+/// parent dir get one named by the final component. `del` flags a
+/// self-delete: IN_IGNORED follows and the watch dies (Linux drops
+/// the wd on object destruction).
+fn ino_report(path: &[u8], mask: u32, cookie: u32) {
+    let base = match path.iter().rposition(|&c| c == b'/') {
+        Some(p) => &path[p + 1..],
+        None => path,
+    };
+    let parent = &path[..path.len() - base.len() - (base.len() < path.len()) as usize];
+    let selfmask = mask & (IN_DELETE_SELF | IN_MOVE_SELF);
+    let mut queued = false;
+    let insts = unsafe { &mut *core::ptr::addr_of_mut!(INOTIFY) };
+    for ii in 0..MAX_INOTIFY {
+        let Some(inst) = insts[ii].as_mut() else { continue };
+        for wi in 0..MAX_IWATCHES {
+            let Some(w) = inst.watches[wi].as_ref() else { continue };
+            let wpath = &w.path[..w.nlen as usize];
+            if wpath == path {
+                // Self watch: self events always land; dir-style
+                // events need the mask bit like Linux filtering.
+                let m = if selfmask != 0 { selfmask } else { mask };
+                if m & w.mask & IN_ALL_EVENTS != 0 || selfmask != 0 {
+                    ino_q_push(ii, InoEv {
+                        wd: wi as i32 + 1, mask: m, cookie,
+                        name: [0; 128], nlen: 0,
+                    });
+                    queued = true;
+                }
+            } else if w.dir && wpath == parent {
+                if mask & w.mask & IN_ALL_EVENTS != 0 {
+                    let mut ev = InoEv {
+                        wd: wi as i32 + 1, mask, cookie,
+                        name: [0; 128], nlen: 0,
+                    };
+                    let n = base.len().min(128);
+                    ev.name[..n].copy_from_slice(&base[..n]);
+                    ev.nlen = n as u8;
+                    ino_q_push(ii, ev);
+                    queued = true;
+                }
+            }
+        }
+    }
+    // Wake blocked readers only when an event actually landed —
+    // emitters call this from mid-syscall borrows of the task
+    // table, so the scan must stay out of the common no-watch path.
+    if !queued {
+        return;
+    }
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state == TaskState::Blocked {
+            if let WaitOn::Inotify(ii) = t.wait_on {
+                ino_deposit(t, ii);
+            }
+        }
+    }
+}
+
+/// Self-watch teardown: queue IN_IGNORED and free the wd — the
+/// object's lifetime ended (delete, rename-away, rm_watch).
+fn ino_watch_kill(ii: usize, wi: usize) {
+    ino_q_push(ii, InoEv {
+        wd: wi as i32 + 1, mask: IN_IGNORED, cookie: 0,
+        name: [0; 128], nlen: 0,
+    });
+    let Some(inst) = (unsafe { &mut *core::ptr::addr_of_mut!(INOTIFY) })
+        .get_mut(ii)
+        .and_then(|s| s.as_mut())
+    else {
+        return;
+    };
+    inst.watches[wi] = None;
+}
+
+/// Drop every watch that sits on `path` (self-delete or move).
+fn ino_report_self_loss(path: &[u8], selfmask: u32, cookie: u32) {
+    let insts = unsafe { &mut *core::ptr::addr_of_mut!(INOTIFY) };
+    for ii in 0..MAX_INOTIFY {
+        let Some(inst) = insts[ii].as_mut() else { continue };
+        for wi in 0..MAX_IWATCHES {
+            let kill = inst.watches[wi]
+                .as_ref()
+                .is_some_and(|w| &w.path[..w.nlen as usize] == path);
+            if kill {
+                ino_q_push(ii, InoEv {
+                    wd: wi as i32 + 1, mask: selfmask, cookie,
+                    name: [0; 128], nlen: 0,
+                });
+                ino_watch_kill(ii, wi);
+            }
+        }
+    }
+}
+
+/// Render an event into a fixed buffer — {i32 wd, u32 mask,
+/// u32 cookie, u32 len} + name padded to a 16-byte record total,
+/// the userspace ABI. Returns the record length.
+fn ino_record(out: &mut [u8; 288], ev: &InoEv) -> usize {
+    let len = if ev.nlen == 0 {
+        0usize
+    } else {
+        (ev.nlen as usize + 1 + 15) & !15
+    };
+    out[..4].copy_from_slice(&ev.wd.to_le_bytes());
+    out[4..8].copy_from_slice(&ev.mask.to_le_bytes());
+    out[8..12].copy_from_slice(&ev.cookie.to_le_bytes());
+    out[12..16].copy_from_slice(&(len as u32).to_le_bytes());
+    for b in out[16..16 + len].iter_mut() {
+        *b = 0;
+    }
+    if ev.nlen > 0 {
+        out[16..16 + ev.nlen as usize]
+            .copy_from_slice(&ev.name[..ev.nlen as usize]);
+    }
+    16 + len
+}
+
+/// Deposit the head event to a sleeping reader's wait_ptr; returns
+/// the record length (rax). Queue-empty is a no-wake.
+fn ino_deposit(t: &mut Task, ii: usize) {
+    let Some(inst) = (unsafe { &mut *core::ptr::addr_of_mut!(INOTIFY) })
+        .get_mut(ii)
+        .and_then(|s| s.as_mut())
+    else {
+        return;
+    };
+    let head = inst.q.iter().position(|e| e.is_some());
+    let Some(hi) = head else { return };
+    let mut rec = [0u8; 288];
+    let n = ino_record(&mut rec, inst.q[hi].as_ref().unwrap());
+    if n as u64 > t.wait_len {
+        return; // Linux: a record that can't fit stays queued
+    }
+    inst.q[hi] = None;
+    inst.q.copy_within(hi + 1.., hi); // compact FIFO left
+    inst.q[MAX_IEVS - 1] = None;
+    write_task_bytes(t.pml4, t.wait_ptr, &rec[..n]);
+    t.ctx.rax = n as u64;
+    t.wait_on = WaitOn::None;
+    t.wait_ptr = 0;
+    t.wait_len = 0;
+    t.wait_deadline = 0;
+    t.state = TaskState::Runnable;
+}
+
+/// inotify_init/init1(flags): an anon-inode fd over the instance
+/// table. flags are IN_NONBLOCK|IN_CLOEXEC (O_ values).
+pub fn fd_inotify_init1(flags: u64) -> u64 {
+    const ENFILE_: u64 = (-23i64) as u64;
+    const IN_NONBLOCK: u64 = 0o4000;
+    const IN_CLOEXEC: u64 = 0o2000000;
+    if flags & !(IN_NONBLOCK | IN_CLOEXEC) != 0 {
+        return EINVAL;
+    }
+    let insts = unsafe { &mut *core::ptr::addr_of_mut!(INOTIFY) };
+    let Some(i) = insts.iter().position(Option::is_none) else {
+        return ENFILE_;
+    };
+    insts[i] = Some(Inotify {
+        watches: [const { None }; MAX_IWATCHES],
+        q: [const { None }; MAX_IEVS],
+        overflow: false,
+        nonblock: flags & IN_NONBLOCK != 0,
+    });
+    let fd = anon_fd(FdKind::Inotify(i), flags & IN_CLOEXEC != 0);
+    if (fd as i64) < 0 {
+        insts[i] = None;
+    }
+    fd
+}
+
+/// inotify_add_watch(fd, path, mask): path must exist (Linux
+/// ENOENT). Re-adding a watched path replaces the mask and keeps
+/// the wd — the wd is slot+1 so 0 never leaks as a real id.
+pub fn inotify_add_watch(fd: u64, path: &[u8], mask: u32) -> u64 {
+    const ENOSPC_: u64 = (-28i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let FdKind::Inotify(i) = o.kind else { return EINVAL };
+    if !fs_exists(path) || path.len() > 128 {
+        return ENOENT;
+    }
+    if mask & IN_ALL_EVENTS == 0 {
+        return EINVAL; // Linux: a watch needs at least one event bit
+    }
+    let dir = dir_exists(path) && !is_file(path);
+    let insts = unsafe { &mut *core::ptr::addr_of_mut!(INOTIFY) };
+    let Some(inst) = insts.get_mut(i).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    if let Some(wi) = inst.watches.iter_mut().position(|w| {
+        w.as_ref()
+            .is_some_and(|w| &w.path[..w.nlen as usize] == path)
+    }) {
+        inst.watches[wi].as_mut().unwrap().mask = mask;
+        return wi as u64 + 1;
+    }
+    let Some(wi) = inst.watches.iter_mut().position(|w| w.is_none())
+    else {
+        return ENOSPC_;
+    };
+    let mut w = IWatch {
+        path: [0; 128],
+        nlen: path.len() as u8,
+        dir,
+        mask,
+    };
+    w.path[..path.len()].copy_from_slice(path);
+    inst.watches[wi] = Some(w);
+    wi as u64 + 1
+}
+
+/// inotify_rm_watch(fd, wd): drop the watch and queue its
+/// IN_IGNORED record — Linux's final event for a wd.
+pub fn inotify_rm_watch(fd: u64, wd: u64) -> u64 {
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let FdKind::Inotify(i) = o.kind else { return EINVAL };
+    let insts = unsafe { &*core::ptr::addr_of!(INOTIFY) };
+    let wi = wd as usize;
+    match insts.get(i).and_then(|s| s.as_ref()) {
+        Some(inst)
+            if wi >= 1
+                && wi <= MAX_IWATCHES
+                && inst.watches[wi - 1].is_some() =>
+        {
+            ino_watch_kill(i, wi - 1);
+            0
+        }
+        _ => EINVAL,
+    }
+}
+
+/// inotify read: one event record per call (Linux-valid minimum —
+/// records are {wd,mask,cookie,len} + name padded to 16). Overflow
+/// drains as a final {wd=-1, IN_Q_OVERFLOW} record.
+fn inotify_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
+    const EAGAIN: u64 = (-11i64) as u64;
+    const EINTR: u64 = (-4i64) as u64;
+    if len < 16 {
+        return EINVAL;
+    }
+    if !range_ok_w(buf, len.min(288)) {
+        return EFAULT;
+    }
+    let insts = unsafe { &mut *core::ptr::addr_of_mut!(INOTIFY) };
+    let Some(inst) = insts.get_mut(i).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    let hi = inst.q.iter().position(|e| e.is_some());
+    if let Some(hi) = hi {
+        let mut rec = [0u8; 288];
+        let n = ino_record(&mut rec, inst.q[hi].as_ref().unwrap());
+        if n as u64 > len {
+            return EINVAL; // Linux: a record must fit or the read fails
+        }
+        inst.q[hi] = None;
+        inst.q.copy_within(hi + 1.., hi);
+        inst.q[MAX_IEVS - 1] = None;
+        // SAFETY: buf validated writable for n <= len.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                rec.as_ptr(),
+                buf as *mut u8,
+                n,
+            )
+        };
+        return n as u64;
+    }
+    if inst.overflow {
+        inst.overflow = false;
+        let rec: [u8; 16] = {
+            let mut r = [0u8; 16];
+            r[..4].copy_from_slice(&(-1i32).to_le_bytes());
+            r[4..8].copy_from_slice(&IN_Q_OVERFLOW.to_le_bytes());
+            r
+        };
+        // SAFETY: buf validated writable for 16 bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(rec.as_ptr(), buf as *mut u8, 16)
+        };
+        return 16;
+    }
+    let nonblock = inst.nonblock;
+    if nonblock {
+        return EAGAIN;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    if deliverable(t) {
+        return EINTR;
+    }
+    t.wait_on = WaitOn::Inotify(i);
+    t.wait_ptr = buf;
+    t.wait_len = len;
     t.wait_deadline = 0;
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
@@ -9692,6 +10194,9 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
         let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
         for (i, pb) in pidbuf.iter_mut().enumerate() {
             let Some(t) = tasks[i].as_ref() else { continue };
+            if proc_dead(t, tasks) {
+                continue;
+            }
             // Render "proc/<pid>" into pidbuf and feed it through
             // add() so the pid component lands like any other name.
             let b = &mut *pb;
