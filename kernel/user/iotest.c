@@ -586,6 +586,157 @@ int main(void) {
         errno = 0;
         check(open("/proc/x", O_RDWR | O_CREAT, 0600) < 0 &&
               errno == EROFS, "proc O_CREAT EROFS");
+
+        /* run-97 breadth: system files, links, fd view. */
+        fd = open("/proc/stat", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        check(fd >= 0 && n2 > 0, "open+read /proc/stat");
+        if (n2 > 0) {
+            pbuf[n2] = 0;
+            check(strncmp(pbuf, "cpu ", 4) == 0 &&
+                  strstr(pbuf, "\nprocesses ") != NULL &&
+                  strstr(pbuf, "ctxt") != NULL,
+                  "proc/stat cpu+counts");
+        }
+        if (fd >= 0) close(fd);
+
+        fd = open("/proc/cpuinfo", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        check(fd >= 0 && n2 > 0, "open+read cpuinfo");
+        if (n2 > 0) {
+            pbuf[n2] = 0;
+            check(strstr(pbuf, "processor") != NULL &&
+                  strstr(pbuf, "vendor_id") != NULL &&
+                  strstr(pbuf, "model name") != NULL,
+                  "cpuinfo fields");
+        }
+        if (fd >= 0) close(fd);
+
+        fd = open("/proc/filesystems", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        check(fd >= 0 && n2 > 0 && (pbuf[n2] = 0,
+              strstr(pbuf, "proc") != NULL), "filesystems has proc");
+        if (fd >= 0) close(fd);
+
+        fd = open("/proc/mounts", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        check(fd >= 0 && n2 > 0 && (pbuf[n2] = 0,
+              strstr(pbuf, "/proc") != NULL), "mounts has proc");
+        if (fd >= 0) close(fd);
+
+        fd = open("/proc/self/statm", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        check(fd >= 0 && n2 > 0, "open+read statm");
+        if (n2 > 0) {
+            unsigned long vsz, rss;
+            pbuf[n2] = 0;
+            check(sscanf(pbuf, "%lu %lu", &vsz, &rss) == 2 && rss > 0,
+                  "statm size+rss");
+        }
+        if (fd >= 0) close(fd);
+
+        fd = open("/proc/self/environ", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf)) : -1;
+        check(fd >= 0 && n2 == 0, "environ empty");
+        if (fd >= 0) close(fd);
+
+        fd = open("/proc/self/io", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        check(fd >= 0 && n2 > 0 && (pbuf[n2] = 0,
+              strstr(pbuf, "rchar:") != NULL), "io counters");
+        if (fd >= 0) close(fd);
+
+        /* cmdline holds NUL-joined argv — spawn gave us argv0. */
+        fd = open("/proc/self/cmdline", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf)) : -1;
+        check(fd >= 0 && n2 > 1 && pbuf[n2 - 1] == 0 &&
+              strstr(pbuf, "iotest") != NULL, "cmdline argv");
+        if (fd >= 0) close(fd);
+
+        /* Link targets. */
+        n2 = readlink("/proc/self", pbuf, sizeof(pbuf) - 1);
+        check(n2 > 0 && (pbuf[n2] = 0, atoi(pbuf) == getpid()),
+              "readlink self -> pid");
+        n2 = readlink("/proc/self/cwd", pbuf, sizeof(pbuf) - 1);
+        check(n2 == 1 && pbuf[0] == '/', "readlink cwd -> /");
+        n2 = readlink("/proc/self/root", pbuf, sizeof(pbuf) - 1);
+        check(n2 == 1 && pbuf[0] == '/', "readlink root -> /");
+
+        /* fd dir: our std streams appear by number. */
+        fd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+        check(fd >= 0, "open self/fd dir");
+        if (fd >= 0) {
+            char db[2048];
+            int dl = syscall(SYS_getdents64, fd, db, sizeof(db));
+            int saw0 = 0, saw2 = 0;
+            for (int o = 0; dl > 0 && o < dl;) {
+                struct {
+                    unsigned long ino, off2;
+                    unsigned short rlen;
+                    unsigned char type;
+                    char name[];
+                } *de = (void *)(db + o);
+                if (!strcmp(de->name, "0")) saw0 = 1;
+                if (!strcmp(de->name, "2")) saw2 = 1;
+                o += de->rlen;
+            }
+            check(saw0 && saw2, "self/fd lists streams");
+            close(fd);
+        }
+        n2 = readlink("/proc/self/fd/1", pbuf, sizeof(pbuf) - 1);
+        check(n2 > 0 && (pbuf[n2] = 0,
+              strcmp(pbuf, "/dev/console") == 0),
+              "fd/1 -> console");
+
+        /* fdinfo is a generated 0400 file with pos+flags. */
+        fd = open("/proc/self/fdinfo/2", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        check(fd >= 0 && n2 > 0 && (pbuf[n2] = 0,
+              strstr(pbuf, "pos:") != NULL &&
+              strstr(pbuf, "flags:") != NULL), "fdinfo fields");
+        if (fd >= 0) close(fd);
+
+        /* open() of an fd link shares the description — a pipe's
+           read end opened through /proc/self/fd reads the bytes. */
+        {
+            int pf[2];
+            check(pipe(pf) == 0, "pipe for fd-open");
+            if (pf[0] >= 0) {
+                write(pf[1], "z", 1);
+                char fp[64];
+                snprintf(fp, sizeof(fp), "/proc/self/fd/%d", pf[0]);
+                int d = open(fp, O_RDONLY);
+                check(d >= 0, "open self/fd link");
+                if (d >= 0) {
+                    char c = 0;
+                    check(read(d, &c, 1) == 1 && c == 'z',
+                          "fd-open shares OFD");
+                    close(d);
+                }
+                close(pf[0]);
+                close(pf[1]);
+            }
+        }
+
+        /* utime/stime are real counters — at least utime must have
+           ticked for this long-running task. */
+        fd = open("/proc/self/stat", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        check(fd >= 0 && n2 > 0, "stat for utime");
+        if (n2 > 0) {
+            /* field 14 after the ')' — count space-separated words. */
+            char *q = strrchr(pbuf, ')');
+            unsigned long fv[20]; int fc = 0;
+            if (q) {
+                char *w = strtok(q + 2, " ");
+                while (w && fc < 20) {
+                    fv[fc++] = strtoul(w, NULL, 10);
+                    w = strtok(NULL, " ");
+                }
+            }
+            check(fc >= 12 && fv[11] > 0, "utime ticked");
+        }
+        if (fd >= 0) close(fd);
     }
 
     int n = snprintf(buf, sizeof(buf), "iotest: %d failures, done\n", fails);
