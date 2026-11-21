@@ -14,6 +14,8 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <poll.h>
+#include <sys/signalfd.h>
+#include <fcntl.h>
 #include <sched.h>
 
 static int fails;
@@ -26,6 +28,89 @@ static void check(int ok, const char *what) {
 
 int main(void) {
     setbuf(stdout, NULL);
+
+    /* run-99: synchronous signals - sigtimedwait + signalfd. */
+    {
+        sigset_t sw;
+        sigemptyset(&sw);
+        sigaddset(&sw, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &sw, NULL);
+
+        siginfo_t si;
+        memset(&si, 0, sizeof(si));
+        struct timespec z = {0, 0};
+        errno = 0;
+        check(sigtimedwait(&sw, &si, &z) == -1 && errno == EAGAIN,
+              "sigtimedwait empty window -> EAGAIN");
+
+        kill(getpid(), SIGUSR1);
+        memset(&si, 0, sizeof(si));
+        check(sigtimedwait(&sw, &si, &z) == SIGUSR1 &&
+              si.si_signo == SIGUSR1,
+              "sigtimedwait collects blocked pending USR1");
+
+        pid_t kc = fork();
+        if (kc == 0) {
+            struct timespec ts = {0, 20000000};
+            nanosleep(&ts, NULL);
+            kill(getppid(), SIGUSR1);
+            _exit(0);
+        }
+        memset(&si, 0, sizeof(si));
+        struct timespec two = {2, 0};
+        check(sigtimedwait(&sw, &si, &two) == SIGUSR1,
+              "sigtimedwait wakes on in-set arrival");
+        waitpid(kc, NULL, 0);
+
+        int sfd = signalfd(-1, &sw, SFD_NONBLOCK);
+        check(sfd >= 0, "signalfd4 create");
+        struct signalfd_siginfo fsi;
+        errno = 0;
+        check(read(sfd, &fsi, sizeof(fsi)) == -1 && errno == EAGAIN,
+              "signalfd nonblock empty -> EAGAIN");
+
+        kill(getpid(), SIGUSR1);
+        struct pollfd sp = {sfd, POLLIN, 0};
+        check(poll(&sp, 1, 0) == 1 && (sp.revents & POLLIN),
+              "signalfd poll POLLIN on pending USR1");
+        memset(&fsi, 0, sizeof(fsi));
+        check(read(sfd, &fsi, sizeof(fsi)) == (ssize_t)sizeof(fsi) &&
+              fsi.ssi_signo == SIGUSR1,
+              "signalfd read 128B ssi_signo=USR1");
+
+        /* blocked read: fresh fd without SFD_NONBLOCK (fcntl
+           nonblock toggling is a documented divergence here). */
+        close(sfd);
+        sfd = signalfd(-1, &sw, 0);
+        check(sfd >= 0, "signalfd blocking create");
+        pid_t kc2 = fork();
+        if (kc2 == 0) {
+            struct timespec ts = {0, 20000000};
+            nanosleep(&ts, NULL);
+            kill(getppid(), SIGUSR1);
+            _exit(0);
+        }
+        memset(&fsi, 0, sizeof(fsi));
+        check(read(sfd, &fsi, sizeof(fsi)) == (ssize_t)sizeof(fsi) &&
+              fsi.ssi_signo == SIGUSR1,
+              "signalfd blocked read wakes on arrival");
+        waitpid(kc2, NULL, 0);
+        close(sfd);
+
+        sigset_t sw2;
+        sigemptyset(&sw2);
+        sigaddset(&sw2, SIGUSR2);
+        int sfd3 = signalfd(-1, &sw2, SFD_NONBLOCK);
+        check(signalfd(sfd3, &sw, 0) == sfd3,
+              "signalfd mask update same fd");
+        check(signalfd(1, &sw, 0) == -1 && errno == EINVAL,
+              "signalfd on non-signalfd -> EINVAL");
+        close(sfd3);
+
+        sigprocmask(SIG_UNBLOCK, &sw, NULL);
+        sigprocmask(SIG_UNBLOCK, &sw2, NULL);
+    }
+
     printf("pgtest: process groups + job control\n");
 
     /* --- identity ------------------------------------------------ */

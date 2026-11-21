@@ -179,6 +179,12 @@ enum WaitOn {
     /// deadline, no resource to poll. The generic signal-wake path
     /// supplies the -EINTR these calls always return.
     SigWait,
+    /// sigwaitinfo/sigtimedwait/signalfd-read: wait_len is the wait
+    /// set, wait_ptr the record VA (siginfo_t or signalfd_siginfo),
+    /// wait_ptr2 nonzero picks the signalfd record shape (rax=128).
+    /// An in-set signal is CONSUMED at wake, never delivered;
+    /// wait_deadline is sigtimedwait's EAGAIN bound.
+    SigTimed,
     /// epoll_wait(): the payload is the EPOLLS index; `wait_ptr` is
     /// the user epoll_event array, `wait_len` maxevents. Any
     /// fd-state change re-scans the interest set like Poll.
@@ -252,6 +258,9 @@ enum FdKind {
     Epoll(usize),
     /// An eventfd counter — the semaphore lives in EVENTFDS[id].
     Eventfd(usize),
+    /// A signalfd — the wait mask lives in SIGNALFDS[id]; reads
+    /// dequeue the READER's pending signals in that mask.
+    Signalfd(usize),
     /// A timerfd — arming/expiry state lives in TIMERFDS[id].
     Timerfd(usize),
     /// A generated /proc file — contents are rendered into a
@@ -351,6 +360,20 @@ struct Timerfd {
 
 static mut TIMERFDS: [Option<Timerfd>; MAX_TIMERFDS] =
     [const { None }; MAX_TIMERFDS];
+
+/// Max signalfd instances.
+const MAX_SIGNALFDS: usize = 8;
+
+/// A signalfd: a per-instance signal mask. read() dequeues the
+/// READER's pending signals in the mask into signalfd_siginfo
+/// records — the object is just the mask, the queue is the task's.
+struct Signalfd {
+    mask: u32,
+    nonblock: bool,
+}
+
+static mut SIGNALFDS: [Option<Signalfd>; MAX_SIGNALFDS] =
+    [const { None }; MAX_SIGNALFDS];
 
 /// The 512-byte fxsave64 image — per-task FPU/SSE state. 16-aligned
 /// per the instruction's contract. Every context switch does
@@ -472,6 +495,18 @@ fn unmasked_pending(t: &Task) -> Option<usize> {
 #[inline]
 fn deliverable(t: &Task) -> bool {
     unmasked_pending(t).is_some()
+}
+
+/// SIG_IGN or a default-ignore disposition — the signal is a
+/// non-event: no wake, no collect, no EINTR (Linux drops these at
+/// send; we keep the bit but treat it as noise everywhere).
+fn sig_ignored(t: &Task, sig: u64) -> bool {
+    let h = sigt(t)
+        .handlers
+        .get(sig as usize - 1)
+        .copied()
+        .unwrap_or(SIG_DFL);
+    h == SIG_IGN || (h == SIG_DFL && sig_default_ignore(sig as usize))
 }
 
 fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
@@ -673,8 +708,36 @@ fn pend_one(t: &mut Task, sig: u64) -> Option<(u64, u64, u64)> {
     // Wake a blocked target only when the signal actually interrupts:
     // an ignored disposition (SIG_IGN, or a default-ignore signal)
     // must not turn a sleeping syscall into a spurious EINTR.
-    let h = sigt(t).handlers.get(sig as usize - 1).copied().unwrap_or(SIG_DFL);
-    let ignored = h == SIG_IGN || (h == SIG_DFL && sig_default_ignore(sig as usize));
+    let ignored = sig_ignored(t, sig);
+    // SigTimed (sigwait*/signalfd): an in-set signal is CONSUMED —
+    // dequeued into the record buffer, never delivered. Out-of-set
+    // signals that can't be delivered (masked, or ignored) leave the
+    // sleeper alone; a deliverable one falls through to the generic
+    // -EINTR wake like any other wait.
+    if t.state == TaskState::Blocked && matches!(t.wait_on, WaitOn::SigTimed) {
+        if !ignored && t.wait_len & (1u64 << (sig - 1)) != 0 {
+            t.pending &= !(1u32 << (sig - 1));
+            if t.wait_ptr != 0 {
+                // siginfo_t and signalfd_siginfo share s[i]_signo@0;
+                // Linux zero-fills the 128-byte record either way.
+                let mut rec = [0u8; 128];
+                rec[..4].copy_from_slice(&(sig as u32).to_le_bytes());
+                write_task_bytes(t.pml4, t.wait_ptr, &rec);
+            }
+            // sigwait* returns the signo; signalfd-read returns 128.
+            t.ctx.rax = if t.wait_ptr2 != 0 { 128 } else { sig };
+            t.wait_on = WaitOn::None;
+            t.wait_ptr = 0;
+            t.wait_len = 0;
+            t.wait_deadline = 0;
+            t.wait_ptr2 = 0;
+            t.state = TaskState::Runnable;
+            return contd;
+        }
+        if !deliverable(t) {
+            return contd;
+        }
+    }
     if t.state == TaskState::Blocked && !ignored && !matches!(t.wait_on, WaitOn::Vfork(_)) {
         // A nanosleep interrupted by this signal reports the unslept
         // remainder in rem (stored in wait_ptr) — Linux semantics.
@@ -698,8 +761,9 @@ fn pend_one(t: &mut Task, sig: u64) -> Option<(u64, u64, u64)> {
         // installed — Linux runs the handler inside the suspend, then
         // restores the mask on the -EINTR return. Delivering after
         // psel_restore would re-mask the pending signal and the
-        // handler would never run.
-        if matches!(t.wait_on, WaitOn::SigWait) {
+        // handler would never run. SigTimed wakes this way only on
+        // an out-of-set signal — in-set ones were consumed above.
+        if matches!(t.wait_on, WaitOn::SigWait | WaitOn::SigTimed) {
             let mut c = t.ctx;
             maybe_deliver(t, &mut c);
             t.ctx = c;
@@ -3256,6 +3320,17 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                             }
                         })
                 }
+                // signalfd: 128 when a masked signal pends on the
+                // reader, else 0 (one record at a time).
+                FdKind::Signalfd(i) => {
+                    let sfs = unsafe { &*core::ptr::addr_of!(SIGNALFDS) };
+                    let pend = cur_mut().map_or(0, |t| t.pending);
+                    sfs.get(*i)
+                        .and_then(|s| s.as_ref())
+                        .map_or(0, |s| {
+                            if pend & s.mask != 0 { 128 } else { 0 }
+                        })
+                }
             };
             // SAFETY: arg validated writable for 4 bytes.
             unsafe {
@@ -3614,9 +3689,10 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         FdKind::Udp(_) | FdKind::Tcp(_) => (0o140777, 0, 0), // S_IFSOCK
         // anon_inodefs objects stat as a chrdev — Linux shows
         // S_IFCHR|0600 for epoll/eventfd/timerfd alike.
-        FdKind::Epoll(_) | FdKind::Eventfd(_) | FdKind::Timerfd(_) => {
-            (0o20600, 0, 0)
-        }
+        FdKind::Epoll(_)
+        | FdKind::Eventfd(_)
+        | FdKind::Timerfd(_)
+        | FdKind::Signalfd(_) => (0o20600, 0, 0),
     }
 }
 
@@ -4278,6 +4354,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Epoll(_) => EINVAL,
         FdKind::Eventfd(i) => eventfd_read(ctx, *i, buf, len),
         FdKind::Timerfd(i) => timerfd_read(ctx, *i, buf, len),
+        FdKind::Signalfd(i) => signalfd_read(ctx, *i, buf, len),
         FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, 0),
         FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, 0),
         FdKind::File(data) => {
@@ -4421,6 +4498,9 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     }
     if let FdKind::Timerfd(_) = &o.kind {
         return EINVAL; // timerfds aren't writable — Linux's answer
+    }
+    if let FdKind::Signalfd(_) = &o.kind {
+        return EINVAL; // signalfds aren't writable either
     }
     if let FdKind::Ram(i) = &o.kind {
         if o.accmode == 0 {
@@ -5617,6 +5697,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         FdKind::Timerfd(_) => {
             s.puts(b"anon_inode:[timerfd]");
         }
+        FdKind::Signalfd(_) => {
+            s.puts(b"anon_inode:[signalfd]");
+        }
         FdKind::Proc { .. } => {
             s.puts(b"anon_inode:[proc]");
         }
@@ -6254,6 +6337,9 @@ fn ofd_release(oi: usize) {
     if let FdKind::Timerfd(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(TIMERFDS))[i] = None };
     }
+    if let FdKind::Signalfd(i) = kind {
+        unsafe { (*core::ptr::addr_of_mut!(SIGNALFDS))[i] = None };
+    }
     if let FdKind::Pipe { id, write } = kind {
         pipe_end_closed(id, write);
     }
@@ -6498,13 +6584,14 @@ fn poll_revents(t: &Task, fd: i32, events: u16) -> u16 {
     let Some(oi) = fdt(t).fds[fd as usize] else {
         return POLLNVAL;
     };
-    ofd_revents(oi, events)
+    ofd_revents(t.pending, oi, events)
 }
 
-/// The task-free core: revents of an OPEN FILE DESCRIPTION. epoll
+/// The task-light core: revents of an OPEN FILE DESCRIPTION. epoll
 /// pins the OFD, so its scan evaluates this directly — the fd
-/// number only matters at ctl time.
-fn ofd_revents(oi: u8, events: u16) -> u16 {
+/// number only matters at ctl time. `pend` is the polling task's
+/// signal mask (signalfd readiness is per-reader).
+fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
     let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
     let Some(o) = ofds.get(oi as usize).and_then(|s| s.as_ref()) else {
         return POLLNVAL;
@@ -6597,7 +6684,7 @@ fn ofd_revents(oi: u8, events: u16) -> u16 {
             let mut r = 0;
             if let Some(inst) = eps.get(*ei).and_then(|s| s.as_ref()) {
                 for e in inst.ents.iter().flatten() {
-                    let x = ofd_revents(e.ofd, e.events as u16);
+                    let x = ofd_revents(pend, e.ofd, e.events as u16);
                     if x != 0 && x & POLLNVAL == 0 {
                         r = POLLIN;
                         break;
@@ -6639,6 +6726,17 @@ fn ofd_revents(oi: u8, events: u16) -> u16 {
                     } else {
                         0
                     }
+                }
+            }
+        }
+        // signalfd: readable when the POLLING task has a pending
+        // signal in the instance's mask — the queue is the reader's.
+        FdKind::Signalfd(i) => {
+            let sfs = unsafe { &*core::ptr::addr_of!(SIGNALFDS) };
+            match sfs.get(*i).and_then(|s| s.as_ref()) {
+                None => POLLNVAL,
+                Some(s) => {
+                    if pend & s.mask != 0 { POLLIN } else { 0 }
                 }
             }
         }
@@ -6850,6 +6948,9 @@ fn poll_expire() {
                     }
                 }
                 WaitOn::Timer => t.ctx.rax = 0, // nanosleep elapsed
+                // sigtimedwait deadline: nothing arrived — EAGAIN
+                // is Linux's timeout answer (not EINTR).
+                WaitOn::SigTimed => t.ctx.rax = (-11i64) as u64,
                 WaitOn::Futex(_) => {
                     t.ctx.rax = (-110i64) as u64 // ETIMEDOUT
                 }
@@ -6974,6 +7075,219 @@ fn psel_restore(t: &mut Task) {
     }
 }
 
+// --- synchronous signals: sigwait*, signalfd -------------------------
+// The wait consumes pending signals from a set rather than running
+// handlers — signals to wait on must be blocked by the caller so
+// they STAY pending (POSIX). The waiter is WaitOn::SigTimed:
+// pend_one collects an in-set arrival into the record buffer, an
+// out-of-set deliverable signal interrupts like any wait, and the
+// deadline arm answers EAGAIN for sigtimedwait timeouts.
+
+/// Shared core of rt_sigwaitinfo/rt_sigtimedwait: dequeue the
+/// lowest pending in-set signal into a 128-byte siginfo_t
+/// (signo@0, rest zero — SI_USER kill() provenance is all zeros
+/// beyond signo). Blocks in SigTimed when the set is cold.
+fn sig_wait(ctx: &mut UCtx, set: u64, info: u64, ts: u64, timed: bool) -> u64 {
+    const EAGAIN: u64 = (-11i64) as u64;
+    const EINTR: u64 = (-4i64) as u64;
+    if !range_ok(set, 8) {
+        return EFAULT;
+    }
+    // SAFETY: validated user sigset under cur cr3.
+    // SIGKILL/SIGSTOP can't be waited for — Linux strips them from
+    // the set (do_sigtimedwait's sigdelsetmask), matching here.
+    let wset = unsafe { (set as *const u64).read_unaligned() } as u32
+        & !((1u32 << (SIGKILL - 1)) | (1u32 << (SIGSTOP - 1)));
+    if info != 0 && !range_ok_w(info, 128) {
+        return EFAULT;
+    }
+    let mut deadline = 0u64;
+    if timed && ts != 0 {
+        if !range_ok(ts, 16) {
+            return EFAULT;
+        }
+        // SAFETY: validated user timespec {sec,nsec} under cur cr3.
+        let (sec, nsec) = unsafe {
+            (
+                (ts as *const u64).read_unaligned(),
+                (ts as *const u64).add(1).read_unaligned(),
+            )
+        };
+        if nsec >= 1_000_000_000 {
+            return EINVAL;
+        }
+        let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        deadline = now
+            .saturating_add(sec.saturating_mul(100))
+            .saturating_add(nsec.div_ceil(10_000_000));
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    // Collect a signal that's already pending — ignored-disposition
+    // bits are noise, skip them like pend_one does.
+    let mut p = t.pending & wset;
+    while p != 0 {
+        let sig = p.trailing_zeros() as u64 + 1;
+        p &= !(1u32 << (sig - 1));
+        if sig_ignored(t, sig) {
+            continue;
+        }
+        t.pending &= !(1u32 << (sig - 1));
+        if info != 0 {
+            let mut rec = [0u8; 128];
+            rec[..4].copy_from_slice(&(sig as u32).to_le_bytes());
+            // SAFETY: info validated writable for 128 bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    rec.as_ptr(),
+                    info as *mut u8,
+                    128,
+                )
+            };
+        }
+        return sig;
+    }
+    if timed && deadline <= crate::apic::TICKS
+        .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return EAGAIN; // ts={0,0} polls once — no sleep
+    }
+    if deliverable(t) {
+        return EINTR;
+    }
+    t.wait_on = WaitOn::SigTimed;
+    t.wait_len = wset as u64;
+    t.wait_ptr = info;
+    t.wait_ptr2 = 0; // siginfo_t shape — rax = signo at wake
+    t.wait_deadline = deadline;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
+/// rt_sigtimedwait(set, info, timespec, sigsetsize) — nr 128 is
+/// the ONLY sigwait syscall on x86_64: glibc's sigwaitinfo calls
+/// it with a NULL timespec, which is the infinite-wait path here.
+pub fn sys_rt_sigtimedwait(
+    ctx: &mut UCtx,
+    set: u64,
+    info: u64,
+    ts: u64,
+    sigsize: u64,
+) -> u64 {
+    if sigsize != 8 {
+        return EINVAL;
+    }
+    sig_wait(ctx, set, info, ts, true)
+}
+
+/// signalfd4(fd, mask, sizemask, flags): fd<0 creates an instance,
+/// fd>=0 replaces its mask. sizemask must be 8 like the sigset
+/// family; signalfd(282) is the same minus the flags arg.
+pub fn fd_signalfd4(fd: u64, mask_ptr: u64, sigsize: u64, flags: u64) -> u64 {
+    const ENFILE_: u64 = (-23i64) as u64;
+    const SFD_NONBLOCK: u64 = 0o4000;
+    const SFD_CLOEXEC: u64 = 0o2000000;
+    if sigsize != 8 || flags & !(SFD_NONBLOCK | SFD_CLOEXEC) != 0 {
+        return EINVAL;
+    }
+    if !range_ok(mask_ptr, 8) {
+        return EFAULT;
+    }
+    // SAFETY: validated user sigset under cur cr3.
+    let mask = unsafe { (mask_ptr as *const u64).read_unaligned() } as u32;
+    let Some(t) = cur_mut() else { return EINVAL };
+    // fd is an int: user space's -1 arrives zero-extended as
+    // 0xFFFFFFFF, not u64::MAX — compare the low word.
+    if fd as i32 != -1 {
+        // Update an existing signalfd's mask (the only valid reuse).
+        let Some(o) = ofd(t, fd) else { return EBADF };
+        let FdKind::Signalfd(i) = o.kind else { return EINVAL };
+        let sfs = unsafe { &mut *core::ptr::addr_of_mut!(SIGNALFDS) };
+        let Some(s) = sfs.get_mut(i).and_then(|s| s.as_mut()) else {
+            return EBADF;
+        };
+        s.mask = mask;
+        return fd;
+    }
+    let sfs = unsafe { &mut *core::ptr::addr_of_mut!(SIGNALFDS) };
+    let Some(i) = sfs.iter().position(Option::is_none) else {
+        return ENFILE_;
+    };
+    sfs[i] = Some(Signalfd {
+        mask,
+        nonblock: flags & SFD_NONBLOCK != 0,
+    });
+    let nfd = anon_fd(FdKind::Signalfd(i), flags & SFD_CLOEXEC != 0);
+    if (nfd as i64) < 0 {
+        sfs[i] = None; // fd table full — don't leak the instance
+    }
+    nfd
+}
+
+/// signalfd(fd, mask, sizemask) — the pre-flags call; SFD_NONBLOCK
+/// can't be requested here (glibc fcntls it on when needed).
+pub fn fd_signalfd(fd: u64, mask_ptr: u64, sigsize: u64) -> u64 {
+    fd_signalfd4(fd, mask_ptr, sigsize, 0)
+}
+
+/// signalfd read: dequeue the reader's lowest pending in-mask
+/// signal into a 128-byte signalfd_siginfo (signo@0, rest zero).
+/// Empty queue: EAGAIN nonblock, else WaitOn::SigTimed — the waker
+/// deposits the record and answers 128 like a PipeRead deposit.
+fn signalfd_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
+    const EAGAIN: u64 = (-11i64) as u64;
+    const EINTR: u64 = (-4i64) as u64;
+    if len < 128 {
+        return EINVAL;
+    }
+    if !range_ok_w(buf, 128) {
+        return EFAULT;
+    }
+    let sfs = unsafe { &*core::ptr::addr_of!(SIGNALFDS) };
+    let Some(mask) = sfs
+        .get(i)
+        .and_then(|s| s.as_ref())
+        .map(|s| s.mask)
+    else {
+        return EBADF;
+    };
+    let Some(t) = cur_mut() else { return EBADF };
+    let mut p = t.pending & mask;
+    while p != 0 {
+        let sig = p.trailing_zeros() as u64 + 1;
+        p &= !(1u32 << (sig - 1));
+        if sig_ignored(t, sig) {
+            continue;
+        }
+        t.pending &= !(1u32 << (sig - 1));
+        let mut rec = [0u8; 128];
+        rec[..4].copy_from_slice(&(sig as u32).to_le_bytes());
+        // SAFETY: buf validated writable for 128 bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(rec.as_ptr(), buf as *mut u8, 128)
+        };
+        return 128;
+    }
+    let nonblock = sfs
+        .get(i)
+        .and_then(|s| s.as_ref())
+        .map_or(false, |s| s.nonblock);
+    if nonblock {
+        return EAGAIN;
+    }
+    if deliverable(t) {
+        return EINTR;
+    }
+    t.wait_on = WaitOn::SigTimed;
+    t.wait_len = mask as u64;
+    t.wait_ptr = buf;
+    t.wait_ptr2 = 1; // signalfd_siginfo shape — rax = 128 at wake
+    t.wait_deadline = 0;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
 // --- epoll -----------------------------------------------------------
 // Interest sets pin the OFD (Linux's file*), so readiness survives
 // the registering fd closing while a dup lives on; ofd_release
@@ -6996,7 +7310,7 @@ fn epoll_scan(t: &Task, ei: usize, out: u64, max: u64) -> u64 {
         if n == max {
             break;
         }
-        let r = ofd_revents(e.ofd, e.events as u16);
+        let r = ofd_revents(t.pending, e.ofd, e.events as u16);
         // NVAL means the interest's OFD is dead — the purge in
         // ofd_release normally beats this; either way Linux would
         // never report EPOLLNVAL to epoll_wait.

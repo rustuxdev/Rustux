@@ -333,6 +333,9 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         34 => user::sys_pause(ctx),
         127 => user::sys_sigpending(a1, a2),
         130 => user::sys_sigsuspend(ctx, a1, a2),
+        // rt_sigtimedwait(set,info,ts,sigsize): glibc sigwaitinfo
+        // reaches it with ts=NULL — there is no nr-129 sigwaitinfo.
+        128 => user::sys_rt_sigtimedwait(ctx, a1, a2, a3, a4),
         270 => user::fd_pselect(ctx, a1, a2, a3, a4, a5, a6),
         271 => user::fd_ppoll(ctx, a1, a2, a3, a4, a5),
         // epoll: create(213) is legacy-size, create1(291) is flags.
@@ -344,6 +347,10 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         // anon-inode semaphores + tick timers.
         284 => user::fd_eventfd(a1, 0),  // eventfd: no flags
         290 => user::fd_eventfd(a1, a2), // eventfd2
+        // signalfd(fd,mask,sizemask) / signalfd4 +flags arg —
+        // fd<0 creates a new instance, fd>=0 updates the mask.
+        282 => user::fd_signalfd(a1, a2, a3),
+        289 => user::fd_signalfd4(a1, a2, a3, a4),
         283 => user::fd_timerfd_create(a1, a2),
         286 => user::fd_timerfd_settime(a1, a2, a3, a4),
         287 => user::fd_timerfd_gettime(a1, a2),
