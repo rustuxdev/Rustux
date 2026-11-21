@@ -1805,3 +1805,19 @@ PROT_NONE page, non-inheritance of queued payloads. 42 tasks,
 frames 108588 -> 108588 zero leak, exit 33. Audit run-75 (quick,
 scoped): 0 confirmed unresolved (the evasion defect fixed
 pre-commit). Ledger: 110.
+
+run-102 — real statfs/fstatfs(137/138): the ramfs reports the
+frame allocator's capacity (f_blocks/f_bfree/f_bavail =
+total/free frames, 4KiB bsize+frsize, namelen 255) and the
+vfile table's inode count (f_files=MAX_VFILES, f_ffree=free
+slots); /proc reports its own superblock — PROC_SUPER_MAGIC,
+ST_RDONLY|NOSUID|NODEV|NOEXEC flags, zeroed storage fields.
+statfs canon'd its path (ENOENT on a miss, /proc* routes to the
+proc fill); fstatfs resolves the fd — Proc OFDs and Dir OFDs
+naming proc get procfs, everything else ramfs. Also fixed a
+latent offset bug: the old fill wrote f_namelen/f_frsize at the
+f_flags/f_spare offsets. busybox df now prints real numbers
+(rustux 438676 22316 416360 5%). iotest +7 checks: struct field
+assertions on both superblocks, ENOENT, fd-kind routing.
+42 tasks, frames 108589 -> 108589 zero leak, exit 33.
+Audit run-76 (quick, scoped): 0 confirmed. Ledger: 110.
