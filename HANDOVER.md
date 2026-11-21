@@ -1737,3 +1737,37 @@ with ssi_signo, blocked-read wake via child kill, mask update,
 EINVAL on foreign fd. 42 tasks, frames 108610 -> 108610 zero
 leak, exit 33 WSL + VM. Audit run-73 (quick, scoped): 0 confirmed;
 cve.now has no signalfd/sigtimedwait-class entries. Ledger: 104.
+
+## run-100: inotify — the last anon-inode fd family
+
+inotify_init/init1(253/294) + inotify_add_watch(254) +
+inotify_rm_watch(255): FdKind::Inotify over a bounded INOTIFY table,
+watches keyed on canonical path. ino_report routes self events
+(nameless) vs parent-dir events (named by final component);
+ino_report_self_loss queues DELETE_SELF/MOVE_SELF then IN_IGNORED
+and frees the wd. Emitters at open/create/write/truncate/unlink/
+rename/mkdir/rmdir/writable-close; bounded queue folds overflow
+into one IN_Q_OVERFLOW record; poll reports POLLIN, FIONREAD sums
+the whole queue, read returns one 16B-aligned record per call,
+blocked readers wake via ino_deposit through the sleeper's own
+tables; generic pend_one covers the signal -EINTR path.
+Wired bugs found en route: the wake-scan in ino_report originally
+walked TASKS unconditionally on every emit — a mid-syscall
+iter_mut borrow hazard that raced iotest's reaped-pid proc checks
+(now gated on an event actually landing); and a pre-existing /proc
+race the shifted timing exposed — a wait4-collected zombie kept
+its pid dir until the NEXT pick_next (the exiting task can't reap
+its own slot mid-pick). proc_dead now mirrors pick_next's
+reapability rule: a zombie nobody can still wait4 is invisible to
+/proc lookup and enumeration while its slot lingers. Also fixed
+in review: events consumed on undersized buffers (pop after the
+fit check, EINVAL keeps them like Linux), mask==0 EINVAL after the
+existence check (ENOENT wins like Linux), FIONREAD head-only.
+iotest +24 checks: lifecycle, EAGAIN/EINVAL surfaces, POLLIN,
+IN_OPEN->IN_MODIFY->IN_CLOSE_WRITE sequence, rm_watch IN_IGNORED,
+dir-watch create/delete, blocked-read wake. 42 tasks, frames
+108608 -> 108608 zero leak, exit 33 WSL + VM. Audit run-74 (quick,
+scoped): 0 confirmed; inotify CVE class cross-checked. Ledger: 110.
+Known divergences: path-keyed watches (a self-watch on a renamed
+file dies with MOVE_SELF+IGNORED rather than following the inode);
+one record per read; F_SETFL can't toggle instance nonblock.
