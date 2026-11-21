@@ -33,6 +33,11 @@ static mut ALLOC: Kalloc = Kalloc {
     cache: [0; N_CLASSES],
 };
 
+/// Conventional frames the memory map reported at init — the
+/// /proc/meminfo MemTotal figure (kernel-resident frames included,
+/// like Linux counting them in MemTotal).
+static mut TOTAL_FRAMES: u64 = 0;
+
 use crate::pio::{irq_restore, irq_save};
 
 /// Size class for `size` payload bytes, or None when it needs a direct
@@ -74,8 +79,10 @@ fn refill(alloc: &mut Kalloc, c: usize) {
 /// spans (the page-table carve). Called once, post-EBS, from main.
 pub fn init<M: MemoryMap>(mmap: &M, reserved: &[(u64, u64)]) {
     let alloc = unsafe { &mut *core::ptr::addr_of_mut!(ALLOC) };
+    let mut total = 0u64;
     for d in mmap.entries() {
         if d.ty == MemoryType::CONVENTIONAL {
+            total += d.page_count;
             alloc.buddy.add_range(
                 d.phys_start,
                 d.phys_start + d.page_count * PAGE,
@@ -83,6 +90,7 @@ pub fn init<M: MemoryMap>(mmap: &M, reserved: &[(u64, u64)]) {
             );
         }
     }
+    unsafe { *core::ptr::addr_of_mut!(TOTAL_FRAMES) = total };
 }
 
 /// Allocate `size` bytes (uninitialized; null on size==0 or OOM).
@@ -202,4 +210,9 @@ pub unsafe fn kfree(p: *mut u8) {
 /// are cache-owned and not counted, matching slab semantics).
 pub fn free_frames() -> u64 {
     unsafe { (*core::ptr::addr_of!(ALLOC)).buddy.free_count() }
+}
+
+/// Total conventional frames the firmware map reported (MemTotal).
+pub fn total_frames() -> u64 {
+    unsafe { *core::ptr::addr_of!(TOTAL_FRAMES) }
 }

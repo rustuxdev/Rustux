@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
+#include <sys/syscall.h>
 #include <time.h>
 
 static int fails;
@@ -396,6 +397,195 @@ int main(void) {
               "epoll read -> EINVAL");
         close(epfd[0]); close(epfd[1]);
         close(ep);
+    }
+
+    /* ---- /proc: generated files, pid dirs, stat content ---- */
+    {
+        char pbuf[256];
+        struct stat pst;
+
+        /* /proc/self is a live pid dir; its files are generated. */
+        int fd = open("/proc/self/stat", O_RDONLY);
+        check(fd >= 0, "open /proc/self/stat");
+        int n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        check(n2 > 0, "read /proc/self/stat");
+        if (n2 > 0) {
+            long rpid, rppid;
+            char rcomm[64], rstate;
+            pbuf[n2] = 0;
+            check(sscanf(pbuf, "%ld (%63[^)]) %c %ld",
+                         &rpid, rcomm, &rstate, &rppid) == 4,
+                  "stat parse pid/comm/state/ppid");
+            check(rpid == getpid() && rstate == 'R',
+                  "stat self pid+state");
+            /* ppid is 0 — suite tasks are spawned, not forked. */
+            check(rppid == 0, "stat self ppid");
+        }
+        if (fd >= 0) close(fd);
+
+        /* comm and cmdline carry the image identity. */
+        fd = open("/proc/self/comm", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf)) : -1;
+        check(fd >= 0 && n2 == 7 &&
+              memcmp(pbuf, "iotest\n", 7) == 0, "comm iotest");
+        if (fd >= 0) close(fd);
+
+        fd = open("/proc/self/cmdline", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf)) : -1;
+        check(fd >= 0 && n2 > 0 &&
+              memcmp(pbuf, "iotest", 6) == 0 && pbuf[n2 - 1] == 0,
+              "cmdline exe+NUL");
+        if (fd >= 0) close(fd);
+
+        /* The exe link: readlink resolves it, stat follows it. */
+        n2 = readlink("/proc/self/exe", pbuf, sizeof(pbuf));
+        check(n2 == 7 && memcmp(pbuf, "/iotest", 7) == 0,
+              "readlink self/exe");
+        check(stat("/proc/self/exe", &pst) == 0 &&
+              S_ISREG(pst.st_mode) && pst.st_size > 0,
+              "stat self/exe -> image");
+
+        /* Global files. */
+        fd = open("/proc/uptime", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        if (n2 > 0) pbuf[n2] = 0;
+        unsigned long us, is;
+        check(fd >= 0 && n2 > 0 &&
+              sscanf(pbuf, "%lu.%*u %lu.%*u", &us, &is) == 2,
+              "uptime parses");
+        if (fd >= 0) close(fd);
+
+        fd = open("/proc/meminfo", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        if (n2 > 0) pbuf[n2] = 0;
+        check(fd >= 0 && n2 > 0 &&
+              strstr(pbuf, "MemTotal:") != NULL &&
+              strstr(pbuf, "MemFree:") != NULL,
+              "meminfo fields");
+        if (fd >= 0) close(fd);
+
+        fd = open("/proc/version", O_RDONLY);
+        n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+        if (n2 > 0) pbuf[n2] = 0;
+        check(fd >= 0 && n2 > 0 &&
+              strstr(pbuf, "Rustux") != NULL,
+              "version names rustux");
+        if (fd >= 0) close(fd);
+
+        /* fstat shape: a 0444 regular with the snapshot size;
+           lseek/pread walk it like a file. */
+        fd = open("/proc/self/stat", O_RDONLY);
+        check(fd >= 0 && fstat(fd, &pst) == 0 &&
+              S_ISREG(pst.st_mode) && (pst.st_mode & 0777) == 0444,
+              "proc fstat 0444 reg");
+        if (fd >= 0) {
+            check(lseek(fd, 5, SEEK_SET) == 5 &&
+                  read(fd, pbuf, 3) == 3, "proc lseek+read");
+            check(pread(fd, pbuf, 4, 0) == 4, "proc pread");
+        }
+        if (fd >= 0) close(fd);
+
+        /* Directory shapes. */
+        check(stat("/proc", &pst) == 0 && S_ISDIR(pst.st_mode),
+              "stat /proc dir");
+        check(stat("/proc/self", &pst) == 0 && S_ISDIR(pst.st_mode),
+              "stat /proc/self dir");
+
+        /* /proc lists numeric pid dirs + the synthetic names. */
+        int dfd = open("/proc", O_RDONLY | O_DIRECTORY);
+        check(dfd >= 0, "open /proc dir");
+        if (dfd >= 0) {
+            char dbuf[1024];
+            int dl = syscall(SYS_getdents64, dfd, dbuf, sizeof(dbuf));
+            check(dl > 0, "getdents /proc");
+            int saw_self = 0, saw_pid = 0, saw_uptime = 0;
+            char pp[16];
+            snprintf(pp, sizeof(pp), "%d", getpid());
+            for (int off = 0; dl > 0 && off < dl; ) {
+                struct {
+                    unsigned long ino, off2;
+                    unsigned short rlen;
+                    unsigned char type;
+                    char name[];
+                } *de = (void *)(dbuf + off);
+                if (strcmp(de->name, "self") == 0) saw_self = 1;
+                if (strcmp(de->name, "uptime") == 0) saw_uptime = 1;
+                if (strcmp(de->name, pp) == 0) saw_pid = 1;
+                off += de->rlen;
+            }
+            check(saw_self && saw_uptime, "proc lists self+uptime");
+            check(saw_pid, "proc lists own pid");
+            close(dfd);
+        }
+
+        /* The pid dir lists the per-task files. */
+        dfd = open("/proc/self", O_RDONLY | O_DIRECTORY);
+        check(dfd >= 0, "open /proc/self dir");
+        if (dfd >= 0) {
+            char dbuf[512];
+            int dl = syscall(SYS_getdents64, dfd, dbuf, sizeof(dbuf));
+            int saw_stat = 0, saw_exe = 0;
+            for (int off = 0; dl > 0 && off < dl; ) {
+                struct {
+                    unsigned long ino, off2;
+                    unsigned short rlen;
+                    unsigned char type;
+                    char name[];
+                } *de = (void *)(dbuf + off);
+                if (strcmp(de->name, "stat") == 0) saw_stat = 1;
+                if (strcmp(de->name, "exe") == 0) saw_exe = 1;
+                off += de->rlen;
+            }
+            check(saw_stat && saw_exe, "pid dir lists stat+exe");
+            close(dfd);
+        }
+
+        /* A child's stat is visible under its own pid while it
+           lives — fork, read /proc/<kid>/stat in the parent. */
+        pid_t kid = fork();
+        if (kid == 0) {
+            struct timespec nap = {0, 200000000};
+            nanosleep(&nap, NULL);
+            _exit(0);
+        }
+        if (kid > 0) {
+            char kp[64];
+            snprintf(kp, sizeof(kp), "/proc/%d/stat", kid);
+            fd = open(kp, O_RDONLY);
+            n2 = fd >= 0 ? read(fd, pbuf, sizeof(pbuf) - 1) : -1;
+            check(fd >= 0 && n2 > 0, "read child stat");
+            if (n2 > 0) {
+                long rpid, rppid;
+                char rc[64], rs;
+                pbuf[n2] = 0;
+                check(sscanf(pbuf, "%ld (%63[^)]) %c %ld",
+                             &rpid, rc, &rs, &rppid) == 4 &&
+                      rpid == kid && rppid == getpid(),
+                      "child stat pid+ppid");
+            }
+            if (fd >= 0) close(fd);
+            /* Reaped: the dir and its files go ENOENT. */
+            waitpid(kid, NULL, 0);
+            check(open(kp, O_RDONLY) < 0 && errno == ENOENT,
+                  "reaped pid stat ENOENT");
+            snprintf(kp, sizeof(kp), "/proc/%d", kid);
+            check(open(kp, O_RDONLY | O_DIRECTORY) < 0 &&
+                  errno == ENOENT, "reaped pid dir ENOENT");
+        }
+
+        /* Error paths. */
+        errno = 0;
+        check(open("/proc/definitely-not-a-file", O_RDONLY) < 0 &&
+              errno == ENOENT, "proc miss ENOENT");
+        errno = 0;
+        check(open("/proc/999999", O_RDONLY | O_DIRECTORY) < 0 &&
+              errno == ENOENT, "dead pid dir ENOENT");
+        errno = 0;
+        check(open("/proc/uptime", O_WRONLY) < 0 &&
+              errno == EROFS, "proc file EROFS write");
+        errno = 0;
+        check(open("/proc/x", O_RDWR | O_CREAT, 0600) < 0 &&
+              errno == EROFS, "proc O_CREAT EROFS");
     }
 
     int n = snprintf(buf, sizeof(buf), "iotest: %d failures, done\n", fails);

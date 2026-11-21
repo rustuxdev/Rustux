@@ -254,6 +254,11 @@ enum FdKind {
     Eventfd(usize),
     /// A timerfd — arming/expiry state lives in TIMERFDS[id].
     Timerfd(usize),
+    /// A generated /proc file — contents are rendered into a
+    /// kernel frame at open (Linux's seq_file snapshot model), so
+    /// reads and stats see one consistent image even if the task
+    /// it describes exits before the last read.
+    Proc { buf: u64, len: usize },
 }
 
 /// Max concurrent pipes — a hard bound on kernel frame pressure,
@@ -1024,6 +1029,9 @@ pub struct Task {
     /// Resumed by SIGCONT since the last WCONTINUED report —
     /// consumed once per continue, like stop_sig.
     cont_report: bool,
+    /// apic::TICKS at spawn — /proc/<pid>/stat's starttime (field 22)
+    /// is in ticks-since-boot like Linux's jiffies figure.
+    start_ticks: u64,
     /// Per-task FPU/SSE state -- fxsave'd on every way out,
     /// fxrstor'd on every resume so xmm state never crosses tasks.
     fx: FxState,
@@ -1525,12 +1533,12 @@ pub fn set_initrd(img: &'static [u8]) {
 /// by open and execve alike.
 pub fn fs_lookup(name: &[u8]) -> Option<&'static [u8]> {
     let arc = unsafe { *core::ptr::addr_of!(INITRD) }?;
-    // /proc/self/exe resolves to the caller's executable image —
-    // busybox's FEATURE_PREFER_APPLETS re-exec path depends on it.
-    if name == b"proc/self/exe" {
-        let i = unsafe { *core::ptr::addr_of!(CUR_I) };
+    // /proc/<pid-or-self>/exe resolves to that task's executable
+    // image — busybox's FEATURE_PREFER_APPLETS re-exec path and
+    // /proc/pid/exe consumers alike depend on it.
+    if let Some(ProcEnt::Task(slot, b"exe")) = proc_parse(name) {
         let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
-        let t = tasks.get(i).and_then(|s| s.as_ref())?;
+        let t = tasks.get(slot).and_then(|s| s.as_ref())?;
         return crate::cpio::find(arc, &t.exe[..t.exe_len as usize]);
     }
     crate::cpio::find(arc, name)
@@ -1810,6 +1818,8 @@ fn load(img: &[u8]) -> Option<Task> {
         did_exec: true,
         stop_sig: 0,
         cont_report: false,
+        start_ticks: crate::apic::TICKS
+            .load(core::sync::atomic::Ordering::Relaxed),
     };
     // std streams: 0=stdin (EOF), 1/2=serial console — each a fresh
     // global OFD, like separate opens of /dev/console.
@@ -3141,6 +3151,9 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 FdKind::Stdin => (unsafe { RD_LEN }) as u64,
                 FdKind::Console => 0u64,
                 FdKind::File(d) => d.len().saturating_sub(o.pos) as u64,
+                FdKind::Proc { len, .. } => {
+                    len.saturating_sub(o.pos) as u64
+                }
                 FdKind::Ram(i) => vfile(*i)
                     .map_or(0, |v| v.len.saturating_sub(o.pos))
                     as u64,
@@ -3424,26 +3437,6 @@ pub fn sys_rt_sigprocmask(how: u64, set: u64, old: u64, sigsetsize: u64) -> u64 
     0
 }
 
-/// readlinkat("/proc/self/exe") → the image's cpio name — the only
-/// proc path that exists. Anything else is ENOENT like a procfs
-/// miss. Returns the byte count (no NUL), capped at the buffer.
-pub fn read_proc_self_exe(buf: u64, len: u64) -> u64 {
-    if len == 0 || !range_ok_w(buf, len) {
-        return EFAULT;
-    }
-    let Some(t) = cur_mut() else { return ENOENT };
-    let n = t.exe_len as usize;
-    // glibc's _dl_get_origin asserts the link is absolute — the
-    // canonical name has no leading '/', so "/" + exe is honest.
-    let total = (n + 1).min(len as usize);
-    // SAFETY: buf validated writable for len bytes.
-    unsafe {
-        (buf as *mut u8).write(b'/');
-        (buf as *mut u8).add(1).copy_from(t.exe.as_ptr(), total - 1)
-    };
-    total as u64
-}
-
 /// getcwd(buf, len): "/" + the shared cwd bytes + NUL; ERANGE
 /// when the caller's buffer can't hold it — Linux semantics.
 pub fn sys_getcwd(buf: u64, len: u64) -> u64 {
@@ -3578,6 +3571,11 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
                 .count();
             (0o100644, vfile(*i).map_or(0, |v| v.len) as u64,
              (arc_n + vidx) as u64 + 1)
+        }
+        // proc files stat as read-only regulars; the rendered
+        // length is the honest size of this snapshot.
+        FdKind::Proc { buf, len } => {
+            (0o100444, *len as u64, buf / 4096)
         }
         FdKind::Pipe { .. } => (0o10644, 0, 0), // S_IFIFO
         FdKind::Udp(_) | FdKind::Tcp(_) => (0o140777, 0, 0), // S_IFSOCK
@@ -4250,6 +4248,30 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             o.pos += n;
             n as u64
         }
+        FdKind::Proc { buf: kbuf, len: dlen } => {
+            if o.accmode == 1 {
+                return EBADF; // O_WRONLY
+            }
+            let avail = dlen.saturating_sub(o.pos);
+            let n = core::cmp::min(len as usize, avail);
+            if n == 0 {
+                return 0;
+            }
+            if !range_ok_w(buf, n as u64) {
+                return EFAULT;
+            }
+            // SAFETY: same user-window proof as File; the proc frame
+            // is kernel-owned, identity-mapped, OFD-lifetime.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (*kbuf as *const u8).add(o.pos),
+                    buf as *mut u8,
+                    n,
+                )
+            };
+            o.pos += n;
+            n as u64
+        }
         FdKind::Ram(i) => {
             if o.accmode == 1 {
                 return EBADF; // O_WRONLY
@@ -4643,6 +4665,34 @@ pub fn newfstatat(path: &[u8], statbuf: u64) -> u64 {
         st[3] = 0o100644; // st_mode: S_IFREG | 0644
         st[6] = v.len as u64; // st_size
         st[8] = (v.len as u64).div_ceil(512); // st_blocks
+    } else if let Some(pe) = proc_parse(path) {
+        // The exe link stats its target like a followed symlink;
+        // the generated files show Linux's 0444/size-0 proc shape.
+        if let ProcEnt::Task(slot, b"exe") = pe {
+            let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+            let Some(t) = tasks.get(slot).and_then(|s| s.as_ref())
+            else {
+                return ENOENT;
+            };
+            let Some(arc) = (unsafe { *core::ptr::addr_of!(INITRD) })
+            else {
+                return ENOENT;
+            };
+            let Some((idx, (_, data))) = crate::cpio::entries(arc)
+                .enumerate()
+                .find(|(_, (n, _))| *n == &t.exe[..t.exe_len as usize])
+            else {
+                return ENOENT;
+            };
+            st[1] = idx as u64 + 1;
+            st[2] = 1;
+            st[3] = 0o100777;
+            st[6] = data.len() as u64;
+            st[8] = (data.len() as u64).div_ceil(512);
+        } else {
+            st[2] = 1;
+            st[3] = 0o100444; // S_IFREG | 0444 — proc files are ro
+        }
     } else {
         let Some(arc) = (unsafe { *core::ptr::addr_of!(INITRD) }) else {
             return ENOENT;
@@ -4772,7 +4822,9 @@ pub fn canon_path(dfd: u64, path: &[u8]) -> Result<([u8; 256], usize), u64> {
 
 /// Does `p` (canonical) name a regular file in either namespace?
 fn is_file(p: &[u8]) -> bool {
-    vfile_find(p).is_some() || fs_lookup(p).is_some()
+    vfile_find(p).is_some()
+        || fs_lookup(p).is_some()
+        || proc_parse(p).is_some()
 }
 
 /// Does `p` (canonical) name a directory? Root always exists;
@@ -4784,6 +4836,13 @@ fn dir_exists(p: &[u8]) -> bool {
     }
     if p == b"proc" || p == b"proc/self" {
         return true;
+    }
+    // "proc/<pid>" is a dir while the task lives (zombies included,
+    // like Linux's pre-reap /proc entries).
+    if let Some(rest) = p.strip_prefix(b"proc/") {
+        if !rest.contains(&b'/') && proc_pid_slot(rest).is_some() {
+            return true;
+        }
     }
     let mut pre = [0u8; 256];
     if p.len() + 1 > pre.len() {
@@ -4807,6 +4866,339 @@ fn dir_exists(p: &[u8]) -> bool {
     unsafe { &*core::ptr::addr_of!(VDIRS) }.iter().flatten().any(|d| {
         d.path[..d.nlen].starts_with(pre)
     })
+}
+
+/// ---- /proc -------------------------------------------------------------
+/// The virtual process/system view. File contents are generated at
+/// open() into a kernel frame the OFD owns — Linux's seq_file snapshot
+/// model — so a reader sees one consistent image even when the task it
+/// describes exits mid-read, and no separate reader state is needed.
+///
+/// `proc/<pid>` directories exist for every task slot, Exited zombies
+/// included (Linux keeps them until the reap, and so do we); "self" is
+/// the caller's pid resolved eagerly at lookup.
+
+/// Leaf files a per-task dir exports, "exe" included — it isn't
+/// rendered text but resolves to the task's image like a symlink.
+const PROC_TFILES: [&[u8]; 5] =
+    [b"stat", b"status", b"comm", b"cmdline", b"exe"];
+/// Synthetic system files under /proc itself.
+const PROC_GFILES: [&[u8]; 5] =
+    [b"uptime", b"meminfo", b"loadavg", b"version", b"stat"];
+
+/// What a canonical "proc/..." path names — global file by PROC_GFILES
+/// index, or a per-task leaf on a task slot.
+enum ProcEnt {
+    Global(usize),
+    Task(usize, &'static [u8]),
+}
+
+/// The task slot holding `pid`, zombies included (see the /proc note).
+fn task_slot_by_pid(pid: u64) -> Option<usize> {
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    (0..tasks.len())
+        .find(|&i| tasks[i].as_ref().is_some_and(|t| t.pid == pid))
+}
+
+/// Resolve a pid-dir component — decimal pid or "self" (the caller) —
+/// to a live task slot.
+fn proc_pid_slot(comp: &[u8]) -> Option<usize> {
+    if comp == b"self" {
+        return Some(unsafe { *core::ptr::addr_of!(CUR_I) });
+    }
+    // Strictly decimal, 1..=20 digits, no sign — anything else is
+    // just an odd filename, not a pid.
+    if comp.is_empty()
+        || comp.len() > 20
+        || !comp.iter().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut pid = 0u64;
+    for &c in comp {
+        pid = pid * 10 + (c - b'0') as u64;
+    }
+    task_slot_by_pid(pid)
+}
+
+/// Parse "proc/<file>" and "proc/<pid-or-self>/<file>" paths.
+/// Two-level only — nothing nested deeper exists under a pid dir.
+fn proc_parse(p: &[u8]) -> Option<ProcEnt> {
+    let rest = p.strip_prefix(b"proc/")?;
+    let Some(i) = rest.iter().position(|&c| c == b'/') else {
+        return PROC_GFILES
+            .iter()
+            .position(|f| *f == rest)
+            .map(ProcEnt::Global);
+    };
+    let leaf = &rest[i + 1..];
+    if leaf.contains(&b'/') {
+        return None;
+    }
+    let slot = proc_pid_slot(&rest[..i])?;
+    PROC_TFILES
+        .iter()
+        .find(|f| **f == leaf)
+        .map(|f| ProcEnt::Task(slot, *f))
+}
+
+/// Count resident 4K leaf pages in `pml4`'s user half — the RSS
+/// figure /proc/<pid>/stat field 24 reports (in pages, like Linux).
+/// The page table is the allocation ledger, so this walk IS the
+/// honest count; user-space tables are identity-mapped for us.
+fn task_rss_pages(pml4: u64) -> u64 {
+    let mut n = 0u64;
+    for i in 0..256u64 {
+        let e = rd64(pml4 + 8 * i);
+        if e & PRESENT == 0 {
+            continue;
+        }
+        let pdpt = e & PHYS_MASK;
+        for j in 0..512u64 {
+            let e = rd64(pdpt + 8 * j);
+            if e & PRESENT == 0 || e & (1 << 7) != 0 {
+                continue; // user space never gets a 1G leaf
+            }
+            let pd = e & PHYS_MASK;
+            for k in 0..512u64 {
+                let e = rd64(pd + 8 * k);
+                if e & PRESENT == 0 || e & (1 << 7) != 0 {
+                    continue; // ... nor a 2M one
+                }
+                let pt = e & PHYS_MASK;
+                for l in 0..512u64 {
+                    if rd64(pt + 8 * l) & PRESENT != 0 {
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+/// 'R'/'S'/'T'/'Z' — the ps state column for a TaskState.
+fn proc_state_char(st: TaskState) -> u8 {
+    match st {
+        TaskState::Runnable => b'R',
+        TaskState::Blocked => b'S',
+        TaskState::Stopped => b'T',
+        TaskState::Exited => b'Z',
+    }
+}
+
+/// Render one proc file's text into `s`.
+fn proc_fill(ent: &ProcEnt, s: &mut klib::seqbuf::SeqBuf) {
+    use klib::fmt::Arg;
+    match *ent {
+        ProcEnt::Global(gi) => match PROC_GFILES[gi] {
+            b"uptime" => {
+                let t = crate::apic::TICKS
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                // <uptime> <idle> — centiseconds, 100Hz ticks.
+                s.printf(
+                    b"%u.%02u %u.%02u\n",
+                    &[
+                        Arg::U(t / 100),
+                        Arg::U(t % 100),
+                        Arg::U(t / 100),
+                        Arg::U(t % 100),
+                    ],
+                );
+            }
+            b"meminfo" => {
+                let total = kalloc::total_frames() * 4;
+                let free = kalloc::free_frames() * 4;
+                s.printf(
+                    b"MemTotal:       %u kB\n\
+                      MemFree:        %u kB\n\
+                      MemAvailable:   %u kB\n\
+                      Buffers:               0 kB\n\
+                      Cached:                0 kB\n\
+                      SwapTotal:             0 kB\n\
+                      SwapFree:              0 kB\n",
+                    &[Arg::U(total), Arg::U(free), Arg::U(free)],
+                );
+            }
+            b"loadavg" => {
+                // <l1> <l5> <l15> <running+sleeping>/<total> <lastpid>
+                // — no real load accounting yet, honest 0.00s.
+                let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+                let (mut live, mut last) = (0u64, 0u64);
+                for t in tasks.iter().flatten() {
+                    live += 1;
+                    last = last.max(t.pid);
+                }
+                s.printf(
+                    b"0.00 0.00 0.00 %u/%u %u\n",
+                    &[Arg::U(live), Arg::U(live), Arg::U(last)],
+                );
+            }
+            b"version" => {
+                s.puts(b"Rustux version 0.1.0\n");
+            }
+            b"stat" => {
+                // The cpu-line fields tools parse; only the idle
+                // column is real (we have no per-task accounting).
+                let t = crate::apic::TICKS
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+                let mut live = 0u64;
+                for _ in tasks.iter().flatten() {
+                    live += 1;
+                }
+                s.printf(
+                    b"cpu  0 0 0 %u 0 0 0 0 0 0\n\
+                      cpu0 0 0 0 %u 0 0 0 0 0 0\n\
+                      intr 0\nctxt 0\nbtime 0\n\
+                      processes %u\nprocs_running 1\nprocs_blocked 0\n",
+                    &[Arg::U(t), Arg::U(t), Arg::U(live)],
+                );
+            }
+            _ => {}
+        },
+        ProcEnt::Task(slot, leaf) => {
+            let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+            let Some(t) = tasks.get(slot).and_then(|s| s.as_ref()) else {
+                return;
+            };
+            let name_end = t
+                .name
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(t.name.len());
+            let name = &t.name[..name_end];
+            let state = proc_state_char(t.state);
+            match leaf {
+                b"stat" => {
+                    // Field 22 (starttime) is ticks-since-boot;
+                    // utime/stime are 0 (no per-task accounting);
+                    // rss is the real leaf-page count.
+                    let tpgid = if t.sid
+                        == unsafe { *core::ptr::addr_of!(CONSOLE_SID) }
+                    {
+                        unsafe { *core::ptr::addr_of!(FG_PGID) }
+                    } else {
+                        0
+                    };
+                    let nthr = tasks
+                        .iter()
+                        .flatten()
+                        .filter(|x| x.tgid == t.tgid)
+                        .count() as u64;
+                    let vsize = t.brk_cur;
+                    let rss = task_rss_pages(t.pml4);
+                    s.printf(
+                        b"%d (%s) %c %d %d %d 0 %d \
+                          0 0 0 0 0 0 0 0 0 \
+                          20 0 %d 0 \
+                          %u %u %d %u \
+                          0 0 %u \
+                          0 0 %u %u 0 0 \
+                          0 0 0 \
+                          17 \
+                          0 0 0 0 0 0 \
+                          0 0 %u \
+                          0 0 0 0 0\n",
+                        &[
+                            Arg::I(t.pid as i64),      // 1 pid
+                            Arg::S(name),              // 2 comm
+                            Arg::C(state as i64),      // 3 state
+                            Arg::I(t.ppid as i64),     // 4 ppid
+                            Arg::I(t.pgid as i64),     // 5 pgrp
+                            Arg::I(t.sid as i64),      // 6 session
+                            Arg::I(tpgid as i64),      // 8 tty_pgrp
+                            Arg::I(nthr as i64),       // 20 num_threads
+                            Arg::U(t.start_ticks),     // 22 starttime
+                            Arg::U(vsize),             // 23 vsize
+                            Arg::I(rss as i64),        // 24 rss
+                            Arg::U(u64::MAX),          // 25 rsslim
+                            Arg::U(t.stack_top),       // 28 startstack
+                            Arg::U(t.pending as u64),  // 31 signal
+                            Arg::U(t.sigmask as u64),  // 32 blocked
+                            Arg::U(t.brk_base),        // 47 start_brk
+                        ],
+                    );
+                }
+                b"status" => {
+                    s.printf(
+                        b"Name:\t%s\nState:\t%c\nTgid:\t%d\nPid:\t%d\n\
+                          PPid:\t%d\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n",
+                        &[
+                            Arg::S(name),
+                            Arg::C(state as i64),
+                            Arg::I(t.tgid as i64),
+                            Arg::I(t.pid as i64),
+                            Arg::I(t.ppid as i64),
+                        ],
+                    );
+                }
+                b"comm" => {
+                    s.printf(b"%s\n", &[Arg::S(name)]);
+                }
+                b"cmdline" => {
+                    // argv isn't stored — the image path alone is the
+                    // honest command line we have.
+                    s.putmem(&t.exe[..t.exe_len as usize]);
+                    s.putc(0);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// open() of a proc file: render the snapshot or resolve the exe
+/// link to its image. None when `path` isn't a proc file.
+fn proc_open(path: &[u8]) -> Option<FdKind> {
+    let ent = proc_parse(path)?;
+    if let ProcEnt::Task(slot, b"exe") = ent {
+        // The exe link opens its target — the image in the initrd,
+        // exactly what fs_lookup's proc/self/exe case does for self.
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        let t = tasks.get(slot).and_then(|s| s.as_ref())?;
+        let arc = unsafe { *core::ptr::addr_of!(INITRD) }?;
+        return crate::cpio::find(arc, &t.exe[..t.exe_len as usize])
+            .map(FdKind::File);
+    }
+    let buf = kalloc::alloc_frame()?;
+    let len = {
+        // SAFETY: buf is a fresh 4096-byte frame, identity-mapped.
+        let dst =
+            unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 4096) };
+        let mut s = klib::seqbuf::SeqBuf::new(dst);
+        proc_fill(&ent, &mut s);
+        s.used()
+    };
+    Some(FdKind::Proc { buf, len })
+}
+
+/// readlink() answer for "proc/self/exe" and "proc/<pid>/exe" —
+/// "/"-prefixed image path, capped at the user buffer like Linux.
+/// ENOENT for a dead pid or a non-exe path; usize::MAX signals
+/// "not a proc link at all" so the caller can fall through.
+pub fn proc_readlink(path: &[u8], buf: u64, len: u64) -> u64 {
+    if !path.starts_with(b"proc/") {
+        return usize::MAX as u64;
+    }
+    let Some(ProcEnt::Task(slot, b"exe")) = proc_parse(path) else {
+        return ENOENT;
+    };
+    if len == 0 || !range_ok_w(buf, len) {
+        return EFAULT;
+    }
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    let Some(t) = tasks.get(slot).and_then(|s| s.as_ref()) else {
+        return ENOENT;
+    };
+    let n = t.exe_len as usize;
+    let total = (n + 1).min(len as usize);
+    // SAFETY: buf validated writable for len bytes.
+    unsafe {
+        (buf as *mut u8).write(b'/');
+        (buf as *mut u8).add(1).copy_from(t.exe.as_ptr(), total - 1)
+    };
+    total as u64
 }
 
 /// The canonical path a Dir OFD names — for dirfd resolution.
@@ -4889,6 +5281,20 @@ pub fn fd_open(path: &[u8], flags: u64) -> u64 {
         }
         let arc = unsafe { *core::ptr::addr_of!(INITRD) }.unwrap();
         FdKind::File(crate::cpio::find(arc, path).unwrap())
+    } else if proc_parse(path).is_some() {
+        // Generated /proc files are read-only like the archive —
+        // checked BEFORE the snapshot frame is rendered so an
+        // EROFS/EEXIST miss never owns one.
+        if writing {
+            return EROFS;
+        }
+        if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) {
+            return EEXIST;
+        }
+        let Some(kind) = proc_open(path) else {
+            return (-12i64) as u64; // ENOMEM — the frame alloc failed
+        };
+        kind
     } else if dir_exists(path) {
         // A real directory: read-only opens only, like Linux.
         if writing || flags & O_CREAT != 0 {
@@ -4907,6 +5313,11 @@ pub fn fd_open(path: &[u8], flags: u64) -> u64 {
         }
         FdKind::Stdin
     } else if flags & O_CREAT != 0 {
+        // procfs is fully synthetic — nothing may be created under
+        // it even though its pid dirs read as directories.
+        if path.starts_with(b"proc/") {
+            return EROFS;
+        }
         // The parent must be a real directory; a file in a path
         // component is ENOTDIR like Linux.
         if let Some(pi) = path.iter().rposition(|&c| c == b'/') {
@@ -4930,13 +5341,22 @@ pub fn fd_open(path: &[u8], flags: u64) -> u64 {
         return ENOENT;
     };
     if flags & O_DIRECTORY != 0 && !matches!(kind, FdKind::Dir(_)) {
+        if let FdKind::Proc { buf, .. } = kind {
+            kalloc::free_frame(buf);
+        }
         return ENOTDIR;
     }
     let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
     let Some(oi) = ofds.iter().position(Option::is_none) else {
+        if let FdKind::Proc { buf, .. } = kind {
+            kalloc::free_frame(buf);
+        }
         return EMFILE;
     };
     let Some(fi) = fdt(t).fds.iter().position(Option::is_none) else {
+        if let FdKind::Proc { buf, .. } = kind {
+            kalloc::free_frame(buf);
+        }
         return EMFILE;
     };
     ofds[oi] = Some(OpenFile {
@@ -5102,6 +5522,7 @@ pub fn fd_lseek(fd: u64, off: i64, whence: u64) -> u64 {
     }
     let dlen = match &o.kind {
         FdKind::File(d) => d.len(),
+        FdKind::Proc { len, .. } => *len,
         FdKind::Ram(i) => match vfile(*i) {
             Some(v) => v.len,
             None => return EBADF,
@@ -5140,6 +5561,7 @@ pub fn fd_pread(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
     }
     let (data, dlen) = match &o.kind {
         FdKind::File(d) => (d.as_ptr(), d.len()),
+        FdKind::Proc { buf, len } => (*buf as *const u8, *len),
         FdKind::Ram(i) => match vfile(*i) {
             Some(v) => (v.data as *const u8, v.len),
             None => return EBADF,
@@ -5352,6 +5774,10 @@ fn ofd_release(oi: usize) {
     }
     if let FdKind::Tcp(i) = kind {
         tcp_sock_close(i);
+    }
+    if let FdKind::Proc { buf, .. } = kind {
+        // The rendered snapshot frame — OFD-owned, freed with it.
+        kalloc::free_frame(buf);
     }
     if let FdKind::Ram(i) = kind {
         // unlinked-while-open storage dies with its last OFD; a
@@ -5605,8 +6031,8 @@ fn ofd_revents(oi: u8, events: u16) -> u16 {
             }
         }
         FdKind::Console => POLLOUT,
-        // File and dir reads never block (EOF reads return 0).
-        FdKind::File(_) | FdKind::Dir(_) => POLLIN,
+        // File, dir and proc reads never block (EOF reads return 0).
+        FdKind::File(_) | FdKind::Dir(_) | FdKind::Proc { .. } => POLLIN,
         // A RAM file is a regular file: reads never block at EOF and
         // writes never block — Linux polls both ready always.
         FdKind::Ram(_) => POLLIN | POLLOUT,
@@ -8445,6 +8871,58 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
     add(dpath, &mut names, &mut n, b"proc");
     add(dpath, &mut names, &mut n, b"proc/self");
     add(dpath, &mut names, &mut n, b"proc/self/exe");
+    // /proc enumeration — task slots can't be reaped mid-syscall, so
+    // the pid set is stable across this pass. pidbuf backs the
+    // rendered pid names names[] borrows; files under a pid dir are
+    // the static PROC_TFILES leaves.
+    let mut pidbuf = [[0u8; 26]; MAX_TASKS];
+    if dpath == b"proc" {
+        for f in PROC_GFILES {
+            if n < names.len() && !names[..n].iter().flatten().any(|e| *e == f) {
+                names[n] = Some(f);
+                n += 1;
+            }
+        }
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        for (i, pb) in pidbuf.iter_mut().enumerate() {
+            let Some(t) = tasks[i].as_ref() else { continue };
+            // Render "proc/<pid>" into pidbuf and feed it through
+            // add() so the pid component lands like any other name.
+            let b = &mut *pb;
+            b[..5].copy_from_slice(b"proc/");
+            let mut m = 5usize;
+            let mut v = t.pid;
+            let mut d = [0u8; 20];
+            let mut dl = 0usize;
+            loop {
+                d[dl] = b'0' + (v % 10) as u8;
+                v /= 10;
+                dl += 1;
+                if v == 0 {
+                    break;
+                }
+            }
+            while dl > 0 {
+                dl -= 1;
+                b[m] = d[dl];
+                m += 1;
+            }
+            add(dpath, &mut names, &mut n, &pb[..m]);
+        }
+    } else if dpath
+        .strip_prefix(b"proc/")
+        .and_then(proc_pid_slot)
+        .is_some()
+    {
+        // A live pid dir — its children are the bare leaf names,
+        // pushed directly (add() extracts components of FULL paths).
+        for f in PROC_TFILES {
+            if n < names.len() {
+                names[n] = Some(f);
+                n += 1;
+            }
+        }
+    }
     if let Some(arc) = unsafe { *core::ptr::addr_of!(INITRD) } {
         for (name, _data) in crate::cpio::entries(arc) {
             add(dpath, &mut names, &mut n, name);
@@ -9247,6 +9725,8 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         did_exec: false, // fork resets the child-exec'd flag
         stop_sig: 0,
         cont_report: false,
+        start_ticks: crate::apic::TICKS
+            .load(core::sync::atomic::Ordering::Relaxed),
     };
     // Either failure frees the (possibly partial) user page-table
     // tree + pml4 — NOT reap(): child's fd slots name OFDs whose refs
@@ -9399,6 +9879,8 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         did_exec: false,
         stop_sig: 0,
         cont_report: false,
+        start_ticks: crate::apic::TICKS
+            .load(core::sync::atomic::Ordering::Relaxed),
     };
     if c.tgid == 0 {
         c.tgid = c.pid; // a non-THREAD clone leads its own group

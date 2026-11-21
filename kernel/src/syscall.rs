@@ -721,11 +721,13 @@ fn sys_readlink(path: u64, buf: u64, len: u64) -> u64 {
         Ok(n) => n,
         Err(e) => return e,
     };
-    if &name[..n] == b"/proc/self/exe" {
-        user::read_proc_self_exe(buf, len)
-    } else {
-        ENOENT
+    if name[..n].starts_with(b"/proc/") {
+        return match user::proc_readlink(&name[1..n], buf, len) {
+            x if x == usize::MAX as u64 => ENOENT,
+            x => x,
+        };
     }
+    ENOENT
 }
 
 /// readlinkat(dirfd, path, buf, len): canon resolves dirfd/cwd —
@@ -740,11 +742,13 @@ fn sys_readlinkat(dirfd: u64, path: u64, buf: u64, len: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    if &cb[..cn] == b"proc/self/exe" {
-        user::read_proc_self_exe(buf, len)
-    } else {
-        ENOENT
+    if cb[..cn].starts_with(b"proc/") {
+        return match user::proc_readlink(&cb[..cn], buf, len) {
+            x if x == usize::MAX as u64 => ENOENT,
+            x => x,
+        };
     }
+    ENOENT
 }
 
 /// write(fd, buf, len): console fds only, buffer fully validated
