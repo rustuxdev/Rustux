@@ -1687,3 +1687,27 @@ CVE-2011-1020 (procfs tree access not restricted after setuid
 exec, public exploit) recorded n/a-by-construction — Rustux has
 no uids or privilege boundary for the missing check to cross.
 CVE ledger: 104.
+
+## run-98: real-tool verification — sysinfo + lstat/proc-link fixes
+
+bbtest now drives the real static busybox through the new procfs:
+ps, free, uptime, top, df, cat cpuinfo, and 'ls -l /proc/self/fd'.
+ps/top/uptime/df/cpuinfo worked immediately against run-97 procfs
+(ps lists every live task with real TIME; df prints the rustux mount
+row). Two real kernel bugs surfaced and were fixed:
+- sys_sysinfo wrote totalram=0 and left mem_unit uninitialized, so
+  busybox free computed totalram*mem_unit on a garbage multiplier.
+  Now zeroes the 112-byte struct then fills uptime, totalram
+  (total_frames*4096), freeram, procs (live task count), mem_unit=1.
+- lstat followed proc links, so 'ls -l fd/' printed target modes and
+  no 'name -> target' arrows. newfstatat takes a nofollow flag; lstat
+  and AT_SYMLINK_NOFOLLOW (0x100) now report S_IFLNK|0777 with the
+  link-target length as st_size for self/exe/cwd/root/fd/<n>. stat
+  (follow) is unchanged — still resolves to the target OFD shape.
+iotest suite 0 failures; bbtest 0 failures; 42 tasks, frames
+108611 -> 108611 (zero leak), exit 33 on WSL and native VM.
+Audit run-72 (quick, scoped to the two functions + dispatch): 0
+confirmed findings. cve.now: no directly-applicable sysinfo/stat
+entries; the copyout-uninit infoleak class (CVE-2022-50531,
+CVE-2024-35849, CVE-2023-53798 — unrelated drivers) is the
+defensive pattern the new zero-fill already follows. Ledger: 104.
