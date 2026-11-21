@@ -3,8 +3,10 @@
 /esp.img
 /esp-bash.img
 /esp-ttout.img
+/esp-demo.img
 /initrd-bash.cpio
 /initrd-ttout.cpio
+/initrd-demo.cpio
 **/.rust-anything/
 
 __pycache__/

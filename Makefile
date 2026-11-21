@@ -144,10 +144,42 @@ run-ttout: $(ESP_TOUT)
 		-snapshot \
 		-serial stdio -display none \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		-no-reboot
+
+INITRD_DEMO := initrd-demo.cpio
+ESP_DEMO    := esp-demo.img
+
+# Scripted bash demo for docs/assets/rustux-bash.gif: demodrv is the
+# solo task — it prints the interactive prompt + "typed" lines and
+# execs real /bin/bash -c per command, so every output byte is real
+# bash under real fork/exec/ld.so. (Headless QEMU 8.2.2 cannot feed
+# UART input while a capture channel is up, so the session is
+# scripted guest-side; live input is proven by run-bash.)
+$(INITRD_DEMO): kernel/user/demodrv.elf kernel/user/bash kernel/user/busybox kernel/user/libtinfo.so.6 kernel/user/motd.txt tools/mkinitrd.py /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6
+	python3 tools/mkinitrd.py kernel/user/demodrv.elf demodrv kernel/user/bash bin/bash kernel/user/busybox bin/busybox /lib64/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6 lib/x86_64-linux-gnu/libc.so.6 kernel/user/libtinfo.so.6 lib/x86_64-linux-gnu/libtinfo.so.6 kernel/user/motd.txt motd.txt > $@
+
+$(ESP_DEMO): $(KERNEL) $(INITRD_DEMO)
+	dd if=/dev/zero of=$@ bs=1M count=64
+	mformat -i $@ ::
+	mmd -i $@ ::/EFI
+	mmd -i $@ ::/EFI/BOOT
+	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(INITRD_DEMO) ::/initrd.cpio
+
+run-demo: $(ESP_DEMO)
+	$(QEMU) \
+		-machine q35 \
+		-m 512M \
+		-cpu qemu64,+rdrand \
+		-bios $(OVMF) \
+		-drive file=$(ESP_DEMO),format=raw,if=ide \
+		-snapshot \
+		-serial stdio -display none \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 		-no-reboot; \
 	status=$$?; \
-	if [ $$status -eq 33 ]; then echo "ttout test: PASS (qemu exit 33)"; \
-	else echo "ttout test: FAIL (qemu exit $$status)"; exit 1; fi
+	if [ $$status -eq 33 ]; then echo "demo: PASS (qemu exit 33)"; \
+	else echo "demo: FAIL (qemu exit $$status)"; exit 1; fi
 
 clean:
 	cargo clean
