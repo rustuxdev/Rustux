@@ -1821,3 +1821,30 @@ f_flags/f_spare offsets. busybox df now prints real numbers
 assertions on both superblocks, ENOENT, fd-kind routing.
 42 tasks, frames 108589 -> 108589 zero leak, exit 33.
 Audit run-76 (quick, scoped): 0 confirmed. Ledger: 110.
+
+run-103 — real VFS symlinks: a link is a VFile whose bytes are the
+raw target text (is_link flag; no NUL). resolve_links() is a Linux
+namei-style iterative rewriter — every component prefix naming a
+link swaps for canon(link's-dir + target), absolute targets ignore
+the dir, 40-hop cap -> ELOOP; `last` controls whether the final
+component follows (lstat/readlink/unlink never, everything else
+always). syscall(88)/symlinkat(266) mint links where a file could
+be created — parent dir real, name free, proc EROFS, empty target
+ENOENT. Hooks: fd_open (O_NOFOLLOW -> ELOOP, CREAT|EXCL -> EEXIST,
+plain O_CREAT through a dangling link mints the TARGET), newfstatat
+(lstat reports S_IFLNK|0777 + st_size=target length, vfile-space
+st_ino), fs_unlink/fs_rename/fs_truncate/fs_mkdir/fs_rmdir/
+sys_chdir/statfs_path/sys_access/sys_execve/interp_load/
+inotify_add_watch, getdents DT_LNK(10). proc_readlink retired —
+fs_readlink covers vfile + proc links and splits EINVAL(existing
+non-link)/ENOENT properly. Audit caught a REAL overflow: fs_rename
+length-checked the UNRESOLVED new name — a resolved name past the
+128-byte name slot would panic the copy; now checked post-resolve.
+iotest +39 checks: create/readlink/lstat/stat/open/O_NOFOLLOW/
+EEXIST/EINVAL, dangling (lstat-visible, stat ENOENT, CREAT mints),
+relative targets + link-to-dir 2-hop, chdir-through-link,
+symlinkat/readlinkat FDCWD, self+mutual ELOOP, rename-the-link,
+truncate-follows, unlink-leaves-target, bad-parent/empty-target
+errnos, getdents d_type. 42 tasks, frames 108587 -> 108587 zero
+leak, exit 33. Audit run-77 (quick, scoped): 1 confirmed fixed
+pre-commit. Ledger: 110.

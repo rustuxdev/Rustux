@@ -71,7 +71,9 @@ ones via `PT_INTERP`/ld.so — a 120+-call syscall surface covering
 trampoline — including queued signals (`sigqueue`/`sigqueueinfo`,
 `SA_SIGINFO` siginfo_t with real `si_code`/`si_pid`/`si_value`),
 `brk`/anonymous and file-backed `mmap`/`munmap`/`mprotect`,
-a hierarchical VFS with a generated `/proc` (per-pid
+a hierarchical VFS with real symlinks (`symlink`/`symlinkat`,
+`readlink`, `lstat` `S_IFLNK`, relative/absolute targets,
+ELOOP-bounded resolution) and a generated `/proc` (per-pid
 `stat`/`status`/`comm`/`cmdline`/`statm`/`fd`/`fdinfo`, the
 `exe`/`cwd`/`root`/`self` links, real utime/stime accounting,
 `uptime`/`meminfo`/`loadavg`/`stat`/`cpuinfo`/`mounts`),
