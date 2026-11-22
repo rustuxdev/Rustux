@@ -61,7 +61,7 @@ const KSTACK_SIZE: usize = 16384;
 /// the vm_max_map_count analog: mmap/mprotect splits consume slots,
 /// brk/ELF/stack hold permanent ones. Overflow fails the op (ENOMEM),
 /// never silently maps unvalidated VA.
-// Sized for the NT module ledger's own ceiling: NT_MAX_MODS=8
+// Sized for the NT module ledger's own ceiling: NT_MAX_MODS=16
 // images of ~11 mapped sections each + the exe's + system VMAs.
 const MAX_RANGES: usize = 128;
 
@@ -2370,7 +2370,7 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
     // run before the image executes, and both honestly fail the load.
     // The exe's dep mask is unused: implicitly loaded deps live for
     // the process's span and sweep with it.
-    let mut exe_deps = 0u8;
+    let mut exe_deps = 0u32;
     if !pe_apply_relocs(t, p) || !pe_resolve_imports(t, p, true, 0, &mut exe_deps) {
         return false;
     }
@@ -2471,7 +2471,7 @@ fn pe_apply_relocs(t: &mut Task, p: &crate::pe::Pe) -> bool {
 /// (base, span, dep_mask, entry_va) — dep_mask marks the
 /// module-ledger slots this image bound imports against. `depth`
 /// bounds recursive dependent-DLL loads.
-fn pe_map_image(t: &mut Task, img: &[u8], depth: u8) -> Option<(u64, u64, u8, u64)> {
+fn pe_map_image(t: &mut Task, img: &[u8], depth: u8) -> Option<(u64, u64, u32, u64)> {
     let mut p = crate::pe::parse(img)?;
 
     let size = (p.size + 0xfff) & !0xfff;
@@ -2489,7 +2489,7 @@ fn pe_map_image(t: &mut Task, img: &[u8], depth: u8) -> Option<(u64, u64, u8, u6
         }
     }
     p.bias = base;
-    let mut deps = 0u8;
+    let mut deps = 0u32;
     let mut mapped_hi = base + PAGE;
     let ok = (|| {
         map_page(t, base, USER | NX)?;
@@ -2580,8 +2580,8 @@ fn pe_map_image(t: &mut Task, img: &[u8], depth: u8) -> Option<(u64, u64, u8, u6
 /// DllMain(DLL_PROCESS_DETACH) pending (the FreeLibrary thunk drains
 /// these descending — importer first), 3 = detached, awaiting the
 /// finalize unmap.
-const NT_MAX_MODS: usize = 8;
-static mut NT_MODS: [(u64, u64, u64, u64, u64, u8, [u8; 32], u8, u8);
+const NT_MAX_MODS: usize = 16;
+static mut NT_MODS: [(u64, u64, u64, u64, u64, u8, [u8; 32], u32, u8);
     NT_MAX_MODS] = [(0, 0, 0, 0, 0, 0, [0; 32], 0, 0); NT_MAX_MODS];
 
 /// Find a live module for the caller's process by name.
@@ -2609,7 +2609,7 @@ fn nt_mod_add(
     size: u64,
     entry: u64,
     name: &[u8],
-    dep_mask: u8,
+    dep_mask: u32,
 ) -> bool {
     if name.is_empty() || name.len() > 32 {
         return false;
@@ -2807,7 +2807,7 @@ pub fn nt_next_attach() -> u64 {
 
 /// Release the dep refs a failed or aborted load claimed — mirror
 /// of the cascade in nt_mod_refdown for the not-yet-ledgered case.
-fn nt_deps_release(mask: u8) {
+fn nt_deps_release(mask: u32) {
     for d in 0..NT_MAX_MODS {
         if mask & (1 << d) != 0 {
             nt_mod_refdown(d);
@@ -2936,7 +2936,7 @@ pub fn nt_free_dll(hmod: u64) -> u64 {
     for (k, e) in tab.iter().enumerate() {
         sim[k] = if e.0 == owner { e.3 } else { 0 };
     }
-    let mut marked = 0u8;
+    let mut marked = 0u32;
     let mut stack = [0usize; NT_MAX_MODS];
     let mut sp = 0;
     if tab[i].8 < 2 {
@@ -3048,7 +3048,7 @@ pub fn nt_thr_enum(prev: u64, dir: u64) -> u64 {
             None => return 0,
         }
     };
-    let live = |e: &(u64, u64, u64, u64, u64, u8, [u8; 32], u8, u8)| {
+    let live = |e: &(u64, u64, u64, u64, u64, u8, [u8; 32], u32, u8)| {
         if e.0 == owner && e.1 != 0 && e.8 == 0 {
             Some(e.1)
         } else {
@@ -3080,7 +3080,7 @@ pub fn nt_detach_fin() -> u64 {
     let Some(t) = mm_owner_mut() else { return 0 };
     let owner = t.pid;
     let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
-    let mut marked = 0u8;
+    let mut marked = 0u32;
     for (k, e) in tab.iter().enumerate() {
         if e.3 != 0 && e.0 == owner && e.8 >= 2 {
             marked |= 1 << k;
@@ -5456,7 +5456,7 @@ fn pe_resolve_imports(
     p: &crate::pe::Pe,
     primary: bool,
     depth: u8,
-    dep_mask: &mut u8,
+    dep_mask: &mut u32,
 ) -> bool {
     // Stub pages map unconditionally — import thunks and the TLS
     // callback trampoline both live there.
