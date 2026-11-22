@@ -1394,6 +1394,8 @@ pub struct Task {
     /// hold nt::NTH_* object tags. Fork copies it (a cloned
     /// handle stays open in the child like DuplicateHandle).
     nth: [u8; crate::nt::MAX_NTH],
+    /// The task fd a NTH_FILE handle slot owns (0xff = none).
+    nth_fd: [u8; crate::nt::MAX_NTH],
     /// NT anonymous-VM bump cursor — NtAllocateVirtualMemory
     /// hands out pages upward from NT_ALLOC_VA.
     nt_alloc: u64,
@@ -1430,6 +1432,11 @@ pub struct Task {
 /// fds name the same descriptions — same offsets, same refs —
 /// exactly like Linux's files_struct sharing of struct file.
 static mut OFDS: [Option<OpenFile>; MAX_OFDS] = [const { None }; MAX_OFDS];
+/// Per-OFD delete-pending — Windows FileDispositionInformation.
+/// An OFD flagged here unlinks its vfile at last close, the
+/// FILE_DELETE_ON_CLOSE semantic (POSIX unlink-while-open falls
+/// out of vfile_remove's live-OFD check for free).
+static mut OFD_DEL: [u8; MAX_OFDS] = [0; MAX_OFDS];
 
 /// A task fd table — the files_struct analogue. The table is the OFD
 /// owner: users counts referencing TASKS, and each fd slot points at
@@ -2289,6 +2296,25 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
         return false;
     }
     k32_data_init(t);
+    // The fixed PE regions are real user mappings — register them
+    // in the ranges ledger like the image sections so range_ok's
+    // VMA gate covers the data page a CreateFileA thunk names.
+    for r in [
+        (crate::pe::PEB_VA, crate::pe::PEB_VA + 0x1000, RNG_R | RNG_W),
+        (crate::pe::TEB_VA, crate::pe::TEB_VA + 0x1000, RNG_R | RNG_W),
+        (crate::pe::STUB_VA, crate::pe::STUB_DATA_VA, RNG_R | RNG_X),
+        (
+            crate::pe::STUB_DATA_VA,
+            crate::pe::STUB_DATA_VA + 0x1000,
+            RNG_R | RNG_W,
+        ),
+    ] {
+        if t.nranges >= MAX_RANGES {
+            return false;
+        }
+        t.ranges[t.nranges] = r;
+        t.nranges += 1;
+    }
     t.pers = PERS_NT;
     t.gs_base = crate::pe::TEB_VA;
     t.nt_alloc = NT_ALLOC_VA;
@@ -2298,6 +2324,7 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
     // zeroed first: exec reuses the task and must not leak a prior
     // image's handles into the new one.
     t.nth = [0; crate::nt::MAX_NTH];
+    t.nth_fd = [0xff; crate::nt::MAX_NTH];
     t.nth[0] = crate::nt::NTH_STDIN;
     t.nth[1] = crate::nt::NTH_STDOUT;
     t.nth[2] = crate::nt::NTH_STDERR;
@@ -2378,12 +2405,24 @@ struct Emit<'a> {
 }
 impl<'a> Emit<'a> {
     fn raw(&mut self, s: &[u8]) {
+        if self.n + s.len() > self.b.len() {
+            // Overflow poisons the count — k32_emit's caller maps
+            // a count past the buffer to an honest load failure
+            // rather than a kernel panic on image input.
+            self.n = self.b.len() + 1;
+            return;
+        }
         self.b[self.n..self.n + s.len()].copy_from_slice(s);
         self.n += s.len();
     }
     /// mov rax, imm64
     fn rax_imm(&mut self, v: u64) {
         self.raw(&[0x48, 0xb8]);
+        self.raw(&v.to_le_bytes());
+    }
+    /// mov rdx, imm64
+    fn rdx_imm(&mut self, v: u64) {
+        self.raw(&[0x48, 0xba]);
         self.raw(&v.to_le_bytes());
     }
     /// jcc rel8 (cc = low nibble of 0x70|cc) with a fix-up slot.
@@ -2467,6 +2506,172 @@ fn emit_strlen_rcx(e: &mut Emit) {
         0x48, 0xf7, 0xd1, //                not rcx
         0x48, 0xff, 0xc9, //                dec rcx  (len, sans NUL)
         0x5f, //                            pop rdi
+    ]);
+}
+
+/// Emit the 5-arg NtQueryInformationFile call inside a frame that
+/// already stashed the handle at [rsp+0x60]: iosb at [rsp+0x10],
+/// info buffer at [rsp+buf], `len`/`class` immediate. Ends with
+/// syscall + `test eax,eax` — caller emits the branch.
+fn emit_qinfo(e: &mut Emit, buf: u8, len: u8, class: u8) {
+    e.raw(&[
+        0x4c, 0x8b, 0x54, 0x24, 0x60, // mov r10,[rsp+0x60] h
+        0x48, 0x8d, 0x54, 0x24, 0x10, // lea rdx,[rsp+0x10] iosb
+        0x4c, 0x8d, 0x44, 0x24, buf, //  lea r8,[rsp+buf]
+        0x41, 0xb9, len, 0, 0, 0, //    mov r9d,len
+        0x48, 0xc7, 0x44, 0x24, 0x28, class, 0, 0, 0, // [+0x28]=class
+        0xb8, 0x11, 0, 0, 0, //         mov eax,0x11
+        0x0f, 0x05, //                  syscall
+        0x85, 0xc0, //                  test eax,eax
+    ]);
+}
+
+/// Emit the shared CreateFileA/W body: a 0xc8 frame carrying the
+/// UNICODE_STRING + OBJECT_ATTRIBUTES + 7 stack args for the 11-arg
+/// NtCreateFile. `wide` skips the ANSI->UTF-16 conversion (buf is
+/// then the caller's W name; A converts into data+0x400, capped at
+/// 126 chars). Returns the minted handle or -1 with the raw
+/// NTSTATUS in TEB.LastError (Win32-code mapping is a divergence).
+fn emit_openpath(e: &mut Emit, wide: bool, d: u64, delete: bool) {
+    e.raw(&[
+        0x48, 0x81, 0xec, 0xc8, 0, 0, 0, // sub rsp,0xc8
+        0x48, 0x89, 0x4c, 0x24, 0x60, //   mov [rsp+0x60],rcx name
+    ]);
+    if delete {
+        // DeleteFileA/W(name): open GENERIC_READ, share 0,
+        // OPEN_EXISTING, attr 0 — all constant.
+        e.raw(&[
+            0x48, 0xc7, 0x44, 0x24, 0x68, 0, 0, 0, 0x80, // access
+            0x48, 0xc7, 0x44, 0x24, 0x70, 0, 0, 0, 0, //    share
+            0x48, 0xc7, 0x44, 0x24, 0x78, 3, 0, 0, 0, //    disp
+            0x48, 0xc7, 0x84, 0x24, 0x80, 0, 0, 0, 0, 0, 0, 0, // attr
+        ]);
+    } else {
+        e.raw(&[
+            0x48, 0x89, 0x54, 0x24, 0x68, //   mov [rsp+0x68],rdx access
+            0x4c, 0x89, 0x44, 0x24, 0x70, //   mov [rsp+0x70],r8  share
+            0x48, 0x8b, 0x84, 0x24, 0xf0, 0, 0, 0, // mov rax,[rsp+0xf0] disp
+            0x48, 0x89, 0x44, 0x24, 0x78, //   mov [rsp+0x78],rax
+            0x48, 0x8b, 0x84, 0x24, 0xf8, 0, 0, 0, // mov rax,[rsp+0xf8] attr
+            0x48, 0x89, 0x84, 0x24, 0x80, 0, 0, 0, // mov [rsp+0x80],rax
+        ]);
+    }
+    e.raw(&[
+        0x48, 0x8b, 0x4c, 0x24, 0x60, //   mov rcx,[rsp+0x60] name
+        0x31, 0xc0, //                     xor eax,eax
+    ]);
+    if wide {
+        // wcslen: chars*2 = byte length; buf = name itself.
+        let lp = e.n;
+        e.raw(&[0x66, 0x83, 0x3c, 0x41, 0x00]); // cmp word[rcx+rax*2],0
+        let dn = e.jcc(0x4); //                   je done
+        e.raw(&[0x48, 0x83, 0xc0, 0x01]); //     add rax,1
+        let back = e.jmp8();
+        e.b[back] = (lp as i64 - back as i64 - 1) as i8 as u8;
+        e.fix(dn);
+        e.raw(&[
+            0x48, 0x89, 0xca, // mov rdx,rcx       buf=name
+            0x48, 0xd1, 0xe0, // shl rax,1         chars->bytes
+        ]);
+    } else {
+        // ANSI->UTF-16 into the 256B scratch at d+0x400.
+        e.rdx_imm(d + 0x400);
+        let lp = e.n;
+        e.raw(&[
+            0x44, 0x0f, 0xb6, 0x1c, 0x01, // movzx r11d,byte[rcx+rax]
+            0x66, 0x44, 0x89, 0x1c, 0x42, // mov [rdx+rax*2],r11w
+            0x45, 0x84, 0xdb, //           test r11b,r11b
+        ]);
+        let dn = e.jcc(0x4); // je done
+        e.raw(&[
+            0x48, 0xff, 0xc0, // inc rax
+            0x48, 0x83, 0xf8, 0x7e, // cmp rax,0x7e  (126-char cap)
+        ]);
+        let capped = e.jcc(0x3); // jae done
+        let back = e.jmp8();
+        e.b[back] = (lp as i64 - back as i64 - 1) as i8 as u8;
+        e.fix(dn);
+        e.fix(capped);
+        e.raw(&[
+            0x66, 0xc7, 0x04, 0x42, 0x00, 0x00, // mov word[rdx+rax*2],0
+            0x48, 0xd1, 0xe0, //                 shl rax,1
+        ]);
+    }
+    e.raw(&[
+        // UNICODE_STRING at [rsp+0x88]: {len, cap, pad, buf}
+        0x66, 0x89, 0x84, 0x24, 0x88, 0, 0, 0, // mov [rsp+0x88],ax len
+        0x66, 0x89, 0x84, 0x24, 0x8a, 0, 0, 0, // mov [rsp+0x8a],ax cap
+        0xc7, 0x84, 0x24, 0x8c, 0, 0, 0, 0, 0, 0, 0, // [rsp+0x8c]=0
+        0x48, 0x89, 0x94, 0x24, 0x90, 0, 0, 0, // mov [rsp+0x90],rdx buf
+        // OBJECT_ATTRIBUTES at [rsp+0x98]
+        0xc7, 0x84, 0x24, 0x98, 0, 0, 0, 0x30, 0, 0, 0, // oa.len=48
+        0x48, 0xc7, 0x84, 0x24, 0xa0, 0, 0, 0, 0, 0, 0, 0, // root=0
+        0x48, 0x8d, 0x84, 0x24, 0x88, 0, 0, 0, // lea rax,[rsp+0x88]
+        0x48, 0x89, 0x84, 0x24, 0xa8, 0, 0, 0, // oa.name=&us
+        0xc7, 0x84, 0x24, 0xb0, 0, 0, 0, 0, 0, 0, 0, // oa.attrs=0
+        0x48, 0xc7, 0x84, 0x24, 0xb8, 0, 0, 0, 0, 0, 0, 0, // sd=0
+        0x48, 0xc7, 0x84, 0x24, 0xc0, 0, 0, 0, 0, 0, 0, 0, // sqos=0
+        0x48, 0xc7, 0x44, 0x24, 0x08, 0, 0, 0, 0, // hout=0
+        0x48, 0xc7, 0x44, 0x24, 0x10, 0, 0, 0, 0, // iosb=0
+        0x48, 0xc7, 0x44, 0x24, 0x18, 0, 0, 0, 0,
+        0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0, // a4 allocsize=0
+        0x48, 0x8b, 0x84, 0x24, 0x80, 0, 0, 0, // mov rax,[rsp+0x80] attr
+        0x48, 0x89, 0x44, 0x24, 0x30, //               a5 attr
+        0x48, 0x8b, 0x44, 0x24, 0x70, //         mov rax,[rsp+0x70] share
+        0x48, 0x89, 0x44, 0x24, 0x38, //               a6 share
+        0x48, 0x8b, 0x44, 0x24, 0x78, //         mov rax,[rsp+0x78] disp
+        0x48, 0x89, 0x44, 0x24, 0x40, //               a7 disp
+        0x48, 0xc7, 0x44, 0x24, 0x48, 0, 0, 0, 0, // a8 options=0
+        0x48, 0xc7, 0x44, 0x24, 0x50, 0, 0, 0, 0, // a9 ea=0
+        0x48, 0xc7, 0x44, 0x24, 0x58, 0, 0, 0, 0, // a10 ealen=0
+        0x4c, 0x8d, 0x54, 0x24, 0x08, //        lea r10,[rsp+0x08] &hout
+        0x48, 0x8b, 0x54, 0x24, 0x68, //        mov rdx,[rsp+0x68] access
+        0x4c, 0x8d, 0x84, 0x24, 0x98, 0, 0, 0, // lea r8,[rsp+0x98] &oa
+        0x4c, 0x8d, 0x4c, 0x24, 0x10, //        lea r9,[rsp+0x10] &iosb
+        0xb8, 0x55, 0, 0, 0, //                 mov eax,0x55
+        0x0f, 0x05, //                          syscall
+        0x85, 0xc0, //                          test eax,eax
+    ]);
+    let fail = e.jcc(0x8); // js fail
+    if delete {
+        // Open succeeded: FileDispositionInformation(TRUE) then
+        // NtClose — the file unlinks when the handle drops.
+        e.raw(&[
+            0x48, 0x8b, 0x44, 0x24, 0x08, // mov rax,[rsp+0x08] h
+            0x48, 0x89, 0x84, 0x24, 0x88, 0, 0, 0, // [rsp+0x88]=h stash
+            0xc6, 0x84, 0x24, 0x90, 0, 0, 0, 1, // mov byte[rsp+0x90],1
+            0x4c, 0x8b, 0x94, 0x24, 0x88, 0, 0, 0, // mov r10,[+0x88] h
+            0x48, 0x8d, 0x54, 0x24, 0x10, //   lea rdx,[rsp+0x10] iosb
+            0x4c, 0x8d, 0x84, 0x24, 0x90, 0, 0, 0, // lea r8,[+0x90] &bool
+            0x41, 0xb9, 0x01, 0, 0, 0, //    mov r9d,1
+            0x48, 0xc7, 0x44, 0x24, 0x28, 0x0d, 0, 0, 0, // [+0x28]=13
+            0xb8, 0x27, 0, 0, 0, //         mov eax,0x27
+            0x0f, 0x05, //                  syscall
+            // Close either way — a failed mark still drops the handle.
+            0x4c, 0x8b, 0x94, 0x24, 0x88, 0, 0, 0, // mov r10,[+0x88]
+            0xb8, 0x0f, 0, 0, 0, //         mov eax,0x0f
+            0x0f, 0x05, //                  syscall
+            0xb8, 1, 0, 0, 0, //           mov eax,1
+            0x48, 0x81, 0xc4, 0xc8, 0, 0, 0, // add rsp,0xc8
+            0xc3,
+        ]);
+    } else {
+        e.raw(&[
+            0x48, 0x8b, 0x44, 0x24, 0x08, // mov rax,[rsp+0x08] hout
+            0x48, 0x81, 0xc4, 0xc8, 0, 0, 0, // add rsp,0xc8
+            0xc3,
+        ]);
+    }
+    e.fix(fail);
+    e.raw(&[0x65, 0x89, 0x04, 0x25, 0x68, 0, 0, 0]); // mov gs:[0x68],eax
+    if delete {
+        e.raw(&[0x31, 0xc0]); // xor eax,eax
+    } else {
+        e.raw(&[0x48, 0x83, 0xc8, 0xff]); // or rax,-1
+    }
+    e.raw(&[
+        0x48, 0x81, 0xc4, 0xc8, 0, 0, 0, // add rsp,0xc8
+        0xc3,
     ]);
 }
 
@@ -2628,6 +2833,137 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.fix(fail);
             e.raw(&[0x31, 0xc0, 0xc3]);
         }
+        // --- file API -------------------------------------------
+        // CloseHandle(h) -> NtClose; BOOL out.
+        b"CloseHandle" => {
+            e.raw(&[
+                0x4c, 0x8b, 0xd1, // mov r10,rcx
+                0xb8, 0x0f, 0, 0, 0, // mov eax,0x0f
+                0x0f, 0x05, //          syscall
+                0x85, 0xc0, //          test eax,eax
+            ]);
+            let fail = e.jcc(0x8); // js fail
+            e.raw(&[0xb8, 1, 0, 0, 0, 0xc3]); // mov eax,1; ret
+            e.fix(fail);
+            e.raw(&[0x31, 0xc0, 0xc3]);
+        }
+        // GetFileSizeEx(h,&out): NtQueryInformationFile
+        // FileStandardInformation(5) -> EndOfFile copied to *out.
+        b"GetFileSizeEx" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x68, // sub rsp,0x68
+                0x48, 0x89, 0x54, 0x24, 0x60, // mov [rsp+0x60],rdx
+                0x4c, 0x8b, 0xd1, //           mov r10,rcx
+                0x48, 0x8d, 0x54, 0x24, 0x10, // lea rdx,[rsp+0x10] iosb
+                0x4c, 0x8d, 0x44, 0x24, 0x48, // lea r8,[rsp+0x48] buf
+                0x41, 0xb9, 0x18, 0, 0, 0, //    mov r9d,24
+                0x48, 0xc7, 0x44, 0x24, 0x28, 0x05, 0, 0, 0, // [rsp+0x28]=5
+                0xb8, 0x11, 0, 0, 0, //         mov eax,0x11
+                0x0f, 0x05, //                  syscall
+                0x85, 0xc0, //                  test eax,eax
+            ]);
+            let fail = e.jcc(0x8);
+            e.raw(&[
+                0x48, 0x8b, 0x44, 0x24, 0x50, // mov rax,[rsp+0x50] eof
+                0x48, 0x8b, 0x4c, 0x24, 0x60, // mov rcx,[rsp+0x60] out
+                0x48, 0x89, 0x01, //           mov [rcx],rax
+                0xb8, 1, 0, 0, 0, //           mov eax,1
+                0x48, 0x83, 0xc4, 0x68, //     add rsp,0x68
+                0xc3,
+            ]);
+            e.fix(fail);
+            e.raw(&[
+                0x65, 0x89, 0x04, 0x25, 0x68, 0, 0, 0, // mov gs:[0x68],eax
+                0x31, 0xc0, //                         xor eax,eax
+                0x48, 0x83, 0xc4, 0x68, 0xc3, //        add rsp,0x68; ret
+            ]);
+        }
+        // SetFilePointerEx(h, li, out, method): method 0=BEGIN is a
+        // direct FilePositionInformation set; 1/2 compose
+        // current-pos/eof + li via NtQueryInformationFile first.
+        b"SetFilePointerEx" => {
+            let mut fails = [0usize; 4];
+            let mut nf = 0;
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x78, // sub rsp,0x78
+                0x48, 0x89, 0x4c, 0x24, 0x60, // mov [rsp+0x60],rcx h
+                0x4c, 0x89, 0x44, 0x24, 0x68, // mov [rsp+0x68],r8  out
+                0x48, 0x89, 0x54, 0x24, 0x70, // mov [rsp+0x70],rdx li
+                0x4d, 0x85, 0xc9, //           test r9,r9
+            ]);
+            let begin = e.jcc(0x4); // jz FILE_BEGIN
+            e.raw(&[0x49, 0x83, 0xf9, 0x01]); // cmp r9,1
+            let cur = e.jcc(0x4); //           je FILE_CURRENT
+            e.raw(&[0x49, 0x83, 0xf9, 0x02]); // cmp r9,2
+            fails[nf] = e.jcc(0x5); //         jne fail
+            nf += 1;
+            // FILE_END: query FileStandardInformation(24B).
+            emit_qinfo(&mut e, 0x48, 24, 5);
+            fails[nf] = e.jcc(0x8); // js fail
+            nf += 1;
+            e.raw(&[0x48, 0x8b, 0x44, 0x24, 0x50]); // mov rax,[+0x50] eof
+            let to_add1 = e.jmp8();
+            // FILE_CURRENT: query FilePositionInformation(8B).
+            e.fix(cur);
+            emit_qinfo(&mut e, 0x48, 8, 14);
+            fails[nf] = e.jcc(0x8);
+            nf += 1;
+            e.raw(&[0x48, 0x8b, 0x44, 0x24, 0x48]); // mov rax,[+0x48] pos
+            e.fix(to_add1);
+            e.raw(&[
+                0x48, 0x03, 0x44, 0x24, 0x70, // add rax,[rsp+0x70]
+            ]);
+            let to_set = e.jmp8();
+            // FILE_BEGIN: pos = li.
+            e.fix(begin);
+            e.raw(&[0x48, 0x8b, 0x44, 0x24, 0x70]); // mov rax,[+0x70]
+            // .set: store composed pos, NtSetInformationFile(14).
+            e.fix(to_set);
+            e.raw(&[
+                0x48, 0x89, 0x44, 0x24, 0x48, // mov [rsp+0x48],rax
+                0x4c, 0x8b, 0x54, 0x24, 0x60, // mov r10,[rsp+0x60] h
+                0x48, 0x8d, 0x54, 0x24, 0x10, // lea rdx,[rsp+0x10] iosb
+                0x4c, 0x8d, 0x44, 0x24, 0x48, // lea r8,[rsp+0x48] pos
+                0x41, 0xb9, 0x08, 0, 0, 0, //    mov r9d,8
+                0x48, 0xc7, 0x44, 0x24, 0x28, 0x0e, 0, 0, 0, // [+0x28]=14
+                0xb8, 0x27, 0, 0, 0, //         mov eax,0x27
+                0x0f, 0x05, //                  syscall
+                0x85, 0xc0, //                  test eax,eax
+            ]);
+            fails[nf] = e.jcc(0x8);
+            nf += 1;
+            e.raw(&[
+                0x48, 0x8b, 0x4c, 0x24, 0x68, // mov rcx,[rsp+0x68] out
+                0x48, 0x85, 0xc9, //           test rcx,rcx
+            ]);
+            let noout = e.jcc(0x4); // jz no out ptr
+            e.raw(&[
+                0x48, 0x8b, 0x44, 0x24, 0x48, // mov rax,[rsp+0x48]
+                0x48, 0x89, 0x01, //           mov [rcx],rax
+            ]);
+            e.fix(noout);
+            e.raw(&[
+                0xb8, 1, 0, 0, 0, // mov eax,1
+                0x48, 0x83, 0xc4, 0x78, 0xc3, // add rsp,0x78; ret
+            ]);
+            for f in fails.iter().take(nf) {
+                e.fix(*f);
+            }
+            e.raw(&[
+                0x65, 0x89, 0x04, 0x25, 0x68, 0, 0, 0, // mov gs:[0x68],eax
+                0x31, 0xc0, //                         xor eax,eax
+                0x48, 0x83, 0xc4, 0x78, 0xc3, //        add rsp,0x78; ret
+            ]);
+        }
+        // CreateFileA/W: build OBJECT_ATTRIBUTES+UNICODE_STRING in
+        // a local frame, ANSI names converted to UTF-16 in the data
+        // page's 256B name scratch. -> NtCreateFile; HANDLE or -1.
+        b"CreateFileA" => emit_openpath(&mut e, false, d, false),
+        b"CreateFileW" => emit_openpath(&mut e, true, d, false),
+        // DeleteFileA/W(name): same OA frame as CreateFile but
+        // constant args — open + FileDispositionInformation + close.
+        b"DeleteFileA" => emit_openpath(&mut e, false, d, true),
+        b"DeleteFileW" => emit_openpath(&mut e, true, d, true),
         // --- msvcrt startup ------------------------------------
         // __getmainargs(&argc,&argv,&envp,dowildcard,si).
         b"__getmainargs" => {
@@ -2910,7 +3246,7 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
         }
         _ => return None,
     }
-    Some(e.n)
+    (e.n <= e.b.len()).then_some(e.n)
 }
 
 /// msvcrt's DATA exports: the IAT slot must hold the variable's
@@ -2988,7 +3324,10 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
     if p.import_size == 0 {
         return true;
     }
-    if map_page(t, crate::pe::STUB_VA, USER | WRITE).is_none() {
+    if map_page(t, crate::pe::STUB_VA, USER | WRITE).is_none()
+        || map_page(t, crate::pe::STUB_VA + 0x1000, USER | WRITE)
+            .is_none()
+    {
         return false;
     }
     let mut stub_next = crate::pe::STUB_VA;
@@ -3060,7 +3399,7 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
                     continue;
                 }
             }
-            let mut buf = [0u8; 160];
+            let mut buf = [0u8; 512];
             let used = if k32 {
                 k32_emit(&mut buf, &fname[..fl])
             } else if fl != 0 {
@@ -3080,7 +3419,7 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
                 return false;
             };
             let used = ((used as u64) + 15) & !15;
-            if stub_next + used > crate::pe::STUB_VA + 0x1000
+            if stub_next + used > crate::pe::STUB_DATA_VA
                 || !write_task_bytes(t.pml4, stub_next, &buf[..used as usize])
             {
                 return false;
@@ -3096,8 +3435,9 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
         }
         i += 1;
     }
-    // Fill done — drop the stub page to read+execute.
+    // Fill done — drop the stub pages to read+execute.
     map_page(t, crate::pe::STUB_VA, USER);
+    map_page(t, crate::pe::STUB_VA + 0x1000, USER);
     true
 }
 
@@ -3274,6 +3614,7 @@ fn load(img: &[u8]) -> Option<Task> {
         pers: PERS_LINUX,
         gs_base: 0,
         nth: [0; crate::nt::MAX_NTH],
+        nth_fd: [0xff; crate::nt::MAX_NTH],
         nt_alloc: 0,
         stop_sig: 0,
         cont_report: false,
@@ -6012,18 +6353,69 @@ pub fn nt_handle_kind(h: u64) -> u8 {
     t.nth[h as usize - 1]
 }
 
-/// NtClose: drop the handle's slot. Free slots and out-of-range
-/// handles fail like a real INVALID_HANDLE.
+/// NtClose: drop the handle's slot — closing the fd an NTH_FILE
+/// slot owns first. Free slots and out-of-range handles fail
+/// like a real INVALID_HANDLE.
 pub fn nt_handle_close(h: u64) -> bool {
     let Some(t) = cur_mut() else { return false };
     if h == 0 || h > crate::nt::MAX_NTH as u64 {
         return false;
     }
-    let s = &mut t.nth[h as usize - 1];
-    if *s == 0 {
+    let i = h as usize - 1;
+    if t.nth[i] == 0 {
         return false;
     }
-    *s = 0;
+    if t.nth[i] == crate::nt::NTH_FILE {
+        fd_close(t.nth_fd[i] as u64);
+    }
+    t.nth[i] = 0;
+    t.nth_fd[i] = 0xff;
+    true
+}
+
+/// Bind the first free handle slot to task fd `fd` (NTH_FILE) and
+/// return its 1-based handle, or None when the table is full.
+pub fn nt_handle_alloc_file(fd: u64) -> Option<u64> {
+    let t = cur_mut()?;
+    for i in 0..crate::nt::MAX_NTH {
+        if t.nth[i] == 0 {
+            t.nth[i] = crate::nt::NTH_FILE;
+            t.nth_fd[i] = fd as u8;
+            return Some(i as u64 + 1);
+        }
+    }
+    None
+}
+
+/// The task fd an NTH_FILE handle resolves to.
+pub fn nt_handle_fd(h: u64) -> Option<u64> {
+    let t = cur_mut()?;
+    if h == 0 || h > crate::nt::MAX_NTH as u64 {
+        return None;
+    }
+    let i = h as usize - 1;
+    (t.nth[i] == crate::nt::NTH_FILE).then_some(t.nth_fd[i] as u64)
+}
+
+/// (size, OFD position, is-dir) for an open fd — the
+/// QueryInformationFile backing data.
+pub fn nt_file_info(fd: u64) -> Option<(u64, u64, bool)> {
+    let t = cur_mut()?;
+    let o = ofd(t, fd)?;
+    let (_, size, _) = ofd_stat_shape(&o.kind);
+    Some((size, o.pos as u64, matches!(o.kind, FdKind::Dir(_))))
+}
+
+/// Set or clear the delete-pending flag on fd's OFD — Windows
+/// FileDispositionInformation. Only regular vfiles can die;
+/// the flag is ignored elsewhere.
+pub fn nt_fd_delete_pending(fd: u64, on: bool) -> bool {
+    let Some(t) = cur_mut() else { return false };
+    let Some(&oi) = fdt(t).fds.get(fd as usize).and_then(|s| s.as_ref())
+    else {
+        return false;
+    };
+    unsafe { OFD_DEL[oi as usize] = on as u8 };
     true
 }
 
@@ -9208,6 +9600,14 @@ fn ofd_release(oi: usize) {
         _ => None,
     };
     if let Some(i) = ram_i {
+        // Delete-pending (Windows FileDispositionInformation): the
+        // vfile loses its name at last close; its storage lives on
+        // while other OFDs share it — unlink-while-open for free.
+        let del = unsafe { OFD_DEL[oi] };
+        if del != 0 {
+            unsafe { OFD_DEL[oi] = 0 };
+            vfile_remove(i);
+        }
         // inotify close events: CLOSE_WRITE iff the file was opened
         // for writing, CLOSE_NOWRITE otherwise (Linux's rule).
         if let Some(v) = vfile(i) {
@@ -13907,6 +14307,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         pers: p.pers,
         gs_base: p.gs_base,
         nth: p.nth,
+        nth_fd: p.nth_fd,
         nt_alloc: p.nt_alloc,
         stop_sig: 0,
         cont_report: false,
@@ -14072,6 +14473,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         pers: p.pers,
         gs_base: p.gs_base,
         nth: p.nth,
+        nth_fd: p.nth_fd,
         nt_alloc: p.nt_alloc,
         stop_sig: 0,
         cont_report: false,
