@@ -1618,6 +1618,8 @@ const VFILE_MAX: usize = 1 << 20;
 /// A scratch file: kmalloc'd contents + a fixed name slot. `unlinked`
 /// survives removal while fds still name it — Linux's open-unlink
 /// semantics: the OFD keeps working until its last close frees data.
+/// `is_link` marks a symlink: `data` then holds the raw target text
+/// (no NUL — readlink echoes bytes verbatim).
 struct VFile {
     name: [u8; 128],
     nlen: usize,
@@ -1625,6 +1627,7 @@ struct VFile {
     len: usize,
     cap: usize,
     unlinked: bool,
+    is_link: bool,
 }
 // SAFETY: VFILES slots own their buffers; single-CPU, IF-masked
 // context means no concurrent access. Raw ptr never escapes.
@@ -1663,6 +1666,7 @@ fn vfile_create(path: &[u8]) -> u64 {
         len: 0,
         cap: 0,
         unlinked: false,
+        is_link: false,
     };
     v.name[..path.len()].copy_from_slice(path);
     vs[i] = Some(v);
@@ -2120,7 +2124,10 @@ fn interp_load(t: &mut Task, e: &elf::Elf, img: &[u8]) -> Option<(u64, u64)> {
     };
     // The fs names archive members without the leading '/'.
     let name = path.strip_prefix(b"/").unwrap_or(path);
-    let iimg = fs_lookup(name)?;
+    // The interpreter may itself sit behind a link — follow fully;
+    // an unresolvable chain fails the exec like the ENOENT below.
+    let (rb, rn, _) = resolve_links(name, true).ok()?;
+    let iimg = fs_lookup(&rb[..rn])?;
     // Measure the span at a probe bias (bias-0 would fail parse's
     // entry-in-window check; the span itself is bias-independent),
     // first-fit a gap in the mmap arena, then map so the lowest
@@ -4178,7 +4185,14 @@ pub fn fs_mkdir(dfd: u64, path: &[u8]) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    let p = &buf[..n];
+    // Intermediates resolve — the dir to create inside may sit
+    // behind a link. The final component stays literal: an existing
+    // link there is EEXIST like Linux.
+    let (rb, rn, _) = match resolve_links(&buf[..n], false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let p = &rb[..rn];
     if p.len() > 128 {
         return ENAMETOOLONG_;
     }
@@ -4213,7 +4227,13 @@ pub fn fs_rmdir(dfd: u64, path: &[u8]) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    let p = &buf[..n];
+    // Intermediates resolve; the final component stays literal —
+    // rmdir on a link is ENOTDIR like Linux.
+    let (rb, rn, _) = match resolve_links(&buf[..n], false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let p = &rb[..rn];
     if is_file(p) {
         return ENOTDIR_;
     }
@@ -4258,19 +4278,24 @@ pub fn sys_chdir(path: &[u8]) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    if is_file(&buf[..n]) {
+    // chdir follows links all the way — cwd lands on the real dir.
+    let (rb, rn, _) = match resolve_links(&buf[..n], true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if is_file(&rb[..rn]) {
         return ENOTDIR_;
     }
-    if !dir_exists(&buf[..n]) {
+    if !dir_exists(&rb[..rn]) {
         return ENOENT;
     }
-    if n > 128 {
+    if rn > 128 {
         return (-36i64) as u64; // ENAMETOOLONG: cwd field is 128
     }
     let Some(t) = cur_mut() else { return EBADF };
     let f = fst(t);
-    f.cwd[..n].copy_from_slice(&buf[..n]);
-    f.cwdlen = n as u8;
+    f.cwd[..rn].copy_from_slice(&rb[..rn]);
+    f.cwdlen = rn as u8;
     0
 }
 
@@ -4428,6 +4453,12 @@ fn fill_statfs(buf: u64, proc: bool) {
 /// statfs(path, buf): cpath is the canonical path — ENOENT on a
 /// miss like Linux, proc paths report the procfs superblock.
 pub fn statfs_path(cpath: &[u8], buf: u64) -> u64 {
+    // statfs follows links — the mount underneath is what reports.
+    let (rb, rn, _) = match resolve_links(cpath, true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let cpath = &rb[..rn];
     if !fs_exists(cpath) {
         return ENOENT;
     }
@@ -5237,10 +5268,58 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
         return EFAULT;
     }
     let mut st = [0u64; 18];
+    // Link resolution: intermediates always; the final component
+    // follows only when statting (nofollow == lstat). A real VFile
+    // link under lstat reports S_IFLNK|0777 with the target length —
+    // the same shape the proc magic links take below.
+    let rbuf;
+    let rn;
+    if nofollow {
+        let (b, n, link) = match resolve_links(path, false) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        rbuf = b;
+        rn = n;
+        if link {
+            let Some(i) = vfile_find(&rbuf[..rn]) else {
+                return ENOENT;
+            };
+            let Some(v) = vfile(i) else { return ENOENT };
+            let arc_n = (unsafe { *core::ptr::addr_of!(INITRD) })
+                .map_or(0, |a| crate::cpio::entries(a).count());
+            let vidx = unsafe { &*core::ptr::addr_of!(VFILES) }[..i]
+                .iter()
+                .filter(|s| s.as_ref().is_some_and(|v| !v.unlinked))
+                .count();
+            st[1] = (arc_n + vidx + 1) as u64; // st_ino — vfile space
+            st[2] = 1;
+            st[3] = 0o120777; // S_IFLNK | 0777
+            st[6] = v.len as u64; // st_size = target length
+            st[7] = 4096;
+            // SAFETY: range_ok_w proved statbuf writable.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    st.as_ptr() as *const u8,
+                    statbuf as *mut u8,
+                    STAT_LEN as usize,
+                )
+            };
+            return 0;
+        }
+    } else {
+        match resolve_links(path, true) {
+            Ok((b, n, _)) => {
+                rbuf = b;
+                rn = n;
+            }
+            Err(e) => return e,
+        }
+    }
+    let path = &rbuf[..rn];
     // lstat: proc link paths report S_IFLNK|0777 with the target
     // length — self, exe, cwd, root, and every fd/<n> are links on
-    // Linux; stat (follow) resolves them instead. No other symlinks
-    // exist in either namespace.
+    // Linux; stat (follow) resolves them instead.
     if nofollow {
         let is_link = path == b"proc/self"
             || match proc_parse(path) {
@@ -5471,6 +5550,215 @@ pub fn canon_path(dfd: u64, path: &[u8]) -> Result<([u8; 256], usize), u64> {
     match canon(&base.0[..base.1], path, &mut out) {
         Some(n) => Ok((out, n)),
         None => Err(ENAMETOOLONG),
+    }
+}
+
+/// Follow symlinks inside a canonical flat name. Every component
+/// prefix that names a link VFile is replaced by canon(link's dir +
+/// stored target) — an absolute target ignores the dir, exactly like
+/// Linux's namei. `last` says whether the FINAL component follows
+/// too: lstat/readlink/unlink callers pass false, ordinary lookups
+/// true. Depth-capped at 40 hops like Linux's MAXSYMLINKS -> ELOOP.
+/// The bool in the Ok triple reports "the settled name's final
+/// component is itself a link" — only meaningful with last=false
+/// (a followed final can never settle on a link).
+pub fn resolve_links(
+    cpath: &[u8],
+    last: bool,
+) -> Result<([u8; 256], usize, bool), u64> {
+    const ELOOP_: u64 = (-40i64) as u64;
+    const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    let mut cur = [0u8; 256];
+    let mut cn = cpath.len().min(256);
+    cur[..cn].copy_from_slice(&cpath[..cn]);
+    for _ in 0..40 {
+        let mut i = 0usize;
+        let mut hit = false;
+        while i < cn {
+            let end = cur[i..cn]
+                .iter()
+                .position(|&b| b == b'/')
+                .map(|p| i + p)
+                .unwrap_or(cn);
+            if end == cn && !last {
+                break; // the final component stays literal
+            }
+            // Prefix cur[..end] a link? The target must be copied to
+            // the stack — VFILES is borrowed mutably during lookup
+            // and the rewrite overwrites cur itself.
+            let mut tgt = [0u8; 256];
+            let mut tl = 0usize;
+            if let Some(vi) = vfile_find(&cur[..end]) {
+                if let Some(v) = vfile(vi) {
+                    if v.is_link && !v.data.is_null() {
+                        tl = v.len.min(256);
+                        // SAFETY: data is a live kmalloc buffer of
+                        // len bytes; tl is clamped to both sides.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                v.data,
+                                tgt.as_mut_ptr(),
+                                tl,
+                            )
+                        };
+                    }
+                }
+            }
+            if tl > 0 {
+                // A relative target joins the link's own directory —
+                // canon already discards the base on '/'-led input.
+                let dir_end =
+                    cur[..end].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                let mut nb = [0u8; 256];
+                let Some(nn) = canon(&cur[..dir_end], &tgt[..tl], &mut nb)
+                else {
+                    return Err(ENAMETOOLONG_);
+                };
+                // Resolved prefix + the untouched tail (leading '/'
+                // included when present) re-forms the working path.
+                let tail = cn - end;
+                if nn + tail > 256 {
+                    return Err(ENAMETOOLONG_);
+                }
+                let mut n2 = [0u8; 256];
+                n2[..nn].copy_from_slice(&nb[..nn]);
+                n2[nn..nn + tail].copy_from_slice(&cur[end..cn]);
+                cur = n2;
+                cn = nn + tail;
+                hit = true;
+                break;
+            }
+            if end == cn {
+                break;
+            }
+            i = end + 1;
+        }
+        if !hit {
+            let fl = vfile_find(&cur[..cn])
+                .is_some_and(|j| vfile(j).is_some_and(|v| v.is_link));
+            return Ok((cur, cn, fl));
+        }
+    }
+    Err(ELOOP_)
+}
+
+/// symlinkat(target, linkpath@dirfd): a link is a VFile whose data
+/// holds the raw target text. It lands only where a file could be
+/// created — parent dir exists, nothing owns the name, proc stays
+/// synthetic (EROFS). An empty target is ENOENT like Linux; the
+/// target's own path validity is never checked (links may dangle).
+pub fn fs_symlink(dfd: u64, target: &[u8], linkpath: &[u8]) -> u64 {
+    const EEXIST_: u64 = (-17i64) as u64;
+    const EROFS_: u64 = (-30i64) as u64;
+    const ENOTDIR_: u64 = (-20i64) as u64;
+    const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    if target.is_empty() {
+        return ENOENT;
+    }
+    let (buf, n) = match canon_path(dfd, linkpath) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    // Intermediates resolve — a symlink inside a dir reached through
+    // another link lands on the real path, like Linux.
+    let (rb, rn, _) = match resolve_links(&buf[..n], false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let p = &rb[..rn];
+    if p.len() > 128 {
+        return ENAMETOOLONG_;
+    }
+    // "" is the canon root — a live dir, so EEXIST like Linux.
+    if is_file(p) || dir_exists(p) {
+        return EEXIST_;
+    }
+    if p.starts_with(b"proc/") {
+        return EROFS_;
+    }
+    if let Some(pi) = p.iter().rposition(|&c| c == b'/') {
+        let par = &p[..pi];
+        if !dir_exists(par) {
+            return if is_file(par) { ENOTDIR_ } else { ENOENT };
+        }
+    }
+    let r = vfile_create(p);
+    if (r as i64) < 0 {
+        return r;
+    }
+    let i = r as usize;
+    let g = {
+        let Some(v) = vfile(i) else { return (-12i64) as u64 };
+        let g = vfile_grow(v, target.len());
+        if g == 0 {
+            // SAFETY: grow owns >= target.len() writable bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    target.as_ptr(),
+                    v.data,
+                    target.len(),
+                )
+            };
+            v.len = target.len();
+            v.is_link = true;
+        }
+        g
+    };
+    if g != 0 {
+        // Roll the slot back — a link with no target must not exist.
+        unsafe { (*core::ptr::addr_of_mut!(VFILES))[i] = None };
+        return g;
+    }
+    ino_report(p, IN_CREATE, 0);
+    0
+}
+
+/// readlink/readlinkat on a canonical name: intermediates resolve,
+/// the final component must itself be a link — VFile links answer
+/// with their stored target, proc magic links via proc_link_target.
+/// Linux EINVALs readlink on an existing non-link, ENOENT on a miss.
+pub fn fs_readlink(cpath: &[u8], buf: u64, len: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    if len != 0 && !range_ok_w(buf, len) {
+        return EFAULT;
+    }
+    let (rb, rn, was_link) = match resolve_links(cpath, false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let p = &rb[..rn];
+    if was_link {
+        let Some(i) = vfile_find(p) else { return ENOENT };
+        let Some(v) = vfile(i) else { return ENOENT };
+        let n = v.len.min(len as usize);
+        // SAFETY: buf is validated writable for len; data holds len.
+        if n > 0 {
+            unsafe { core::ptr::copy_nonoverlapping(v.data, buf as *mut u8, n) };
+        }
+        return n as u64;
+    }
+    if p.starts_with(b"proc/") {
+        let mut out = [0u8; 160];
+        return match proc_link_target(p, &mut out) {
+            Some(tn) => {
+                let total = tn.min(len as usize);
+                // SAFETY: buf is validated writable for len bytes.
+                unsafe { (buf as *mut u8).copy_from(out.as_ptr(), total) };
+                total as u64
+            }
+            None => {
+                if fs_exists(p) {
+                    EINVAL_
+                } else {
+                    ENOENT
+                }
+            }
+        };
+    }
+    if fs_exists(p) {
+        EINVAL_
+    } else {
+        ENOENT
     }
 }
 
@@ -6180,27 +6468,6 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
     s.used()
 }
 
-/// readlink() answer for the proc link family — self, exe, cwd,
-/// root, fd/N — capped at the user buffer like Linux. ENOENT for a
-/// dead pid or a non-link path; usize::MAX signals "not a proc link
-/// at all" so the caller can fall through.
-pub fn proc_readlink(path: &[u8], buf: u64, len: u64) -> u64 {
-    if !path.starts_with(b"proc/") {
-        return usize::MAX as u64;
-    }
-    if len == 0 || !range_ok_w(buf, len) {
-        return EFAULT;
-    }
-    let mut out = [0u8; 160];
-    let Some(n) = proc_link_target(path, &mut out) else {
-        return ENOENT;
-    };
-    let total = n.min(len as usize);
-    // SAFETY: buf validated writable for len bytes.
-    unsafe { (buf as *mut u8).copy_from(out.as_ptr(), total) };
-    total as u64
-}
-
 /// The canonical path a Dir OFD names — for dirfd resolution.
 pub fn fd_dir_path(fd: u64) -> Option<([u8; 128], usize)> {
     let t = cur_mut()?;
@@ -6257,6 +6524,32 @@ pub fn fd_open(path: &[u8], flags: u64) -> u64 {
     let acc = flags & O_ACCMODE;
     let writing = acc != 0;
     let Some(t) = cur_mut() else { return EBADF };
+    // Symlink resolution: intermediates always, the final component
+    // unless O_NOFOLLOW (ELOOP — O_PATH included, a documented
+    // divergence). O_CREAT|O_EXCL sees the link itself and EEXISTs
+    // like Linux; plain O_CREAT through a dangling link mints the
+    // TARGET. The resolved name drives every arm below, so a link
+    // may point anywhere — vfiles, the archive, dirs, even proc.
+    let (mut rb, mut rn, was_link) = match resolve_links(path, false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if was_link {
+        if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) {
+            return EEXIST;
+        }
+        if flags & O_NOFOLLOW != 0 {
+            return (-40i64) as u64; // ELOOP
+        }
+        match resolve_links(&rb[..rn], true) {
+            Ok((b, n, _)) => {
+                rb = b;
+                rn = n;
+            }
+            Err(e) => return e,
+        }
+    }
+    let path = &rb[..rn];
     // /proc/<pid>/fd/<n> opens the named open description itself —
     // a cross-task dup: same OFD, same pos, refs+1. Sockets refuse
     // like Linux (ENXIO); an O_WRONLY ask on a read-only OFD is
@@ -6460,6 +6753,13 @@ fn vfile_remove(i: usize) {
 pub fn fs_unlink(path: &[u8]) -> u64 {
     const EISDIR_: u64 = (-21i64) as u64;
     const EROFS_: u64 = (-30i64) as u64;
+    // Intermediates resolve; the final component never does — unlink
+    // removes the link itself, like Linux.
+    let (rb, rn, _) = match resolve_links(path, false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let path = &rb[..rn];
     if dir_exists(path) {
         return EISDIR_;
     }
@@ -6483,6 +6783,23 @@ pub fn fs_rename(old: &[u8], new: &[u8]) -> u64 {
     if new.len() > 128 {
         return ENAMETOOLONG_;
     }
+    // Intermediates resolve on both names; the final components stay
+    // literal — rename moves the link itself, like Linux. The RESOLVED
+    // new name must still fit the 128-byte name slot (its input-side
+    // check above can't see a longer resolution).
+    let (ob, oc, _) = match resolve_links(old, false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let old = &ob[..oc];
+    let (nb, nc, _) = match resolve_links(new, false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if nc > 128 {
+        return ENAMETOOLONG_;
+    }
+    let new = &nb[..nc];
     let Some(i) = vfile_find(old) else {
         return if fs_lookup(old).is_some() { EROFS_ } else { ENOENT };
     };
@@ -6537,6 +6854,12 @@ pub fn fs_truncate(path: &[u8], len: u64) -> u64 {
     if path.is_empty() || path == b"." {
         return EISDIR_;
     }
+    // truncate(2) follows the final link — the target takes the size.
+    let (rb, rn, _) = match resolve_links(path, true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let path = &rb[..rn];
     let Some(i) = vfile_find(path) else {
         return if fs_lookup(path).is_some() { EROFS_ } else { ENOENT };
     };
@@ -8031,6 +8354,12 @@ pub fn inotify_add_watch(fd: u64, path: &[u8], mask: u32) -> u64 {
     let Some(t) = cur_mut() else { return EINVAL };
     let Some(o) = ofd(t, fd) else { return EBADF };
     let FdKind::Inotify(i) = o.kind else { return EINVAL };
+    // add_watch follows links — the watch keys the target's name.
+    let (rb, rn, _) = match resolve_links(path, true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let path = &rb[..rn];
     if !fs_exists(path) || path.len() > 128 {
         return ENOENT;
     }
@@ -10669,6 +10998,10 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
             fn_ += name.len();
             let ty = if idx < 2 || dir_exists(&full[..fn_]) {
                 4u8
+            } else if vfile_find(&full[..fn_])
+                .is_some_and(|i| vfile(i).is_some_and(|v| v.is_link))
+            {
+                10u8 // DT_LNK — links keep their own type
             } else {
                 8u8
             };

@@ -259,6 +259,7 @@ const NR_RMDIR: u64 = 84;
 const NR_MKDIRAT: u64 = 258;
 const NR_CLONE: u64 = 56;
 const NR_GETCWD: u64 = 79;
+const NR_SYMLINK: u64 = 88;
 const NR_READLINK: u64 = 89;
 const NR_GETRLIMIT: u64 = 97;
 const NR_SETPGID: u64 = 109;
@@ -270,6 +271,7 @@ const NR_GETPRIORITY: u64 = 140;
 const NR_SETPRIORITY: u64 = 141;
 const NR_CLOCK_GETRES: u64 = 229;
 const NR_TGKILL: u64 = 234;
+const NR_SYMLINKAT: u64 = 266;
 const NR_READLINKAT: u64 = 267;
 const NR_FACCESSAT: u64 = 269;
 const NR_PREAD64: u64 = 17;
@@ -428,6 +430,8 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_FSTAT => user::sys_fstat(a1, a2),
         NR_ACCESS => sys_access(u64::MAX, a1),
         NR_FACCESSAT => sys_access(a1, a2),
+        NR_SYMLINK => sys_symlink(a1, a2),
+        NR_SYMLINKAT => sys_symlinkat(a1, a2, a3),
         NR_READLINK => sys_readlink(a1, a2, a3),
         NR_READLINKAT => sys_readlinkat(a1, a2, a3, a4),
         NR_FSYNC | NR_FDATASYNC => user::fd_fsync(a1),
@@ -579,7 +583,13 @@ fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    let name = &cb[..cn];
+    // execve follows links — the image under the resolved name is
+    // what runs; an unresolvable chain reports its error (ELOOP/...).
+    let (rb, rn, _) = match user::resolve_links(&cb[..cn], true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let name = &rb[..rn];
     let Some(img) = user::fs_lookup(name) else {
         return ENOENT;
     };
@@ -652,7 +662,12 @@ fn sys_access(dirfd: u64, path: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    if user::fs_exists(&cb[..cn]) {
+    // access follows links — the question is about the target.
+    let (rb, rn, _) = match user::resolve_links(&cb[..cn], true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if user::fs_exists(&rb[..rn]) {
         0
     } else {
         ENOENT
@@ -759,26 +774,24 @@ fn sys_rmdir(path: u64) -> u64 {
     user::fs_rmdir(u64::MAX, &name[..n])
 }
 
-/// readlink/readlinkat(path, buf, len): "/proc/self/exe" is the only
-/// link that resolves (to the image's cpio name). No other symlinks
-/// exist — ENOENT like a procfs miss.
+/// readlink(path, buf, len): canon then the shared link core —
+/// VFile links report their stored target, proc magic links theirs,
+/// a non-link EINVALs and a miss ENOENTs like Linux.
 fn sys_readlink(path: u64, buf: u64, len: u64) -> u64 {
     let mut name = [0u8; 257];
     let n = match copy_user_path(path, &mut name) {
         Ok(n) => n,
         Err(e) => return e,
     };
-    if name[..n].starts_with(b"/proc/") {
-        return match user::proc_readlink(&name[1..n], buf, len) {
-            x if x == usize::MAX as u64 => ENOENT,
-            x => x,
-        };
-    }
-    ENOENT
+    let (cb, cn) = match user::canon_path(u64::MAX, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::fs_readlink(&cb[..cn], buf, len)
 }
 
-/// readlinkat(dirfd, path, buf, len): canon resolves dirfd/cwd —
-/// proc/self/exe is the only link that answers.
+/// readlinkat(dirfd, path, buf, len): canon resolves dirfd/cwd, then
+/// the same link core answers.
 fn sys_readlinkat(dirfd: u64, path: u64, buf: u64, len: u64) -> u64 {
     let mut name = [0u8; 257];
     let n = match copy_user_path(path, &mut name) {
@@ -789,13 +802,37 @@ fn sys_readlinkat(dirfd: u64, path: u64, buf: u64, len: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    if cb[..cn].starts_with(b"proc/") {
-        return match user::proc_readlink(&cb[..cn], buf, len) {
-            x if x == usize::MAX as u64 => ENOENT,
-            x => x,
-        };
-    }
-    ENOENT
+    user::fs_readlink(&cb[..cn], buf, len)
+}
+
+/// symlink(target, linkpath): cwd-relative — canon inside fs_symlink.
+fn sys_symlink(target: u64, linkpath: u64) -> u64 {
+    let mut tp = [0u8; 257];
+    let tn = match copy_user_path(target, &mut tp) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mut lp = [0u8; 257];
+    let ln = match copy_user_path(linkpath, &mut lp) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::fs_symlink(u64::MAX, &tp[..tn], &lp[..ln])
+}
+
+/// symlinkat(target, dirfd, linkpath): dirfd canon inside fs_symlink.
+fn sys_symlinkat(target: u64, dirfd: u64, linkpath: u64) -> u64 {
+    let mut tp = [0u8; 257];
+    let tn = match copy_user_path(target, &mut tp) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mut lp = [0u8; 257];
+    let ln = match copy_user_path(linkpath, &mut lp) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::fs_symlink(dirfd, &tp[..tn], &lp[..ln])
 }
 
 /// write(fd, buf, len): console fds only, buffer fully validated

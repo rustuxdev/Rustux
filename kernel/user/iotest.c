@@ -908,6 +908,142 @@ int main(void) {
               "statfs nonexistent -> ENOENT");
     }
 
+
+    /* run-103: real VFS symlinks — a link is a VFile whose bytes are
+       the raw target; intermediates + finals resolve per Linux. */
+    {
+        struct stat ls, fs;
+        char lb[128];
+        int f = open("sl_target", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        check(f >= 0, "symlink: create target");
+        if (f >= 0) { write(f, "LX", 2); close(f); }
+        check(symlink("sl_target", "sl_link") == 0, "symlink creates");
+        memset(lb, 0, sizeof(lb));
+        int lr = readlink("sl_link", lb, sizeof(lb));
+        check(lr == 9 && memcmp(lb, "sl_target", 9) == 0,
+              "readlink target bytes");
+        check(lstat("sl_link", &ls) == 0 && S_ISLNK(ls.st_mode) &&
+              ls.st_size == 9, "lstat -> S_IFLNK + size");
+        check(stat("sl_link", &fs) == 0 && S_ISREG(fs.st_mode),
+              "stat follows -> regular");
+        f = open("sl_link", O_RDONLY);
+        char rb[8] = {0};
+        check(f >= 0 && read(f, rb, 8) == 2 && memcmp(rb, "LX", 2) == 0,
+              "open through link reads target");
+        if (f >= 0) close(f);
+        errno = 0;
+        check(open("sl_link", O_RDONLY | O_NOFOLLOW) < 0 &&
+              errno == ELOOP, "O_NOFOLLOW -> ELOOP");
+        errno = 0;
+        check(open("sl_link", O_CREAT | O_EXCL | O_WRONLY, 0644) < 0 &&
+              errno == EEXIST, "CREAT|EXCL on link -> EEXIST");
+        errno = 0;
+        check(readlink("sl_target", lb, sizeof(lb)) < 0 &&
+              errno == EINVAL, "readlink non-link -> EINVAL");
+
+        /* dangling links: lstat/readlink see them, followers ENOENT. */
+        check(symlink("sl_missing", "sl_dangle") == 0,
+              "symlink dangling");
+        check(lstat("sl_dangle", &ls) == 0 && S_ISLNK(ls.st_mode),
+              "lstat dangling link");
+        errno = 0;
+        check(stat("sl_dangle", &fs) < 0 && errno == ENOENT,
+              "stat dangling -> ENOENT");
+        errno = 0;
+        check(open("sl_dangle", O_RDONLY) < 0 && errno == ENOENT,
+              "open dangling -> ENOENT");
+        f = open("sl_dangle", O_WRONLY | O_CREAT, 0644);
+        check(f >= 0, "CREAT through dangling mints target");
+        if (f >= 0) { write(f, "DT", 2); close(f); }
+        check(stat("sl_missing", &fs) == 0 && S_ISREG(fs.st_mode),
+              "dangling target now real");
+
+        /* relative targets join the link's own dir; links to dirs
+           resolve as intermediates — a two-hop open. */
+        check(mkdir("sl_dir", 0755) == 0, "mkdir for links");
+        check(symlink("../sl_target", "sl_dir/rel") == 0,
+              "relative target link");
+        check(symlink("sl_dir", "sl_dirlink") == 0, "link to dir");
+        memset(rb, 0, sizeof(rb));
+        f = open("sl_dirlink/rel", O_RDONLY);
+        check(f >= 0 && read(f, rb, 8) == 2 && memcmp(rb, "LX", 2) == 0,
+              "open link-dir + relative link");
+        if (f >= 0) close(f);
+        check(stat("sl_dirlink", &fs) == 0 && S_ISDIR(fs.st_mode),
+              "stat link-to-dir -> dir");
+        check(lstat("sl_dirlink", &ls) == 0 && S_ISLNK(ls.st_mode),
+              "lstat link-to-dir -> link");
+        check(chdir("sl_dirlink") == 0 && chdir("/") == 0,
+              "chdir follows link");
+        check(symlinkat("sl_target", AT_FDCWD, "sl_at") == 0 &&
+              readlinkat(AT_FDCWD, "sl_at", lb, sizeof(lb)) == 9,
+              "symlinkat + readlinkat FDCWD");
+
+        /* loops and self-links: ELOOP, never a hang. */
+        check(symlink("sl_loop", "sl_loop") == 0, "self-link creates");
+        errno = 0;
+        check(stat("sl_loop", &ls) < 0 && errno == ELOOP,
+              "stat self-loop -> ELOOP");
+        errno = 0;
+        check(open("sl_loop", O_RDONLY) < 0 && errno == ELOOP,
+              "open self-loop -> ELOOP");
+        check(symlink("sl_loop2", "sl_loop1") == 0 &&
+              symlink("sl_loop1", "sl_loop2") == 0, "2-link loop");
+        errno = 0;
+        check(stat("sl_loop1", &ls) < 0 && errno == ELOOP,
+              "stat 2-loop -> ELOOP");
+
+        /* rename/unlink act on the link; truncate follows it. */
+        check(rename("sl_link", "sl_link2") == 0, "rename moves link");
+        check(lstat("sl_link2", &ls) == 0 && S_ISLNK(ls.st_mode) &&
+              stat("sl_link2", &fs) == 0 && S_ISREG(fs.st_mode),
+              "renamed link still links");
+        check(truncate("sl_link2", 1) == 0 &&
+              stat("sl_target", &fs) == 0 && fs.st_size == 1,
+              "truncate through link hits target");
+        check(unlink("sl_link2") == 0, "unlink removes link");
+        errno = 0;
+        check(lstat("sl_link2", &ls) < 0 && errno == ENOENT,
+              "unlinked link gone");
+        check(stat("sl_target", &fs) == 0, "target survives unlink");
+        errno = 0;
+        check(symlink("x", "sl_target") < 0 && errno == EEXIST,
+              "symlink over file -> EEXIST");
+        errno = 0;
+        check(symlink("x", "no_such_dir/y") < 0 && errno == ENOENT,
+              "symlink bad parent -> ENOENT");
+        errno = 0;
+        check(symlink("", "sl_empty") < 0 && errno == ENOENT,
+              "empty target -> ENOENT");
+
+        /* getdents d_type reports DT_LNK(10) for the link itself. */
+        int dfd = open("/", O_RDONLY | O_DIRECTORY);
+        check(dfd >= 0, "open / for dents");
+        if (dfd >= 0) {
+            char db[2048];
+            int dl = syscall(SYS_getdents64, dfd, db, sizeof(db));
+            int saw_lnk = 0;
+            for (int o = 0; dl > 0 && o < dl;) {
+                struct {
+                    unsigned long ino, off2;
+                    unsigned short rlen;
+                    unsigned char type;
+                    char name[];
+                } *de = (void *)(db + o);
+                if (!strcmp(de->name, "sl_at") && de->type == 10)
+                    saw_lnk = 1;
+                o += de->rlen;
+            }
+            check(saw_lnk, "getdents d_type DT_LNK");
+            close(dfd);
+        }
+
+        unlink("sl_target"); unlink("sl_missing"); unlink("sl_dangle");
+        unlink("sl_dir/rel"); unlink("sl_dirlink"); unlink("sl_at");
+        unlink("sl_loop"); unlink("sl_loop1"); unlink("sl_loop2");
+        unlink("sl_empty"); rmdir("sl_dir");
+    }
+
     int n = snprintf(buf, sizeof(buf), "iotest: %d failures, done\n", fails);
     say(buf);
     return fails;
