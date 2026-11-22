@@ -1014,6 +1014,10 @@ fn main() -> Status {
     // SAFETY: initrd names LOADER_DATA pages we allocated pre-EBS;
     // they are identity-mapped and still owned.
     let arc = initrd.map(|(a, l)| unsafe { core::slice::from_raw_parts(a as *const u8, l) });
+    // Boot-time /dev population — device nodes and their links are
+    // kernel-lifetime objects like the initrd, so they belong outside
+    // the task-leak window.
+    user::dev_init();
     let before = kalloc::free_frames();
     let mut queued = 0u32;
     // Capture the fninit FPU image tasks start from — must run

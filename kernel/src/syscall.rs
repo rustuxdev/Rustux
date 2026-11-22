@@ -256,7 +256,9 @@ const NR_CHDIR: u64 = 80;
 const NR_FCHDIR: u64 = 81;
 const NR_MKDIR: u64 = 83;
 const NR_RMDIR: u64 = 84;
+const NR_MKNOD: u64 = 133;
 const NR_MKDIRAT: u64 = 258;
+const NR_MKNODAT: u64 = 259;
 const NR_CLONE: u64 = 56;
 const NR_GETCWD: u64 = 79;
 const NR_SYMLINK: u64 = 88;
@@ -497,6 +499,8 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_UTIMENSAT => sys_utimensat(a1, a2, a3, a4),
         NR_MKDIR => sys_mkdirat(u64::MAX, a1, a2),
         NR_MKDIRAT => sys_mkdirat(a1, a2, a3),
+        NR_MKNOD => sys_mknodat(u64::MAX, a1, a2, a3),
+        NR_MKNODAT => sys_mknodat(a1, a2, a3, a4),
         NR_RMDIR => sys_rmdir(a1),
         NR_EXIT => sys_exit(a1),
         _ => {
@@ -785,6 +789,16 @@ fn sys_mkdirat(dirfd: u64, path: u64, mode: u64) -> u64 {
         Err(e) => return e,
     };
     user::fs_mkdir(dirfd, &name[..n], mode)
+}
+
+/// mknodat(dirfd, path, mode, dev): canon inside fs_mknod.
+fn sys_mknodat(dirfd: u64, path: u64, mode: u64, dev: u64) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::fs_mknod(dirfd, &name[..n], mode, dev)
 }
 
 /// rmdir(path): cwd-relative — canon inside fs_rmdir.

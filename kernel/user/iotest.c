@@ -21,6 +21,7 @@
 #include <sys/inotify.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/vfs.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
@@ -1160,6 +1161,103 @@ int main(void) {
         if (f >= 0) close(f);
         unlink("meta_f"); unlink("meta_l"); unlink("meta_u");
         rmdir("meta_d");
+    }
+
+    /* ---- run-105: char devices + real /dev ------------------------- */
+    {
+        struct stat ds;
+        check(stat("/dev/null", &ds) == 0 && S_ISCHR(ds.st_mode) &&
+              ds.st_rdev == makedev(1, 3), "/dev/null S_IFCHR+rdev");
+        check(stat("/dev/tty", &ds) == 0 && S_ISCHR(ds.st_mode) &&
+              ds.st_rdev == makedev(5, 0), "/dev/tty S_IFCHR+rdev");
+
+        int nf = open("/dev/null", O_RDWR);
+        check(nf >= 0, "open /dev/null");
+        if (nf >= 0) {
+            check(write(nf, "xyz", 3) == 3, "/dev/null write sinks");
+            check(read(nf, buf, 16) == 0, "/dev/null read EOF");
+            check(lseek(nf, 7, SEEK_SET) == 0, "/dev/null lseek 0");
+            struct stat fs2;
+            check(fstat(nf, &fs2) == 0 && S_ISCHR(fs2.st_mode),
+                  "fstat dev S_IFCHR");
+            struct pollfd np = { .fd = nf, .events = POLLIN | POLLOUT };
+            check(poll(&np, 1, 0) == 1 &&
+                  (np.revents & POLLIN) && (np.revents & POLLOUT),
+                  "poll /dev/null ready");
+            close(nf);
+        }
+
+        int zf = open("/dev/zero", O_RDONLY);
+        check(zf >= 0, "open /dev/zero");
+        if (zf >= 0) {
+            memset(buf, 0xAA, 32);
+            check(read(zf, buf, 32) == 32, "/dev/zero read len");
+            int allz = 1;
+            for (int i = 0; i < 32; i++) if (buf[i]) allz = 0;
+            check(allz, "/dev/zero contents");
+            close(zf);
+        }
+
+        int uf = open("/dev/urandom", O_RDONLY);
+        check(uf >= 0, "open /dev/urandom");
+        if (uf >= 0) {
+            memset(buf, 0, 32);
+            check(read(uf, buf, 32) == 32, "/dev/urandom read len");
+            int any = 0;
+            for (int i = 0; i < 32; i++) if (buf[i]) any = 1;
+            check(any, "/dev/urandom nonzero");
+            close(uf);
+        }
+
+        int ff = open("/dev/full", O_WRONLY);
+        check(ff >= 0, "open /dev/full");
+        if (ff >= 0) {
+            errno = 0;
+            check(write(ff, "x", 1) < 0 && errno == ENOSPC,
+                  "/dev/full ENOSPC");
+            close(ff);
+        }
+
+        /* mknod(133)/mknodat(259) create real nodes. */
+        check(mknod("dnull", S_IFCHR | 0666, makedev(1, 3)) == 0,
+              "mknod char");
+        int mf = open("dnull", O_RDWR);
+        check(mf >= 0 && write(mf, "qq", 2) == 2 &&
+              read(mf, buf, 4) == 0, "mknod node works");
+        if (mf >= 0) close(mf);
+        check(mknodat(AT_FDCWD, "dreg", S_IFREG | 0644, 0) == 0,
+              "mknodat S_IFREG");
+        check(stat("dreg", &ds) == 0 && S_ISREG(ds.st_mode),
+              "mknod reg stat");
+        errno = 0;
+        check(mknod("dbad", S_IFDIR | 0755, 0) < 0 && errno == EINVAL,
+              "mknod bad fmt EINVAL");
+        errno = 0;
+        check(mknod("dnull", S_IFCHR | 0666, makedev(1, 3)) < 0 &&
+              errno == EEXIST, "mknod existing EEXIST");
+        unlink("dnull"); unlink("dreg");
+
+        /* getdents d_type reports DT_CHR(2) under /dev. */
+        int dd = open("/dev", O_RDONLY | O_DIRECTORY);
+        check(dd >= 0, "open /dev");
+        if (dd >= 0) {
+            char db[2048];
+            int dl = syscall(SYS_getdents64, dd, db, sizeof(db));
+            int saw_chr = 0;
+            for (int o = 0; dl > 0 && o < dl;) {
+                struct {
+                    unsigned long ino, off2;
+                    unsigned short rlen;
+                    unsigned char type;
+                    char name[];
+                } *de = (void *)(db + o);
+                if (!strcmp(de->name, "null") && de->type == 2)
+                    saw_chr = 1;
+                o += de->rlen;
+            }
+            check(saw_chr, "getdents d_type DT_CHR");
+            close(dd);
+        }
     }
 
     int n = snprintf(buf, sizeof(buf), "iotest: %d failures, done\n", fails);

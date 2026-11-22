@@ -273,6 +273,12 @@ enum FdKind {
     /// reads and stats see one consistent image even if the task
     /// it describes exits before the last read.
     Proc { buf: u64, len: usize },
+    /// A character-device node — VFILES[i] holds the node (name,
+    /// metadata, rdev). Data lives in driver semantics: null/zero/
+    /// full/random sink or mint bytes, tty/console bridge the
+    /// serial pair. Block devs and fifos never reach this — ENODEV /
+    /// ENXIO at fd_open like Linux without a driver.
+    Dev(usize),
 }
 
 /// Max concurrent pipes — a hard bound on kernel frame pressure,
@@ -1612,7 +1618,7 @@ const MAX_OFDS: usize = 256;
 /// cpio names are read-only, VFILES names are created, written,
 /// truncated, renamed and unlinked. Bounded so untrusted fd churn
 /// can't exhaust frames.
-const MAX_VFILES: usize = 16;
+const MAX_VFILES: usize = 32;
 /// Per-file ceiling — an honest ENOSPC, not an unbounded grow.
 const VFILE_MAX: usize = 1 << 20;
 
@@ -1631,6 +1637,11 @@ struct VFile {
     cap: usize,
     unlinked: bool,
     is_link: bool,
+    /// S_IFMT bits — S_IFREG for regulars and (harmlessly) links,
+    /// S_IFCHR/S_IFBLK/S_IFIFO for mknod'd nodes.
+    fmt: u32,
+    /// Device id for S_IFCHR/S_IFBLK nodes — makedev(major<<8|minor).
+    rdev: u32,
     mode: u16,
     uid: u32,
     gid: u32,
@@ -1679,6 +1690,8 @@ fn vfile_create(path: &[u8]) -> u64 {
         cap: 0,
         unlinked: false,
         is_link: false,
+        fmt: 0o100000, // S_IFREG
+        rdev: 0,
         mode: 0,
         uid: 0,
         gid: 0,
@@ -3472,7 +3485,9 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     const FIONBIO: u64 = 0x5421;
     let Some(t) = cur_mut() else { return EBADF };
     let Some(o) = ofd(t, fd) else { return EBADF };
-    let tty = matches!(o.kind, FdKind::Stdin | FdKind::Console);
+    let tty = matches!(o.kind, FdKind::Stdin | FdKind::Console)
+        || matches!(&o.kind, FdKind::Dev(i)
+            if vfile(*i).is_some_and(|v| v.rdev >> 8 == 5));
     match req {
         TCGETS => {
             if !tty {
@@ -3601,6 +3616,13 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 // queue here (canonical or not). The write half has
                 // no input side: honest 0 like a tty asked that way.
                 FdKind::Stdin => (unsafe { RD_LEN }) as u64,
+                FdKind::Dev(i) => {
+                    if vfile(*i).is_some_and(|v| v.rdev >> 8 == 5) {
+                        (unsafe { RD_LEN }) as u64
+                    } else {
+                        0
+                    }
+                }
                 FdKind::Console => 0u64,
                 FdKind::File(d) => d.len().saturating_sub(o.pos) as u64,
                 FdKind::Proc { len, .. } => {
@@ -4126,12 +4148,25 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
                 .count();
             let (mode, len) = vfile(*i).map_or((0o644u64, 0usize), |v| {
                 (
-                    (if v.is_link { 0o20000 } else { 0o100000 })
+                    (if v.is_link { 0o120000 } else { v.fmt as u64 })
                         | v.mode as u64,
                     v.len,
                 )
             });
             (mode, len as u64, (arc_n + vidx) as u64 + 1)
+        }
+        FdKind::Dev(i) => {
+            // A device node stats S_IFCHR|mode with a vfile-space
+            // ino — the rdev slot is filled by sys_fstat's meta arm.
+            let arc_n = (unsafe { *core::ptr::addr_of!(INITRD) })
+                .map_or(0, |a| crate::cpio::entries(a).count());
+            let vidx = unsafe { &*core::ptr::addr_of!(VFILES) }[..*i]
+                .iter()
+                .filter(|s| s.as_ref().is_some_and(|v| !v.unlinked))
+                .count();
+            let mode = vfile(*i)
+                .map_or(0o20644u64, |v| 0o20000 | v.mode as u64);
+            (mode, 0, (arc_n + vidx) as u64 + 1)
         }
         // proc files stat as read-only regulars; the rendered
         // length is the honest size of this snapshot.
@@ -4177,6 +4212,19 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     match &o.kind {
         FdKind::Ram(i) => {
             if let Some(v) = vfile(*i) {
+                stat_meta(
+                    &mut st,
+                    v.uid,
+                    v.gid,
+                    (v.atime, v.atime_ns),
+                    (v.mtime, v.mtime_ns),
+                    (v.ctime, v.ctime_ns),
+                );
+            }
+        }
+        FdKind::Dev(i) => {
+            if let Some(v) = vfile(*i) {
+                st[5] = v.rdev as u64; // st_rdev
                 stat_meta(
                     &mut st,
                     v.uid,
@@ -4842,6 +4890,103 @@ fn ofd(t: &mut Task, fd: u64) -> Option<&'static mut OpenFile> {
 pub fn fd_is_console(fd: u64) -> bool {
     let Some(t) = cur_mut() else { return false };
     matches!(ofd(t, fd).map(|o| &o.kind), Some(FdKind::Console))
+        || matches!(ofd(t, fd).map(|o| &o.kind), Some(FdKind::Dev(i))
+            if vfile(*i).is_some_and(|v| v.rdev >> 8 == 5))
+}
+
+/// PRNG state for /dev/{,u}random — a plain xorshift64* seeded at
+/// first use from rdtsc. Good enough for urandom semantics; nothing
+/// in the kernel depends on it being unpredictable to a local observer.
+static mut RNG_SEED: u64 = 0;
+
+fn rng_seed() -> u64 {
+    let s = unsafe { *core::ptr::addr_of!(RNG_SEED) };
+    if s != 0 {
+        return s;
+    }
+    // SAFETY: rdtsc is always readable; mixed with the boot tick for
+    // a non-constant first state.
+    let t = unsafe { core::arch::x86_64::_rdtsc() }
+        ^ crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let s = if t == 0 { 0x2545_f491_4f6c_dd1d } else { t };
+    unsafe { *core::ptr::addr_of_mut!(RNG_SEED) = s };
+    s
+}
+
+/// tty-input read shared by fd 0 and the /dev/tty|console nodes —
+/// job-control gate, ldisc drain, block-on-empty are identical.
+fn tty_input_read(
+    t: &mut Task,
+    ctx: &mut UCtx,
+    buf: u64,
+    len: u64,
+) -> u64 {
+    // Job control: a background pgrp of the console's own
+    // session gets SIGTTIN'd on a tty read — the signal
+    // stops the group so `fg` can bring it forward. An
+    // orphaned group gets EIO; a blocked/ignored SIGTTIN
+    // reads through — Linux's tty_check_change(SIGTTIN).
+    let (fg, csid) = unsafe { (FG_PGID, CONSOLE_SID) };
+    let fg_live = fg != 0
+        && unsafe { &*core::ptr::addr_of!(TASKS) }
+            .iter()
+            .flatten()
+            .any(|x| x.pgid == fg);
+    if t.sid == csid && fg_live && t.pgid != fg {
+        let h = sigt(t)
+            .handlers
+            .get(20) // SIGTTIN - 1
+            .copied()
+            .unwrap_or(SIG_DFL);
+        let bypass = h == SIG_IGN || t.sigmask & (1 << 20) != 0;
+        if !bypass {
+            const EIO_: u64 = (-5i64) as u64;
+            if pgrp_orphaned(t.pgid, t.sid) {
+                return EIO_;
+            }
+            kill_pgrp(t.pgid, 21);
+            if deliverable(t) {
+                return (-4i64) as u64; // -EINTR: stop lands
+            }
+        }
+    }
+    let n = stdin_take(len as usize);
+    match n {
+        usize::MAX => {
+            // Empty input queue — block like PipeRead: the
+            // waker copies through our tables and lands the
+            // count in ctx.rax.
+            if len == 0 {
+                return 0;
+            }
+            if !range_ok_w(buf, 1) {
+                return EFAULT;
+            }
+            if deliverable(t) {
+                return (-4i64) as u64; // -EINTR before sleep
+            }
+            t.wait_on = WaitOn::Stdin;
+            t.wait_ptr = buf;
+            t.wait_len = len;
+            t.ctx = *ctx;
+            t.state = TaskState::Blocked;
+            block_switch()
+        }
+        0 => 0, // VEOF on an empty line — tty EOF
+        _ => {
+            if !range_ok_w(buf, n as u64) {
+                return EFAULT;
+            }
+            for i in 0..n {
+                let b = unsafe { *(core::ptr::addr_of!(READY) as *const u8).add(i) };
+                // SAFETY: validated user window, cur cr3.
+                unsafe { ((buf + i as u64) as *mut u8).write(b) };
+            }
+            stdin_consume(n);
+            n as u64
+        }
+    }
 }
 
 /// read(fd, buf, len): File yields up to `len` bytes from its shared
@@ -4857,74 +5002,61 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     let Some(t) = cur_mut() else { return EBADF };
     let Some(o) = ofd(t, fd) else { return EBADF };
     match &o.kind {
-        FdKind::Stdin => {
-            // Job control: a background pgrp of the console's own
-            // session gets SIGTTIN'd on a tty read — the signal
-            // stops the group so `fg` can bring it forward. An
-            // orphaned group gets EIO; a blocked/ignored SIGTTIN
-            // reads through — Linux's tty_check_change(SIGTTIN).
-            let (fg, csid) = unsafe { (FG_PGID, CONSOLE_SID) };
-            let fg_live = fg != 0
-                && unsafe { &*core::ptr::addr_of!(TASKS) }
-                    .iter()
-                    .flatten()
-                    .any(|x| x.pgid == fg);
-            if t.sid == csid && fg_live && t.pgid != fg {
-                let h = sigt(t)
-                    .handlers
-                    .get(20) // SIGTTIN - 1
-                    .copied()
-                    .unwrap_or(SIG_DFL);
-                let bypass = h == SIG_IGN || t.sigmask & (1 << 20) != 0;
-                if !bypass {
-                    const EIO_: u64 = (-5i64) as u64;
-                    if pgrp_orphaned(t.pgid, t.sid) {
-                        return EIO_;
-                    }
-                    kill_pgrp(t.pgid, 21);
-                    if deliverable(t) {
-                        return (-4i64) as u64; // -EINTR: stop lands
-                    }
-                }
+        FdKind::Stdin => tty_input_read(t, ctx, buf, len),
+        FdKind::Console => EBADF,
+        FdKind::Dev(i) => {
+            if o.accmode == 1 {
+                return EBADF; // O_WRONLY
             }
-            let n = stdin_take(len as usize);
-            match n {
-                usize::MAX => {
-                    // Empty input queue — block like PipeRead: the
-                    // waker copies through our tables and lands the
-                    // count in ctx.rax.
-                    if len == 0 {
-                        return 0;
-                    }
-                    if !range_ok_w(buf, 1) {
+            let Some(v) = vfile(*i) else { return EBADF };
+            let (ts, tns) = now();
+            v.atime = ts;
+            v.atime_ns = tns;
+            match v.rdev {
+                // /dev/null reads EOF.
+                0x103 => 0,
+                // /dev/zero and /dev/full both read zeroes.
+                0x105 | 0x107 => {
+                    let n = len as usize;
+                    if n > 0 && !range_ok_w(buf, len) {
                         return EFAULT;
                     }
-                    if deliverable(t) {
-                        return (-4i64) as u64; // -EINTR before sleep
-                    }
-                    t.wait_on = WaitOn::Stdin;
-                    t.wait_ptr = buf;
-                    t.wait_len = len;
-                    t.ctx = *ctx;
-                    t.state = TaskState::Blocked;
-                    block_switch()
-                }
-                0 => 0, // VEOF on an empty line — tty EOF
-                _ => {
-                    if !range_ok_w(buf, n as u64) {
-                        return EFAULT;
-                    }
-                    for i in 0..n {
-                        let b = unsafe { *(core::ptr::addr_of!(READY) as *const u8).add(i) };
-                        // SAFETY: validated user window, cur cr3.
-                        unsafe { ((buf + i as u64) as *mut u8).write(b) };
-                    }
-                    stdin_consume(n);
+                    // SAFETY: validated user window under cur cr3.
+                    unsafe {
+                        core::ptr::write_bytes(buf as *mut u8, 0, n)
+                    };
                     n as u64
                 }
+                // /dev/random and /dev/urandom — ChaCha-free xorshift
+                // seeded from rdtsc jitter; urandom-grade entropy is
+                // honest, blocking-on-entropy is a pool we lack.
+                0x108 | 0x109 => {
+                    let n = len as usize;
+                    if n > 0 && !range_ok_w(buf, len) {
+                        return EFAULT;
+                    }
+                    let mut s = rng_seed();
+                    for i in 0..n {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        // SAFETY: validated user window.
+                        unsafe {
+                            ((buf + i as u64) as *mut u8)
+                                .write(s as u8)
+                        };
+                    }
+                    unsafe { *core::ptr::addr_of_mut!(RNG_SEED) = s };
+                    n as u64
+                }
+                // /dev/tty and /dev/console read the ldisc queue —
+                // the same path fd 0 takes, job-control gate and all.
+                0x500 | 0x501 => tty_input_read(t, ctx, buf, len),
+                // Unreachable while open() whitelists rdevs — belt
+                // and braces against a future arm forgetting this.
+                _ => EINVAL,
             }
         }
-        FdKind::Console => EBADF,
         FdKind::Dir(_) => EISDIR,
         // read() on an epoll fd has no stream to read — EINVAL like
         // Linux, not EBADF (the fd is real).
@@ -5088,6 +5220,27 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     }
     if let FdKind::Inotify(_) = &o.kind {
         return EINVAL;
+    }
+    if let FdKind::Dev(i) = &o.kind {
+        if o.accmode == 0 {
+            return EBADF; // O_RDONLY
+        }
+        if len > 0 && !range_ok(buf, len) {
+            return EFAULT;
+        }
+        let Some(v) = vfile(*i) else { return EBADF };
+        const ENOSPC_: u64 = (-28i64) as u64;
+        return match v.rdev {
+            // /dev/full is the one dev that answers a write —
+            // ENOSPC on every byte, like a full disk.
+            0x107 => ENOSPC_,
+            // Everything else sinks the bytes: null/zero discard,
+            // random/urandom fold them into the pool (Linux's
+            // write-to-urandom is accepted and never fails),
+            // and major-5 tty writes never reach here — they
+            // take sys_write's console path via fd_is_console.
+            _ => len,
+        };
     }
     if let FdKind::Ram(i) = &o.kind {
         if o.accmode == 0 {
@@ -5520,8 +5673,9 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
         st[3] = if v.is_link {
             0o120000 | v.mode as u64 // S_IFLNK | stored (followed-into case)
         } else {
-            0o100000 | v.mode as u64 // S_IFREG | stored mode
+            v.fmt as u64 | v.mode as u64 // stored S_IFMT | stored mode
         };
+        st[5] = v.rdev as u64; // st_rdev — 0 on regular files
         st[6] = v.len as u64; // st_size
         st[8] = (v.len as u64).div_ceil(512); // st_blocks
         stat_meta(
@@ -5879,6 +6033,7 @@ pub fn fs_symlink(dfd: u64, target: &[u8], linkpath: &[u8]) -> u64 {
             };
             v.len = target.len();
             v.is_link = true;
+            v.fmt = 0o120000;
         }
         g
     };
@@ -5889,6 +6044,135 @@ pub fn fs_symlink(dfd: u64, target: &[u8], linkpath: &[u8]) -> u64 {
     }
     ino_report(p, IN_CREATE, 0);
     0
+}
+
+/// mknod/mknodat on a canonical-ish path: intermediates resolve,
+/// the final component must be free — a link there is EEXIST like
+/// Linux. The node is a VFile that carries no data; `fmt`/`rdev`
+/// record what it is. Type bits allowed by Linux mknod: S_IFREG,
+/// S_IFCHR, S_IFBLK, S_IFIFO, and mode==0 which means a regular.
+pub fn fs_mknod(dfd: u64, path: &[u8], mode: u64, rdev: u64) -> u64 {
+    const EEXIST_: u64 = (-17i64) as u64;
+    const EROFS_: u64 = (-30i64) as u64;
+    const ENOTDIR_: u64 = (-20i64) as u64;
+    const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    const ENOSPC_: u64 = (-28i64) as u64;
+    let (buf, n) = match canon_path(dfd, path) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let (rb, rn, _) = match resolve_links(&buf[..n], false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let p = &rb[..rn];
+    if p.len() > 128 {
+        return ENAMETOOLONG_;
+    }
+    let fmt = (mode & 0o170000) as u32;
+    if !matches!(fmt, 0 | 0o100000 | 0o20000 | 0o60000 | 0o10000 | 0o140000)
+    {
+        return EINVAL;
+    }
+    if is_file(p) || dir_exists(p) {
+        return EEXIST_;
+    }
+    if p.starts_with(b"proc/") {
+        return EROFS_;
+    }
+    if let Some(pi) = p.iter().rposition(|&c| c == b'/') {
+        let par = &p[..pi];
+        if !dir_exists(par) {
+            return if is_file(par) { ENOTDIR_ } else { ENOENT };
+        }
+    }
+    let r = vfile_create(p);
+    if (r as i64) < 0 {
+        return r;
+    }
+    let umask = cur_mut().map_or(0, |t| fst(t).umask);
+    let Some(v) = vfile(r as usize) else { return ENOSPC_ };
+    vfile_stamp(v, mode & 0o7777, umask);
+    v.fmt = if fmt == 0 { 0o100000 } else { fmt };
+    v.rdev = rdev as u32;
+    ino_report(p, IN_CREATE, 0);
+    0
+}
+
+/// Mint the boot /dev population — called once from main context
+/// before the first task, so no locking and no canon needed. The
+/// nodes are plain VFiles; their semantics live in the Dev OFD arm.
+pub fn dev_init() {
+    let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
+    if let Some(i) = ds.iter().position(Option::is_none) {
+        let (s, ns) = now();
+        let mut d = VDir {
+            path: [0; 128],
+            nlen: 3,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: s,
+            atime_ns: ns,
+            mtime: s,
+            mtime_ns: ns,
+            ctime: s,
+            ctime_ns: ns,
+        };
+        d.path[..3].copy_from_slice(b"dev");
+        ds[i] = Some(d);
+    }
+    // (path, rdev = major<<8|minor, perms) — the classic mem/tty set.
+    for (name, rdev, mode) in [
+        (b"dev/null" as &[u8], 0x103u32, 0o666u64),
+        (b"dev/zero", 0x105, 0o666),
+        (b"dev/full", 0x107, 0o666),
+        (b"dev/random", 0x108, 0o666),
+        (b"dev/urandom", 0x109, 0o666),
+        (b"dev/tty", 0x500, 0o666),
+        (b"dev/console", 0x501, 0o600),
+    ] {
+        let r = vfile_create(name);
+        if (r as i64) < 0 {
+            continue;
+        }
+        if let Some(v) = vfile(r as usize) {
+            vfile_stamp(v, mode, 0);
+            v.fmt = 0o20000; // S_IFCHR
+            v.rdev = rdev;
+        }
+    }
+    // The /dev convenience links real Linux images carry.
+    for (link, tgt) in [
+        (b"dev/fd" as &[u8], b"/proc/self/fd" as &[u8]),
+        (b"dev/stdin", b"/proc/self/fd/0"),
+        (b"dev/stdout", b"/proc/self/fd/1"),
+        (b"dev/stderr", b"/proc/self/fd/2"),
+    ] {
+        let r = vfile_create(link);
+        if (r as i64) < 0 {
+            continue;
+        }
+        if let Some(v) = vfile(r as usize) {
+            vfile_stamp(v, 0o777, 0);
+            let g = vfile_grow(v, tgt.len());
+            if g == 0 {
+                // SAFETY: grow owns >= tgt.len() writable bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        tgt.as_ptr(),
+                        v.data,
+                        tgt.len(),
+                    )
+                };
+                v.len = tgt.len();
+                v.is_link = true;
+                v.fmt = 0o120000;
+            } else {
+                unsafe { (*core::ptr::addr_of_mut!(VFILES))[r as usize] = None };
+            }
+        }
+    }
 }
 
 /// readlink/readlinkat on a canonical name: intermediates resolve,
@@ -6599,7 +6883,7 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
                 s.puts(b"/deleted");
             }
         }
-        FdKind::Ram(i) => {
+        FdKind::Ram(i) | FdKind::Dev(i) => {
             let name = unsafe { &*core::ptr::addr_of!(VFILES) }
                 .get(*i)
                 .and_then(|v| v.as_ref())
@@ -6779,7 +7063,8 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) {
             return EEXIST;
         }
-        if flags & O_TRUNC != 0 && writing {
+        let dev_node = vfile(i).is_some_and(|v| v.fmt != 0o100000);
+        if flags & O_TRUNC != 0 && writing && !dev_node {
             let Some(v) = vfile(i) else { return ENOENT };
             v.len = 0;
             let (ts, tns) = now();
@@ -6789,7 +7074,50 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
             v.ctime_ns = tns;
             ino_report(path, IN_MODIFY, 0);
         }
-        FdKind::Ram(i)
+        if dev_node {
+            const ENODEV: u64 = (-19i64) as u64;
+            const ENXIO: u64 = (-6i64) as u64;
+            let v = vfile(i).unwrap();
+            match v.fmt {
+                // No block driver exists to claim the node —
+                // Linux's answer opening a driverless block dev.
+                0o60000 => return ENODEV,
+                // A fifo node exists but no fifo semantics live
+                // here yet — ENXIO is the documented divergence
+                // (Linux blocks for a peer; there is no peer).
+                0o10000 | 0o140000 => return ENXIO,
+                0o20000 => match v.rdev >> 8 {
+                    // mem family — only the minors we actually
+                    // implement; a crafted node on another minor
+                    // must not fall through to a driver it isn't.
+                    1 => match v.rdev & 0xff {
+                        3 | 5 | 7 | 8 | 9 => {}
+                        _ => return ENXIO,
+                    },
+                    // /dev/tty is the ctty — only the console's
+                    // own session has one, ENXIO otherwise.
+                    5 => match v.rdev & 0xff {
+                        // /dev/tty is the ctty — only the console's
+                        // own session has one, ENXIO otherwise.
+                        0 => {
+                            if t.sid
+                                != unsafe { *core::ptr::addr_of!(CONSOLE_SID) }
+                            {
+                                return ENXIO;
+                            }
+                        }
+                        // /dev/console — same driver.
+                        1 => {}
+                        _ => return ENXIO,
+                    },
+                    _ => return ENODEV,
+                },
+                _ => return ENODEV,
+            }
+            FdKind::Dev(i)
+        } else {
+            FdKind::Ram(i)
+        }
     } else if (unsafe { *core::ptr::addr_of!(INITRD) })
         .is_some_and(|arc| crate::cpio::find(arc, path).is_some())
         && !dir_exists(path)
@@ -6826,17 +7154,6 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
             return EISDIR;
         }
         FdKind::Dir(DirPath::of(path))
-    } else if path == b"dev/tty" {
-        // The controlling terminal — interactive shells (bash job
-        // control) open it regardless of where their stdio points.
-        // Only the console-owning session has one; ENXIO like Linux.
-        if t.sid != unsafe { *core::ptr::addr_of!(CONSOLE_SID) } {
-            return (-6i64) as u64; // ENXIO
-        }
-        if flags & O_DIRECTORY != 0 {
-            return ENOTDIR;
-        }
-        FdKind::Stdin
     } else if flags & O_CREAT != 0 {
         // procfs is fully synthetic — nothing may be created under
         // it even though its pid dirs read as directories.
@@ -6923,7 +7240,7 @@ fn vfile_remove(i: usize) {
     let live = unsafe { &*core::ptr::addr_of!(OFDS) }
         .iter()
         .flatten()
-        .any(|o| matches!(o.kind, FdKind::Ram(j) if j == i));
+        .any(|o| matches!(o.kind, FdKind::Ram(j) | FdKind::Dev(j) if j == i));
     if !live {
         if !data.is_null() {
             // SAFETY: data was kmalloc'd at cap; the slot is cleared
@@ -7059,6 +7376,10 @@ pub fn fs_truncate(path: &[u8], len: u64) -> u64 {
         return if fs_lookup(path).is_some() { EROFS_ } else { ENOENT };
     };
     let Some(v) = vfile(i) else { return ENOENT };
+    // Device nodes and fifos have no size to set — Linux EINVAL.
+    if v.fmt != 0o100000 && !v.is_link {
+        return EINVAL;
+    }
     let r = vfile_truncate(v, len);
     if r == 0 {
         ino_report(path, IN_MODIFY, 0);
@@ -7136,7 +7457,7 @@ pub fn fd_chmod(fd: u64, mode: u64) -> u64 {
     let Some(o) = ofd(t, fd) else { return EBADF };
     let (s, ns) = now();
     match &o.kind {
-        FdKind::Ram(i) => {
+        FdKind::Ram(i) | FdKind::Dev(i) => {
             let Some(v) = vfile(*i) else { return EBADF };
             v.mode = (mode & 0o7777) as u16;
             v.ctime = s;
@@ -7223,7 +7544,7 @@ pub fn fd_chown(fd: u64, uid: u64, gid: u64) -> u64 {
     let uid = uid as u32;
     let gid = gid as u32;
     match &o.kind {
-        FdKind::Ram(i) => {
+        FdKind::Ram(i) | FdKind::Dev(i) => {
             let Some(v) = vfile(*i) else { return EBADF };
             if uid != u32::MAX {
                 v.uid = uid;
@@ -7349,7 +7670,7 @@ pub fn fd_utimens(fd: u64, ts: Option<[[u64; 2]; 2]>) -> u64 {
     }
     let nw = now();
     match &o.kind {
-        FdKind::Ram(i) => {
+        FdKind::Ram(i) | FdKind::Dev(i) => {
             let Some(v) = vfile(*i) else { return EBADF };
             (v.atime, v.atime_ns) =
                 utspec(at, (v.atime, v.atime_ns), nw);
@@ -7407,6 +7728,11 @@ pub fn fd_lseek(fd: u64, off: i64, whence: u64) -> u64 {
             return 0;
         }
         return EINVAL;
+    }
+    // Character devices are noop_llseek — the "position" exists but
+    // lseek answers 0 without moving anything.
+    if let FdKind::Dev(_) = &o.kind {
+        return 0;
     }
     let dlen = match &o.kind {
         FdKind::File(d) => d.len(),
@@ -7674,7 +8000,11 @@ fn ofd_release(oi: usize) {
         // The rendered snapshot frame — OFD-owned, freed with it.
         kalloc::free_frame(buf);
     }
-    if let FdKind::Ram(i) = kind {
+    let ram_i = match kind {
+        FdKind::Ram(i) | FdKind::Dev(i) => Some(i),
+        _ => None,
+    };
+    if let Some(i) = ram_i {
         // inotify close events: CLOSE_WRITE iff the file was opened
         // for writing, CLOSE_NOWRITE otherwise (Linux's rule).
         if let Some(v) = vfile(i) {
@@ -7934,6 +8264,19 @@ fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
                 POLLIN
             } else {
                 0
+            }
+        }
+        FdKind::Dev(i) => {
+            if vfile(*i).is_some_and(|v| v.rdev >> 8 == 5) {
+                // tty: writable always, readable when input queues.
+                let mut r = POLLOUT;
+                if stdin_ready() > 0 {
+                    r |= POLLIN;
+                }
+                r
+            } else {
+                // null/zero/full/random never block either way.
+                POLLIN | POLLOUT
             }
         }
         FdKind::Console => POLLOUT,
@@ -11489,12 +11832,17 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
             fn_ += name.len();
             let ty = if idx < 2 || dir_exists(&full[..fn_]) {
                 4u8
-            } else if vfile_find(&full[..fn_])
-                .is_some_and(|i| vfile(i).is_some_and(|v| v.is_link))
-            {
-                10u8 // DT_LNK — links keep their own type
             } else {
-                8u8
+                match vfile_find(&full[..fn_]).and_then(|i| {
+                    vfile(i).map(|v| (v.is_link, v.fmt))
+                }) {
+                    Some((true, _)) => 10u8,  // DT_LNK
+                    Some((false, 0o20000)) => 2u8,  // DT_CHR
+                    Some((false, 0o60000)) => 6u8,  // DT_BLK
+                    Some((false, 0o10000)) => 1u8,  // DT_FIFO
+                    Some((false, 0o140000)) => 12u8, // DT_SOCK
+                    _ => 8u8,                        // DT_REG
+                }
             };
             ((base + 18) as *mut u8).write(ty);
             core::ptr::copy_nonoverlapping(
