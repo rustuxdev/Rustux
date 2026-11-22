@@ -71,6 +71,19 @@ def main():
         imgs.append(im)
     if not imgs:
         print("no frames captured"); sys.exit(1)
+    # The VGA text screen before GOP init is smaller than the GOP mode;
+    # the GIF canvas takes the FIRST frame's size, so larger later
+    # frames would be clipped. Letterbox every frame onto a black
+    # canvas of the largest captured size.
+    w = max(im.width for im in imgs)
+    h = max(im.height for im in imgs)
+    def letterbox(im):
+        if im.width == w and im.height == h:
+            return im
+        c = Image.new("RGB", (w, h))
+        c.paste(im, (0, 0))
+        return c
+    imgs = [letterbox(im) for im in imgs]
     # hold the last frame longer so the summary is readable
     dur = [350] * len(imgs); dur[-1] = 4000
     q = [im.quantize(colors=256, method=Image.MEDIANCUT) for im in imgs]
