@@ -4547,11 +4547,18 @@ fn load(img: &[u8]) -> Option<Task> {
 const RNG_R: u8 = 1;
 const RNG_W: u8 = 2;
 const RNG_X: u8 = 4;
+/// Reserved-but-uncommitted VMA (NtAllocateVirtualMemory
+/// MEM_RESERVE): occupies VA in the ledger but maps no pages. The
+/// low bits carry the reservation's placeholder protection for
+/// AllocationProtect fidelity, so probes must exclude RNG_RES
+/// explicitly — RNG_R|RNG_W on it must NOT pass.
+const RNG_RES: u8 = 8;
 
 /// Is `[va, va+len)` wholly inside a mapped user range? This is THE
 /// user-pointer gate for the syscall layer — checked arithmetic only.
 /// `need_write` demands RNG_W (kernel writes into the buffer);
-/// otherwise RNG_R suffices — a PROT_NONE VMA fails both.
+/// otherwise RNG_R suffices — a PROT_NONE VMA fails both, and so
+/// does a reserved-not-committed one.
 fn range_check(va: u64, len: u64, need_write: bool) -> bool {
     if len == 0 {
         return false;
@@ -4566,7 +4573,7 @@ fn range_check(va: u64, len: u64, need_write: bool) -> bool {
     cur.is_some_and(|p| {
         p.ranges[..p.nranges]
             .iter()
-            .any(|&(lo, hi, fl)| va >= lo && end <= hi && fl & want != 0)
+            .any(|&(lo, hi, fl)| va >= lo && end <= hi && fl & want != 0 && fl & RNG_RES == 0)
     })
 }
 
@@ -4656,18 +4663,24 @@ fn range_compact(t: &mut Task) {
         if lo >= hi {
             continue;
         }
-        if w > 0 {
-            let p = &mut out[w - 1];
-            if p.1 == lo && p.2 == fl {
-                p.1 = hi;
-                continue;
-            }
-        }
         out[w] = (lo, hi, fl);
         w += 1;
     }
+    // Entries aren't kept sorted — splits append at the tail — so
+    // merges need ordering first; insertion sort is fine at this
+    // table's fixed small size.
+    out[..w].sort_unstable();
+    let mut k = 0usize;
+    for i in 1..w {
+        if out[k].1 == out[i].0 && out[k].2 == out[i].2 {
+            out[k].1 = out[i].1;
+        } else {
+            k += 1;
+            out[k] = out[i];
+        }
+    }
     t.ranges = out;
-    t.nranges = w;
+    t.nranges = if w == 0 { 0 } else { k + 1 };
 }
 
 /// Entries needed after clipping [a,b) out of `t`'s table — partial
@@ -4717,6 +4730,26 @@ fn range_covered(t: &Task, a: u64, b: u64) -> bool {
         let mut adv = cur;
         for &(lo, hi, _) in &t.ranges[..t.nranges] {
             if lo <= cur && hi > adv {
+                adv = hi;
+            }
+        }
+        if adv == cur {
+            return false;
+        }
+        cur = adv;
+    }
+    true
+}
+
+/// Committed-only coverage: like range_covered, but RNG_RES
+/// (reserved-not-committed) entries don't count — VirtualProtect
+/// and decommit need pages that actually exist.
+fn range_committed(t: &Task, a: u64, b: u64) -> bool {
+    let mut cur = a;
+    while cur < b {
+        let mut adv = cur;
+        for &(lo, hi, fl) in &t.ranges[..t.nranges] {
+            if fl & RNG_RES == 0 && lo <= cur && hi > adv {
                 adv = hi;
             }
         }
@@ -7496,57 +7529,268 @@ pub fn nt_stdin_read(ctx: &mut UCtx, buf: u64, len: u64) -> (u64, u64) {
     (crate::nt::STATUS_SUCCESS, n)
 }
 
-/// NtAllocateVirtualMemory backing: commit `size` zeroed bytes at
-/// `hint` if the window is free, else bump-allocate upward from
-/// t.nt_alloc (the NT arena, disjoint from mmap/brk space).
-fn nt_try_map(t: &mut Task, va: u64, size: u64) -> Option<u64> {
+/// Is [va, va+size) placeable by the NT VM layer? Bounds-checked to
+/// the user window, clear of the heap arena (committed or not — a
+/// VirtualAlloc hint must never alias a future heap block), and
+/// overlapping no existing ledger range. No pages are touched.
+fn nt_place_ok(t: &Task, va: u64, size: u64) -> bool {
     if va < elf::USER_VA_LO || va + size >= elf::USER_VA_HI || va + size <= va {
-        return None;
+        return false;
     }
-    // The heap owns its whole arena, committed or not — a
-    // VirtualAlloc hint must never alias a future heap block
-    // (only the committed prefix is a registered range).
     if va < crate::pe::HEAP_MAX && va + size > crate::pe::HEAP_VA {
-        return None;
+        return false;
     }
-    // Reject any overlap with an existing range -- mmap's arena
-    // must not hand the NT layer a page a VMA already owns.
     for i in 0..t.nranges {
         let (a, b, _) = t.ranges[i];
         if va < b && va + size > a {
-            return None;
+            return false;
         }
     }
-    let mut va_cur = va;
-    while va_cur < va + size {
-        map_page(t, va_cur, USER | WRITE | NX)?;
-        va_cur += PAGE;
-    }
-    Some(va)
+    true
 }
 
-pub fn nt_alloc_pages(hint: u64, size: u64) -> Option<u64> {
+/// NtAllocateVirtualMemory backing: `size` zeroed bytes at `hint`
+/// if the window is free, else bump-allocate upward from
+/// t.nt_alloc (the NT arena, disjoint from mmap/brk space).
+/// `commit` maps pages now (`pfl` leaf flags, `rfl` ledger access);
+/// otherwise the entry is RNG_RES|placeholder — VA held, no frames.
+pub fn nt_alloc_pages(hint: u64, size: u64, commit: bool, rfl: u8, pfl: u64) -> Option<u64> {
     let t = cur_mut()?;
-    if hint != 0 {
-        if let Some(va) = nt_try_map(t, hint & !0xfff, size) {
-            return Some(va);
-        }
-    }
-    let mut va = t.nt_alloc.max(NT_ALLOC_VA);
-    loop {
-        if let Some(got) = nt_try_map(t, va, size) {
-            t.nt_alloc = got + size;
-            if t.nranges < MAX_RANGES {
-                t.ranges[t.nranges] = (got, got + size, RNG_R | RNG_W);
-                t.nranges += 1;
+    let mut va = hint & !0xfff;
+    if hint == 0 || !nt_place_ok(t, va, size) {
+        va = t.nt_alloc.max(NT_ALLOC_VA);
+        loop {
+            if va + size >= elf::USER_VA_HI || va < NT_ALLOC_VA {
+                return None;
             }
-            return Some(got);
-        }
-        va += size;
-        if va + size >= elf::USER_VA_HI || va < NT_ALLOC_VA {
-            return None;
+            if nt_place_ok(t, va, size) {
+                break;
+            }
+            va += size;
         }
     }
+    if commit {
+        let mut cur = va;
+        while cur < va + size {
+            map_page(t, cur, pfl)?;
+            cur += PAGE;
+        }
+    }
+    t.nt_alloc = (va + size).max(t.nt_alloc);
+    if t.nranges < MAX_RANGES {
+        let fl = if commit { rfl } else { RNG_RES | rfl };
+        t.ranges[t.nranges] = (va, va + size, fl);
+        t.nranges += 1;
+        return Some(va);
+    }
+    // Ledger full: undo the mapping so frames don't leak.
+    if commit {
+        let mut cur = va;
+        while cur < va + size {
+            unmap_page(t, cur);
+            cur += PAGE;
+        }
+    }
+    None
+}
+
+/// Commit [base,base+size): RNG_RES pieces inside become committed
+/// (ledger split at window edges, pages mapped with `pfl`), already-
+/// committed pieces are left alone (re-commit is a no-op like real
+/// Windows), and unowned gaps become new committed entries — a
+/// MEM_COMMIT at unreserved VA is an implicit reserve. Fails only
+/// on ledger exhaustion or OOM; on OOM the earlier pieces stay
+/// committed, matching the partial-success Windows also permits.
+pub fn nt_commit_window(t: &mut Task, base: u64, size: u64, rfl: u8, pfl: u64) -> bool {
+    let Some(end) = base.checked_add(size) else {
+        return false;
+    };
+    if size == 0
+        || base & 0xfff != 0
+        || base < elf::USER_VA_LO
+        || end > elf::USER_VA_HI
+    {
+        return false;
+    }
+    // The heap arena self-manages — committing inside it would
+    // hand the allocator pages it never reserved.
+    if base < crate::pe::HEAP_MAX && end > crate::pe::HEAP_VA {
+        return false;
+    }
+    // Pre-flight the ledger: each overlapped RNG_RES piece can split
+    // into three and each gap adds one — refuse before mutating.
+    let mut need = 0usize;
+    {
+        let mut cur = base;
+        while cur < end {
+            let mut cov: Option<(u64, u64)> = None;
+            let mut next_lo = end;
+            for &(lo, hi, fl) in &t.ranges[..t.nranges] {
+                if lo <= cur && hi > cur {
+                    cov = Some((lo, hi));
+                    if fl & RNG_RES != 0 {
+                        // The committed piece reuses the slot — only
+                        // the two possible RES remnants are new.
+                        need += (lo < cur) as usize + (hi > end) as usize;
+                    }
+                } else if lo > cur && lo < next_lo {
+                    next_lo = lo;
+                }
+            }
+            let piece_end = cov.map(|(_, hi)| hi.min(end)).unwrap_or(next_lo);
+            if cov.is_none() {
+                need += 1;
+            }
+            cur = piece_end;
+        }
+    }
+    if t.nranges + need > MAX_RANGES {
+        return false;
+    }
+    let mut cur = base;
+    while cur < end {
+        // Find the range covering cur, if any.
+        let mut i = None;
+        let mut next_lo = end;
+        for (j, &(lo, hi, _)) in t.ranges[..t.nranges].iter().enumerate() {
+            if lo <= cur && hi > cur {
+                i = Some(j);
+            } else if lo > cur && lo < next_lo {
+                next_lo = lo;
+            }
+        }
+        let pend = i.map_or(next_lo, |j| t.ranges[j].1.min(end));
+        if let Some(j) = i {
+            let (lo, hi, fl) = t.ranges[j];
+            if fl & RNG_RES != 0 {
+                // Map first — a mapped-but-still-RES page is an
+                // inconsistent ledger; on OOM unwind what's mapped.
+                let mut va = cur;
+                while va < pend {
+                    if map_page(t, va, pfl).is_none() {
+                        let mut u = cur;
+                        while u < va {
+                            unmap_page(t, u);
+                            u += PAGE;
+                        }
+                        return false;
+                    }
+                    va += PAGE;
+                }
+                let res = RNG_RES | (fl & !RNG_RES);
+                t.ranges[j] = (cur, pend, rfl);
+                if lo < cur {
+                    t.ranges[t.nranges] = (lo, cur, res);
+                    t.nranges += 1;
+                }
+                if hi > pend {
+                    t.ranges[t.nranges] = (pend, hi, res);
+                    t.nranges += 1;
+                }
+            }
+        } else {
+            let mut va = cur;
+            while va < pend {
+                if map_page(t, va, pfl).is_none() {
+                    let mut u = cur;
+                    while u < va {
+                        unmap_page(t, u);
+                        u += PAGE;
+                    }
+                    return false;
+                }
+                va += PAGE;
+            }
+            t.ranges[t.nranges] = (cur, pend, rfl);
+            t.nranges += 1;
+        }
+        cur = pend;
+    }
+    range_compact(t);
+    true
+}
+
+/// Decommit [base,base+size): every ledger piece in the window must
+/// exist (a gap is STATUS_MEMORY_NOT_ALLOCATED upstream); committed
+/// pieces drop their pages and become RNG_RES keeping their access
+/// bits as placeholder, reserved pieces are a no-op — matching
+/// Windows, where decommitting a decommitted page succeeds.
+pub fn nt_decommit_window(t: &mut Task, base: u64, size: u64) -> bool {
+    let Some(end) = base.checked_add(size) else {
+        return false;
+    };
+    if size == 0
+        || base & 0xfff != 0
+        || base < elf::USER_VA_LO
+        || end > elf::USER_VA_HI
+    {
+        return false;
+    }
+    // The heap arena self-manages like everywhere else — a
+    // decommit would leave HeapAlloc handing out unmapped pages
+    // marked RNG_RES.
+    if base < crate::pe::HEAP_MAX && end > crate::pe::HEAP_VA {
+        return false;
+    }
+    if !range_covered(t, base, end) {
+        return false;
+    }
+    // Same split worst case as protect: bounded first, mutate after.
+    if protect_entry_count(t, base, end) > MAX_RANGES {
+        return false;
+    }
+    let mut va = base;
+    while va < end {
+        unmap_page(t, va);
+        va += PAGE;
+    }
+    for i in 0..t.nranges {
+        let (lo, hi, fl) = t.ranges[i];
+        if lo >= end || hi <= base || fl & RNG_RES != 0 {
+            continue;
+        }
+        let res = RNG_RES | fl;
+        if lo < base && hi > end {
+            t.ranges[i] = (base, end, res);
+            t.ranges[t.nranges] = (lo, base, fl);
+            t.nranges += 1;
+            t.ranges[t.nranges] = (end, hi, fl);
+            t.nranges += 1;
+        } else if lo < base {
+            t.ranges[i] = (base, hi.min(end), res);
+            t.ranges[t.nranges] = (lo, base, fl);
+            t.nranges += 1;
+        } else if hi > end {
+            t.ranges[i] = (lo.max(base), end, res);
+            t.ranges[t.nranges] = (end, hi, fl);
+            t.nranges += 1;
+        } else {
+            t.ranges[i] = (lo, hi, res);
+        }
+    }
+    range_compact(t);
+    true
+}
+
+/// nt_commit_window on the current task.
+pub fn nt_commit_window_cur(base: u64, size: u64, rfl: u8, pfl: u64) -> bool {
+    cur_mut().is_some_and(|t| nt_commit_window(t, base, size, rfl, pfl))
+}
+
+/// nt_decommit_window on the current task.
+pub fn nt_decommit_window_cur(base: u64, size: u64) -> bool {
+    cur_mut().is_some_and(|t| nt_decommit_window(t, base, size))
+}
+
+/// Extent of the ledger region containing `base` — for a
+/// MEM_RELEASE whose caller passed size 0 (the common form: the
+/// runtime hands back only the base it was given).
+pub fn nt_region_extent(base: u64) -> Option<u64> {
+    let t = cur_mut()?;
+    t.ranges[..t.nranges]
+        .iter()
+        .find(|&&(lo, hi, _)| base >= lo && base < hi)
+        .map(|&(_, hi, _)| hi - base)
 }
 
 /// NtFreeVirtualMemory backing: unmap every page in
@@ -7612,6 +7856,9 @@ pub fn nt_free_pages(base: u64, size: u64) {
 /// PAGE_* constant for a range's RNG flags — what NtQueryVirtualMemory
 /// reports and what VirtualProtect's old-protect readback returns.
 fn prot_from_rng(fl: u8) -> u32 {
+    // RNG_RES rides along with placeholder access bits on reserved
+    // entries — the PAGE_* value reports access, not reservation.
+    let fl = fl & !RNG_RES;
     match (fl & RNG_R != 0, fl & RNG_W != 0, fl & RNG_X != 0) {
         (_, _, true) => {
             if fl & RNG_W != 0 {
@@ -7632,7 +7879,7 @@ fn prot_from_rng(fl: u8) -> u32 {
 /// RNG flags + PTE leaf flags for a PAGE_* protection value.
 /// Modifier bits (GUARD/NOCACHE/WRITECOMBINE) are stripped — we
 /// honor the base protection only; unknown bases fail honestly.
-fn rng_from_prot(prot: u32) -> Option<(u8, u64)> {
+pub fn rng_from_prot(prot: u32) -> Option<(u8, u64)> {
     match prot & 0xff {
         0x01 => Some((0, 0)),                        // NOACCESS
         0x02 => Some((RNG_R, USER | NX)),            // READONLY
@@ -7667,10 +7914,15 @@ pub fn nt_query_vm(base: u64, buf: u64) {
         Some((lo, hi, fl)) => {
             let p = prot_from_rng(fl) as u64;
             w(0x00, lo);
-            w(0x08, lo); // AllocationBase — no reserve/commit split
+            w(0x08, lo);
             w(0x10, p); // AllocationProtect (low u32)
             w(0x18, hi - lo);
-            w(0x20, 0x1000 | (p << 32)); // MEM_COMMIT | Protect
+            if fl & RNG_RES != 0 {
+                // Reserved: state MEM_RESERVE, page Protect 0.
+                w(0x20, 0x2000);
+            } else {
+                w(0x20, 0x1000 | (p << 32)); // MEM_COMMIT | Protect
+            }
             w(0x28, 0x2_0000); // MEM_PRIVATE
         }
         None => {
@@ -7717,7 +7969,7 @@ pub fn nt_protect_vm(base: u64, size: u64, prot: u32, old_ptr: u64) -> u64 {
     let Some(t) = cur_mut() else {
         return crate::nt::STATUS_INVALID_HANDLE;
     };
-    if !range_covered(t, lo, hi)
+    if !range_committed(t, lo, hi)
         || protect_entry_count(t, lo, hi) > MAX_RANGES
     {
         return crate::nt::STATUS_MEMORY_NOT_ALLOCATED;

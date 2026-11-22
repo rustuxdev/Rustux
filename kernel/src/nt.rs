@@ -579,16 +579,29 @@ fn nt_set_info(ctx: &mut UCtx) -> u64 {
 }
 
 /// NtAllocateVirtualMemory(process, &base, zerobits, &size, type,
-/// protect): anonymous commit at a hint or a bump arena. MEM_RESERVE
-/// alone isn't honored — every page is committed on demand like the
-/// rest of our mm.
+/// protect): MEM_RESERVE places an RNG_RES ledger entry — VA held,
+/// no frames (a 1 GiB reservation costs nothing). MEM_COMMIT pages
+/// in a window: inside a reservation it commits in place, at free
+/// VA it's an implicit reserve+commit, over committed pages it's a
+/// no-op success. Both flags place then commit, the common form.
+/// `protect` is honored via rng_from_prot — the page-table flags,
+/// not just bookkeeping.
 fn nt_alloc_vm(ctx: &mut UCtx) -> u64 {
+    const MEM_RESERVE: u64 = 0x2000;
+    const MEM_COMMIT: u64 = 0x1000;
     let base_ptr = arg(ctx, 1);
     let size_ptr = arg(ctx, 3);
     // Write-side check: results land back through these pointers —
     // a read-only probe address must fault like a real AV.
     if !user::range_ok_w(base_ptr, 8) || !user::range_ok_w(size_ptr, 8) {
         return STATUS_ACCESS_VIOLATION;
+    }
+    let (ty, prot) = (arg(ctx, 4), arg(ctx, 5) as u32);
+    let Some((rfl, pfl)) = user::rng_from_prot(prot) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if ty & (MEM_RESERVE | MEM_COMMIT) == 0 {
+        return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: validated user window.
     let (hint, mut size) = unsafe {
@@ -601,8 +614,36 @@ fn nt_alloc_vm(ctx: &mut UCtx) -> u64 {
     if size == 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    let Some(va) = user::nt_alloc_pages(hint, size) else {
-        return STATUS_NO_MEMORY;
+    let va = if ty & MEM_RESERVE != 0 {
+        // Reserve the window, then commit it too if asked.
+        let Some(va) = user::nt_alloc_pages(hint, size, false, rfl, pfl) else {
+            return STATUS_NO_MEMORY;
+        };
+        if ty & MEM_COMMIT != 0 && !user::nt_commit_window_cur(va, size, rfl, pfl) {
+            // Don't leave a reservation behind on a call the
+            // caller believes failed.
+            user::nt_free_pages(va, size);
+            return STATUS_NO_MEMORY;
+        }
+        va
+    } else {
+        // Commit-only: hint lands inside a reservation or on free
+        // VA — the window routine handles both plus re-commit.
+        let (base, owned) = if hint != 0 {
+            (hint & !0xfff, false)
+        } else {
+            let Some(va) = user::nt_alloc_pages(0, size, false, rfl, pfl) else {
+                return STATUS_NO_MEMORY;
+            };
+            (va, true)
+        };
+        if !user::nt_commit_window_cur(base, size, rfl, pfl) {
+            if owned {
+                user::nt_free_pages(base, size);
+            }
+            return STATUS_NO_MEMORY;
+        }
+        base
     };
     // SAFETY: both pointers validated above.
     unsafe {
@@ -613,11 +654,13 @@ fn nt_alloc_vm(ctx: &mut UCtx) -> u64 {
 }
 
 /// NtFreeVirtualMemory(process, &base, &size, type): MEM_RELEASE
-/// (0x8000) unmaps every page in [base, base+size) — the Win32
-/// layer's free()/HeapFree path recovers the extent from the
-/// malloc header the VirtualAlloc thunk wrote. MEM_DECOMMIT alone
-/// isn't honored (no reserve/commit split in our mm).
+/// drops the whole region — the recorded extent is looked up from
+/// the ledger (a caller may legally pass size=0). MEM_DECOMMIT
+/// returns pages but keeps the reservation. Anything else is
+/// invalid like real Windows.
 fn nt_free_vm(ctx: &mut UCtx) -> u64 {
+    const MEM_DECOMMIT: u64 = 0x4000;
+    const MEM_RELEASE: u64 = 0x8000;
     if arg(ctx, 0) != u64::MAX {
         return STATUS_INVALID_PARAMETER;
     }
@@ -626,11 +669,9 @@ fn nt_free_vm(ctx: &mut UCtx) -> u64 {
     if !user::range_ok_w(bp, 8) || !user::range_ok_w(sp, 8) {
         return STATUS_ACCESS_VIOLATION;
     }
-    if arg(ctx, 3) & 0x8000 == 0 {
-        return STATUS_NOT_IMPLEMENTED;
-    }
+    let ty = arg(ctx, 3);
     // SAFETY: both pointers validated above.
-    let (base, size) = unsafe {
+    let (base, mut size) = unsafe {
         (
             (bp as *const u64).read_unaligned(),
             (sp as *const u64).read_unaligned(),
@@ -638,6 +679,24 @@ fn nt_free_vm(ctx: &mut UCtx) -> u64 {
     };
     if base == 0 || base & 0xfff != 0 {
         return STATUS_INVALID_PARAMETER;
+    }
+    if ty & MEM_DECOMMIT != 0 {
+        size = (size + 0xfff) & !0xfff;
+        return if user::nt_decommit_window_cur(base, size) {
+            STATUS_SUCCESS
+        } else {
+            STATUS_MEMORY_NOT_ALLOCATED
+        };
+    }
+    if ty & MEM_RELEASE == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // size==0 on release names the whole covering region.
+    if size == 0 {
+        let Some(ext) = user::nt_region_extent(base) else {
+            return STATUS_MEMORY_NOT_ALLOCATED;
+        };
+        size = ext;
     }
     user::nt_free_pages(base, size);
     STATUS_SUCCESS

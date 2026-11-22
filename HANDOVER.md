@@ -2123,3 +2123,52 @@ findings; cve.now PTE-protection hits are all Linux-mm
 concurrent-walker UAF races (n/a — synchronous rewrite under
 the global lock). Suite: 21/21 0 failures, 50 tasks, frames
 108480 -> 108480 zero leak, qemu exit 33. Ledger: 114.
+
+run-114 — NT virtual-memory reserve/commit split: VirtualAlloc
+finally behaves like real Windows memory. MEM_RESERVE places an
+RNG_RES ledger entry (bit 8) that holds VA with zero frames —
+a 1 GiB reservation costs nothing — carrying the placeholder
+protection in the access bits for honest AllocationProtect;
+range_check now excludes RNG_RES explicitly so placeholder
+bits can never pass a user-pointer probe into unmapped pages.
+MEM_COMMIT walks the window piecewise through
+nt_commit_window: inside a reservation it splits the entry
+(remnants keep RNG_RES|placeholder) and maps pages with the
+call-supplied protection — protect is finally honored, not
+just bookkeeping — at unowned VA its
+
+run-114 — NT virtual-memory reserve/commit split: VirtualAlloc
+finally behaves like real Windows memory. MEM_RESERVE places an
+RNG_RES ledger entry (bit 8) that holds VA with zero frames —
+a 1 GiB reservation costs nothing — carrying the placeholder
+protection in the access bits for honest AllocationProtect;
+range_check now excludes RNG_RES explicitly so placeholder
+bits can never pass a user-pointer probe into unmapped pages.
+MEM_COMMIT walks the window piecewise through
+nt_commit_window: inside a reservation it splits the entry
+(remnants keep RNG_RES|placeholder) and maps pages with the
+call-supplied protection — protect is finally honored, not
+just bookkeeping — at unowned VA it's an implicit
+reserve+commit, and over committed pages it's the no-op
+re-commit Windows allows. MEM_DECOMMIT lands as its own path:
+committed pieces unmap and flip to RNG_RES, reserved pieces
+are no-ops, gaps fail; and MEM_RELEASE with size 0 resolves
+the covering region extent like real callers expect.
+VirtualQuery reports MEM_RESERVE with Protect 0; protect and
+decommit require committed coverage (range_committed). All
+window ops bound to user VA, page-align bases, reject the
+self-managed heap arena (commit/decommit/protect/free now
+consistent), pre-flight ledger capacity before any split,
+and map-before-flag with per-piece unwind so a mapped-but-
+reserved page can never exist. range_compact now sorts
+before merging since splits append out of order — repeated
+commit/decommit cycles can't exhaust the ledger. Audit
+run-88 quick scoped: no confirmed findings; the audit caught
+that decommit was missing the heap-arena exclusion the other
+three ops had (would have left HeapAlloc handing out unmapped
+pages). winmem.exe.gz (real MinGW) proves it end to end:
+1 GiB reserve succeeds (eager would need ~262k frames),
+in-reservation commit, Query RESERVE->COMMIT->RESERVE->FREE,
+protect-on-reserved fails, decommit and both release forms
+work — exits 29. Suite: 21/21 0 failures, 51 tasks, frames
+108477 -> 108477 zero leak, qemu exit 33. Ledger: 115.
