@@ -1426,6 +1426,10 @@ pub struct Task {
     tls_tmpl_va: u64,
     tls_tmpl_sz: u64,
     thr_exit_va: u64,
+    /// Thunk-stub bump cursor — the exe's import thunks start at
+    /// STUB_VA and every later-mapped DLL continues from here (0 =
+    /// uninitialized, lazily set to STUB_VA on first emit).
+    nt_stub: u64,
     /// The signal that stopped this task (0 = not stop-reported).
     /// wait4 WUNTRACED consumes it once per stop.
     stop_sig: u8,
@@ -2284,6 +2288,16 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
         return false;
     }
     for s in p.sections.iter().take(p.nsec) {
+        // DISCARDABLE sections (.debug_*) are not part of the loaded
+        // image — skipping them also keeps the ranges[] ledger from
+        // exhausting MAX_RANGES on debug-linked MinGW builds. MinGW
+        // marks .reloc discardable too, so a discardable section
+        // that carries the base-reloc directory is still kept.
+        if s.chars & 0x0200_0000 != 0
+            && !(p.reloc_rva >= s.va && p.reloc_rva < s.va + s.vsize.max(1))
+        {
+            continue;
+        }
         let va0 = (p.bias + s.va) & !0xfff;
         let va1 = (p.bias + s.va + s.vsize.max(1) + 0xfff) & !0xfff;
         // IMAGE_SCN_MEM_{EXECUTE,READ,WRITE} → our page flags.
@@ -2299,10 +2313,14 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
                 return false;
             }
         }
+        let rend = s.raw.saturating_add(s.raw_len) as usize;
+        if s.raw as usize > img.len() || rend > img.len() {
+            return false;
+        }
         if !write_task_bytes_force(
             t.pml4,
             p.bias + s.va,
-            &img[s.raw as usize..(s.raw + s.raw_len) as usize],
+            &img[s.raw as usize..rend],
         ) {
             return false;
         }
@@ -2324,7 +2342,7 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
     }
     // Rebase against the load bias, then bind imports — both must
     // run before the image executes, and both honestly fail the load.
-    if !pe_apply_relocs(t, p) || !pe_resolve_imports(t, p) {
+    if !pe_apply_relocs(t, p) || !pe_resolve_imports(t, p, true) {
         return false;
     }
     for i in 0..USTACK_PAGES {
@@ -2436,6 +2454,298 @@ fn pe_apply_relocs(t: &mut Task, p: &crate::pe::Pe) -> bool {
         va += bsz;
     }
     true
+}
+
+/// Map a PE image as a loadable module (LoadLibrary's kernel half):
+/// the preferred base when free, else the next NT-arena window;
+/// headers + per-section pages at their RVAs, base relocations and
+/// IAT binding — pe_load_inner's mapping half, minus process state.
+/// Returns (HMODULE base, page-rounded span), or unwinds + None.
+fn pe_map_image(img: &[u8]) -> Option<(u64, u64)> {
+    let mut p = crate::pe::parse(img)?;
+
+    let t = mm_owner_mut()?;
+    let size = (p.size + 0xfff) & !0xfff;
+    let mut base = p.image_base & !0xfff;
+    if !(base >= elf::USER_VA_LO && nt_place_ok(t, base, size)) {
+        base = t.nt_alloc.max(NT_ALLOC_VA);
+        loop {
+            if base + size >= elf::USER_VA_HI || base < NT_ALLOC_VA {
+                return None;
+            }
+            if nt_place_ok(t, base, size) {
+                break;
+            }
+            base += PAGE;
+        }
+    }
+    p.bias = base;
+    let ok = (|| {
+        map_page(t, base, USER | NX)?;
+        let hdrlen = (p.sections[0].raw as usize).min(img.len()).min(4096);
+        if !write_task_bytes_force(t.pml4, base, &img[..hdrlen]) {
+            return None;
+        }
+        for s in p.sections.iter().take(p.nsec) {
+            // DISCARDABLE sections (.debug_*, .drectve) are not part
+            // of the loaded image — the Windows loader skips them
+            // too. Mapping them would also burn one ranges[] slot
+            // each and exhaust MAX_RANGES on debug builds. MinGW
+            // marks .reloc discardable, so a discardable section
+            // that carries the base-reloc directory is still kept.
+            if s.chars & 0x0200_0000 != 0
+                && !(p.reloc_rva >= s.va && p.reloc_rva < s.va + s.vsize.max(1))
+            {
+                continue;
+            }
+            let va0 = (base + s.va) & !0xfff;
+            let va1 = (base + s.va + s.vsize.max(1) + 0xfff) & !0xfff;
+            let mut fl = USER;
+            if s.chars & 0x8000_0000 != 0 {
+                fl |= WRITE;
+            }
+            if s.chars & 0x2000_0000 == 0 {
+                fl |= NX;
+            }
+            for va in (va0..va1).step_by(4096) {
+                map_page(t, va, fl)?;
+            }
+            let rend = s.raw.saturating_add(s.raw_len) as usize;
+            if s.raw as usize > img.len() || rend > img.len() {
+                return None;
+            }
+            if !write_task_bytes_force(
+                t.pml4,
+                base + s.va,
+                &img[s.raw as usize..rend],
+            ) {
+                return None;
+            }
+            if t.nranges >= MAX_RANGES {
+                return None;
+            }
+            let mut rfl = 0u8;
+            if s.chars & 0x4000_0000 != 0 {
+                rfl |= RNG_R;
+            }
+            if s.chars & 0x8000_0000 != 0 {
+                rfl |= RNG_W;
+            }
+            if s.chars & 0x2000_0000 != 0 {
+                rfl |= RNG_X;
+            }
+            t.ranges[t.nranges] = (va0, va1, rfl);
+            t.nranges += 1;
+        }
+        (pe_apply_relocs(t, &p) && pe_resolve_imports(t, &p, false)).then_some(())
+    })();
+    if ok.is_none() {
+        nt_free_pages_t(t, base, size);
+        return None;
+    }
+    t.nt_alloc = (base + size).max(t.nt_alloc);
+    Some((base, size))
+}
+
+/// Loaded-module ledger: (owner_pid, base, span, refs, nlen, name).
+/// LoadLibrary dedups by name — a second load of the same module
+/// bumps refs and hands back the same HMODULE, like Windows.
+const NT_MAX_MODS: usize = 8;
+static mut NT_MODS: [(u64, u64, u64, u64, u8, [u8; 32]); NT_MAX_MODS] =
+    [(0, 0, 0, 0, 0, [0; 32]); NT_MAX_MODS];
+
+/// Find a live module for the caller's process by name.
+fn nt_mod_find(owner: u64, name: &[u8]) -> Option<usize> {
+    let tab = unsafe { &*core::ptr::addr_of!(NT_MODS) };
+    tab.iter().position(|e| {
+        e.3 != 0 && e.0 == owner && &e.5[..e.4 as usize] == name
+    })
+}
+
+/// Find a live module for the caller's process by base address.
+fn nt_mod_find_base(owner: u64, base: u64) -> Option<usize> {
+    let tab = unsafe { &*core::ptr::addr_of!(NT_MODS) };
+    tab.iter()
+        .position(|e| e.3 != 0 && e.0 == owner && e.1 == base)
+}
+
+/// Record a freshly-mapped module. Caller already holds nothing —
+/// the slot is claimed here.
+fn nt_mod_add(owner: u64, base: u64, size: u64, name: &[u8]) -> bool {
+    if name.is_empty() || name.len() > 32 {
+        return false;
+    }
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
+    // Sweep slots whose owning process is fully gone.
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    for e in tab.iter_mut() {
+        if e.3 != 0 && !tasks.iter().flatten().any(|t| t.pid == e.0) {
+            *e = (0, 0, 0, 0, 0, [0; 32]);
+        }
+    }
+    let Some(i) = tab.iter().position(|e| e.3 == 0) else {
+        return false;
+    };
+    let mut nm = [0u8; 32];
+    nm[..name.len()].copy_from_slice(name);
+    tab[i] = (owner, base, size, 1, name.len() as u8, nm);
+    true
+}
+
+/// LoadLibraryA/W kernel half: read the module name off the user
+/// stack (ANSI, or UTF-16 when `wide`), dedup against live modules
+/// of this process, resolve backing bytes (VFILES "/name" first,
+/// then the initrd), map the image and record it. HMODULE or 0.
+pub fn nt_load_dll(name_va: u64, wide: bool) -> u64 {
+    let (pml4, owner) = match mm_owner_mut() {
+        Some(t) => (t.pml4, t.pid),
+        None => return 0,
+    };
+    if !range_ok(name_va, 2) {
+        return 0;
+    }
+    let mut nb = [0u8; 64];
+    let nl = if wide {
+        let mut i = 0usize;
+        while i < 63 {
+            let Some(c) = read_task_u(pml4, name_va + i as u64 * 2, 2) else {
+                return 0;
+            };
+            if c == 0 {
+                break;
+            }
+            if c > 0x7f {
+                return 0;
+            }
+            nb[i] = c as u8;
+            i += 1;
+        }
+        i
+    } else {
+        read_task_str(pml4, name_va, &mut nb)
+    };
+    if nl == 0 {
+        return 0;
+    }
+    // Basename only — the flat VFS has no search path to honor.
+    let name = &nb[..nl];
+    let st = name
+        .iter()
+        .rposition(|&c| c == b'\\' || c == b'/')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let name = &name[st..];
+    if name.is_empty() {
+        return 0;
+    }
+    if let Some(i) = nt_mod_find(owner, name) {
+        let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
+        tab[i].3 += 1;
+        return tab[i].1; // dedup: plain base, no FRESH bit
+    }
+    if name.len() > 62 {
+        return 0;
+    }
+    let mut full = [0u8; 64];
+    full[0] = b'/';
+    full[1..1 + name.len()].copy_from_slice(name);
+    let img: Option<&[u8]> =
+        if let Some(v) = vfile_find(&full[..1 + name.len()]).and_then(vfile) {
+            (!v.data.is_null() && v.len != 0)
+                .then(|| unsafe { core::slice::from_raw_parts(v.data, v.len) })
+        } else {
+            unsafe { *core::ptr::addr_of!(INITRD) }
+                .and_then(|arc| crate::cpio::find(arc, name))
+        };
+    let Some(img) = img else { return 0 };
+    let Some((base, size)) = pe_map_image(img) else { return 0 };
+    if !nt_mod_add(owner, base, size, name) {
+        nt_free_pages(base, size);
+        return 0;
+    }
+    // Bit 63 tells the thunk this is a fresh map — DllMain's
+    // DLL_PROCESS_ATTACH runs only then, not on dedup hits.
+    base | (1 << 63)
+}
+
+/// GetProcAddress kernel half: `hmod` must be a live module of the
+/// caller's process; walks its export directory by name. Returns
+/// the export's VA or 0 (unknown module, bad name, forwarder — a
+/// forwarded export needs another module's machinery we don't run).
+pub fn nt_get_proc(hmod: u64, name_va: u64) -> u64 {
+    let (pml4, owner) = match mm_owner_mut() {
+        Some(t) => (t.pml4, t.pid),
+        None => return 0,
+    };
+    let Some(mi) = nt_mod_find_base(owner, hmod) else {
+        return 0;
+    };
+    let span = unsafe { &*core::ptr::addr_of!(NT_MODS) }[mi].2;
+    if !range_ok(name_va, 1) {
+        return 0;
+    }
+    let mut nb = [0u8; 64];
+    let nl = read_task_str(pml4, name_va, &mut nb);
+    if nl == 0 {
+        return 0;
+    }
+    let name = &nb[..nl];
+    let rd = |off: u64, w: u64| read_task_u(pml4, hmod + off, w);
+    let Some(peoff) = rd(0x3c, 4) else { return 0 };
+    let opt = peoff + 24;
+    let (Some(erva), Some(esz)) = (rd(opt + 112, 4), rd(opt + 116, 4)) else {
+        return 0;
+    };
+    if erva == 0 {
+        return 0;
+    }
+    let (Some(nnames), Some(af), Some(an), Some(ao)) = (
+        rd(erva + 0x18, 4),
+        rd(erva + 0x1c, 4),
+        rd(erva + 0x20, 4),
+        rd(erva + 0x24, 4),
+    ) else {
+        return 0;
+    };
+    for i in 0..nnames.min(8192) {
+        let Some(nrva) = rd(an + i * 4, 4) else { return 0 };
+        let mut cmpb = [0u8; 64];
+        let cl = read_task_str(pml4, hmod + nrva, &mut cmpb);
+        if cl == 0 || &cmpb[..cl] != name {
+            continue;
+        }
+        let Some(ord) = rd(ao + i * 2, 2) else { return 0 };
+        let Some(frva) = rd(af + ord * 4, 4) else { return 0 };
+        if frva >= erva && frva < erva + esz {
+            return 0; // forwarded export — not supported
+        }
+        if frva >= span {
+            return 0; // export RVA outside the image — malformed
+        }
+        return hmod + frva;
+    }
+    0
+}
+
+/// FreeLibrary kernel half: refs-- on the caller's module; the last
+/// ref unmaps the whole image span and frees the slot.
+pub fn nt_free_dll(hmod: u64) -> u64 {
+    let owner = nt_owner_pid();
+    let Some(i) = nt_mod_find_base(owner, hmod) else {
+        return 0;
+    };
+    let (base, size) = {
+        let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
+        tab[i].3 -= 1;
+        if tab[i].3 != 0 {
+            return 1;
+        }
+        let e = tab[i];
+        tab[i] = (0, 0, 0, 0, 0, [0; 32]);
+        (e.1, e.2)
+    };
+    nt_free_pages(base, size);
+    1
 }
 
 /// Read a NUL-terminated string out of a task's space into `out`;
@@ -3521,6 +3831,99 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             ]);
         }
         // Sleep(ms) -> NtDelayExecution(0, &(-ms*10000)).
+        // LoadLibraryA/W(name) -> RUX_LOAD_DLL: the kernel maps the
+        // module; the thunk then calls DllMain(hmod, ATTACH, 0) in
+        // userland when the image has an entry point — kernel code
+        // never invokes user code directly.
+        b"LoadLibraryA" => {
+            e.raw(&[
+                0x4c, 0x8b, 0xd1, //       mov r10,rcx
+                0x31, 0xd2, //             xor edx,edx   wide=0
+                0xb8, 0xf4, 0, 0, 0, //   mov eax,0xF4
+                0x0f, 0x05, //             syscall
+                0x48, 0x85, 0xc0, //       test rax,rax
+            ]);
+            let nul = e.jcc(0x4); //        NULL -> ret
+            let fresh = e.jcc(0x8); //      sign (FRESH bit) -> DllMain
+            e.raw(&[0xc3]); //             dedup hit -> ret as-is
+            e.fix(fresh);
+            e.raw(&[
+                0x48, 0x0f, 0xba, 0xf0, 0x3f, // btr rax,63  clear FRESH
+                0x8b, 0x48, 0x3c, //          mov ecx,[rax+0x3c]    peoff
+                0x8b, 0x4c, 0x08, 0x28, //    mov ecx,[rax+rcx+0x28] entry_rva
+                0x85, 0xc9, //                test ecx,ecx
+            ]);
+            let noent = e.jcc(0x4);
+            e.raw(&[
+                0x48, 0x01, 0xc1, //       add rcx,rax   entry_va
+                0x49, 0x89, 0xc9, //       mov r9,rcx
+                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
+                0x48, 0x89, 0x44, 0x24, 0x20, // mov [rsp+0x20],rax
+                0x48, 0x89, 0xc1, //       mov rcx,rax   hinst
+                0xba, 0x01, 0, 0, 0, //   mov edx,1     DLL_PROCESS_ATTACH
+                0x45, 0x31, 0xc0, //       xor r8d,r8d
+                0x41, 0xff, 0xd1, //       call r9       DllMain
+                0x48, 0x8b, 0x44, 0x24, 0x20, // mov rax,[rsp+0x20]
+                0x48, 0x83, 0xc4, 0x38, // add rsp,0x38
+            ]);
+            e.fix(nul);
+            e.fix(noent);
+            e.raw(&[0xc3]); //             ret
+        }
+        b"LoadLibraryW" => {
+            e.raw(&[
+                0x4c, 0x8b, 0xd1, //       mov r10,rcx
+                0xba, 0x01, 0, 0, 0, //   mov edx,1     wide=1
+                0xb8, 0xf4, 0, 0, 0, //   mov eax,0xF4
+                0x0f, 0x05, //             syscall
+                0x48, 0x85, 0xc0, //       test rax,rax
+            ]);
+            let nul = e.jcc(0x4); //        NULL -> ret
+            let fresh = e.jcc(0x8); //      sign (FRESH bit) -> DllMain
+            e.raw(&[0xc3]); //             dedup hit -> ret as-is
+            e.fix(fresh);
+            e.raw(&[
+                0x48, 0x0f, 0xba, 0xf0, 0x3f, // btr rax,63  clear FRESH
+                0x8b, 0x48, 0x3c, //          mov ecx,[rax+0x3c]
+                0x8b, 0x4c, 0x08, 0x28, //    mov ecx,[rax+rcx+0x28]
+                0x85, 0xc9, //                test ecx,ecx
+            ]);
+            let noent = e.jcc(0x4);
+            e.raw(&[
+                0x48, 0x01, 0xc1, //       add rcx,rax
+                0x49, 0x89, 0xc9, //       mov r9,rcx
+                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
+                0x48, 0x89, 0x44, 0x24, 0x20, // mov [rsp+0x20],rax
+                0x48, 0x89, 0xc1, //       mov rcx,rax
+                0xba, 0x01, 0, 0, 0, //   mov edx,1
+                0x45, 0x31, 0xc0, //       xor r8d,r8d
+                0x41, 0xff, 0xd1, //       call r9
+                0x48, 0x8b, 0x44, 0x24, 0x20, // mov rax,[rsp+0x20]
+                0x48, 0x83, 0xc4, 0x38, // add rsp,0x38
+            ]);
+            e.fix(nul);
+            e.fix(noent);
+            e.raw(&[0xc3]); //             ret
+        }
+        // GetProcAddress(hmod,name) -> RUX_GET_PROC: kernel walks the
+        // module's export directory; rdx already carries arg1.
+        b"GetProcAddress" => {
+            e.raw(&[
+                0x4c, 0x8b, 0xd1, //       mov r10,rcx
+                0xb8, 0xf5, 0, 0, 0, //   mov eax,0xF5
+                0x0f, 0x05, //             syscall
+                0xc3, //                   ret
+            ]);
+        }
+        // FreeLibrary(hmod) -> RUX_FREE_DLL: BOOL-ish 1/0.
+        b"FreeLibrary" => {
+            e.raw(&[
+                0x4c, 0x8b, 0xd1, //       mov r10,rcx
+                0xb8, 0xf6, 0, 0, 0, //   mov eax,0xF6
+                0x0f, 0x05, //             syscall
+                0xc3, //                   ret
+            ]);
+        }
         b"Sleep" => {
             e.raw(&[
                 0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
@@ -4448,7 +4851,11 @@ fn k32_data_init(t: &mut Task) {
 /// honest load failure), map each ILT name to a service number, emit
 /// `mov r10,rcx; mov eax,nr; syscall; ret` (the real ntdll shape),
 /// and patch the IAT so compiled `call [rip+IAT]` code just works.
-fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
+/// Bind an image's IAT to emitted thunks. `primary` (the process
+/// exe) also gets the TLS-attach trampoline — which rewrites
+/// `t.entry` — and the thread-exit stub; a later-loaded DLL must
+/// touch neither.
+fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe, primary: bool) -> bool {
     // Stub pages map unconditionally — import thunks and the TLS
     // callback trampoline both live there.
     if map_page(t, crate::pe::STUB_VA, USER | WRITE).is_none()
@@ -4459,7 +4866,13 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
     {
         return false;
     }
-    let mut stub_next = crate::pe::STUB_VA;
+    // The cursor persists on the task: the exe's thunks start at
+    // STUB_VA and each later-mapped DLL continues from where the
+    // last image left off — shared stub space, one bump pointer.
+    if t.nt_stub == 0 {
+        t.nt_stub = crate::pe::STUB_VA;
+    }
+    let mut stub_next = t.nt_stub;
     if p.import_size != 0 {
         let mut i = 0u64;
         loop {
@@ -4568,19 +4981,25 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
     }
     // TLS-callback trampoline (DLL_PROCESS_ATTACH) shares the stub
     // pages — it must land before the read+execute lock-down.
-    if emit_tls_tramp(t, p, &mut stub_next).is_none() {
-        return false;
+    // Exe-only: a DLL's callbacks fire from the LoadLibrary path,
+    // and `t.entry` already names the running image.
+    if primary {
+        if emit_tls_tramp(t, p, &mut stub_next).is_none() {
+            return false;
+        }
+        // The thread-exit stub too: a secondary thread's start_fn
+        // "returns" here — rax's value becomes the thread exit
+        // status via NtTerminateThread(0, status).
+        if emit_thr_exit(t, &mut stub_next).is_none() {
+            return false;
+        }
     }
-    // The thread-exit stub too: a secondary thread's start_fn
-    // "returns" here — rax's value becomes the thread exit status
-    // via NtTerminateThread(0, status).
-    if emit_thr_exit(t, &mut stub_next).is_none() {
-        return false;
-    }
-    // Fill done — drop the stub pages to read+execute.
+    // Fill done — drop the stub pages to read+execute and publish
+    // the cursor so the next mapped module appends, not overwrites.
     map_page(t, crate::pe::STUB_VA, USER);
     map_page(t, crate::pe::STUB_VA + 0x1000, USER);
     map_page(t, crate::pe::STUB_VA + 0x2000, USER);
+    t.nt_stub = stub_next;
     true
 }
 
@@ -4933,6 +5352,7 @@ fn load(img: &[u8]) -> Option<Task> {
         tls_tmpl_va: 0,
         tls_tmpl_sz: 0,
         thr_exit_va: 0,
+        nt_stub: 0,
         stop_sig: 0,
         cont_report: false,
         start_ticks: crate::apic::TICKS
@@ -8332,6 +8752,7 @@ pub fn nt_thread_create(
         tls_tmpl_va: p.tls_tmpl_va,
         tls_tmpl_sz: p.tls_tmpl_sz,
         thr_exit_va: p.thr_exit_va,
+        nt_stub: p.nt_stub,
         stop_sig: 0,
         cont_report: false,
         start_ticks: crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed),
@@ -8909,6 +9330,12 @@ pub fn nt_region_extent(base: u64) -> Option<u64> {
 /// free either — only the frames).
 pub fn nt_free_pages(base: u64, size: u64) {
     let Some(t) = mm_owner_mut() else { return };
+    nt_free_pages_t(t, base, size);
+}
+
+/// nt_free_pages on an already-resolved owner task — the module
+/// loader's failure unwind can't re-borrow through mm_owner_mut.
+fn nt_free_pages_t(t: &mut Task, base: u64, size: u64) {
     let end = base.saturating_add(size);
     let mut i = 0;
     while i < t.nranges {
@@ -17086,6 +17513,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         tls_tmpl_va: p.tls_tmpl_va,
         tls_tmpl_sz: p.tls_tmpl_sz,
         thr_exit_va: p.thr_exit_va,
+        nt_stub: p.nt_stub,
         stop_sig: 0,
         cont_report: false,
         start_ticks: crate::apic::TICKS
@@ -17259,6 +17687,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         tls_tmpl_va: p.tls_tmpl_va,
         tls_tmpl_sz: p.tls_tmpl_sz,
         thr_exit_va: p.thr_exit_va,
+        nt_stub: p.nt_stub,
         stop_sig: 0,
         cont_report: false,
         start_ticks: crate::apic::TICKS

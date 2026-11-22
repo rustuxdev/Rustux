@@ -2313,3 +2313,21 @@ denied cases — exit(39). Audit run-91 quick scoped: 2
 confirmed findings fixed in-run, no remaining. Suite: 21/21
 0 failures, 53 tasks, frames 108475 -> 108475 zero leak,
 qemu exit 33. Ledger: 118.
+
+## run-118 — PE DLL loading (LoadLibrary/GetProcAddress/FreeLibrary)
+
+Real MinGW windll.dll loads inside a running NT process: pe_map_image
+maps the image into an existing address space (arena placement, per-
+section PTE+ledger, DISCARDABLE skip that keeps .reloc since MinGW
+marks it discardable), relocs + IAT thunks via the persisted nt_stub
+cursor, NT_MODS ledger for dedup/refs/unload. LoadLibraryA/W thunks
+call DllMain(DLL_PROCESS_ATTACH) only on fresh maps — the kernel
+returns base|1<<63 and the thunk js/btr-rax,63s on it. nt_get_proc
+walks the export dir by name (owner-checked hmod, forwarders rejected,
+frva span-checked). nt_free_dll refcount-unmaps. windlltest exits 33:
+load, export call, DllMain state, dedup same-HMODULE, two FreeLibrary,
+reload fresh map, missing export + missing dll rejection. Audit
+run-92 quick scoped: no confirmed findings, 2 latent fixed in-diff
+(frva span, raw-extent slice guard both loaders). Suite: 21/21
+0 failures, 54 tasks, frames 108468 -> 108468 zero leak,
+qemu exit 33. Ledger: 120.

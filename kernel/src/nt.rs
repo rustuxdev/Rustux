@@ -72,6 +72,11 @@ const RUX_HEAP_ALLOC: u32 = 0xF0;
 const RUX_HEAP_REALLOC: u32 = 0xF1;
 const RUX_HEAP_FREE: u32 = 0xF2;
 const RUX_HEAP_SIZE: u32 = 0xF3;
+/// Private module-loader services — LdrLoadDll is usermode ntdll
+/// on real Windows, so these have no canonical service number.
+const RUX_LOAD_DLL: u32 = 0xF4;
+const RUX_GET_PROC: u32 = 0xF5;
+const RUX_FREE_DLL: u32 = 0xF6;
 
 /// Handle table tags — a per-task `nth` slot's object kind. Real
 /// handles are small indices (1-based) like the actual handle table;
@@ -1261,6 +1266,11 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         RUX_HEAP_REALLOC => nt_heap_realloc_svc(ctx),
         RUX_HEAP_FREE => nt_heap_free_svc(ctx),
         RUX_HEAP_SIZE => nt_heap_size_svc(ctx),
+        // LoadLibraryA(name[,wide]) / GetProcAddress / FreeLibrary —
+        // private services backing the Win32 thunks.
+        RUX_LOAD_DLL => user::nt_load_dll(arg(ctx, 0), arg(ctx, 1) != 0),
+        RUX_GET_PROC => user::nt_get_proc(arg(ctx, 0), arg(ctx, 1)),
+        RUX_FREE_DLL => user::nt_free_dll(arg(ctx, 0)),
         NT_TERMINATE_PROCESS => {
             // hProcess == (HANDLE)-1 means self; anything else is a
             // kill we don't model yet — the common case is self-exit.

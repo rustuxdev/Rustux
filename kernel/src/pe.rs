@@ -40,6 +40,7 @@ const CHAR_EXEC: u16 = 0x0002;
 const CHAR_LARGE_ADDR: u16 = 0x0020;
 
 /// Directory-entry indices into the optional header's DataDirectory.
+const DIR_EXPORT: usize = 0;
 const DIR_IMPORT: usize = 1;
 const DIR_RELOC: usize = 5;
 const DIR_TLS: usize = 9;
@@ -138,11 +139,17 @@ pub fn parse(b: &[u8]) -> Option<Pe> {
             (0, 0)
         }
     };
+    let (export_rva, export_size) = dir(DIR_EXPORT);
     let (import_rva, import_size) = dir(DIR_IMPORT);
     let (reloc_rva, reloc_size) = dir(DIR_RELOC);
     let (tls_rva, tls_size) = dir(DIR_TLS);
     // Directory extents must lie inside the image span when present.
-    for (r, sz) in [(import_rva, import_size), (reloc_rva, reloc_size), (tls_rva, tls_size)] {
+    for (r, sz) in [
+        (export_rva, export_size),
+        (import_rva, import_size),
+        (reloc_rva, reloc_size),
+        (tls_rva, tls_size),
+    ] {
         if sz != 0 && r.checked_add(sz).is_none_or(|e| e > size) {
             return None;
         }

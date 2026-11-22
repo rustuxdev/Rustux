@@ -1036,8 +1036,10 @@ fn main() -> Status {
             // '/' names are support files (lib64/ld-linux...,
             // lib/.../libc.so.6) — ELFs, but not tasks. MZ marks a
             // PE32+ image — those spawn under the NT personality.
+            // .dll files are loadable modules, not processes.
             if !(img.starts_with(b"\x7fELF") || img.starts_with(b"MZ"))
                 || name.contains(&b'/')
+                || name.ends_with(b".dll")
             {
                 kprintln!(con, "rustux: task {nm}: skipped (data file)");
                 continue;
