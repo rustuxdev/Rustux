@@ -388,6 +388,7 @@ const MAX_IEVS: usize = 8;
 /// inotify event bits (Linux uapi values).
 const IN_ACCESS: u32 = 0x1;
 const IN_MODIFY: u32 = 0x2;
+const IN_ATTRIB: u32 = 0x4;
 const IN_CLOSE_WRITE: u32 = 0x8;
 const IN_CLOSE_NOWRITE: u32 = 0x10;
 const IN_OPEN: u32 = 0x20;
@@ -1619,7 +1620,9 @@ const VFILE_MAX: usize = 1 << 20;
 /// survives removal while fds still name it — Linux's open-unlink
 /// semantics: the OFD keeps working until its last close frees data.
 /// `is_link` marks a symlink: `data` then holds the raw target text
-/// (no NUL — readlink echoes bytes verbatim).
+/// (no NUL — readlink echoes bytes verbatim). mode/uid/gid and the
+/// three timestamps are stored like a real inode — chmod/chown/
+/// utimensat mutate them and stat reports them.
 struct VFile {
     name: [u8; 128],
     nlen: usize,
@@ -1628,6 +1631,15 @@ struct VFile {
     cap: usize,
     unlinked: bool,
     is_link: bool,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    atime: u64,
+    atime_ns: u32,
+    mtime: u64,
+    mtime_ns: u32,
+    ctime: u64,
+    ctime_ns: u32,
 }
 // SAFETY: VFILES slots own their buffers; single-CPU, IF-masked
 // context means no concurrent access. Raw ptr never escapes.
@@ -1667,10 +1679,42 @@ fn vfile_create(path: &[u8]) -> u64 {
         cap: 0,
         unlinked: false,
         is_link: false,
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        atime: 0,
+        atime_ns: 0,
+        mtime: 0,
+        mtime_ns: 0,
+        ctime: 0,
+        ctime_ns: 0,
     };
     v.name[..path.len()].copy_from_slice(path);
     vs[i] = Some(v);
     i as u64
+}
+
+/// Current wall time as (sec, nsec): TICKS is 100 Hz so subsecond
+/// granularity is an honest 10 ms — no fake nanosecond noise.
+fn now() -> (u64, u32) {
+    let t = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    (t / 100, (t % 100) as u32 * 10_000_000)
+}
+
+/// Fresh-object metadata: creation mode with the caller's umask
+/// applied (umask only ever masks 0o777, setuid bits pass like
+/// Linux), owner 0:0, all three timestamps "now".
+fn vfile_stamp(v: &mut VFile, mode: u64, umask: u16) {
+    let (s, ns) = now();
+    v.mode = (mode & 0o7777 & !(umask as u64)) as u16;
+    v.uid = 0;
+    v.gid = 0;
+    v.atime = s;
+    v.atime_ns = ns;
+    v.mtime = s;
+    v.mtime_ns = ns;
+    v.ctime = s;
+    v.ctime_ns = ns;
 }
 
 /// Grow a VFile's buffer to at least `need` bytes — zeroed fresh
@@ -4055,7 +4099,14 @@ pub fn sys_rseq(uaddr: u64, len: u64, flags: u64, sig: u64) -> u64 {
 fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
     match kind {
         FdKind::Stdin | FdKind::Console => (0o20644u64, 0u64, 0), // S_IFCHR
-        FdKind::Dir(_) => (0o40755, 0, 0),
+        FdKind::Dir(dp) => {
+            let m = vdir_find(dp.bytes())
+                .and_then(|i| unsafe {
+                    (*core::ptr::addr_of!(VDIRS))[i]
+                })
+                .map_or(0o755u64, |d| d.mode as u64);
+            (0o40000 | m, 0, 0)
+        }
         FdKind::File(d) => {
             let ino = (unsafe { *core::ptr::addr_of!(INITRD) })
                 .and_then(|arc| {
@@ -4073,8 +4124,14 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
                 .iter()
                 .filter(|s| s.as_ref().is_some_and(|v| !v.unlinked))
                 .count();
-            (0o100644, vfile(*i).map_or(0, |v| v.len) as u64,
-             (arc_n + vidx) as u64 + 1)
+            let (mode, len) = vfile(*i).map_or((0o644u64, 0usize), |v| {
+                (
+                    (if v.is_link { 0o20000 } else { 0o100000 })
+                        | v.mode as u64,
+                    v.len,
+                )
+            });
+            (mode, len as u64, (arc_n + vidx) as u64 + 1)
         }
         // proc files stat as read-only regulars; the rendered
         // length is the honest size of this snapshot.
@@ -4115,6 +4172,38 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     st[6] = size;
     st[7] = 4096;
     st[8] = size.div_ceil(512);
+    // Stored inode metadata — only Ram inodes and explicit dirs
+    // carry it; everything else reports zeros like Linux initramfs.
+    match &o.kind {
+        FdKind::Ram(i) => {
+            if let Some(v) = vfile(*i) {
+                stat_meta(
+                    &mut st,
+                    v.uid,
+                    v.gid,
+                    (v.atime, v.atime_ns),
+                    (v.mtime, v.mtime_ns),
+                    (v.ctime, v.ctime_ns),
+                );
+            }
+        }
+        FdKind::Dir(dp) => {
+            if let Some(i) = vdir_find(dp.bytes()) {
+                let ds = unsafe { &*core::ptr::addr_of!(VDIRS) };
+                if let Some(d) = ds[i].as_ref() {
+                    stat_meta(
+                        &mut st,
+                        d.uid,
+                        d.gid,
+                        (d.atime, d.atime_ns),
+                        (d.mtime, d.mtime_ns),
+                        (d.ctime, d.ctime_ns),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
     // SAFETY: statbuf validated writable for 144 bytes.
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -4176,7 +4265,7 @@ pub fn sys_clock_gettime(_clk: u64, ts: u64) -> u64 {
 /// mkdir/mkdirat(dirfd, path, mode): create an explicit VDIRS dir —
 /// mode is accepted and ignored (no per-file modes yet). EEXIST on
 /// any existing name; the parent must already be a directory.
-pub fn fs_mkdir(dfd: u64, path: &[u8]) -> u64 {
+pub fn fs_mkdir(dfd: u64, path: &[u8], mode: u64) -> u64 {
     const EEXIST_: u64 = (-17i64) as u64;
     const ENOSPC_: u64 = (-28i64) as u64;
     const ENOTDIR_: u64 = (-20i64) as u64;
@@ -4209,7 +4298,21 @@ pub fn fs_mkdir(dfd: u64, path: &[u8]) -> u64 {
     let Some(i) = ds.iter().position(Option::is_none) else {
         return ENOSPC_;
     };
-    let mut d = VDir { path: [0; 128], nlen: p.len() };
+    let umask = cur_mut().map_or(0, |t| fst(t).umask);
+    let (s, ns) = now();
+    let mut d = VDir {
+        path: [0; 128],
+        nlen: p.len(),
+        mode: (mode & 0o7777 & !(umask as u64)) as u16,
+        uid: 0,
+        gid: 0,
+        atime: s,
+        atime_ns: ns,
+        mtime: s,
+        mtime_ns: ns,
+        ctime: s,
+        ctime_ns: ns,
+    };
     d.path[..p.len()].copy_from_slice(p);
     ds[i] = Some(d);
     ino_report(p, IN_CREATE | IN_ISDIR, 0);
@@ -4904,6 +5007,9 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                 )
             };
             o.pos += n;
+            let (ts, tns) = now();
+            v.atime = ts;
+            v.atime_ns = tns;
             let mut nm = [0u8; 128];
             nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
             ino_report(&nm[..v.nlen], IN_ACCESS, 0);
@@ -5018,6 +5124,11 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         };
         v.len = v.len.max(need);
         o.pos = need;
+        let (ts, tns) = now();
+        v.mtime = ts;
+        v.mtime_ns = tns;
+        v.ctime = ts;
+        v.ctime_ns = tns;
         let mut nm = [0u8; 128];
         nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
         ino_report(&nm[..v.nlen], IN_MODIFY, 0);
@@ -5256,6 +5367,27 @@ pub fn fd_pipe(fdptr: u64, flags: u64) -> u64 {
     0
 }
 
+/// Fill the uid/gid + timestamp region of the 144-byte stat record
+/// (offsets: uid@28 folds into st[3]'s top half, gid@32, times at
+/// 72/88/104 with nsec at +8). Callers set st[3]'s low half first.
+fn stat_meta(
+    st: &mut [u64; 18],
+    uid: u32,
+    gid: u32,
+    atime: (u64, u32),
+    mtime: (u64, u32),
+    ctime: (u64, u32),
+) {
+    st[3] |= (uid as u64) << 32;
+    st[4] = gid as u64;
+    st[9] = atime.0;
+    st[10] = atime.1 as u64;
+    st[11] = mtime.0;
+    st[12] = mtime.1 as u64;
+    st[13] = ctime.0;
+    st[14] = ctime.1 as u64;
+}
+
 /// newfstatat(dirfd, path, statbuf, flags) -> Linux struct stat
 /// (144 bytes, x86_64 layout) at a user pointer. The cpio archive
 /// is the whole fs: ino is the entry's archive index, mode is
@@ -5297,6 +5429,14 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
             st[3] = 0o120777; // S_IFLNK | 0777
             st[6] = v.len as u64; // st_size = target length
             st[7] = 4096;
+            stat_meta(
+                &mut st,
+                v.uid,
+                v.gid,
+                (v.atime, v.atime_ns),
+                (v.mtime, v.mtime_ns),
+                (v.ctime, v.ctime_ns),
+            );
             // SAFETY: range_ok_w proved statbuf writable.
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -5350,7 +5490,22 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
     if !is_file(path) && dir_exists(path) {
         // Any directory — root, VDIRS, implicit prefix, virtual proc.
         st[2] = 2; // st_nlink
-        st[3] = 0o40755; // st_mode: S_IFDIR | 0755 (u64 slot holds u32)
+        if let Some(i) = vdir_find(path) {
+            // An explicit mkdir'd dir reports its stored metadata.
+            let ds = unsafe { &*core::ptr::addr_of!(VDIRS) };
+            let Some(d) = ds[i].as_ref() else { return ENOENT };
+            st[3] = 0o40000 | d.mode as u64; // S_IFDIR | stored mode
+            stat_meta(
+                &mut st,
+                d.uid,
+                d.gid,
+                (d.atime, d.atime_ns),
+                (d.mtime, d.mtime_ns),
+                (d.ctime, d.ctime_ns),
+            );
+        } else {
+            st[3] = 0o40755; // st_mode: S_IFDIR | 0755
+        }
     } else if let Some(i) = vfile_find(path) {
         // RAM files shadow the archive — same lookup order as open.
         let Some(v) = vfile(i) else { return ENOENT };
@@ -5362,9 +5517,21 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
             .count();
         st[1] = (arc_n + vidx) as u64 + 1; // st_ino — getdents order
         st[2] = 1; // st_nlink
-        st[3] = 0o100644; // st_mode: S_IFREG | 0644
+        st[3] = if v.is_link {
+            0o120000 | v.mode as u64 // S_IFLNK | stored (followed-into case)
+        } else {
+            0o100000 | v.mode as u64 // S_IFREG | stored mode
+        };
         st[6] = v.len as u64; // st_size
         st[8] = (v.len as u64).div_ceil(512); // st_blocks
+        stat_meta(
+            &mut st,
+            v.uid,
+            v.gid,
+            (v.atime, v.atime_ns),
+            (v.mtime, v.mtime_ns),
+            (v.ctime, v.ctime_ns),
+        );
     } else if let Some(pe) = proc_parse(path) {
         // The exe link stats its target like a followed symlink;
         // the generated files show Linux's 0444/size-0 proc shape.
@@ -5461,6 +5628,15 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
 struct VDir {
     path: [u8; 128],
     nlen: usize,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    atime: u64,
+    atime_ns: u32,
+    mtime: u64,
+    mtime_ns: u32,
+    ctime: u64,
+    ctime_ns: u32,
 }
 static mut VDIRS: [Option<VDir>; 16] = [None; 16];
 
@@ -5689,6 +5865,8 @@ pub fn fs_symlink(dfd: u64, target: &[u8], linkpath: &[u8]) -> u64 {
     let i = r as usize;
     let g = {
         let Some(v) = vfile(i) else { return (-12i64) as u64 };
+        // Linux links are always 0o777 — umask never applies.
+        vfile_stamp(v, 0o777, 0);
         let g = vfile_grow(v, target.len());
         if g == 0 {
             // SAFETY: grow owns >= target.len() writable bytes.
@@ -6503,15 +6681,16 @@ fn cloexec_set(t: &mut Task, fi: usize, on: bool) {
     }
 }
 
-/// open(path, flags): "" and "." name the namespace root (a Dir
+/// open(path, flags, mode): "" and "." name the namespace root (a Dir
 /// OFD); names resolve VFILES first then cpio — a scratch file may
 /// shadow an archive name the same way a mount does. Writable
 /// opens land on Ram files only; cpio writes are EROFS, like a
-/// read-only mount. O_CREAT mints a VFile; O_EXCL with it is EEXIST
+/// read-only mount. O_CREAT mints a VFile whose stored mode is
+/// `mode & ~umask` like Linux; O_EXCL with it is EEXIST
 /// on either namespace; O_TRUNC needs write access (ignored on
 /// O_RDONLY per Linux); O_APPEND sets per-OFD append. Unknown flag
 /// bits → EINVAL, ENOENT when absent, EMFILE at the table bounds.
-pub fn fd_open(path: &[u8], flags: u64) -> u64 {
+pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
     const EROFS: u64 = (-30i64) as u64;
     const ENOTDIR: u64 = (-20i64) as u64;
     const EEXIST: u64 = (-17i64) as u64;
@@ -6603,6 +6782,11 @@ pub fn fd_open(path: &[u8], flags: u64) -> u64 {
         if flags & O_TRUNC != 0 && writing {
             let Some(v) = vfile(i) else { return ENOENT };
             v.len = 0;
+            let (ts, tns) = now();
+            v.mtime = ts;
+            v.mtime_ns = tns;
+            v.ctime = ts;
+            v.ctime_ns = tns;
             ino_report(path, IN_MODIFY, 0);
         }
         FdKind::Ram(i)
@@ -6670,6 +6854,9 @@ pub fn fd_open(path: &[u8], flags: u64) -> u64 {
         let r = vfile_create(path);
         if (r as i64) < 0 {
             return r;
+        }
+        if let Some(v) = vfile(r as usize) {
+            vfile_stamp(v, mode, fst(t).umask);
         }
         ino_report(path, IN_CREATE, 0);
         FdKind::Ram(r as usize)
@@ -6813,6 +7000,9 @@ pub fn fs_rename(old: &[u8], new: &[u8]) -> u64 {
     v.name = [0; 128];
     v.name[..new.len()].copy_from_slice(new);
     v.nlen = new.len();
+    let (ts, tns) = now();
+    v.ctime = ts;
+    v.ctime_ns = tns;
     let cookie = INO_COOKIE
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u32;
     ino_report_self_loss(old, IN_MOVE_SELF, cookie);
@@ -6844,6 +7034,11 @@ fn vfile_truncate(v: &mut VFile, len: u64) -> u64 {
         unsafe { core::ptr::write_bytes(v.data.add(v.len), 0, need - v.len) };
     }
     v.len = need;
+    let (ts, tns) = now();
+    v.mtime = ts;
+    v.mtime_ns = tns;
+    v.ctime = ts;
+    v.ctime_ns = tns;
     0
 }
 
@@ -6889,6 +7084,302 @@ pub fn fd_ftruncate(fd: u64, len: u64) -> u64 {
         ino_report(&nm[..v.nlen], IN_MODIFY, 0);
     }
     r
+}
+
+/// chmod core on a resolved name: ramfs objects take new permission
+/// bits + a ctime bump; archive/proc are read-only mounts (EROFS);
+/// a miss is ENOENT. `p` names the object — links already resolved
+/// (or deliberately not, for the fd path on a Ram link inode).
+fn chmod_obj(p: &[u8], mode: u64) -> u64 {
+    const EROFS_: u64 = (-30i64) as u64;
+    let (s, ns) = now();
+    if let Some(i) = vfile_find(p) {
+        let Some(v) = vfile(i) else { return ENOENT };
+        v.mode = (mode & 0o7777) as u16;
+        v.ctime = s;
+        v.ctime_ns = ns;
+        ino_report(p, IN_ATTRIB, 0);
+        return 0;
+    }
+    if let Some(i) = vdir_find(p) {
+        let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
+        let Some(d) = ds[i].as_mut() else { return ENOENT };
+        d.mode = (mode & 0o7777) as u16;
+        d.ctime = s;
+        d.ctime_ns = ns;
+        ino_report(p, IN_ATTRIB, 0);
+        return 0;
+    }
+    if fs_exists(p) {
+        EROFS_
+    } else {
+        ENOENT
+    }
+}
+
+/// chmod(path, mode)/fchmodat(dirfd, path, mode): follows the final
+/// link like Linux — there is no lchmod.
+pub fn fs_chmod(cpath: &[u8], mode: u64) -> u64 {
+    let (rb, rn, _) = match resolve_links(cpath, true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    chmod_obj(&rb[..rn], mode)
+}
+
+/// fchmod(fd, mode): Ram OFDs act on their inode directly (unlinked
+/// files still take a mode like Linux); Dir OFDs on an explicit dir.
+pub fn fd_chmod(fd: u64, mode: u64) -> u64 {
+    const EROFS_: u64 = (-30i64) as u64;
+    const EINVAL_: u64 = (-22i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let (s, ns) = now();
+    match &o.kind {
+        FdKind::Ram(i) => {
+            let Some(v) = vfile(*i) else { return EBADF };
+            v.mode = (mode & 0o7777) as u16;
+            v.ctime = s;
+            v.ctime_ns = ns;
+            let mut nm = [0u8; 128];
+            nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+            ino_report(&nm[..v.nlen], IN_ATTRIB, 0);
+            0
+        }
+        FdKind::Dir(dp) => {
+            let Some(i) = vdir_find(dp.bytes()) else { return EROFS_ };
+            let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
+            let Some(d) = ds[i].as_mut() else { return ENOENT };
+            d.mode = (mode & 0o7777) as u16;
+            d.ctime = s;
+            d.ctime_ns = ns;
+            let mut nm = [0u8; 128];
+            nm[..d.nlen].copy_from_slice(&d.path[..d.nlen]);
+            ino_report(&nm[..d.nlen], IN_ATTRIB, 0);
+            0
+        }
+        FdKind::File(_) | FdKind::Proc { .. } => EROFS_,
+        _ => EINVAL_,
+    }
+}
+
+/// chown core on a resolved name — u32::MAX is the "keep" sentinel
+/// (userspace -1). ctime bumps like Linux; IN_ATTRIB emits.
+fn chown_obj(p: &[u8], uid: u32, gid: u32) -> u64 {
+    const EROFS_: u64 = (-30i64) as u64;
+    let (s, ns) = now();
+    if let Some(i) = vfile_find(p) {
+        let Some(v) = vfile(i) else { return ENOENT };
+        if uid != u32::MAX {
+            v.uid = uid;
+        }
+        if gid != u32::MAX {
+            v.gid = gid;
+        }
+        v.ctime = s;
+        v.ctime_ns = ns;
+        ino_report(p, IN_ATTRIB, 0);
+        return 0;
+    }
+    if let Some(i) = vdir_find(p) {
+        let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
+        let Some(d) = ds[i].as_mut() else { return ENOENT };
+        if uid != u32::MAX {
+            d.uid = uid;
+        }
+        if gid != u32::MAX {
+            d.gid = gid;
+        }
+        d.ctime = s;
+        d.ctime_ns = ns;
+        ino_report(p, IN_ATTRIB, 0);
+        return 0;
+    }
+    if fs_exists(p) {
+        EROFS_
+    } else {
+        ENOENT
+    }
+}
+
+/// chown/lchown/fchownat on a canonical name: `nofollow` is the
+/// lchown + AT_SYMLINK_NOFOLLOW split — the link itself takes the
+/// new owner. Register args truncate to u32 like Linux's uid_t.
+pub fn fs_chown(cpath: &[u8], uid: u64, gid: u64, nofollow: bool) -> u64 {
+    let (rb, rn, _) = match resolve_links(cpath, !nofollow) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    chown_obj(&rb[..rn], uid as u32, gid as u32)
+}
+
+/// fchown(fd, uid, gid): the OFD's inode — same mapping as fchmod.
+pub fn fd_chown(fd: u64, uid: u64, gid: u64) -> u64 {
+    const EROFS_: u64 = (-30i64) as u64;
+    const EINVAL_: u64 = (-22i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let (s, ns) = now();
+    let uid = uid as u32;
+    let gid = gid as u32;
+    match &o.kind {
+        FdKind::Ram(i) => {
+            let Some(v) = vfile(*i) else { return EBADF };
+            if uid != u32::MAX {
+                v.uid = uid;
+            }
+            if gid != u32::MAX {
+                v.gid = gid;
+            }
+            v.ctime = s;
+            v.ctime_ns = ns;
+            let mut nm = [0u8; 128];
+            nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+            ino_report(&nm[..v.nlen], IN_ATTRIB, 0);
+            0
+        }
+        FdKind::Dir(dp) => {
+            let Some(i) = vdir_find(dp.bytes()) else { return EROFS_ };
+            let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
+            let Some(d) = ds[i].as_mut() else { return ENOENT };
+            if uid != u32::MAX {
+                d.uid = uid;
+            }
+            if gid != u32::MAX {
+                d.gid = gid;
+            }
+            d.ctime = s;
+            d.ctime_ns = ns;
+            let mut nm = [0u8; 128];
+            nm[..d.nlen].copy_from_slice(&d.path[..d.nlen]);
+            ino_report(&nm[..d.nlen], IN_ATTRIB, 0);
+            0
+        }
+        FdKind::File(_) | FdKind::Proc { .. } => EROFS_,
+        _ => EINVAL_,
+    }
+}
+
+/// utimensat sentinels (Linux uapi).
+const UTIME_NOW: u64 = 0x3fffffff;
+const UTIME_OMIT: u64 = 0x3ffffffe;
+
+/// Apply one (sec, nsec) spec: OMIT keeps, NOW stamps, anything else
+/// is literal. `cur`/`nw` are (sec, nsec) pairs.
+fn utspec(spec: (u64, u64), cur: (u64, u32), nw: (u64, u32)) -> (u64, u32) {
+    match spec.1 {
+        UTIME_OMIT => cur,
+        UTIME_NOW => nw,
+        n => (spec.0, n as u32),
+    }
+}
+
+/// utimensat core on a canonical name: `ts` is the two-spec array
+/// (None == NULL pointer == both NOW); `nofollow` honors
+/// AT_SYMLINK_NOFOLLOW. Spec nsec must be <1e9 or a sentinel —
+/// EINVAL otherwise like Linux.
+pub fn fs_utimens(
+    cpath: &[u8],
+    ts: Option<[[u64; 2]; 2]>,
+    nofollow: bool,
+) -> u64 {
+    let (at, mt) = match ts {
+        Some([[as_, an], [ms, mn]]) => ((as_, an), (ms, mn)),
+        None => ((0, UTIME_NOW), (0, UTIME_NOW)),
+    };
+    let (rb, rn, _) = match resolve_links(cpath, !nofollow) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    // Linux validates the timespecs only after the inode is found —
+    // a missing path outranks a bad nsec.
+    for n in [at.1, mt.1] {
+        if n != UTIME_NOW && n != UTIME_OMIT && n >= 1_000_000_000 {
+            return EINVAL;
+        }
+    }
+    let p = &rb[..rn];
+    const EROFS_: u64 = (-30i64) as u64;
+    let nw = now();
+    if let Some(i) = vfile_find(p) {
+        let Some(v) = vfile(i) else { return ENOENT };
+        (v.atime, v.atime_ns) =
+            utspec(at, (v.atime, v.atime_ns), nw);
+        (v.mtime, v.mtime_ns) =
+            utspec(mt, (v.mtime, v.mtime_ns), nw);
+        v.ctime = nw.0;
+        v.ctime_ns = nw.1;
+        ino_report(p, IN_ATTRIB, 0);
+        return 0;
+    }
+    if let Some(i) = vdir_find(p) {
+        let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
+        let Some(d) = ds[i].as_mut() else { return ENOENT };
+        (d.atime, d.atime_ns) =
+            utspec(at, (d.atime, d.atime_ns), nw);
+        (d.mtime, d.mtime_ns) =
+            utspec(mt, (d.mtime, d.mtime_ns), nw);
+        d.ctime = nw.0;
+        d.ctime_ns = nw.1;
+        ino_report(p, IN_ATTRIB, 0);
+        return 0;
+    }
+    if fs_exists(p) {
+        EROFS_
+    } else {
+        ENOENT
+    }
+}
+
+/// futimens via utimensat(AT_EMPTY_PATH): the OFD's inode — same
+/// mapping as fchmod. `ts` semantics identical to fs_utimens.
+pub fn fd_utimens(fd: u64, ts: Option<[[u64; 2]; 2]>) -> u64 {
+    const EROFS_: u64 = (-30i64) as u64;
+    const EINVAL_: u64 = (-22i64) as u64;
+    let (at, mt) = match ts {
+        Some([[as_, an], [ms, mn]]) => ((as_, an), (ms, mn)),
+        None => ((0, UTIME_NOW), (0, UTIME_NOW)),
+    };
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    for n in [at.1, mt.1] {
+        if n != UTIME_NOW && n != UTIME_OMIT && n >= 1_000_000_000 {
+            return EINVAL_;
+        }
+    }
+    let nw = now();
+    match &o.kind {
+        FdKind::Ram(i) => {
+            let Some(v) = vfile(*i) else { return EBADF };
+            (v.atime, v.atime_ns) =
+                utspec(at, (v.atime, v.atime_ns), nw);
+            (v.mtime, v.mtime_ns) =
+                utspec(mt, (v.mtime, v.mtime_ns), nw);
+            v.ctime = nw.0;
+            v.ctime_ns = nw.1;
+            let mut nm = [0u8; 128];
+            nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+            ino_report(&nm[..v.nlen], IN_ATTRIB, 0);
+            0
+        }
+        FdKind::Dir(dp) => {
+            let Some(i) = vdir_find(dp.bytes()) else { return EROFS_ };
+            let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
+            let Some(d) = ds[i].as_mut() else { return ENOENT };
+            (d.atime, d.atime_ns) =
+                utspec(at, (d.atime, d.atime_ns), nw);
+            (d.mtime, d.mtime_ns) =
+                utspec(mt, (d.mtime, d.mtime_ns), nw);
+            d.ctime = nw.0;
+            d.ctime_ns = nw.1;
+            let mut nm = [0u8; 128];
+            nm[..d.nlen].copy_from_slice(&d.path[..d.nlen]);
+            ino_report(&nm[..d.nlen], IN_ATTRIB, 0);
+            0
+        }
+        FdKind::File(_) | FdKind::Proc { .. } => EROFS_,
+        _ => EINVAL_,
+    }
 }
 
 /// fsync/fdatasync(fd): RAM files have nothing to flush and archive

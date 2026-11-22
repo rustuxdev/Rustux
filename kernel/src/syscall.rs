@@ -289,6 +289,17 @@ const NR_UNLINK: u64 = 87;
 const NR_UNLINKAT: u64 = 263;
 const NR_RENAMEAT: u64 = 264;
 const NR_RENAMEAT2: u64 = 276;
+const NR_CHMOD: u64 = 90;
+const NR_FCHMOD: u64 = 91;
+const NR_CHOWN: u64 = 92;
+const NR_FCHOWN: u64 = 93;
+const NR_LCHOWN: u64 = 94;
+const NR_UTIME: u64 = 132;
+const NR_UTIMES: u64 = 235;
+const NR_FCHOWNAT: u64 = 260;
+const NR_FUTIMESAT: u64 = 261;
+const NR_FCHMODAT: u64 = 268;
+const NR_UTIMENSAT: u64 = 280;
 
 // errno values (negative returns per the kernel ABI).
 const ENOENT: u64 = (-2i64) as u64;
@@ -473,8 +484,19 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_REBOOT => user::sys_reboot(a1, a2, a3),
         NR_CHDIR => sys_chdir(a1),
         NR_FCHDIR => user::sys_fchdir(a1),
-        NR_MKDIR => sys_mkdirat(u64::MAX, a1),
-        NR_MKDIRAT => sys_mkdirat(a1, a2),
+        NR_CHMOD => sys_chmod(a1, a2),
+        NR_FCHMOD => user::fd_chmod(a1, a2),
+        NR_FCHMODAT => sys_fchmodat(a1, a2, a3),
+        NR_CHOWN => sys_chown_path(u64::MAX, a1, a2, a3, false),
+        NR_FCHOWN => user::fd_chown(a1, a2, a3),
+        NR_LCHOWN => sys_chown_path(u64::MAX, a1, a2, a3, true),
+        NR_FCHOWNAT => sys_fchownat(a1, a2, a3, a4, a5),
+        NR_UTIME => sys_utime(a1, a2),
+        NR_UTIMES => sys_utimes_path(u64::MAX, a1, a2),
+        NR_FUTIMESAT => sys_utimes_path(a1, a2, a3),
+        NR_UTIMENSAT => sys_utimensat(a1, a2, a3, a4),
+        NR_MKDIR => sys_mkdirat(u64::MAX, a1, a2),
+        NR_MKDIRAT => sys_mkdirat(a1, a2, a3),
         NR_RMDIR => sys_rmdir(a1),
         NR_EXIT => sys_exit(a1),
         _ => {
@@ -554,7 +576,7 @@ fn sys_open(path: u64, flags: u64, mode: u64) -> u64 {
 /// happen inside canon_path — AT_FDCWD or absolute resolve against
 /// cwd/root, a real dirfd against the dir it names (EBADF bad fd,
 /// ENOTDIR non-dir). The canonical flat name feeds fd_open.
-fn sys_openat(dirfd: u64, path: u64, flags: u64, _mode: u64) -> u64 {
+fn sys_openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> u64 {
     let mut name = [0u8; 257];
     let n = match copy_user_path(path, &mut name) {
         Ok(n) => n,
@@ -564,7 +586,7 @@ fn sys_openat(dirfd: u64, path: u64, flags: u64, _mode: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    user::fd_open(&cb[..cn], flags)
+    user::fd_open(&cb[..cn], flags, mode)
 }
 
 /// execve(path, argv, envp): resolve the name in the initrd, verify it
@@ -754,14 +776,15 @@ fn sys_chdir(path: u64) -> u64 {
     user::sys_chdir(&name[..n])
 }
 
-/// mkdir/mkdirat(dirfd, path, mode): mode is accepted and ignored.
-fn sys_mkdirat(dirfd: u64, path: u64) -> u64 {
+/// mkdir/mkdirat(dirfd, path, mode): mode is the new dir's stored
+/// permission bits after the caller's umask.
+fn sys_mkdirat(dirfd: u64, path: u64, mode: u64) -> u64 {
     let mut name = [0u8; 257];
     let n = match copy_user_path(path, &mut name) {
         Ok(n) => n,
         Err(e) => return e,
     };
-    user::fs_mkdir(dirfd, &name[..n])
+    user::fs_mkdir(dirfd, &name[..n], mode)
 }
 
 /// rmdir(path): cwd-relative — canon inside fs_rmdir.
@@ -833,6 +856,174 @@ fn sys_symlinkat(target: u64, dirfd: u64, linkpath: u64) -> u64 {
         Err(e) => return e,
     };
     user::fs_symlink(dirfd, &tp[..tn], &lp[..ln])
+}
+
+/// chmod(path, mode): canon then the resolved-name chmod — the
+/// final link follows like Linux (no lchmod exists).
+fn sys_chmod(path: u64, mode: u64) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let (cb, cn) = match user::canon_path(u64::MAX, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::fs_chmod(&cb[..cn], mode)
+}
+
+/// fchmodat(dirfd, path, mode): the x86_64 ABI takes no flags arg —
+/// fchmodat2's AT_SYMLINK_NOFOLLOW isn't in this number.
+fn sys_fchmodat(dirfd: u64, path: u64, mode: u64) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let (cb, cn) = match user::canon_path(dirfd, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::fs_chmod(&cb[..cn], mode)
+}
+
+/// chown/lchown(dirfd-less and dirfd variants share this): canon
+/// then fs_chown — `nofollow` is the lchown/AT_SYMLINK_NOFOLLOW
+/// split, acting on the link itself.
+fn sys_chown_path(dirfd: u64, path: u64, uid: u64, gid: u64, nofollow: bool) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let (cb, cn) = match user::canon_path(dirfd, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::fs_chown(&cb[..cn], uid, gid, nofollow)
+}
+
+/// fchownat(dirfd, path, uid, gid, flags): AT_SYMLINK_NOFOLLOW and
+/// AT_EMPTY_PATH only — an empty path with EMPTY_PATH operates on
+/// the dirfd's own inode like Linux.
+fn sys_fchownat(dirfd: u64, path: u64, uid: u64, gid: u64, flags: u64) -> u64 {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return EINVAL;
+    }
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if n == 0 && flags & AT_EMPTY_PATH != 0 {
+        return user::fd_chown(dirfd, uid, gid);
+    }
+    sys_chown_path(dirfd, path, uid, gid, flags & AT_SYMLINK_NOFOLLOW != 0)
+}
+
+/// utime(path, times): utimbuf {actime,modtime} seconds pairs;
+/// NULL means "now" like utimensat's NULL times.
+fn sys_utime(path: u64, times: u64) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let (cb, cn) = match user::canon_path(u64::MAX, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let ts = if times == 0 {
+        None
+    } else {
+        if !user::range_ok(times, 16) {
+            return EFAULT;
+        }
+        // SAFETY: [times, times+16) validated readable user memory.
+        let a = unsafe { (times as *const u64).read_unaligned() };
+        let m = unsafe { (times as *const u64).add(1).read_unaligned() };
+        Some([[a, 0], [m, 0]])
+    };
+    user::fs_utimens(&cb[..cn], ts, false)
+}
+
+/// utimes/futimesat(dirfd, path, timeval[2]): each spec is
+/// {sec, usec} — usec must be <1e6 like Linux, NULL means now.
+fn sys_utimes_path(dirfd: u64, path: u64, times: u64) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let (cb, cn) = match user::canon_path(dirfd, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let ts = if times == 0 {
+        None
+    } else {
+        if !user::range_ok(times, 32) {
+            return EFAULT;
+        }
+        let mut t = [[0u64; 2]; 2];
+        for i in 0..2 {
+            // SAFETY: [times, times+32) validated readable.
+            let s = unsafe { (times as *const u64).add(i * 2).read_unaligned() };
+            let u =
+                unsafe { (times as *const u64).add(i * 2 + 1).read_unaligned() };
+            if u >= 1_000_000 {
+                return EINVAL;
+            }
+            t[i] = [s, u * 1000];
+        }
+        Some(t)
+    };
+    user::fs_utimens(&cb[..cn], ts, false)
+}
+
+/// utimensat(dirfd, path, timespec[2], flags): AT_SYMLINK_NOFOLLOW +
+/// AT_EMPTY_PATH; NULL times is both-NOW. The raw sec/nsec pairs go
+/// to fs_utimens which validates the NOW/OMIT sentinels.
+fn sys_utimensat(dirfd: u64, path: u64, times: u64, flags: u64) -> u64 {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return EINVAL;
+    }
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    // Path copied before the times pointer is touched — a bad path
+    // outranks a bad times pointer like Linux's getname ordering.
+    let ts = if times == 0 {
+        None
+    } else {
+        if !user::range_ok(times, 32) {
+            return EFAULT;
+        }
+        let mut t = [[0u64; 2]; 2];
+        for i in 0..2 {
+            // SAFETY: [times, times+32) validated readable.
+            t[i][0] =
+                unsafe { (times as *const u64).add(i * 2).read_unaligned() };
+            t[i][1] =
+                unsafe { (times as *const u64).add(i * 2 + 1).read_unaligned() };
+        }
+        Some(t)
+    };
+    if n == 0 && flags & AT_EMPTY_PATH != 0 {
+        return user::fd_utimens(dirfd, ts);
+    }
+    let (cb, cn) = match user::canon_path(dirfd, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::fs_utimens(&cb[..cn], ts, flags & AT_SYMLINK_NOFOLLOW != 0)
 }
 
 /// write(fd, buf, len): console fds only, buffer fully validated

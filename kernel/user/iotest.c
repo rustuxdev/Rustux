@@ -26,6 +26,7 @@
 #include <sys/timerfd.h>
 #include <sys/syscall.h>
 #include <time.h>
+#include <utime.h>
 
 static int fails;
 
@@ -1042,6 +1043,123 @@ int main(void) {
         unlink("sl_dir/rel"); unlink("sl_dirlink"); unlink("sl_at");
         unlink("sl_loop"); unlink("sl_loop1"); unlink("sl_loop2");
         unlink("sl_empty"); rmdir("sl_dir");
+    }
+
+
+    /* run-104: stored inode metadata — mode/uid/gid/times on VFiles
+       and VDirs mutate via chmod/chown/utimensat and stat reports
+       them; umask applies at creation; links split follow/nofollow. */
+    {
+        struct stat ms;
+        int f = open("meta_f", O_CREAT | O_WRONLY, 0600);
+        check(f >= 0, "meta: create 0600");
+        if (f >= 0) close(f);
+        check(stat("meta_f", &ms) == 0 && (ms.st_mode & 0777) == 0600,
+              "create mode stored");
+        check(chmod("meta_f", 0750) == 0 &&
+              stat("meta_f", &ms) == 0 && (ms.st_mode & 0777) == 0750,
+              "chmod stored");
+        f = open("meta_f", O_RDONLY);
+        check(f >= 0 && fchmod(f, 0644) == 0, "fchmod");
+        if (f >= 0) close(f);
+        check(stat("meta_f", &ms) == 0 && (ms.st_mode & 0777) == 0644,
+              "fchmod stored");
+        check(chown("meta_f", 1000, 100) == 0 &&
+              stat("meta_f", &ms) == 0 && ms.st_uid == 1000 &&
+              ms.st_gid == 100, "chown stored");
+        f = open("meta_f", O_RDONLY);
+        check(f >= 0 && fchown(f, (uid_t)-1, 200) == 0, "fchown");
+        if (f >= 0) close(f);
+        check(stat("meta_f", &ms) == 0 && ms.st_uid == 1000 &&
+              ms.st_gid == 200, "fchown stored");
+        check(chown("meta_f", (uid_t)-1, (gid_t)-1) == 0 &&
+              stat("meta_f", &ms) == 0 && ms.st_uid == 1000 &&
+              ms.st_gid == 200, "chown -1 keeps");
+        struct timespec ts2[2] = {
+            { .tv_sec = 1500000000, .tv_nsec = 123456789 },
+            { .tv_sec = 1500000001, .tv_nsec = 0 },
+        };
+        check(utimensat(AT_FDCWD, "meta_f", ts2, 0) == 0 &&
+              stat("meta_f", &ms) == 0 && ms.st_atime == 1500000000 &&
+              ms.st_mtime == 1500000001 &&
+              ms.st_atim.tv_nsec == 123456789,
+              "utimensat explicit times");
+        check(utimensat(AT_FDCWD, "meta_f", NULL, 0) == 0 &&
+              stat("meta_f", &ms) == 0 && ms.st_mtime > 0 &&
+              ms.st_mtime < 1500000000, "utimensat NULL -> now");
+        check(stat("meta_f", &ms) == 0, "stat for omit base");
+        long om_at = ms.st_atime;
+        struct timespec ts3[2] = {
+            { .tv_sec = 0, .tv_nsec = UTIME_OMIT },
+            { .tv_sec = 1600000000, .tv_nsec = UTIME_NOW },
+        };
+        check(utimensat(AT_FDCWD, "meta_f", ts3, 0) == 0 &&
+              stat("meta_f", &ms) == 0 && ms.st_atime == om_at,
+              "UTIME_OMIT keeps atime");
+        struct utimbuf ub = {
+            .actime = 1400000000, .modtime = 1400000001
+        };
+        check(utime("meta_f", &ub) == 0 &&
+              stat("meta_f", &ms) == 0 && ms.st_atime == 1400000000 &&
+              ms.st_mtime == 1400000001, "utime stored");
+        check(mkdir("meta_d", 0750) == 0 &&
+              stat("meta_d", &ms) == 0 && (ms.st_mode & 0777) == 0750,
+              "mkdir mode stored");
+        check(chmod("meta_d", 0755) == 0 &&
+              stat("meta_d", &ms) == 0 && (ms.st_mode & 0777) == 0755,
+              "chmod on dir");
+        check(symlink("meta_f", "meta_l") == 0, "meta link");
+        check(chown("meta_l", 100, 0) == 0 &&
+              stat("meta_f", &ms) == 0 && ms.st_uid == 100,
+              "chown through link -> target");
+        check(lchown("meta_l", 500, 50) == 0 &&
+              lstat("meta_l", &ms) == 0 && ms.st_uid == 500 &&
+              ms.st_gid == 50, "lchown acts on link");
+        check(stat("meta_f", &ms) == 0 && ms.st_uid == 100,
+              "lchown leaves target");
+        check(fchownat(AT_FDCWD, "meta_l", 600, (gid_t)-1,
+              AT_SYMLINK_NOFOLLOW) == 0 &&
+              lstat("meta_l", &ms) == 0 && ms.st_uid == 600,
+              "fchownat NOFOLLOW");
+        struct timespec ts4[2] = {
+            { .tv_sec = 1300000000, .tv_nsec = 0 },
+            { .tv_sec = 1300000001, .tv_nsec = 0 },
+        };
+        check(utimensat(AT_FDCWD, "meta_l", ts4,
+              AT_SYMLINK_NOFOLLOW) == 0 &&
+              lstat("meta_l", &ms) == 0 && ms.st_mtime == 1300000001,
+              "utimensat NOFOLLOW -> link");
+        check(stat("meta_f", &ms) == 0 && ms.st_mtime != 1300000001,
+              "utimensat NOFOLLOW leaves target");
+        check(chmod("meta_l", 0666) == 0 &&
+              stat("meta_f", &ms) == 0 && (ms.st_mode & 0777) == 0666,
+              "chmod through link");
+        struct timespec tsbad[2] = {
+            { .tv_sec = 0, .tv_nsec = 2000000000 },
+            { .tv_sec = 0, .tv_nsec = 0 },
+        };
+        errno = 0;
+        check(utimensat(AT_FDCWD, "meta_f", tsbad, 0) < 0 &&
+              errno == EINVAL, "bad nsec -> EINVAL");
+        errno = 0;
+        check(chmod("motd.txt", 0) < 0 && errno == EROFS,
+              "chmod archive -> EROFS");
+        errno = 0;
+        check(chmod("/proc/self/status", 0) < 0 && errno == EROFS,
+              "chmod proc -> EROFS");
+        int oldm = umask(027);
+        f = open("meta_u", O_CREAT | O_WRONLY, 0666);
+        if (f >= 0) close(f);
+        check(stat("meta_u", &ms) == 0 && (ms.st_mode & 0777) == 0640,
+              "umask applied at create");
+        umask(oldm);
+        check(fchmodat(AT_FDCWD, "meta_f", 0644, 0) == 0, "fchmodat");
+        f = open("meta_f", O_RDONLY);
+        check(f >= 0 && utimensat(f, "", NULL, AT_EMPTY_PATH) == 0,
+              "futimens AT_EMPTY_PATH");
+        if (f >= 0) close(f);
+        unlink("meta_f"); unlink("meta_l"); unlink("meta_u");
+        rmdir("meta_d");
     }
 
     int n = snprintf(buf, sizeof(buf), "iotest: %d failures, done\n", fails);
