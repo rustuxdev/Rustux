@@ -1767,7 +1767,7 @@ iotest +24 checks: lifecycle, EAGAIN/EINVAL surfaces, POLLIN,
 IN_OPEN->IN_MODIFY->IN_CLOSE_WRITE sequence, rm_watch IN_IGNORED,
 dir-watch create/delete, blocked-read wake. 42 tasks, frames
 108608 -> 108608 zero leak, exit 33 WSL + VM. Audit run-74 (quick,
-scoped): 0 confirmed; inotify CVE class cross-checked. Ledger: 110.
+scoped): 0 confirmed; inotify CVE class cross-checked. Ledger: 111.
 Known divergences: path-keyed watches (a self-watch on a renamed
 file dies with MOVE_SELF+IGNORED rather than following the inode);
 one record per read; F_SETFL can't toggle instance nonblock.
@@ -1804,7 +1804,7 @@ metadata, signalfd ssi_* fields, SIGSEGV ACCERR+si_addr on a
 PROT_NONE page, non-inheritance of queued payloads. 42 tasks,
 frames 108588 -> 108588 zero leak, exit 33. Audit run-75 (quick,
 scoped): 0 confirmed unresolved (the evasion defect fixed
-pre-commit). Ledger: 110.
+pre-commit). Ledger: 111.
 
 run-102 — real statfs/fstatfs(137/138): the ramfs reports the
 frame allocator's capacity (f_blocks/f_bfree/f_bavail =
@@ -1820,7 +1820,7 @@ f_flags/f_spare offsets. busybox df now prints real numbers
 (rustux 438676 22316 416360 5%). iotest +7 checks: struct field
 assertions on both superblocks, ENOENT, fd-kind routing.
 42 tasks, frames 108589 -> 108589 zero leak, exit 33.
-Audit run-76 (quick, scoped): 0 confirmed. Ledger: 110.
+Audit run-76 (quick, scoped): 0 confirmed. Ledger: 111.
 
 run-103 — real VFS symlinks: a link is a VFile whose bytes are the
 raw target text (is_link flag; no NUL). resolve_links() is a Linux
@@ -1848,3 +1848,39 @@ truncate-follows, unlink-leaves-target, bad-parent/empty-target
 errnos, getdents d_type. 42 tasks, frames 108587 -> 108587 zero
 leak, exit 33. Audit run-77 (quick, scoped): 1 confirmed fixed
 pre-commit. Ledger: 110.
+
+### run-104: real file metadata (chmod/chown/utimensat family)
+VFiles and VDirs now carry real metadata — mode, uid, gid,
+atime/mtime/ctime — stamped at create with the task umask
+applied (vfile_stamp: mode & 0777 & ~umask, setuid bits pass
+through). chmod(90)/fchmod(91)/fchmodat(268), chown(92)/fchown(93)/
+lchown(94)/fchownat(260), utime(132)/utimensat(280)/futimesat(261)/
+futimens(311) all wired; the previously-ignored open/creat/mkdir
+mode args now land (umask(95) was already dispatched but inert).
+stat/lstat/newfstatat/fstat return the stored fields — lstat
+reports the LINK's own meta, stat resolves to the target's.
+Symlink split is honest: chmod/chown/utimensat follow the final
+link, lchown/fchownat(NOFOLLOW)/utimensat(NOFOLLOW) act on the
+link itself via resolve_links(cpath, !nofollow). uid/gid
+(u32)-1 = keep. UTIME_NOW/UTIME_OMIT + nsec>=1e9/usec>=1e6 ->
+EINVAL, NULL times = now, AT_EMPTY_PATH on fchownat/utimensat
+treats the dirfd as the target fd. Metadata mutations emit
+IN_ATTRIB; writes bump mtime+ctime, reads bump atime (always-
+update, stronger than relatime), metadata ops bump ctime, rename
+bumps ctime. Archive members + proc entries EROFS on mutation;
+stat_meta split covers writable-file/vdir/link/proc/archive.
+Audit (run-78, quick, scoped): 2 ordering fixes pre-commit —
+times-pointer read moved after pathname copy (ENOENT outranks
+EFAULT like Linux getname), nsec validation moved after object
+lookup (ENOENT outranks EINVAL like Linux inode-lookup-then-
+validate). cve.now: CVE-2026-63833 ntfs3 xattr-forged i_uid/
+S_ISUID assessed n/a by construction — metadata is stored but
+never enforced (no credential model, no setuid-on-exec, no
+permission checks on open) so planting root-owned setuid bits
+grants nothing; divergence documented alongside run-96's /proc
+access note. iotest +28 checks: create modes + umask, chmod/
+fchmod/fchmodat stored + dir, chown/fchown/lchown through-link vs
+on-link, -1 keeps, utime/utimensat explicit + NOW + OMIT keeps
+atime, futimens AT_EMPTY_PATH, futimesat, bad nsec/usec EINVAL,
+NOFOLLOW vs follow on link, archive/proc EROFS. 42 tasks, frames
+108587 -> 108587 zero leak, exit 33. Ledger: 111.

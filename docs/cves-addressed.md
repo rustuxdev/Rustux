@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**110 unique CVEs recorded.**
+**111 unique CVEs recorded.**
 
 ## klib ports
 
@@ -129,6 +129,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-46063 | queued signals: rt_sigqueueinfo(129)/rt_tgsigqueueinfo(297) + per-bit SigSrc provenance,… | 46063 n/a by construction (no shadow stack, no mmap locks, single-CPU IF-masked). Provenance-forgery gate verified (si_code>=0/SI_TKILL EPERM); copyout records zero-filled; audit… |
 | CVE-2026-46063 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
 | CVE-2026-52937 | real GNU bash 5.2 (dynamic, +libtinfo second DT_NEEDED — ld.so's first multi-library reso… | sockaddr-leak class structurally absent: sock_name copies min(*addrlen,16) bytes of a sockaddr_in built by sockaddr_in() which zero-fills all 16 before writing fields — every copi… |
+| CVE-2026-63833 | real file metadata: chmod/fchmod/fchmodat + chown/lchown/fchown/fchownat + utime/utimensa… | 63833 n/a by construction — metadata stored but never enforced (no credential model/setuid-on-exec/perm checks); audit fixed: times read after pathname copy + nsec validated after… |
 | CVE-2026-63910 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
 | CVE-2026-63913 | tcp/ipv4 (mini) | exact seq+ack required on every transition (no blind RST/state jumps — 63913 class out); option walk bounded, wscale never shifted (31495); seq state fully initialized (72020); do… |
 | CVE-2026-64371 | procfs breadth: generated /proc — global uptime/meminfo/loadavg/version/stat + per-pid di… | 64371 n/a by construction: single-CPU IF-masked syscall context means a task cannot exec while its stat is read, and the seq_file snapshot freezes content at open — reads never sa… |
