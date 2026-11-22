@@ -10251,7 +10251,7 @@ pub fn nt_dir_next(
     let o = ofd(t, fd)?;
     let FdKind::Dir(dp) = &o.kind else { return None };
     let dpath = dp.bytes();
-    let mut names: [Option<&[u8]>; 96] = [None; 96];
+    let mut names: [Option<&[u8]>; 384] = [None; 384];
     names[0] = Some(b".");
     names[1] = Some(b"..");
     let mut n = 2usize;
@@ -17753,7 +17753,7 @@ fn dir_child<'a>(dir: &[u8], name: &'a [u8]) -> Option<&'a [u8]> {
 /// Push name's first component under dir into the dedup'd list.
 fn dir_add<'a>(
     dir: &[u8],
-    names: &mut [Option<&'a [u8]>; 96],
+    names: &mut [Option<&'a [u8]>; 384],
     n: &mut usize,
     name: &'a [u8],
 ) {
@@ -17794,7 +17794,7 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
     // The stream: ".", "..", then each unique first component under
     // this dir — deduped, since "usr/bin/x" and "usr/bin/y" both
     // contribute "usr". Pseudo-dirs /proc + /proc/self fold in.
-    let mut names: [Option<&[u8]>; 96] = [None; 96];
+    let mut names: [Option<&[u8]>; 384] = [None; 384];
     names[0] = Some(b".");
     names[1] = Some(b"..");
     let mut n = 2usize;

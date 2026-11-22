@@ -1023,18 +1023,19 @@ int main(void) {
         check(dfd >= 0, "open / for dents");
         if (dfd >= 0) {
             char db[2048];
-            int dl = syscall(SYS_getdents64, dfd, db, sizeof(db));
-            int saw_lnk = 0;
-            for (int o = 0; dl > 0 && o < dl;) {
-                struct {
-                    unsigned long ino, off2;
-                    unsigned short rlen;
-                    unsigned char type;
-                    char name[];
-                } *de = (void *)(db + o);
-                if (!strcmp(de->name, "sl_at") && de->type == 10)
-                    saw_lnk = 1;
-                o += de->rlen;
+            int saw_lnk = 0, dl;
+            while ((dl = syscall(SYS_getdents64, dfd, db, sizeof(db))) > 0) {
+                for (int o = 0; o < dl;) {
+                    struct {
+                        unsigned long ino, off2;
+                        unsigned short rlen;
+                        unsigned char type;
+                        char name[];
+                    } *de = (void *)(db + o);
+                    if (!strcmp(de->name, "sl_at") && de->type == 10)
+                        saw_lnk = 1;
+                    o += de->rlen;
+                }
             }
             check(saw_lnk, "getdents d_type DT_LNK");
             close(dfd);
@@ -1242,9 +1243,9 @@ int main(void) {
         check(dd >= 0, "open /dev");
         if (dd >= 0) {
             char db[2048];
-            int dl = syscall(SYS_getdents64, dd, db, sizeof(db));
-            int saw_chr = 0;
-            for (int o = 0; dl > 0 && o < dl;) {
+            int saw_chr = 0, dl;
+            while ((dl = syscall(SYS_getdents64, dd, db, sizeof(db))) > 0) {
+                for (int o = 0; o < dl;) {
                 struct {
                     unsigned long ino, off2;
                     unsigned short rlen;
@@ -1252,8 +1253,9 @@ int main(void) {
                     char name[];
                 } *de = (void *)(db + o);
                 if (!strcmp(de->name, "null") && de->type == 2)
-                    saw_chr = 1;
-                o += de->rlen;
+                        saw_chr = 1;
+                    o += de->rlen;
+                }
             }
             check(saw_chr, "getdents d_type DT_CHR");
             close(dd);
