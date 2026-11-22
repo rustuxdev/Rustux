@@ -2409,3 +2409,47 @@ qemu exit 33. Ledger: 120.
   spawn-drain covers only spawn-time pending attaches (later loads
   drain via the LoadLibrary path, as on Windows); borrowed-handle
   semantics (no GetModuleHandleEx ref bump).
+
+## run-121 — DllMain(DLL_PROCESS_DETACH) + cascade unload (this commit)
+
+- nt_free_dll final-ref path no longer unmaps inline: a worklist
+  simulation over dep masks computes the zero-reaching set and marks
+  every member pend_detach (pend_st is now tri-state: 1 pend_attach,
+  2 pend_detach, 3 detached-awaiting-fin). Return is 1|1<<63 so the
+  FreeLibrary thunk knows a drain is owed.
+- FreeLibrary thunk: on the pend bit it loops RUX_DLL_DETACH (0xF9,
+  descending slot order = importer-first), calls each returned base's
+  PE entry with (hinst, DLL_PROCESS_DETACH, 0), then runs
+  RUX_FREE_FIN (0xFA) until it reports no pending work — then returns
+  TRUE explicitly.
+- nt_detach_fin: per-importer dep refdown over each marked mask
+  (a union mask undercounted refs for deps shared by two freed
+  importers — permanent leak), slot clear + unmap of the marked set,
+  then re-marks any live module driven to refs==0 mid-cascade so its
+  detach still runs (the thunk re-drains on the again bit).
+- Re-entrant FreeLibrary from inside a DllMain(DETACH) merges into the
+  live pipeline instead of re-arming it: entries already pend_st >= 2
+  are left alone and the nested call returns a plain success — only
+  the outermost FREE_FIN ever unmaps, so a nested fin cannot pull an
+  image out from under a running outer DllMain. FreeLibrary on an
+  in-flight module is a TRUE no-op (Windows serializes this on the
+  loader lock).
+- pe_map_image now returns the actual mapped extent (mapped_hi), not
+  SizeOfImage: MinGW's discardable .debug tail is never mapped, and a
+  dep legitimately placed in that gap was being unmapped by the
+  importer's FREE_FIN — the "partial unmap mid-DllMain" fault class.
+- Fixture windetach.exe (exit 41): importer-first detach order via
+  probes written into exe-owned memory, shared-dep retention while a
+  second ref holds it, handle disappearance after unmap, non-final
+  release does not detach, final release does, reload re-init works.
+  wchain's detach performs a re-entrant self FreeLibrary (no-op) and
+  probes count calls (+=), so a re-armed or doubled detach fails.
+- Audit run-95 quick scoped: 2 confirmed findings fixed in-diff
+  (re-entrant free pipeline corruption; shared-dep refdown undercount);
+  cve.now clean. Artifacts: ~/security-audit-skill/linux-rust/run-95/.
+- Suite: 57 tasks, frames 108430 -> 108430 zero leak, qemu exit 33.
+- Known gaps (recorded, not bugs): no loader lock — multi-threaded
+  same-owner FreeLibrary/LoadLibrary races are unsynchronized;
+  process exit still does not run detaches for surviving modules;
+  a dep zeroed by a re-entrant free gets its detach from the re-drain
+  with approximate ordering.

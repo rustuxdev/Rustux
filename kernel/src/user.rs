@@ -2489,6 +2489,7 @@ fn pe_map_image(t: &mut Task, img: &[u8], depth: u8) -> Option<(u64, u64, u8, u6
     }
     p.bias = base;
     let mut deps = 0u8;
+    let mut mapped_hi = base + PAGE;
     let ok = (|| {
         map_page(t, base, USER | NX)?;
         let hdrlen = (p.sections[0].raw as usize).min(img.len()).min(4096);
@@ -2545,6 +2546,7 @@ fn pe_map_image(t: &mut Task, img: &[u8], depth: u8) -> Option<(u64, u64, u8, u6
             }
             t.ranges[t.nranges] = (va0, va1, rfl);
             t.nranges += 1;
+            mapped_hi = mapped_hi.max(va1);
         }
         (pe_apply_relocs(t, &p)
             && pe_resolve_imports(t, &p, false, depth, &mut deps))
@@ -2554,22 +2556,29 @@ fn pe_map_image(t: &mut Task, img: &[u8], depth: u8) -> Option<(u64, u64, u8, u6
         // Import binding may have claimed dep refs before failing —
         // release them so a bad image can't strand mappings.
         nt_deps_release(deps);
-        nt_free_pages_t(t, base, size);
+        nt_free_pages_t(t, base, mapped_hi - base);
         return None;
     }
     t.nt_alloc = (base + size).max(t.nt_alloc);
-    Some((base, size, deps, base + p.entry - crate::pe::PE_LOAD_BIAS))
+    // The ledger span is the mapped extent, not SizeOfImage: the
+    // tail of a debug build's image is discardable sections we never
+    // mapped, and another module may legitimately sit in that gap —
+    // FreeLibrary's unmap must not reach past our own last page.
+    Some((base, mapped_hi - base, deps, base + p.entry - crate::pe::PE_LOAD_BIAS))
 }
 
 /// Loaded-module ledger: (owner_pid, base, span, refs, entry_va,
-/// nlen, name, dep_mask, pend_attach). LoadLibrary dedups by name —
+/// nlen, name, dep_mask, pend_st). LoadLibrary dedups by name —
 /// a second load of the same module bumps refs and hands back the
 /// same HMODULE, like Windows. dep_mask's bit i marks slot i as an
 /// import dependency: a module freed to refs==0 refdowns each dep,
-/// so unload cascades like the real loader's. pend_attach marks a
-/// fresh module whose DllMain(DLL_PROCESS_ATTACH) hasn't run — the
-/// LoadLibrary thunk drains pending attaches (deps land in lower
-/// slots, so ascending order runs deps before their importer).
+/// so unload cascades like the real loader's. pend_st is the
+/// DllMain state: 1 = DllMain(DLL_PROCESS_ATTACH) pending (the
+/// LoadLibrary thunk drains these — deps land in lower slots, so
+/// ascending order runs deps before their importer), 2 =
+/// DllMain(DLL_PROCESS_DETACH) pending (the FreeLibrary thunk drains
+/// these descending — importer first), 3 = detached, awaiting the
+/// finalize unmap.
 const NT_MAX_MODS: usize = 8;
 static mut NT_MODS: [(u64, u64, u64, u64, u64, u8, [u8; 32], u8, u8);
     NT_MAX_MODS] = [(0, 0, 0, 0, 0, 0, [0; 32], 0, 0); NT_MAX_MODS];
@@ -2781,7 +2790,7 @@ pub fn nt_next_attach() -> u64 {
     }
     let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
     for e in tab.iter_mut() {
-        if e.3 != 0 && e.0 == owner && e.8 != 0 {
+        if e.3 != 0 && e.0 == owner && e.8 == 1 {
             e.8 = 0;
             return e.1;
         }
@@ -2887,15 +2896,150 @@ fn nt_mod_refdown(i: usize) {
     }
 }
 
-/// FreeLibrary kernel half: refs-- on the caller's module; the last
-/// ref unmaps the whole image span and frees the slot.
+/// FreeLibrary kernel half: refs-- on the caller's module. The last
+/// ref does not unmap here — it simulates the cascade and marks
+/// every module reaching zero pend_detach, returning 1|1<<63 so the
+/// thunk drains DllMain(DLL_PROCESS_DETACH) calls importer-first via
+/// RUX_DLL_DETACH, then RUX_FREE_FIN performs the unmaps and the
+/// surviving dep ref fix-ups. A plain refdown returns 1; a bad
+/// hmod 0.
 pub fn nt_free_dll(hmod: u64) -> u64 {
     let owner = nt_owner_pid();
     let Some(i) = nt_mod_find_base(owner, hmod) else {
         return 0;
     };
-    nt_mod_refdown(i);
-    1
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
+    if tab[i].3 > 1 {
+        tab[i].3 -= 1;
+        return 1;
+    }
+    // A cascade already in flight for this owner — a re-entrant
+    // FreeLibrary from inside a DllMain(DETACH): merge the
+    // zero-reaching set into the live pipeline but return without
+    // the pend bit, so the nested thunk does no drain or finalize.
+    // Only the outermost FREE_FIN unmaps — otherwise a nested fin
+    // would unmap modules whose DllMain is still on the stack.
+    let in_flight = tab.iter().any(|e| e.0 == owner && e.8 >= 2);
+    // Which modules reach zero through the cascade? Worklist over a
+    // simulated refcount drop: freeing a marked module subtracts one
+    // ref from each dep it bound; deps hitting zero join the set.
+    // Entries already mid-detach are excluded — the live cascade
+    // already accounted for their dep release.
+    let mut sim = [0u64; NT_MAX_MODS];
+    for (k, e) in tab.iter().enumerate() {
+        sim[k] = if e.0 == owner { e.3 } else { 0 };
+    }
+    let mut marked = 0u8;
+    let mut stack = [0usize; NT_MAX_MODS];
+    let mut sp = 0;
+    if tab[i].8 < 2 {
+        marked |= 1 << i;
+        sim[i] = 0;
+        stack[sp] = i;
+        sp += 1;
+    }
+    while sp > 0 {
+        sp -= 1;
+        let s = stack[sp];
+        for d in 0..NT_MAX_MODS {
+            if tab[s].7 & (1 << d) != 0 && sim[d] > 0 {
+                sim[d] -= 1;
+                if sim[d] == 0 && marked & (1 << d) == 0 && tab[d].8 < 2 {
+                    marked |= 1 << d;
+                    stack[sp] = d;
+                    sp += 1;
+                }
+            }
+        }
+    }
+    for (k, e) in tab.iter_mut().enumerate() {
+        if marked & (1 << k) != 0 {
+            // A module still pending its ATTACH call never ran
+            // DllMain — skip its detach call (state 3) but keep it
+            // in the finalize set.
+            e.8 = match e.8 {
+                1 => 3,
+                0 => 2,
+                s => s,
+            };
+        }
+    }
+    if in_flight {
+        1
+    } else {
+        1 | (1 << 63)
+    }
+}
+
+/// Pop the caller's most-recently-loaded module pending its
+/// DllMain(DLL_PROCESS_DETACH): marks it detached, returns the
+/// HMODULE, or 0. Descending slot order runs the importer before
+/// its deps — the reverse of the attach drain, like the real
+/// unloader's reverse-init-order calls.
+pub fn nt_next_detach() -> u64 {
+    let owner = nt_owner_pid();
+    if owner == 0 {
+        return 0;
+    }
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
+    for e in tab.iter_mut().rev() {
+        if e.3 != 0 && e.0 == owner && e.8 == 2 {
+            e.8 = 3;
+            return e.1;
+        }
+    }
+    0
+}
+
+/// Finish a FreeLibrary after the thunk drained the DllMain(DETACH)
+/// calls: drop one ref from each surviving dep per marked importer
+/// (two freed modules sharing a dep release two refs, so a union
+/// dep mask is not enough), then unmap every marked module and free
+/// its slot.
+pub fn nt_detach_fin() -> u64 {
+    let Some(t) = mm_owner_mut() else { return 0 };
+    let owner = t.pid;
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
+    let mut marked = 0u8;
+    for (k, e) in tab.iter().enumerate() {
+        if e.3 != 0 && e.0 == owner && e.8 >= 2 {
+            marked |= 1 << k;
+        }
+    }
+    if marked == 0 {
+        return 0;
+    }
+    for k in 0..NT_MAX_MODS {
+        if marked & (1 << k) != 0 {
+            for d in 0..NT_MAX_MODS {
+                if tab[k].7 & (1 << d) != 0 && marked & (1 << d) == 0 {
+                    tab[d].3 = tab[d].3.saturating_sub(1);
+                }
+            }
+        }
+    }
+    for k in 0..NT_MAX_MODS {
+        if marked & (1 << k) != 0 {
+            let e = tab[k];
+            tab[k] = (0, 0, 0, 0, 0, 0, [0; 32], 0, 0);
+            nt_free_pages_t(t, e.1, e.2);
+        }
+    }
+    // A live module whose refs just reached zero — a re-entrant
+    // FreeLibrary mid-cascade consumed a ref the sim still counted —
+    // joins the pipeline so its DllMain(DETACH) runs; the thunk loops
+    // drain/fin while we keep reporting pending work.
+    let mut again = 0u64;
+    for e in tab.iter_mut() {
+        if e.0 == owner && e.1 != 0 && e.3 == 0 && e.8 < 2 {
+            e.8 = match e.8 {
+                1 => 3,
+                _ => 2,
+            };
+            again = 1;
+        }
+    }
+    again
 }
 
 /// Read a NUL-terminated string out of a task's space into `out`;
@@ -4120,14 +4264,62 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0xc3, //                   ret
             ]);
         }
-        // FreeLibrary(hmod) -> RUX_FREE_DLL: BOOL-ish 1/0.
+        // FreeLibrary(hmod) -> RUX_FREE_DLL: on the final ref the
+        // kernel marks the cascade set pend_detach (bit63) — the
+        // thunk drains RUX_DLL_DETACH calling DllMain(DETACH)
+        // importer-first in userland, then RUX_FREE_FIN unmaps.
         b"FreeLibrary" => {
             e.raw(&[
                 0x4c, 0x8b, 0xd1, //       mov r10,rcx
                 0xb8, 0xf6, 0, 0, 0, //   mov eax,0xF6
                 0x0f, 0x05, //             syscall
-                0xc3, //                   ret
+                0x48, 0x85, 0xc0, //       test rax,rax
             ]);
+            let fail = e.jcc(0x4); //        0 -> ret FALSE
+            let pend = e.jcc(0x8); //       sign -> detach drain
+            e.raw(&[0xc3]); //              refdown only -> ret TRUE
+            e.fix(pend);
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x28, // sub rsp,0x28
+            ]);
+            let drain = e.n;
+            e.raw(&[
+                0xb8, 0xf9, 0, 0, 0, //   mov eax,0xF9  RUX_DLL_DETACH
+                0x0f, 0x05, //             syscall
+                0x48, 0x85, 0xc0, //       test rax,rax
+            ]);
+            let done = e.jcc(0x4);
+            e.raw(&[
+                0x8b, 0x48, 0x3c, //        mov ecx,[rax+0x3c]    peoff
+                0x8b, 0x4c, 0x08, 0x28, // mov ecx,[rax+rcx+0x28] entry_rva
+                0x85, 0xc9, //             test ecx,ecx
+            ]);
+            let noent = e.jcc(0x4); //    no entry -> next
+            e.raw(&[
+                0x48, 0x01, 0xc1, //     add rcx,rax   entry_va
+                0x49, 0x89, 0xc9, //     mov r9,rcx
+                0x48, 0x89, 0xc1, //     mov rcx,rax   hinst
+                0x31, 0xd2, //           xor edx,edx   DLL_PROCESS_DETACH
+                0x45, 0x31, 0xc0, //     xor r8d,r8d
+                0x41, 0xff, 0xd1, //     call r9       DllMain
+            ]);
+            e.fix_to(noent, drain);
+            let back = e.jmp();
+            e.fix_to(back, drain);
+            e.fix(done);
+            e.raw(&[
+                0xb8, 0xfa, 0, 0, 0, //   mov eax,0xFA  RUX_FREE_FIN
+                0x0f, 0x05, //             syscall
+                0x48, 0x85, 0xc0, //       test rax,rax
+            ]);
+            let again = e.jcc(0x5); //   deps hit zero late -> re-drain
+            e.fix_to(again, drain);
+            e.raw(&[
+                0xb8, 1, 0, 0, 0, //       mov eax,1   TRUE
+                0x48, 0x83, 0xc4, 0x28, // add rsp,0x28
+            ]);
+            e.fix(fail);
+            e.raw(&[0xc3]); //             ret
         }
         b"Sleep" => {
             e.raw(&[

@@ -79,6 +79,8 @@ const RUX_GET_PROC: u32 = 0xF5;
 const RUX_FREE_DLL: u32 = 0xF6;
 const RUX_DLL_ATTACH: u32 = 0xF7;
 const RUX_MOD_HANDLE: u32 = 0xF8;
+const RUX_DLL_DETACH: u32 = 0xF9;
+const RUX_FREE_FIN: u32 = 0xFA;
 
 /// Handle table tags — a per-task `nth` slot's object kind. Real
 /// handles are small indices (1-based) like the actual handle table;
@@ -1280,6 +1282,11 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         // GetModuleHandleA/W(name[,wide]) — HMODULE lookup without
         // a ref bump; NULL name returns the exe's image base.
         RUX_MOD_HANDLE => user::nt_mod_handle(arg(ctx, 0), arg(ctx, 1) != 0),
+        // FreeLibrary thunk loops on this after a final-ref free so
+        // dependency exit points run after their importer's, then
+        // RUX_FREE_FIN performs the unmaps + surviving dep refdowns.
+        RUX_DLL_DETACH => user::nt_next_detach(),
+        RUX_FREE_FIN => user::nt_detach_fin(),
         NT_TERMINATE_PROCESS => {
             // hProcess == (HANDLE)-1 means self; anything else is a
             // kill we don't model yet — the common case is self-exit.
