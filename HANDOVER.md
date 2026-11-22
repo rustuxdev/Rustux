@@ -2651,3 +2651,40 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   skip index supports it).
 - Verified failing 2/2 on VM-3 pre-fix at both e3df0fd and e59445b
   (pre-existing flake, not a run-125 regression), passing after.
+
+## run-126 — RTC wall clock + NT time/system services (this commit)
+
+- rtc.rs: CMOS reader over ports 0x70/0x71 (NMI stays masked), BCD/
+  binary per reg-B, bounded UIP spin, century reg 0x32, strict field
+  validation (y 2000..2200 etc.), Hinnant days_from_civil +
+  civil_from_days. EPOCH_BASE anchors unix time at boot so wall_now
+  rides the 100Hz tick monotonically; tsc_hz() calibrates rdtsc over
+  the PIT ch2 window (same trick apic::init uses).
+- sys_time/sys_gettimeofday/sys_clock_gettime: REALTIME family (0/5/8)
+  now returns the RTC wall clock; MONOTONIC/BOOTTIME stay tick-based —
+  the clock-id split is deliberate, not a conflation. EFAULT +
+  range_ok_w pointer rules unchanged.
+- RUX_SYS_INFO 0xFF serves the Win32 side: SYSTEM_INFO (48B honest
+  values), GetTickCount64 ms, FILETIME (1601-epoch), SYSTEMTIME via
+  wall_datetime, rdtsc QPC + tsc_hz QPF, packed 10.0.19045 version,
+  OSVERSIONINFOA/W. Thunk arms emit the rcx->rdx out-pointer /
+  r10d=sub / eax=0xFF syscall sequence; NTSTATUS->BOOL via test+sete.
+- WaitOn::NtWait is now (idx, tid) — the run-125 thread-wait ABA is
+  closed: expire checks identity before signaled state, freed slots
+  are zeroed, tids are monotonic, so a recycled slot can only yield
+  STATUS_INVALID_HANDLE never a foreign SUCCESS.
+- Audit run-99 (quick, scoped): 2 confirmed findings fixed in-diff —
+  tsc_hz's OUT2 poll was unbounded and user-reachable (dead PIT ->
+  kernel hang; now a ~0.16s TSC deadline), and NT handle-ledger refs
+  were never released on task death (nt_handle_sweep at last-tgid-
+  standing in both exit_bookkeeping paths + unconditional in
+  Task::reap; idempotent). Verifier: no remaining stale-success path;
+  blocked waiter implies handle ref >=1.
+- winsys.exe (real MinGW, sprintf+puts only — printf/fflush pull
+  imports we don't thunk): exit(45) after SYSTEM_INFO fields, tick
+  monotonicity, QPC freq ~3.49GHz, FILETIME century check, SYSTEMTIME
+  field ranges, GetVersion/ExA. Prints the RTC date on serial.
+- 62 tasks, frames 108423 -> 108423 zero leak, qemu exit 33.
+- Next: another ABI gap from the roadmap — the NT surface still lacks
+  registry/env/console-input services; Linux side lacks fchmodat2/
+  statx-class syscalls and settimeofday.
