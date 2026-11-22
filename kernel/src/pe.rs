@@ -42,6 +42,7 @@ const CHAR_LARGE_ADDR: u16 = 0x0020;
 /// Directory-entry indices into the optional header's DataDirectory.
 const DIR_IMPORT: usize = 1;
 const DIR_RELOC: usize = 5;
+const DIR_TLS: usize = 9;
 
 #[derive(Clone, Copy, Default)]
 pub struct Section {
@@ -76,6 +77,11 @@ pub struct Pe {
     /// Base-relocation directory extent (IMAGE_DIRECTORY_ENTRY_BASERELOC).
     pub reloc_rva: u64,
     pub reloc_size: u64,
+    /// TLS directory extent (IMAGE_DIRECTORY_ENTRY_TLS) — the
+    /// IMAGE_TLS_DIRECTORY holding the template span, index cell,
+    /// and callback array.
+    pub tls_rva: u64,
+    pub tls_size: u64,
 }
 
 fn u16le(b: &[u8], off: usize) -> Option<u16> {
@@ -134,8 +140,9 @@ pub fn parse(b: &[u8]) -> Option<Pe> {
     };
     let (import_rva, import_size) = dir(DIR_IMPORT);
     let (reloc_rva, reloc_size) = dir(DIR_RELOC);
+    let (tls_rva, tls_size) = dir(DIR_TLS);
     // Directory extents must lie inside the image span when present.
-    for (r, sz) in [(import_rva, import_size), (reloc_rva, reloc_size)] {
+    for (r, sz) in [(import_rva, import_size), (reloc_rva, reloc_size), (tls_rva, tls_size)] {
         if sz != 0 && r.checked_add(sz).is_none_or(|e| e > size) {
             return None;
         }
@@ -177,5 +184,7 @@ pub fn parse(b: &[u8]) -> Option<Pe> {
         import_size,
         reloc_rva,
         reloc_size,
+        tls_rva,
+        tls_size,
     })
 }

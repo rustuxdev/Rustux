@@ -2077,3 +2077,49 @@ committed gzip-compressed (winheap.exe.gz, mkinitrd.py
 decompresses .gz sources) because the host AV (Kaspersky)
 quarantines the raw PE on sight — a storage workaround, not a
 kernel change. Ledger: 113.
+
+run-113 — Windows process parameters + TLS + VM honesty: a real
+MinGW CRT binary now gets genuine startup state instead of
+canned cells. pe.rs parses IMAGE_DIRECTORY_ENTRY_TLS (9) into
+tls_rva/tls_size bounds-checked like the other directories. The
+loader emits a TLS trampoline into the stub area before the R-X
+lock-down: it validates the AddressOfCallBacks array is inside
+the image, loops the array calling each entry with
+(hinst, DLL_PROCESS_ATTACH, 0), then tail-jumps to the real
+image entry. pe_tls_init zeroes *AddressOfIndex and points
+gs:[0x58] slot 0 at the image template — enough for .CRT
+callbacks and __thread variables in a single-threaded process.
+The TEB now carries real ClientId (pid at +0x40, tid at +0x48)
+written by pe_late_init after spawn/exec assigns the pid, and
+the PEB command line is a real UNICODE_STRING built from the
+actual exe name (same late call — t.exe is empty during
+teb_peb_init, which was the winmisc bit-0x1 root cause). The
+data page gains a 64-slot TLS array + allocation bitmap
+(TlsAlloc/Free/Get/Set bound index<64), environment blocks in
+both ANSI and UTF-16 (RUSTUX=1), a STARTUPINFO with cb=104, and
+lconv/locale/charset cells for the MinGW CRT probes. Two real
+NT services land: NtQueryVirtualMemory 0x23 (48-byte
+MEMORY_BASIC_INFORMATION from the ranges ledger — committed
+fields, or MEM_FREE to the next registered region) and
+NtProtectVirtualMemory 0x50 (probe-validated pointer args,
+overflow-safe alignment, bounded to user VA, heap arena
+rejected since it self-manages, range_covered + entry-count
+checked before PTE rewrites, TLB flushed). VirtualProtect and
+VirtualQuery thunk-marshal to them; VirtualFree maps to the
+existing NtFreeVirtualMemory. Fourteen new thunk arms fill the
+bigger CRT surface winmisc imports: strstr, wcslen, a strlen
+that returns rax (the run-111 arm left len in rcx for
+puts/fputs — the regression that took windir to exit 5),
+memset/memcpy/strcmp/strncmp fixes, fputc,
+FreeEnvironmentStringsA/W, and locale/charset inert cells.
+winmisc.c is a real MinGW fixture with a .CRT TLS callback
+and a __thread variable; it exits 31 on full pass. Two
+emitter bugs fixed pre-commit: strstr and memset had REX
+direction bytes 0x4c where 0x49 was needed (emitting
+mov rdx,r10 / mov rcx,r9 — reversed — so r10/r9 stayed stale;
+the memset one could rep-stosb through a garbage destination
+inside task space). Audit run-87 quick scoped: no confirmed
+findings; cve.now PTE-protection hits are all Linux-mm
+concurrent-walker UAF races (n/a — synchronous rewrite under
+the global lock). Suite: 21/21 0 failures, 50 tasks, frames
+108480 -> 108480 zero leak, qemu exit 33. Ledger: 114.

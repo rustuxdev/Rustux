@@ -26,6 +26,7 @@ pub const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
 pub const STATUS_NO_MEMORY: u64 = 0xC000_0017;
 pub const STATUS_INFO_LENGTH_MISMATCH: u64 = 0xC000_0004;
 pub const STATUS_INVALID_INFO_CLASS: u64 = 0xC000_0003;
+pub const STATUS_MEMORY_NOT_ALLOCATED: u64 = 0xC000_00A0;
 pub const STATUS_ACCESS_DENIED: u64 = 0xC000_0022;
 pub const STATUS_OBJECT_NAME_INVALID: u64 = 0xC000_0033;
 pub const STATUS_OBJECT_NAME_NOT_FOUND: u64 = 0xC000_0034;
@@ -41,7 +42,9 @@ const NT_CLOSE: u32 = 0x0F;
 const NT_QUERY_INFORMATION_FILE: u32 = 0x11;
 const NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0x18;
 const NT_FREE_VIRTUAL_MEMORY: u32 = 0x1E;
+const NT_QUERY_VIRTUAL_MEMORY: u32 = 0x23;
 const NT_SET_INFORMATION_FILE: u32 = 0x27;
+const NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x50;
 const NT_TERMINATE_PROCESS: u32 = 0x2C;
 const NT_DELAY_EXECUTION: u32 = 0x34;
 const NT_QUERY_DIRECTORY_FILE: u32 = 0x35;
@@ -640,6 +643,68 @@ fn nt_free_vm(ctx: &mut UCtx) -> u64 {
     STATUS_SUCCESS
 }
 
+/// NtQueryVirtualMemory(process, base, class, buf, len, &retlen):
+/// class 0 MemoryBasicInformation only — a 48-byte record built
+/// from the task's ranges ledger (committed range fields, or
+/// MEM_FREE up to the next registered region).
+fn nt_query_vm(ctx: &mut UCtx) -> u64 {
+    if arg(ctx, 0) != u64::MAX {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let (base, class, buf, len, rp) = (
+        arg(ctx, 1),
+        arg(ctx, 2),
+        arg(ctx, 3),
+        arg(ctx, 4),
+        arg(ctx, 5),
+    );
+    if class != 0 {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if len < 48 {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if !user::range_ok_w(buf, 48) || (rp != 0 && !user::range_ok_w(rp, 8)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    user::nt_query_vm(base, buf);
+    if rp != 0 {
+        // SAFETY: pointer validated above.
+        unsafe { (rp as *mut u64).write_unaligned(48) };
+    }
+    STATUS_SUCCESS
+}
+
+/// NtProtectVirtualMemory(process, &base, &size, newprot, &oldprot):
+/// page-aligns the window, requires committed coverage, rewrites
+/// the PTEs and ranges flags, reports the first range's old
+/// protection. The self-managed heap arena is rejected inside.
+fn nt_protect_vm(ctx: &mut UCtx) -> u64 {
+    if arg(ctx, 0) != u64::MAX {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let (bp, sp, prot, op) = (
+        arg(ctx, 1),
+        arg(ctx, 2),
+        arg(ctx, 3) as u32,
+        arg(ctx, 4),
+    );
+    if !user::range_ok(bp, 8) || !user::range_ok(sp, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if op != 0 && !user::range_ok_w(op, 4) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    // SAFETY: both pointers validated above.
+    let (base, size) = unsafe {
+        (
+            (bp as *const u64).read_unaligned(),
+            (sp as *const u64).read_unaligned(),
+        )
+    };
+    user::nt_protect_vm(base, size, prot, op)
+}
+
 /// NtDelayExecution(alertable, &interval): interval is a signed
 /// 100-ns duration — negative means relative to now, the common
 /// form. Alertable sleeps end early on APC delivery; we have none,
@@ -676,6 +741,8 @@ pub fn service_for_name(name: &[u8]) -> Option<u32> {
         b"SetInformationFile" => NT_SET_INFORMATION_FILE,
         b"AllocateVirtualMemory" => NT_ALLOCATE_VIRTUAL_MEMORY,
         b"FreeVirtualMemory" => NT_FREE_VIRTUAL_MEMORY,
+        b"QueryVirtualMemory" => NT_QUERY_VIRTUAL_MEMORY,
+        b"ProtectVirtualMemory" => NT_PROTECT_VIRTUAL_MEMORY,
         b"TerminateProcess" => NT_TERMINATE_PROCESS,
         b"DelayExecution" => NT_DELAY_EXECUTION,
         b"QueryDirectoryFile" => NT_QUERY_DIRECTORY_FILE,
@@ -696,6 +763,8 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         NT_SET_INFORMATION_FILE => nt_set_info(ctx),
         NT_ALLOCATE_VIRTUAL_MEMORY => nt_alloc_vm(ctx),
         NT_FREE_VIRTUAL_MEMORY => nt_free_vm(ctx),
+        NT_QUERY_VIRTUAL_MEMORY => nt_query_vm(ctx),
+        NT_PROTECT_VIRTUAL_MEMORY => nt_protect_vm(ctx),
         NT_DELAY_EXECUTION => nt_delay(ctx),
         RUX_HEAP_ALLOC => nt_heap_alloc_svc(ctx),
         RUX_HEAP_REALLOC => nt_heap_realloc_svc(ctx),
@@ -705,6 +774,11 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
             // hProcess == (HANDLE)-1 means self; anything else is a
             // kill we don't model yet — the common case is self-exit.
             let status = arg(ctx, 1);
+            crate::log::printk(format_args!(
+                "rustux: user: pid {} {} exit({status})",
+                user::getpid(),
+                user::cur_exe()
+            ));
             user::task_exit(status);
         }
         _ => STATUS_NOT_IMPLEMENTED,

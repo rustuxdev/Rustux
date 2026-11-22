@@ -39,10 +39,16 @@ int main(void)
         return 4;
     int txts = 0, bad = 0;
     do {
+        line[0] = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 'D' : 'F';
+        line[1] = ' ';
+        line[2] = '2'; line[3] = ' ';
+        int i = 0;
+        while (fd.cFileName[i] && i < 250) { line[i + 4] = fd.cFileName[i]; i++; }
+        line[i + 4] = 0;
+        puts(line);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             continue;
         txts++;
-        puts(fd.cFileName);
         int l = (int)strlen(fd.cFileName);
         if (l < 4 || strcmp(fd.cFileName + l - 4, ".txt") != 0)
             bad++;

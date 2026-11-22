@@ -2309,6 +2309,9 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
         return false;
     }
     k32_data_init(t);
+    if !pe_tls_init(t, p) {
+        return false;
+    }
     // The fixed PE regions are real user mappings — register them
     // in the ranges ledger like the image sections so range_ok's
     // VMA gate covers the data page a CreateFileA thunk names.
@@ -3034,24 +3037,93 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             ]);
         }
         // GetCommandLineA -> ANSI argv0 in the data page.
-        b"GetCommandLineA" | b"GetCommandLineW" => {
+        b"GetCommandLineA" => {
             e.rax_imm(d + 0x40);
             e.raw(&[0xc3]);
         }
-        // TLS: 8 slots at data+0xc0, bitmap byte at data+0x108.
+        // GetCommandLineW -> the real UNICODE_STRING buffer in
+        // PEB.ProcessParameters.CommandLine (UTF-16 "<exe>.exe").
+        b"GetCommandLineW" => {
+            e.raw(&[
+                0x65, 0x48, 0x8b, 0x04, 0x25, 0x60, 0, 0, 0, // mov rax,gs:[0x60]
+                0x48, 0x8b, 0x40, 0x20, // mov rax,[rax+0x20] ProcessParameters
+                0x48, 0x8b, 0x80, 0x88, 0, 0, 0, // mov rax,[rax+0x88] CmdLine.Buffer
+                0xc3,
+            ]);
+        }
+        // Process/thread identity from TEB.ClientId {pid@0x40,tid@0x48}.
+        b"GetCurrentProcessId" => {
+            e.raw(&[0x65, 0x8b, 0x04, 0x25, 0x40, 0, 0, 0, 0xc3]); // mov eax,gs:[0x40]; ret
+        }
+        b"GetCurrentThreadId" => {
+            e.raw(&[0x65, 0x8b, 0x04, 0x25, 0x48, 0, 0, 0, 0xc3]); // mov eax,gs:[0x48]; ret
+        }
+        b"GetCurrentProcess" => {
+            e.raw(&[0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0xc3]); // rax=-1; ret
+        }
+        b"GetCurrentThread" => {
+            e.raw(&[0x48, 0xc7, 0xc0, 0xfe, 0xff, 0xff, 0xff, 0xc3]); // rax=-2; ret
+        }
+        // GetModuleHandleW — same PEB read as the A arm.
+        b"GetModuleHandleW" => {
+            e.raw(&[
+                0x65, 0x48, 0x8b, 0x04, 0x25, 0x60, 0, 0, 0,
+                0x48, 0x8b, 0x40, 0x10,
+                0xc3,
+            ]);
+        }
+        // Environment blocks in the data page (ANSI 0x800, UTF-16 0x820).
+        b"GetEnvironmentStringsA" | b"GetEnvironmentStrings" => {
+            e.rax_imm(d + 0x800);
+            e.raw(&[0xc3]);
+        }
+        b"GetEnvironmentStringsW" => {
+            e.rax_imm(d + 0x820);
+            e.raw(&[0xc3]);
+        }
+        b"FreeEnvironmentStringsA" | b"FreeEnvironmentStringsW" => {
+            e.raw(&[0xb8, 1, 0, 0, 0, 0xc3]); // mov eax,1; ret
+        }
+        // GetEnvironmentVariable*(name,buf,len): only RUSTUX exists —
+        // report not-found honestly (LastError=ERROR_ENVVAR_NOT_FOUND).
+        b"GetEnvironmentVariableA" | b"GetEnvironmentVariableW" => {
+            e.raw(&[
+                0x65, 0xc7, 0x04, 0x25, 0x68, 0, 0, 0, 0xcb, 0, 0, 0, // gs:[0x68]=203
+                0x31, 0xc0, 0xc3, // xor eax,eax; ret
+            ]);
+        }
+        // GetStartupInfoA/W(&si): rep-movsb the canned 104B STARTUPINFO.
+        b"GetStartupInfoA" | b"GetStartupInfoW" => {
+            e.raw(&[
+                0x48, 0x89, 0xcf, // mov rdi,rcx
+                0x48, 0xbe, //    mov rsi,<d+0x840>
+            ]);
+            e.raw(&(d + 0x840).to_le_bytes());
+            e.raw(&[
+                0xb9, 0x68, 0, 0, 0, // mov ecx,104
+                0xf3, 0xa4, //           rep movsb
+                0xc3,
+            ]);
+        }
+        // TLS: 64 slots — the pointer array gs:[0x58] points at
+        // (data+0x200, the TEB.ThreadLocalStoragePointer layout
+        // compiled __thread/TLS access also uses), 64-bit alloc
+        // bitmap at data+0x108.
         b"TlsGetValue" | b"FlsGetValue" => {
-            e.raw(&[0x83, 0xf9, 0x08]);
-            let fail = e.jcc(0x3); // jae
-            e.rax_imm(d + 0xc0);
-            e.raw(&[0x48, 0x8b, 0x04, 0xc8, 0xc3]); // mov rax,[rax+rcx*8]; ret
+            e.raw(&[0x83, 0xf9, 0x40]); // cmp ecx,0x40
+            let fail = e.jcc(0x3); //       jae
+            e.raw(&[
+                0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0, 0, 0, // mov rax,gs:[0x58]
+                0x48, 0x8b, 0x04, 0xc8, 0xc3, // mov rax,[rax+rcx*8]; ret
+            ]);
             e.fix(fail);
             e.raw(&[0x31, 0xc0, 0xc3]);
         }
         b"TlsSetValue" | b"FlsSetValue" => {
-            e.raw(&[0x83, 0xf9, 0x08]);
+            e.raw(&[0x83, 0xf9, 0x40]);
             let fail = e.jcc(0x3);
-            e.rax_imm(d + 0xc0);
             e.raw(&[
+                0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0, 0, 0, // mov rax,gs:[0x58]
                 0x48, 0x89, 0x14, 0xc8, // mov [rax+rcx*8],rdx
                 0xb8, 1, 0, 0, 0, 0xc3, // mov eax,1; ret
             ]);
@@ -3061,32 +3133,32 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
         b"TlsAlloc" | b"FlsAlloc" => {
             e.rax_imm(d + 0x108);
             e.raw(&[
-                0x0f, 0xb6, 0x08, // movzx ecx,byte[rax]
+                0x48, 0x8b, 0x08, // mov rcx,[rax]
                 0x31, 0xd2, //    xor edx,edx
             ]);
             let lp = e.n;
-            e.raw(&[0x0f, 0xa3, 0xd1]); // bt ecx,edx
-            let found = e.jcc(0x3); //   jae found
-            e.raw(&[0xff, 0xc2, 0x83, 0xfa, 0x08]); // inc edx; cmp edx,8
+            e.raw(&[0x48, 0x0f, 0xa3, 0xd1]); // bt rcx,rdx
+            let found = e.jcc(0x3); //          jae found
+            e.raw(&[0xff, 0xc2, 0x83, 0xfa, 0x40]); // inc edx; cmp edx,0x40
             let back = e.jcc(0x2); //   jb loop
             e.fix_to(back, lp);
             e.raw(&[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3]); // mov eax,-1; ret
             e.fix(found);
             e.raw(&[
-                0x0f, 0xab, 0xd1, // bts ecx,edx
-                0x88, 0x08, //      mov [rax],cl
+                0x48, 0x0f, 0xab, 0xd1, // bts rcx,rdx
+                0x48, 0x89, 0x08, //      mov [rax],rcx
                 0x89, 0xd0, //      mov eax,edx
                 0xc3,
             ]);
         }
         b"TlsFree" | b"FlsFree" => {
-            e.raw(&[0x83, 0xf9, 0x08]);
+            e.raw(&[0x83, 0xf9, 0x40]);
             let fail = e.jcc(0x3);
             e.rax_imm(d + 0x108);
             e.raw(&[
-                0x0f, 0xb6, 0x10, // movzx edx,byte[rax]
-                0x0f, 0xb3, 0xd1, // btr edx,ecx
-                0x88, 0x10, //      mov [rax],dl
+                0x48, 0x8b, 0x10, // mov rdx,[rax]
+                0x48, 0x0f, 0xb3, 0xd1, // btr rdx,rcx
+                0x48, 0x89, 0x10, // mov [rax],rdx
                 0xb8, 1, 0, 0, 0, 0xc3,
             ]);
             e.fix(fail);
@@ -3107,34 +3179,68 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x48, 0x83, 0xc4, 0x38, 0xc3, // add rsp,0x38; ret
             ]);
         }
-        // VirtualProtect: reports old prot as PAGE_READWRITE(4) and
-        // claims success — we don't model per-page prot changes yet.
+        // VirtualProtect(addr,size,newprot,&oldprot) ->
+        // NtProtectVirtualMemory(-1,&base,&size,newprot,&oldcell) —
+        // the kernel rewrites PTEs and ranges[] flags for real.
         b"VirtualProtect" => {
-            e.raw(&[0x4d, 0x85, 0xc9]); // test r9,r9
-            let skip = e.jcc(0x4); //    jz skip
-            e.raw(&[0x41, 0xc7, 0x01, 0x04, 0, 0, 0]); // mov dword[r9],4
-            e.fix(skip);
-            e.raw(&[0xb8, 1, 0, 0, 0, 0xc3]);
-        }
-        // VirtualQuery(addr,buf,len) -> a plausible committed-page
-        // MEMORY_BASIC_INFORMATION; returns 48 (sizeof).
-        b"VirtualQuery" => {
-            e.raw(&[0x49, 0x83, 0xf8, 0x30]); // cmp r8,48
-            let fail = e.jcc(0x2); //          jb fail
             e.raw(&[
-                0x48, 0x89, 0x0a, //                   mov [rdx],rcx
-                0x48, 0x81, 0xe1, 0x00, 0xf0, 0xff, 0xff, // and rcx,-0x1000
-                0x48, 0x89, 0x4a, 0x08, //              mov [rdx+8],rcx
-                0xc7, 0x42, 0x10, 0x04, 0, 0, 0, //    AllocProtect=4
-                0xc7, 0x42, 0x18, 0x04, 0, 0, 0, //    Protect=4
-                0x48, 0xc7, 0x42, 0x20, 0x00, 0x10, 0, 0, // RegionSize=4K
-                0xc7, 0x42, 0x28, 0x00, 0x10, 0, 0, //  State=COMMIT
-                0xc7, 0x42, 0x2c, 0x00, 0x00, 0x02, 0, // Type=PRIVATE
-                0xb8, 0x30, 0, 0, 0, //                mov eax,48
-                0xc3,
+                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
+                0x48, 0x89, 0x4c, 0x24, 0x10, // mov [rsp+0x10],rcx  base
+                0x48, 0x89, 0x54, 0x24, 0x18, // mov [rsp+0x18],rdx  size
+                0x4c, 0x89, 0x4c, 0x24, 0x20, // mov [rsp+0x20],r9   save &oldprot
+                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
+                0x48, 0x8d, 0x54, 0x24, 0x10, // lea rdx,[rsp+0x10] &base
+                0x4d, 0x89, 0xc1, //             mov r9,r8         newprot
+                0x4c, 0x8d, 0x44, 0x24, 0x18, // lea r8,[rsp+0x18] &size
+                0x48, 0x8d, 0x44, 0x24, 0x30, // lea rax,[rsp+0x30] &oldcell
+                0x48, 0x89, 0x44, 0x24, 0x28, // mov [rsp+0x28],rax arg5
+                0xb8, 0x50, 0, 0, 0, //       mov eax,0x50
+                0x0f, 0x05, //                  syscall
+                0x85, 0xc0, //                  test eax,eax
+            ]);
+            let fail = e.jcc(0x8); //           js fail
+            e.raw(&[
+                0x48, 0x8b, 0x4c, 0x24, 0x20, // mov rcx,[rsp+0x20] caller's ptr
+                0x48, 0x85, 0xc9, //            test rcx,rcx
+            ]);
+            let done = e.jcc(0x4); //           jz done
+            e.raw(&[
+                0x8b, 0x54, 0x24, 0x30, // mov edx,[rsp+0x30] oldprot
+                0x89, 0x11, //             mov [rcx],edx
+            ]);
+            e.fix(done);
+            e.raw(&[
+                0xb8, 1, 0, 0, 0, // mov eax,1
+                0x48, 0x83, 0xc4, 0x38, 0xc3, // add rsp,0x38; ret
             ]);
             e.fix(fail);
-            e.raw(&[0x31, 0xc0, 0xc3]);
+            e.raw(&[0x31, 0xc0, 0x48, 0x83, 0xc4, 0x38, 0xc3]); // eax=0; ret
+        }
+        // VirtualQuery(addr,buf,len) ->
+        // NtQueryVirtualMemory(-1,addr,0,buf,len,&retlen) — real
+        // MEMORY_BASIC_INFORMATION from the ranges ledger; returns
+        // the kernel's written length.
+        b"VirtualQuery" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
+                0x4c, 0x89, 0x44, 0x24, 0x28, // mov [rsp+0x28],r8  arg5 len
+                0x48, 0x8d, 0x44, 0x24, 0x10, // lea rax,[rsp+0x10] &retlen
+                0x48, 0x89, 0x44, 0x24, 0x30, // mov [rsp+0x30],rax arg6
+                0x49, 0x89, 0xd1, //           mov r9,rdx        buf
+                0x48, 0x89, 0xca, //           mov rdx,rcx       base
+                0x45, 0x31, 0xc0, //           xor r8d,r8d       class 0
+                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
+                0xb8, 0x23, 0, 0, 0, //       mov eax,0x23
+                0x0f, 0x05, //                  syscall
+                0x85, 0xc0, //                  test eax,eax
+            ]);
+            let fail = e.jcc(0x8); //           js fail
+            e.raw(&[
+                0x48, 0x8b, 0x44, 0x24, 0x10, // mov rax,[rsp+0x10] retlen
+                0x48, 0x83, 0xc4, 0x38, 0xc3, // add rsp,0x38; ret
+            ]);
+            e.fix(fail);
+            e.raw(&[0x31, 0xc0, 0x48, 0x83, 0xc4, 0x38, 0xc3]); // rax=0; ret
         }
         // --- file API -------------------------------------------
         // CloseHandle(h) -> NtClose; BOOL out.
@@ -3479,7 +3585,7 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
         // strlen/memcpy/strncmp — real C-string routines.
         b"strlen" => {
             emit_strlen_rcx(&mut e);
-            e.raw(&[0xc3]);
+            e.raw(&[0x48, 0x89, 0xc8, 0xc3]); // mov rax,rcx; ret
         }
         b"memcpy" => {
             e.raw(&[
@@ -3547,6 +3653,195 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x29, 0xd0, //          sub eax,edx
                 0xc3,
             ]);
+        }
+        // memset(dst,c,n): rep stosb — r9 keeps dst for the return.
+        b"memset" => {
+            e.raw(&[
+                0x49, 0x89, 0xc9, // mov r9,rcx
+                0x48, 0x89, 0xcf, // mov rdi,rcx
+                0x89, 0xd0, //       mov eax,edx  c
+                0x4c, 0x89, 0xc1, // mov rcx,r8   n
+                0xf3, 0xaa, //       rep stosb
+                0x4c, 0x89, 0xc8, // mov rax,r9
+                0xc3,
+            ]);
+        }
+        // wcslen(s): u16 scan — chars, not bytes.
+        b"wcslen" => {
+            e.raw(&[0x48, 0x89, 0xc8]); // mov rax,rcx
+            let lp = e.n;
+            e.raw(&[0x66, 0x83, 0x38, 0x00]); // cmp word[rax],0
+            let done = e.jcc(0x4);
+            e.raw(&[0x48, 0x83, 0xc0, 0x02]); // add rax,2
+            let back = e.jmp();
+            e.fix_to(back, lp);
+            e.fix(done);
+            e.raw(&[0x48, 0x29, 0xc8, 0xc3]); // sub rax,rcx; ret
+        }
+        // strstr(hay,needle): O(nm) scan — p in rax, inner cursors
+        // r9 (hay) / r10 (needle), chars cl / r11b.
+        b"strstr" => {
+            e.raw(&[0x48, 0x89, 0xc8]); // mov rax,rcx   p
+            let outer = e.n;
+            e.raw(&[
+                0x8a, 0x08, //       mov cl,[rax]
+                0x84, 0xc9, //       test cl,cl
+            ]);
+            let nf = e.jcc(0x4); //     jz notfound
+            e.raw(&[
+                0x49, 0x89, 0xc1, // mov r9,rax     q
+                0x49, 0x89, 0xd2, // mov r10,rdx    n
+            ]);
+            let inner = e.n;
+            e.raw(&[
+                0x41, 0x8a, 0x09, // mov cl,[r9]
+                0x45, 0x8a, 0x1a, // mov r11b,[r10]
+                0x45, 0x84, 0xdb, // test r11b,r11b
+            ]);
+            let found = e.jcc(0x4); // needle ended → match at p
+            e.raw(&[0x44, 0x38, 0xd9]); // cmp cl,r11b
+            let next = e.jcc(0x5); //    jne next
+            e.raw(&[
+                0x49, 0xff, 0xc1, // inc r9
+                0x49, 0xff, 0xc2, // inc r10
+            ]);
+            let ib = e.jmp();
+            e.fix_to(ib, inner);
+            e.fix(next);
+            e.raw(&[0x48, 0xff, 0xc0]); // inc rax
+            let ob = e.jmp();
+            e.fix_to(ob, outer);
+            e.fix(found);
+            e.raw(&[0xc3]); //           ret (rax=p)
+            e.fix(nf);
+            e.raw(&[0x31, 0xc0, 0xc3]); // xor eax,eax; ret
+        }
+        // VirtualFree(addr,size,type) -> NtFreeVirtualMemory.
+        b"VirtualFree" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
+                0x48, 0x89, 0x4c, 0x24, 0x10, // [rsp+0x10]=base
+                0x48, 0x89, 0x54, 0x24, 0x18, // [rsp+0x18]=size
+                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // r10=-1
+                0x48, 0x8d, 0x54, 0x24, 0x10, // rdx=&base
+                0x4d, 0x89, 0xc1, //           r9=type
+                0x4c, 0x8d, 0x44, 0x24, 0x18, // r8=&size
+                0xb8, 0x1e, 0, 0, 0, //      eax=0x1e
+                0x0f, 0x05, //               syscall
+                0x85, 0xc0, //               test eax,eax
+            ]);
+            let fail = e.jcc(0x8);
+            e.raw(&[
+                0xb8, 1, 0, 0, 0, // mov eax,1
+                0x48, 0x83, 0xc4, 0x38, 0xc3, // add rsp,0x38; ret
+            ]);
+            e.fix(fail);
+            e.raw(&[0x31, 0xc0, 0x48, 0x83, 0xc4, 0x38, 0xc3]);
+        }
+        // fputc(c,stream): one byte via the stream's fd cell — the
+        // byte itself lives in a data-page scratch cell.
+        b"fputc" => {
+            e.raw(&[
+                0x53, //                push rbx
+                0x48, 0x89, 0xcb, //    mov rbx,rcx   char
+                0x4c, 0x8b, 0x12, //    mov r10,[rdx] fd
+                0x48, 0x83, 0xec, 0x60, // sub rsp,0x60
+            ]);
+            e.rax_imm(d + 0x918);
+            e.raw(&[
+                0x88, 0x08, //                       mov [rax],cl
+                0x48, 0x89, 0x44, 0x24, 0x30, // [rsp+0x30]=buf
+                0x48, 0xc7, 0x44, 0x24, 0x38, 0x01, 0, 0, 0, // len 1
+            ]);
+            emit_xfile_tail(&mut e, 8);
+            e.raw(&[0x85, 0xc0]); // test eax,eax
+            let fail = e.jcc(0x8);
+            e.raw(&[0x0f, 0xb6, 0xc3]); // movzx eax,bl — return c
+            let done = e.jmp();
+            e.fix(fail);
+            e.raw(&[0xb8, 0xff, 0xff, 0xff, 0xff]); // mov eax,-1 EOF
+            e.fix(done);
+            e.raw(&[0x48, 0x83, 0xc4, 0x60, 0x5b, 0xc3]);
+        }
+        // Locale/charset CRT plumbing — honest minimal answers:
+        // no DBCS, cp1252, MB_CUR_MAX 1, static lconv, canned error.
+        b"IsDBCSLeadByteEx" | b"IsDBCSLeadByte" => {
+            e.raw(&[0x31, 0xc0, 0xc3]); // xor eax,eax; ret
+        }
+        b"___lc_codepage_func" => {
+            e.raw(&[0xb8, 0xa4, 0x04, 0, 0, 0xc3]); // mov eax,1252; ret
+        }
+        b"___mb_cur_max_func" => {
+            e.raw(&[0xb8, 1, 0, 0, 0, 0xc3]); // mov eax,1; ret
+        }
+        b"localeconv" => {
+            e.rax_imm(d + 0x8b0);
+            e.raw(&[0xc3]);
+        }
+        b"strerror" => {
+            e.rax_imm(d + 0x910);
+            e.raw(&[0xc3]);
+        }
+        // _lock/_unlock — CRT lock sections; single-threaded → inert.
+        b"_lock" | b"_unlock" => {
+            e.raw(&[0xc3]);
+        }
+        // MultiByteToWideChar(cp,fl,src r8,srclen r9,dst +0x28,
+        // dstlen +0x30): ASCII-only copy — every char <0x80 here.
+        // Returns chars written including a copied NUL.
+        b"MultiByteToWideChar" => {
+            e.raw(&[
+                0x4c, 0x8b, 0x54, 0x24, 0x28, // mov r10,[rsp+0x28] dst
+                0x4c, 0x8b, 0x5c, 0x24, 0x30, // mov r11,[rsp+0x30] dstlen
+                0x31, 0xc0, //                 xor eax,eax
+            ]);
+            let lp = e.n;
+            e.raw(&[0x49, 0x39, 0xc3]); // cmp r11,rax
+            let d1 = e.jcc(0x6); //        jbe done
+            e.raw(&[0x4c, 0x39, 0xc8]); // cmp rax,r9
+            let d2 = e.jcc(0x3); //        jae done
+            e.raw(&[
+                0x41, 0x8a, 0x0c, 0x00, // mov cl,[r8+rax]
+                0x66, 0x41, 0x89, 0x0c, 0x42, // mov [r10+rax*2],cx
+                0x84, 0xc9, //             test cl,cl
+            ]);
+            let fin = e.jcc(0x4); //        jz fin (NUL copied)
+            e.raw(&[0x48, 0xff, 0xc0]); // inc rax
+            let back = e.jmp();
+            e.fix_to(back, lp);
+            e.fix(fin);
+            e.raw(&[0x48, 0xff, 0xc0]); // inc rax — count the NUL
+            e.fix(d1);
+            e.fix(d2);
+            e.raw(&[0xc3]);
+        }
+        // WideCharToMultiByte(cp,fl,src r8,srclen r9,dst +0x28,
+        // dstlen +0x30,...): the ASCII inverse — low byte per u16.
+        b"WideCharToMultiByte" => {
+            e.raw(&[
+                0x4c, 0x8b, 0x54, 0x24, 0x28, // mov r10,[rsp+0x28] dst
+                0x4c, 0x8b, 0x5c, 0x24, 0x30, // mov r11,[rsp+0x30] dstlen
+                0x31, 0xc0, //                 xor eax,eax
+            ]);
+            let lp = e.n;
+            e.raw(&[0x49, 0x39, 0xc3]); // cmp r11,rax
+            let d1 = e.jcc(0x6); //        jbe done
+            e.raw(&[0x4c, 0x39, 0xc8]); // cmp rax,r9
+            let d2 = e.jcc(0x3); //        jae done
+            e.raw(&[
+                0x66, 0x41, 0x8b, 0x0c, 0x40, // mov cx,[r8+rax*2]
+                0x41, 0x88, 0x0c, 0x02, // mov [r10+rax],cl
+                0x66, 0x85, 0xc9, //        test cx,cx
+            ]);
+            let fin = e.jcc(0x4); //        jz fin
+            e.raw(&[0x48, 0xff, 0xc0]); // inc rax
+            let back = e.jmp();
+            e.fix_to(back, lp);
+            e.fix(fin);
+            e.raw(&[0x48, 0xff, 0xc0]); // inc rax
+            e.fix(d1);
+            e.fix(d2);
+            e.raw(&[0xc3]);
         }
         // WriteFile(h,buf,len,&w,ovl)/WriteConsoleA — 9-arg
         // NtWriteFile, iosb.info written back to &written.
@@ -3689,8 +3984,8 @@ fn k32_data_sym(name: &[u8]) -> Option<u64> {
 /// Data-page init for the Win32 thunk layer: argv = {&argv0,NULL},
 /// envp = {NULL}, commode/fmode ints, fake FILE[3] carrying NT std
 /// fds, the '\n' byte puts writes, and argv0 = "<exe>\0" (ANSI —
-/// good enough for ASCII names; GetCommandLineW currently aliases
-/// the same buffer, a documented groundwork divergence).
+/// good enough for ASCII names; GetCommandLineW reads the UTF-16
+/// UNICODE_STRING the PEB process parameters point at.
 fn k32_data_init(t: &mut Task) {
     let d = crate::pe::STUB_DATA_VA;
     // argv[0] pointer + terminator. envp = {"RUSTUX=1", NULL} at
@@ -3732,6 +4027,23 @@ fn k32_data_init(t: &mut Task) {
     }
     // UTF-16 "." at 0x780 — FindFirstFile's NtCreateFile name.
     let _ = write_task_bytes(t.pml4, d + 0x780, &[0x2e, 0]);
+    // Environment blocks for GetEnvironmentStrings: ANSI at 0x800,
+    // UTF-16 at 0x820 — both double-NUL terminated.
+    let _ = write_task_bytes(t.pml4, d + 0x800, b"RUSTUX=1\0\0");
+    let _ = write_task_bytes(t.pml4, d + 0x820, b"R\0U\0S\0T\0U\0X\0=\01\0\0\0\0");
+    // STARTUPINFO at 0x840 — cb=104 (x64), rest zeroed.
+    let _ = write_task_bytes(t.pml4, d + 0x840, &104u32.to_le_bytes());
+    // localeconv's static lconv at 0x8b0: decimal_point → "." at
+    // 0x900, the other nine string fields → the empty string at
+    // 0x908; numeric fields stay zeroed.
+    for i in 0..10u64 {
+        let p = if i == 0 { d + 0x900 } else { d + 0x908 };
+        let _ = write_task_bytes(t.pml4, d + 0x8b0 + i * 8, &p.to_le_bytes());
+    }
+    let _ = write_task_bytes(t.pml4, d + 0x900, b".\0");
+    let _ = write_task_bytes(t.pml4, d + 0x908, &[0u8]);
+    // strerror's canned message + fputc's scratch byte.
+    let _ = write_task_bytes(t.pml4, d + 0x910, b"error\0");
 }
 
 /// Import resolution against the synthetic ntdll stub page: walk
@@ -3740,9 +4052,8 @@ fn k32_data_init(t: &mut Task) {
 /// `mov r10,rcx; mov eax,nr; syscall; ret` (the real ntdll shape),
 /// and patch the IAT so compiled `call [rip+IAT]` code just works.
 fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
-    if p.import_size == 0 {
-        return true;
-    }
+    // Stub pages map unconditionally — import thunks and the TLS
+    // callback trampoline both live there.
     if map_page(t, crate::pe::STUB_VA, USER | WRITE).is_none()
         || map_page(t, crate::pe::STUB_VA + 0x1000, USER | WRITE)
             .is_none()
@@ -3752,8 +4063,9 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
         return false;
     }
     let mut stub_next = crate::pe::STUB_VA;
-    let mut i = 0u64;
-    loop {
+    if p.import_size != 0 {
+        let mut i = 0u64;
+        loop {
         if i >= 64 {
             return false;
         }
@@ -3855,11 +4167,126 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
             stub_next += used;
         }
         i += 1;
+        }
+    }
+    // TLS-callback trampoline (DLL_PROCESS_ATTACH) shares the stub
+    // pages — it must land before the read+execute lock-down.
+    if emit_tls_tramp(t, p, &mut stub_next).is_none() {
+        return false;
     }
     // Fill done — drop the stub pages to read+execute.
     map_page(t, crate::pe::STUB_VA, USER);
     map_page(t, crate::pe::STUB_VA + 0x1000, USER);
     map_page(t, crate::pe::STUB_VA + 0x2000, USER);
+    true
+}
+
+/// TLS directory (IMAGE_TLS_DIRECTORY32/64): emit a process-attach
+/// trampoline into the stub page that calls each PIMAGE_TLS_CALLBACK
+/// in the AddressOfCallBacks array with (hinst, DLL_PROCESS_ATTACH,
+/// NULL), then tail-jumps to the real image entry. Sets `t.entry`
+/// to the trampoline. Some(()) with the cursor bumped, None on
+/// malformed directory or stub-space exhaustion.
+fn emit_tls_tramp(t: &mut Task, p: &crate::pe::Pe, stub_next: &mut u64) -> Option<()> {
+    if p.tls_rva == 0 || p.tls_size < 0x20 {
+        // A directory too short for AddressOfCallBacks (+0x18) has
+        // no callbacks to run.
+        return Some(());
+    }
+    let cb = read_task_u(t.pml4, p.bias + p.tls_rva + 0x18, 8)?;
+    if cb == 0 {
+        return Some(());
+    }
+    // The callback array must live inside the image — anything else
+    // is malformed, not a request to run arbitrary VA.
+    if cb < p.bias || cb + 8 > p.bias + p.size {
+        return None;
+    }
+    let mut buf = [0u8; 128];
+    let mut e = Emit { b: &mut buf, n: 0 };
+    e.raw(&[0x49, 0xbe]); // mov r14,imm64 — callbacks array
+    e.raw(&cb.to_le_bytes());
+    e.raw(&[
+        0x48, 0x83, 0xe4, 0xf0, // and rsp,-16
+        0x48, 0x83, 0xec, 0x20, // sub rsp,0x20
+    ]);
+    let lp = e.n;
+    e.raw(&[
+        0x49, 0x8b, 0x06, // mov rax,[r14]
+        0x48, 0x85, 0xc0, // test rax,rax
+    ]);
+    let done = e.jcc(0x4); //   jz done
+    e.raw(&[0x48, 0xb9]); //   mov rcx,imm64 — hinst
+    e.raw(&p.bias.to_le_bytes());
+    e.raw(&[
+        0xba, 1, 0, 0, 0, //       mov edx,1  DLL_PROCESS_ATTACH
+        0x4d, 0x31, 0xc0, //       xor r8d,r8d
+        0xff, 0xd0, //             call rax
+        0x49, 0x83, 0xc6, 0x08, // add r14,8
+    ]);
+    let back = e.jmp();
+    e.fix_to(back, lp);
+    e.fix(done);
+    e.raw(&[
+        0x48, 0x83, 0xc4, 0x20, // add rsp,0x20
+        0x48, 0xb8, //            mov rax,imm64 — real entry
+    ]);
+    e.raw(&t.entry.to_le_bytes());
+    e.raw(&[0xff, 0xe0]); //     jmp rax
+    let n = e.n;
+    if n > buf.len() {
+        return None;
+    }
+    let used = (n as u64 + 15) & !15;
+    if *stub_next + used > crate::pe::STUB_DATA_VA
+        || !write_task_bytes(t.pml4, *stub_next, &buf[..n])
+    {
+        return None;
+    }
+    t.entry = *stub_next;
+    *stub_next += used;
+    Some(())
+}
+
+/// TLS data side: set *AddressOfIndex = 0 and point slot 0 at the
+/// image's own .tls template span — correct for a single-threaded
+/// process; per-thread copies wait for real NT threads. The
+/// callback trampoline is emitted by emit_tls_tramp inside
+/// pe_resolve_imports.
+fn pe_tls_init(t: &mut Task, p: &crate::pe::Pe) -> bool {
+    if p.tls_rva == 0 {
+        return true;
+    }
+    if p.tls_size < 0x18 {
+        return false; // can't even name template span + index
+    }
+    let dir = p.bias + p.tls_rva;
+    let (Some(start), Some(end), Some(idx)) = (
+        read_task_u(t.pml4, dir, 8),
+        read_task_u(t.pml4, dir + 8, 8),
+        read_task_u(t.pml4, dir + 0x10, 8),
+    ) else {
+        return false;
+    };
+    // Every VA the directory names must land inside the image.
+    if idx != 0 && (idx < p.bias || idx + 4 > p.bias + p.size) {
+        return false;
+    }
+    if end > start && (start < p.bias || end > p.bias + p.size) {
+        return false;
+    }
+    if idx != 0 && !write_task_bytes_force(t.pml4, idx, &0u32.to_le_bytes()) {
+        return false;
+    }
+    if end > start
+        && !write_task_bytes(
+            t.pml4,
+            crate::pe::STUB_DATA_VA + 0x200,
+            &start.to_le_bytes(),
+        )
+    {
+        return false;
+    }
     true
 }
 
@@ -3882,6 +4309,12 @@ fn teb_peb_init(t: &mut Task, p: &crate::pe::Pe) -> bool {
     {
         return false;
     }
+    // TEB.ThreadLocalStoragePointer @0x58 → the 64-pointer slot
+    // array in the data page — the same layout compiled TLS access
+    // (gs:[0x58] indexing) and our Tls* thunks both use.
+    if !write_task_bytes(t.pml4, teb + 0x58, &(crate::pe::STUB_DATA_VA + 0x200).to_le_bytes()) {
+        return false;
+    }
     let params = peb + 0x400;
     for (off, v) in [
         (0x020u64, 1u64), // StandardInput
@@ -3892,13 +4325,34 @@ fn teb_peb_init(t: &mut Task, p: &crate::pe::Pe) -> bool {
             return false;
         }
     }
-    // CommandLine: UNICODE_STRING at params+0x80 → UTF-16 text at
-    // peb+0x600, built from the task's exe name.
+    true
+}
+
+/// Late PEB/TEB state that depends on fields populated only after
+/// load() returns: TEB.ClientId {pid,tid} and the CommandLine
+/// UNICODE_STRING at params+0x80 → UTF-16 text at peb+0x600, built
+/// from t.exe (+ ".exe", the same spelling argv0 uses).
+fn pe_late_init(t: &Task) -> bool {
+    let peb = crate::pe::PEB_VA;
+    let teb = crate::pe::TEB_VA;
+    // TEB.ClientId {UniqueProcess, UniqueThread} — read by the
+    // GetCurrentProcessId/ThreadId thunks via gs:[0x40]/[0x48]. A
+    // fresh TEB page (spawn or PE exec) carries zeros until now.
+    if !write_task_bytes(t.pml4, teb + 0x40, &t.pid.to_le_bytes())
+        || !write_task_bytes(t.pml4, teb + 0x48, &t.pid.to_le_bytes())
+    {
+        return false;
+    }
+    let params = peb + 0x400;
     let mut u16b = [0u8; 256];
-    let wl = (t.exe_len as usize).min(127);
+    let wl = (t.exe_len as usize).min(123);
     for (i, &c) in t.exe[..wl].iter().enumerate() {
         u16b[i * 2..i * 2 + 2].copy_from_slice(&(c as u16).to_le_bytes());
     }
+    for (i, &c) in b".exe".iter().enumerate() {
+        u16b[(wl + i) * 2..(wl + i) * 2 + 2].copy_from_slice(&(c as u16).to_le_bytes());
+    }
+    let wl = wl + 4;
     if !write_task_bytes(t.pml4, peb + 0x600, &u16b[..wl * 2]) {
         return false;
     }
@@ -7153,6 +7607,145 @@ pub fn nt_free_pages(base: u64, size: u64) {
             t.nranges -= 1;
         }
     }
+}
+
+/// PAGE_* constant for a range's RNG flags — what NtQueryVirtualMemory
+/// reports and what VirtualProtect's old-protect readback returns.
+fn prot_from_rng(fl: u8) -> u32 {
+    match (fl & RNG_R != 0, fl & RNG_W != 0, fl & RNG_X != 0) {
+        (_, _, true) => {
+            if fl & RNG_W != 0 {
+                0x40 // EXECUTE_READWRITE
+            } else if fl & RNG_R != 0 {
+                0x20 // EXECUTE_READ
+            } else {
+                0x10 // EXECUTE
+            }
+        }
+        (true, true, false) => 0x04,  // READWRITE
+        (true, false, false) => 0x02, // READONLY
+        (false, true, false) => 0x04, // degenerate W-only → RW
+        (false, false, false) => 0x01, // NOACCESS
+    }
+}
+
+/// RNG flags + PTE leaf flags for a PAGE_* protection value.
+/// Modifier bits (GUARD/NOCACHE/WRITECOMBINE) are stripped — we
+/// honor the base protection only; unknown bases fail honestly.
+fn rng_from_prot(prot: u32) -> Option<(u8, u64)> {
+    match prot & 0xff {
+        0x01 => Some((0, 0)),                        // NOACCESS
+        0x02 => Some((RNG_R, USER | NX)),            // READONLY
+        0x04 | 0x08 => Some((RNG_R | RNG_W, USER | WRITE | NX)),
+        0x10 => Some((RNG_X, USER)),                 // EXECUTE
+        0x20 => Some((RNG_R | RNG_X, USER)),         // EXECUTE_READ
+        0x40 | 0x80 => Some((RNG_R | RNG_W | RNG_X, USER | WRITE)),
+        _ => None,
+    }
+}
+
+/// Fill a 48-byte MEMORY_BASIC_INFORMATION at `buf` (validated
+/// writable by the syscall layer) describing `base` against the
+/// ranges ledger: committed range fields, or MEM_FREE up to the
+/// next registered region.
+pub fn nt_query_vm(base: u64, buf: u64) {
+    let Some(t) = cur_mut() else { return };
+    let mut hit: Option<(u64, u64, u8)> = None;
+    let mut next_lo = u64::MAX;
+    for &(lo, hi, fl) in &t.ranges[..t.nranges] {
+        if base >= lo && base < hi {
+            hit = Some((lo, hi, fl));
+        } else if lo > base && lo < next_lo {
+            next_lo = lo;
+        }
+    }
+    let w = |off: u64, v: u64| {
+        // SAFETY: buf's 48B window was write-validated by the caller.
+        unsafe { ((buf + off) as *mut u64).write_unaligned(v) }
+    };
+    match hit {
+        Some((lo, hi, fl)) => {
+            let p = prot_from_rng(fl) as u64;
+            w(0x00, lo);
+            w(0x08, lo); // AllocationBase — no reserve/commit split
+            w(0x10, p); // AllocationProtect (low u32)
+            w(0x18, hi - lo);
+            w(0x20, 0x1000 | (p << 32)); // MEM_COMMIT | Protect
+            w(0x28, 0x2_0000); // MEM_PRIVATE
+        }
+        None => {
+            let lo = base & !0xfff;
+            let hi = if next_lo == u64::MAX {
+                elf::USER_VA_HI
+            } else {
+                next_lo
+            };
+            w(0x00, lo);
+            w(0x08, 0);
+            w(0x10, 0);
+            w(0x18, hi.saturating_sub(lo));
+            w(0x20, 0x10000); // MEM_FREE, Protect 0
+            w(0x28, 0);
+        }
+    }
+}
+
+/// NtProtectVirtualMemory workhorse: page-align [base,base+size),
+/// require full committed coverage, write the old protection of the
+/// first range to `old_ptr` (validated by the caller), then rewrite
+/// every leaf PTE and the range flags. The heap arena self-manages
+/// and is rejected outright.
+pub fn nt_protect_vm(base: u64, size: u64, prot: u32, old_ptr: u64) -> u64 {
+    let Some((rfl, pfl)) = rng_from_prot(prot) else {
+        return crate::nt::STATUS_INVALID_PARAMETER;
+    };
+    if size == 0 {
+        return crate::nt::STATUS_INVALID_PARAMETER;
+    }
+    let Some(end) = base.checked_add(size) else {
+        return crate::nt::STATUS_INVALID_PARAMETER;
+    };
+    let lo = base & !0xfff;
+    let hi = (end + 0xfff) & !0xfff;
+    if hi <= lo || lo < elf::USER_VA_LO || hi > elf::USER_VA_HI {
+        return crate::nt::STATUS_INVALID_PARAMETER;
+    }
+    // The heap arena is HeapAlloc's — VirtualProtect doesn't apply.
+    if lo < crate::pe::HEAP_MAX && hi > crate::pe::HEAP_VA {
+        return crate::nt::STATUS_INVALID_PARAMETER;
+    }
+    let Some(t) = cur_mut() else {
+        return crate::nt::STATUS_INVALID_HANDLE;
+    };
+    if !range_covered(t, lo, hi)
+        || protect_entry_count(t, lo, hi) > MAX_RANGES
+    {
+        return crate::nt::STATUS_MEMORY_NOT_ALLOCATED;
+    }
+    // Old protection = the flags of the first covered range.
+    let old = t.ranges[..t.nranges]
+        .iter()
+        .find(|&&(rlo, rhi, _)| base >= rlo && base < rhi)
+        .map(|&(_, _, fl)| prot_from_rng(fl))
+        .unwrap_or(0);
+    if old_ptr != 0 {
+        // SAFETY: old_ptr's 4B window was write-validated upstream.
+        unsafe { (old_ptr as *mut u32).write_unaligned(old) };
+    }
+    let mut v = lo;
+    while v < hi {
+        // Covered implies mapped — an absent leaf breaks the
+        // invariant; fail rather than guess.
+        let Some(ent) = leaf_ent(t, v) else {
+            return crate::nt::STATUS_MEMORY_NOT_ALLOCATED;
+        };
+        let e = rd64(ent);
+        wr64(ent, (e & PHYS_MASK) | pfl | PRESENT);
+        v += PAGE;
+    }
+    range_protect(t, lo, hi, rfl);
+    flush_tlb();
+    crate::nt::STATUS_SUCCESS
 }
 
 /// Map heap pages up to `to` (page-rounded) and grow the registered
@@ -14373,6 +14966,9 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
         let el = name.len().min(128);
         t.exe[..el].copy_from_slice(&name[..el]);
         t.exe_len = el as u8;
+        if !pe_late_init(t) {
+            return false;
+        }
         unsafe { core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _) };
         for h in sigt(t).handlers.iter_mut() {
             if *h != SIG_IGN {
@@ -14491,6 +15087,9 @@ pub fn spawn(img: &[u8], name: &str) -> bool {
     t.pid = next_pid();
     t.tgid = t.pid;
     t.pgid = t.pid; // each spawned task leads its own group in sid 1
+    if t.pers == PERS_NT {
+        let _ = pe_late_init(&t);
+    }
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
     for s in tasks.iter_mut() {
         if s.is_none() {
