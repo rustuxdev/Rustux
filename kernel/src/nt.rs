@@ -77,6 +77,7 @@ const RUX_HEAP_SIZE: u32 = 0xF3;
 const RUX_LOAD_DLL: u32 = 0xF4;
 const RUX_GET_PROC: u32 = 0xF5;
 const RUX_FREE_DLL: u32 = 0xF6;
+const RUX_DLL_ATTACH: u32 = 0xF7;
 
 /// Handle table tags — a per-task `nth` slot's object kind. Real
 /// handles are small indices (1-based) like the actual handle table;
@@ -1271,6 +1272,10 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         RUX_LOAD_DLL => user::nt_load_dll(arg(ctx, 0), arg(ctx, 1) != 0),
         RUX_GET_PROC => user::nt_get_proc(arg(ctx, 0), arg(ctx, 1)),
         RUX_FREE_DLL => user::nt_free_dll(arg(ctx, 0)),
+        // Drain one pending DllMain(DLL_PROCESS_ATTACH) — the
+        // LoadLibrary thunk loops on this after a fresh map so
+        // dependency entry points run before their importer's.
+        RUX_DLL_ATTACH => user::nt_next_attach(),
         NT_TERMINATE_PROCESS => {
             // hProcess == (HANDLE)-1 means self; anything else is a
             // kill we don't model yet — the common case is self-exit.

@@ -2331,3 +2331,39 @@ run-92 quick scoped: no confirmed findings, 2 latent fixed in-diff
 (frva span, raw-extent slice guard both loaders). Suite: 21/21
 0 failures, 54 tasks, frames 108468 -> 108468 zero leak,
 qemu exit 33. Ledger: 120.
+
+## run-119: dependent-DLL loading (PE import graph + dep DllMain + unload cascade)
+
+- Modules can now import other user modules: pe_resolve_imports routes
+  any non-system descriptor name (not kernel32/kernelbase/msvcrt/
+  ucrtbase/api-ms-*/ntdll) through nt_mod_resolve — dedup bumps refs on
+  a live module; a miss maps the image recursively via pe_map_image
+  (depth bound 4, cycles fail honestly with full unwind).
+- The importer IAT gets the dep export VA directly (no thunk), bound
+  through nt_export_lookup — the export-directory walk factored out of
+  nt_get_proc and shared by both paths (forwarders rejected, frva
+  span-checked, 8192-name cap).
+- NT_MODS grew to 9 fields: + dep_mask (which slots this image bound),
+  + entry_va, + pend_attach. nt_mod_refdown cascades: final release of
+  a parent refdowns every recorded dep, like the real loader.
+- Dep DllMains run: nt_mod_add flags fresh modules pend_attach; the
+  LoadLibraryA/W thunk drains the queue via new RUX_DLL_ATTACH (0xF7)
+  calling each DllMain(DLL_PROCESS_ATTACH) in userland — deps sit in
+  lower slots so they initialize before their importer.
+- Audit fixes in-diff: duplicate-descriptor dep refs now undo the
+  surplus bump (mask releases once); failed loads release accumulated
+  dep refs via nt_deps_release.
+- MAX_RANGES 32->128 — sized to NT_MAX_MODS=8 images x ~11 mapped
+  sections + exe + system VMAs (+2304B/task static).
+- Fixture winchain.exe (exit 34): wchain.dll statically imports
+  wbase.dll: recursive map, export-bound IAT, dedup to the dep
+  mapping, chain_state/base_state set by drained DllMains, cascade
+  unload + reload at a fresh base. windlltest regression clean.
+- Audit run-93 quick scoped: 2 confirmed fixed in-diff, none remaining;
+  cve.now hits all SMP-concurrent classes (n/a). Artifacts:
+  ~/security-audit-skill/linux-rust/run-93/.
+- Suite: 55 tasks, frames 108432 -> 108432 zero leak, qemu exit 33.
+- Known gaps (recorded, not bugs): module-name dedup is byte-exact
+  (case variants double-load); exe-static-import dep DllMains never
+  drain (no LoadLibrary thunk in the spawn path); import cycles fail
+  at depth 4 rather than binding the in-progress image.
