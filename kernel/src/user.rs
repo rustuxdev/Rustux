@@ -215,10 +215,12 @@ enum WaitOn {
     /// NtResumeThread flips it Runnable; nothing else wakes it.
     NtSuspend,
     /// NtWaitForSingleObject on an NT thread object — the payload
-    /// is the NT_THREADS ledger index, wait_deadline bounds it
-    /// (0 = infinite). nt_wait_expire re-checks the object each
-    /// tick: dead -> STATUS_SUCCESS, expired -> STATUS_TIMEOUT.
-    NtWait(usize),
+    /// is the NT_THREADS ledger index plus the tid recorded at arm
+    /// time — a freed-and-reallocated slot can't satisfy the wait —
+    /// wait_deadline bounds it (0 = infinite). nt_wait_expire
+    /// re-checks the object each tick: dead -> STATUS_SUCCESS,
+    /// expired -> STATUS_TIMEOUT.
+    NtWait(usize, u64),
     /// Same wait on an NT process object — payload is the
     /// NT_PROCS ledger index plus the tgid recorded at arm time, so
     /// a freed-and-reallocated slot can't satisfy the wait.
@@ -1919,6 +1921,22 @@ impl Task {
         self.release_fds();
         self.release_sighand();
         self.release_fstab();
+        // NT handle table dies with the Task: refdown whatever its
+        // slots still name or the NT_THREADS/NT_PROCS/NT_SECTIONS
+        // ledgers leak an entry per abandoned handle. Idempotent —
+        // exit_bookkeeping's last-standing sweep already zeroed the
+        // table when it ran. NTH_FILE slots need nothing: the fd
+        // release above covers them.
+        for i in 0..crate::nt::MAX_NTH {
+            match self.nth[i] {
+                crate::nt::NTH_THREAD => nt_thr_refdown(self.nth_fd[i] as usize),
+                crate::nt::NTH_SECTION => nt_sec_refdown(self.nth_fd[i] as usize),
+                crate::nt::NTH_PROCESS => nt_proc_refdown(self.nth_fd[i] as usize),
+                _ => {}
+            }
+            self.nth[i] = 0;
+            self.nth_fd[i] = 0xff;
+        }
         // A shared mm (CLONE_VM) outlives its users — only the last
         // one frees the mappings and the pml4 frame itself.
         if mm_release(self.pml4) {
@@ -4051,6 +4069,102 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x0f, 0x94, 0xc0, //             sete al
                 0x0f, 0xb6, 0xc0, //             movzx eax,al
                 0xc3, //                         ret
+            ]);
+        }
+        // Time/system-info services — RUX_SYS_INFO 0xFF:
+        // r10 = sub, rdx = out pointer (arg0).
+        // GetSystemInfo/GetNativeSystemInfo(lpSI) -> sub 0, void.
+        b"GetSystemInfo" | b"GetNativeSystemInfo" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 0, 0, 0, 0, //      mov r10d,0
+                0xb8, 0xff, 0, 0, 0, //         mov eax,0xFF
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        // GetTickCount{,64} -> sub 1, ms in rax.
+        b"GetTickCount" | b"GetTickCount64" => {
+            e.raw(&[
+                0x41, 0xba, 1, 0, 0, 0, //      mov r10d,1
+                0xb8, 0xff, 0, 0, 0, //         mov eax,0xFF
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        // GetSystemTimeAsFileTime(lp) -> sub 2, void.
+        b"GetSystemTimeAsFileTime" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 2, 0, 0, 0, //      mov r10d,2
+                0xb8, 0xff, 0, 0, 0, //         mov eax,0xFF
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        // GetSystemTime/GetLocalTime(lp) -> sub 3, void (no TZ
+        // database — LocalTime == SystemTime, recorded divergence).
+        b"GetSystemTime" | b"GetLocalTime" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 3, 0, 0, 0, //      mov r10d,3
+                0xb8, 0xff, 0, 0, 0, //         mov eax,0xFF
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        // QueryPerformanceCounter/Frequency(lp) -> subs 4/5, BOOL.
+        b"QueryPerformanceCounter" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 4, 0, 0, 0, //      mov r10d,4
+                0xb8, 0xff, 0, 0, 0, //         mov eax,0xFF
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        b"QueryPerformanceFrequency" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 5, 0, 0, 0, //      mov r10d,5
+                0xb8, 0xff, 0, 0, 0, //         mov eax,0xFF
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        // GetVersion -> sub 6, packed dword in eax.
+        b"GetVersion" => {
+            e.raw(&[
+                0x41, 0xba, 6, 0, 0, 0, //      mov r10d,6
+                0xb8, 0xff, 0, 0, 0, //         mov eax,0xFF
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        // GetVersionExA/W(lpOSVI) -> subs 7/8, BOOL.
+        b"GetVersionExA" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 7, 0, 0, 0, //      mov r10d,7
+                0xb8, 0xff, 0, 0, 0, //         mov eax,0xFF
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        b"GetVersionExW" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 8, 0, 0, 0, //      mov r10d,8
+                0xb8, 0xff, 0, 0, 0, //         mov eax,0xFF
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
             ]);
         }
         // IsDebuggerPresent -> PEB.BeingDebugged.
@@ -8380,17 +8494,25 @@ pub fn sys_prlimit64(_pid: u64, _res: u64, _new: u64, old: u64) -> u64 {
     0
 }
 
-/// clock_gettime(clk, ts): APIC ticks at 100Hz. Any clock id gets the
-/// same monotonic counter — time domains don't exist yet.
-pub fn sys_clock_gettime(_clk: u64, ts: u64) -> u64 {
+/// clock_gettime(clk, ts): CLOCK_REALTIME-family ids get the
+/// CMOS-anchored wall clock; everything else rides the 100 Hz
+/// monotonic tick (no per-process/thread cputime domains yet).
+pub fn sys_clock_gettime(clk: u64, ts: u64) -> u64 {
     if !range_ok_w(ts, 16) {
         return EFAULT;
     }
-    let t = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    // 0=REALTIME, 5=REALTIME_COARSE, 8=REALTIME_ALARM; 1=MONOTONIC,
+    // 4=MONOTONIC_RAW, 6=MONOTONIC_COARSE, 7=BOOTTIME all share TICKS.
+    let (s, ns) = if matches!(clk, 0 | 5 | 8) {
+        crate::rtc::wall_now()
+    } else {
+        let t = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        (t / 100, (t % 100) * 10_000_000)
+    };
     // SAFETY: ts validated writable for 16 bytes.
     unsafe {
-        (ts as *mut u64).write_unaligned(t / 100);
-        (ts as *mut u64).add(1).write_unaligned((t % 100) * 10_000_000);
+        (ts as *mut u64).write_unaligned(s);
+        (ts as *mut u64).add(1).write_unaligned(ns);
     }
     0
 }
@@ -8552,11 +8674,11 @@ pub fn sys_fchdir(fd: u64) -> u64 {
     0
 }
 
-/// time(tloc): seconds — our clock is ticks-since-boot, not epoch
-/// (documented divergence: no RTC readout yet). tloc mirrors the
-/// return like Linux; a bad pointer is EFAULT.
+/// time(tloc): wall-clock seconds — the CMOS RTC anchored at boot,
+/// boot-relative when there is no clock. tloc mirrors the return
+/// like Linux; a bad pointer is EFAULT.
 pub fn sys_time(tloc: u64) -> u64 {
-    let s = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed) / 100;
+    let (s, _) = crate::rtc::wall_now();
     if tloc != 0 {
         if !range_ok_w(tloc, 8) {
             return EFAULT;
@@ -8801,17 +8923,17 @@ pub fn sys_reboot(magic1: u64, magic2: u64, cmd: u64) -> u64 {
     }
 }
 
-/// gettimeofday(tv, tz): same counter, {sec,usec} layout.
+/// gettimeofday(tv, tz): wall clock, {sec,usec} layout.
 pub fn sys_gettimeofday(tv: u64, _tz: u64) -> u64 {
     if tv != 0 {
         if !range_ok_w(tv, 16) {
             return EFAULT;
         }
-        let t = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        let (s, ns) = crate::rtc::wall_now();
         // SAFETY: tv validated writable for 16 bytes.
         unsafe {
-            (tv as *mut u64).write_unaligned(t / 100);
-            (tv as *mut u64).add(1).write_unaligned((t % 100) * 10_000);
+            (tv as *mut u64).write_unaligned(s);
+            (tv as *mut u64).add(1).write_unaligned(ns / 1000);
         }
     }
     0
@@ -9124,6 +9246,29 @@ pub fn nt_handle_close(h: u64) -> bool {
     true
 }
 
+/// NT handle-table sweep for a dead process: refdown every ledger
+/// object the tgid leader's nth still names. A Task that dies with
+/// open NT handles would otherwise pin the global NT_THREADS/
+/// NT_PROCS/NT_SECTIONS ledgers forever — NTH_FILE slots need
+/// nothing since release_fds already closed the fds underneath.
+/// Called only once no same-tgid thread survives: live siblings
+/// still resolve their handles through this table.
+fn nt_handle_sweep(tasks: &mut [Option<Task>], tgid: u64) {
+    let Some(t) = tasks.iter_mut().flatten().find(|t| t.pid == tgid) else {
+        return;
+    };
+    for i in 0..crate::nt::MAX_NTH {
+        match t.nth[i] {
+            crate::nt::NTH_THREAD => nt_thr_refdown(t.nth_fd[i] as usize),
+            crate::nt::NTH_SECTION => nt_sec_refdown(t.nth_fd[i] as usize),
+            crate::nt::NTH_PROCESS => nt_proc_refdown(t.nth_fd[i] as usize),
+            _ => {}
+        }
+        t.nth[i] = 0;
+        t.nth_fd[i] = 0xff;
+    }
+}
+
 /// Bind the first free handle slot to task fd `fd` (NTH_FILE) and
 /// return its 1-based handle, or None when the table is full.
 pub fn nt_handle_alloc_file(fd: u64) -> Option<u64> {
@@ -9224,7 +9369,10 @@ pub fn nt_wait_expire() {
             continue;
         }
         let rax = match t.wait_on {
-            WaitOn::NtWait(idx) => match tab.get(idx) {
+            WaitOn::NtWait(idx, tid) => match tab.get(idx) {
+                // A freed or reallocated slot no longer names the
+                // waited thread — wake as an invalid handle.
+                Some(e) if e.1 != tid => crate::nt::STATUS_INVALID_HANDLE,
                 Some(e) if e.4 == 2 => crate::nt::STATUS_SUCCESS,
                 Some(e) if e.4 == 1 => {
                     if t.wait_deadline != 0 && now >= t.wait_deadline {
@@ -9265,8 +9413,15 @@ pub fn nt_wait_expire() {
 /// deadline_ticks bounds it (0 = infinite). Never returns — the
 /// wake resumes userland with nt_wait_expire's ctx.rax.
 pub fn nt_wait_block(ctx: &mut UCtx, idx: usize, deadline_ticks: u64) -> ! {
+    // Pin the waited thread's identity: idx alone is reusable once a
+    // handle close frees the ledger slot, and a later CreateThread
+    // could satisfy a stale wait on a foreign object.
+    let tid = unsafe { &*core::ptr::addr_of!(NT_THREADS) }
+        .get(idx)
+        .map(|e| e.1)
+        .unwrap_or(0);
     if let Some(t) = cur_mut() {
-        t.wait_on = WaitOn::NtWait(idx);
+        t.wait_on = WaitOn::NtWait(idx, tid);
         t.wait_deadline = deadline_ticks;
         t.ctx = *ctx;
         t.state = TaskState::Blocked;
@@ -9560,6 +9715,87 @@ pub fn nt_proc_query(h: u64, out_va: u64) -> u64 {
         return STATUS_ACCESS_VIOLATION;
     }
     STATUS_SUCCESS
+}
+
+/// RUX_SYS_INFO(sub, out): the time/system-info services the Win32
+/// thunk layer serves. Subs 1 and 6 return the value in rax; the
+/// rest write a struct at `out` and return NTSTATUS.
+///   0 SYSTEM_INFO 48B   1 tick-ms (rax)        2 FILETIME u64
+///   3 SYSTEMTIME 16B    4 QPC counter u64      5 QPC frequency u64
+///   6 packed version (rax)  7 OSVERSIONINFOA   8 OSVERSIONINFOW
+pub fn nt_sysinfo(sub: u64, out: u64) -> u64 {
+    use crate::nt::*;
+    if sub == 1 {
+        return crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed) * 10;
+    }
+    if sub == 6 {
+        // GetVersion's packed dword: major | minor<<8 | build<<16.
+        return 10 | (19045u64) << 16;
+    }
+    let Some(ct) = mm_owner_mut() else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let pml4 = ct.pml4;
+    let ok = match sub {
+        0 => {
+            // SYSTEM_INFO — honest values: one CPU, our real user
+            // window, page-granule commits (no 64K reservation step).
+            let mut s = [0u8; 48];
+            s[0..2].copy_from_slice(&9u16.to_le_bytes()); // ARCH_AMD64
+            s[4..8].copy_from_slice(&4096u32.to_le_bytes());
+            s[8..16].copy_from_slice(&crate::elf::USER_VA_LO.to_le_bytes());
+            s[16..24].copy_from_slice(&crate::elf::USER_VA_HI.to_le_bytes());
+            s[24..32].copy_from_slice(&1u64.to_le_bytes());
+            s[32..36].copy_from_slice(&1u32.to_le_bytes());
+            s[36..40].copy_from_slice(&8664u32.to_le_bytes());
+            s[40..44].copy_from_slice(&4096u32.to_le_bytes());
+            s[44..46].copy_from_slice(&6u16.to_le_bytes());
+            range_ok_w(out, 48) && write_task_bytes(pml4, out, &s)
+        }
+        2 => {
+            let (s, ns) = crate::rtc::wall_now();
+            let ft = (s + 11_644_473_600) * 10_000_000 + ns / 100;
+            range_ok_w(out, 8) && write_task_bytes(pml4, out, &ft.to_le_bytes())
+        }
+        3 => {
+            let (y, mo, d, h, mi, s, w, ms) = crate::rtc::wall_datetime();
+            let mut b = [0u8; 16];
+            for (i, v) in [y, mo, w, d, h, mi, s, ms].iter().enumerate() {
+                b[i * 2..i * 2 + 2].copy_from_slice(&(*v as u16).to_le_bytes());
+            }
+            range_ok_w(out, 16) && write_task_bytes(pml4, out, &b)
+        }
+        4 => {
+            // SAFETY: rdtsc is always readable in ring 0.
+            let c = unsafe { core::arch::x86_64::_rdtsc() };
+            range_ok_w(out, 8) && write_task_bytes(pml4, out, &c.to_le_bytes())
+        }
+        5 => {
+            let f = crate::rtc::tsc_hz();
+            range_ok_w(out, 8) && write_task_bytes(pml4, out, &f.to_le_bytes())
+        }
+        7 | 8 => {
+            // OSVERSIONINFO A/W: 10.0.19045, NT platform, empty
+            // CSDVersion (the tail of the struct stays zeroed).
+            let sz = if sub == 7 { 148u64 } else { 276u64 };
+            if !range_ok_w(out, sz) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            let mut b = [0u8; 276];
+            b[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
+            b[4..8].copy_from_slice(&10u32.to_le_bytes());
+            b[8..12].copy_from_slice(&0u32.to_le_bytes());
+            b[12..16].copy_from_slice(&19045u32.to_le_bytes());
+            b[16..20].copy_from_slice(&2u32.to_le_bytes()); // WIN32_NT
+            write_task_bytes(pml4, out, &b[..sz as usize])
+        }
+        _ => return STATUS_INVALID_PARAMETER,
+    };
+    if ok {
+        STATUS_SUCCESS
+    } else {
+        STATUS_ACCESS_VIOLATION
+    }
 }
 
 /// CreateProcess's cmdline override: ANSI text at STUB_DATA_VA+0xa00
@@ -18362,8 +18598,8 @@ fn exit_bookkeeping(n: usize) {
         return;
     };
     t.state = TaskState::Exited;
-    let (cpid, cppid, wstatus, is_thread, cpgid) =
-        (t.pid, t.ppid, t.exit_status, t.tgid != t.pid, t.pgid);
+    let (cpid, cppid, wstatus, is_thread, cpgid, ctgid) =
+        (t.pid, t.ppid, t.exit_status, t.tgid != t.pid, t.pgid, t.tgid);
     // exit_files(2): the dying task's fds release NOW, not at reap —
     // a pipe writer's OFD must hit refs=0 here so blocked readers
     // see EOF instead of waiting for the scheduler's reaper pass.
@@ -18402,6 +18638,16 @@ fn exit_bookkeeping(n: usize) {
         if let Some(t) = tasks.get_mut(n).and_then(|s| s.as_mut()) {
             t.ppid = 0; // never a waitable zombie
         }
+        // A non-leader thread can outlive a zombie leader — when it
+        // is the group's last, no leader-path sweep will ever run,
+        // so the dead leader's nth table would pin its NT ledger
+        // objects forever. Sweep here under the same last-standing
+        // condition the leader path uses.
+        if !tasks.iter().flatten().any(|t| {
+            t.pid != cpid && t.tgid == ctgid && t.state != TaskState::Exited
+        }) {
+            nt_handle_sweep(tasks, ctgid);
+        }
         return;
     }
     // NT module ledger: a dead leader's entries are inert — its
@@ -18418,6 +18664,11 @@ fn exit_bookkeeping(n: usize) {
                 *e = (0, 0, 0, 0, 0, 0, [0; 32], 0, 0);
             }
         }
+        // Same last-standing condition: the leader's nth handle
+        // table is released with the process — refs it held on
+        // thread/process/section ledger objects refdown now or the
+        // global ledgers leak a slot per dead handle.
+        nt_handle_sweep(tasks, cpid);
     }
     // Wake a wait-blocked parent whose target just exited.
     let mut collected = false;

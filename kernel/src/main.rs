@@ -30,6 +30,7 @@ mod mm;
 mod pci;
 mod pio;
 mod rand;
+mod rtc;
 mod syscall;
 mod uart;
 mod user;

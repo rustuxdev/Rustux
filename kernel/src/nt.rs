@@ -85,6 +85,7 @@ const RUX_EXIT_DETACH: u32 = 0xFB;
 const RUX_THR_ENUM: u32 = 0xFC;
 const RUX_SPAWN_PROC: u32 = 0xFD;
 const RUX_PROC_QUERY: u32 = 0xFE;
+const RUX_SYS_INFO: u32 = 0xFF;
 
 /// Handle table tags — a per-task `nth` slot's object kind. Real
 /// handles are small indices (1-based) like the actual handle table;
@@ -1332,6 +1333,8 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
             arg(ctx, 3),
         ),
         RUX_PROC_QUERY => user::nt_proc_query(arg(ctx, 0), arg(ctx, 1)),
+
+        RUX_SYS_INFO => user::nt_sysinfo(arg(ctx, 0), arg(ctx, 1)),
         NT_TERMINATE_PROCESS => {
             // hProcess == (HANDLE)-1 means self; anything else is a
             // kill we don't model yet — the common case is self-exit.
