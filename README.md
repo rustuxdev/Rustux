@@ -105,8 +105,13 @@ its own Windows-x64 service-number table (`NtReadFile`/`NtWriteFile`/
 NTSTATUS returns, the `r10`-arg1/stack-args convention, a TEB/PEB
 mapped into the process (`gs:[0x30]` reads the TEB), and a per-task
 handle table — so `.exe` is a first-class executable format next to
-ELF, no Wine-style shim. Import-bearing PEs are rejected until a
-resolver lands; Linux compatibility remains the primary target.
+ELF, no Wine-style shim. Imports resolve against synthetic DLL stubs — `ntdll.dll` names map
+to service stubs, and `kernel32.dll`/`kernelbase.dll`/`api-ms-win-*`
+names map to hand-encoded Win32 translation thunks
+(`GetStdHandle`/`WriteFile`/`ReadFile`/`ExitProcess`/`VirtualAlloc`)
+that re-marshal Win32 args into the NT convention. A real
+MinGW-compiled console `.exe` runs end-to-end; Linux compatibility
+remains the primary target.
 
 Every rung is also security-reviewed: a scoped audit of the diff plus a
 check of that subsystem's published kernel CVEs — each gets a written

@@ -2350,6 +2350,98 @@ fn read_task_str(pml4: u64, va: u64, out: &mut [u8]) -> usize {
     0
 }
 
+/// kernel32/kernelbase/api-ms-* translation thunks: each is a
+/// hand-encoded Win64 function that re-marshals the caller's Win32
+/// arguments into the NT service convention — a real kernel32
+/// import (compiler-emitted call [rip+IAT]) lands on native code
+/// that behaves like the exported function, no DLL needed.
+fn k32_stub(t: &mut Task, va: u64, name: &[u8]) -> Option<u64> {
+    let code: &[u8] = match name {
+        // GetStdHandle(ecx): STD_INPUT/OUTPUT/ERROR (-10/-11/-12)
+        // map to NT std handles 1/2/3; anything else -> NULL.
+        b"GetStdHandle" => &[
+            0x83, 0xf9, 0xf6, 0x74, 0x0d, // cmp ecx,-10; je h1
+            0x83, 0xf9, 0xf5, 0x74, 0x0e, // cmp ecx,-11; je h2
+            0x83, 0xf9, 0xf4, 0x74, 0x0f, // cmp ecx,-12; je h3
+            0x31, 0xc0, 0xc3, //           xor eax,eax; ret
+            0xb8, 1, 0, 0, 0, 0xc3, //     mov eax,1; ret
+            0xb8, 2, 0, 0, 0, 0xc3, //     mov eax,2; ret
+            0xb8, 3, 0, 0, 0, 0xc3, //     mov eax,3; ret
+        ],
+        // WriteFile(h, buf, len, &written, ovl) and WriteConsoleA —
+        // same signature, both land on 9-arg NtWriteFile. The stack
+        // iosb lives on the thunk's own frame; its info word is the
+        // byte count written back to &written (NULL tolerated).
+        b"WriteFile" | b"WriteConsoleA" => &[
+            0x4c, 0x8b, 0xd9, //           mov r11, r9        (&written)
+            0x48, 0x83, 0xec, 0x60, //     sub rsp, 0x60
+            0x48, 0x8d, 0x44, 0x24, 0x50, // lea rax,[rsp+0x50] (iosb)
+            0x48, 0x89, 0x44, 0x24, 0x28, // mov [rsp+0x28],rax
+            0x48, 0x89, 0x54, 0x24, 0x30, // mov [rsp+0x30],rdx (buf)
+            0x4c, 0x89, 0x44, 0x24, 0x38, // mov [rsp+0x38],r8  (len)
+            0x48, 0xc7, 0x44, 0x24, 0x40, 0, 0, 0, 0, // byteoffset=0
+            0x48, 0xc7, 0x44, 0x24, 0x48, 0, 0, 0, 0, // key=0
+            0x4c, 0x8b, 0xd1, //           mov r10, rcx       (handle)
+            0x31, 0xd2, //                xor edx,edx        (event)
+            0x45, 0x31, 0xc0, //          xor r8d,r8d        (apc)
+            0x45, 0x31, 0xc9, //          xor r9d,r9d        (apcctx)
+            0xb8, 8, 0, 0, 0, //          mov eax, NtWriteFile
+            0x0f, 0x05, //                syscall
+            0x4d, 0x85, 0xdb, //          test r11,r11
+            0x74, 0x07, //                jz +7
+            0x8b, 0x4c, 0x24, 0x58, //    mov ecx,[rsp+0x58] (iosb.info)
+            0x41, 0x89, 0x09, //          mov [r11],ecx
+            0x48, 0x83, 0xc4, 0x60, //    add rsp,0x60
+            0xc3, //                      ret
+        ],
+        // ReadFile(h, buf, len, &read, ovl) and ReadConsoleA — the
+        // WriteFile shape on NtReadFile's service number.
+        b"ReadFile" | b"ReadConsoleA" => &[
+            0x4c, 0x8b, 0xd9, 0x48, 0x83, 0xec, 0x60, 0x48, 0x8d, 0x44,
+            0x24, 0x50, 0x48, 0x89, 0x44, 0x24, 0x28, 0x48, 0x89, 0x54,
+            0x24, 0x30, 0x4c, 0x89, 0x44, 0x24, 0x38, 0x48, 0xc7, 0x44,
+            0x24, 0x40, 0, 0, 0, 0, 0x48, 0xc7, 0x44, 0x24, 0x48, 0, 0,
+            0, 0, 0x4c, 0x8b, 0xd1, 0x31, 0xd2, 0x45, 0x31, 0xc0, 0x45,
+            0x31, 0xc9, 0xb8, 6, 0, 0, 0, 0x0f, 0x05, 0x4d, 0x85, 0xdb,
+            0x74, 0x07, 0x8b, 0x4c, 0x24, 0x58, 0x41, 0x89, 0x09, 0x48,
+            0x83, 0xc4, 0x60, 0xc3,
+        ],
+        // ExitProcess(code) -> NtTerminateProcess(-1, code).
+        b"ExitProcess" => &[
+            0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
+            0x89, 0xca, //                            mov edx,ecx
+            0xb8, 0x2c, 0, 0, 0, //                   mov eax,0x2C
+            0x0f, 0x05, //                            syscall
+            0xc3, //                                 ret (unreached)
+        ],
+        // VirtualAlloc(addr, size, type, prot) ->
+        // NtAllocateVirtualMemory(-1, &slot, 0, &sz, type, prot);
+        // returns the committed base, NULL on failure.
+        b"VirtualAlloc" => &[
+            0x48, 0x83, 0xec, 0x50, //    sub rsp,0x50
+            0x48, 0x89, 0x4c, 0x24, 0x40, // mov [rsp+0x40],rcx  (base)
+            0x48, 0x89, 0x54, 0x24, 0x48, // mov [rsp+0x48],rdx  (size)
+            0x4c, 0x89, 0x44, 0x24, 0x28, // mov [rsp+0x28],r8   (type)
+            0x4c, 0x89, 0x4c, 0x24, 0x30, // mov [rsp+0x30],r9   (prot)
+            0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
+            0x48, 0x8d, 0x54, 0x24, 0x40, // lea rdx,[rsp+0x40]
+            0x45, 0x31, 0xc0, //          xor r8d,r8d
+            0x4c, 0x8d, 0x4c, 0x24, 0x48, // lea r9,[rsp+0x48]
+            0xb8, 0x18, 0, 0, 0, //      mov eax,0x18
+            0x0f, 0x05, //               syscall
+            0x85, 0xc0, //               test eax,eax
+            0x78, 0x07, //               js fail
+            0x48, 0x8b, 0x44, 0x24, 0x40, // mov rax,[rsp+0x40]
+            0xeb, 0x02, //               jmp done
+            0x31, 0xc0, //               fail: xor eax,eax
+            0x48, 0x83, 0xc4, 0x50, //   done: add rsp,0x50
+            0xc3, //                     ret
+        ],
+        _ => return None,
+    };
+    write_task_bytes(t.pml4, va, code).then(|| (code.len() as u64 + 15) & !15)
+}
+
 /// Import resolution against the synthetic ntdll stub page: walk
 /// IMAGE_IMPORT_DESCRIPTORs (ntdll.dll only — other DLLs are an
 /// honest load failure), map each ILT name to a service number, emit
@@ -2387,7 +2479,12 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
         }
         let mut nb = [0u8; 32];
         let nl = read_task_str(t.pml4, p.bias + name_rva, &mut nb);
-        if nl == 0 || !nb[..nl].eq_ignore_ascii_case(b"ntdll.dll") {
+        let dll = &nb[..nl];
+        let k32 = nl != 0
+            && (dll.eq_ignore_ascii_case(b"kernel32.dll")
+                || dll.eq_ignore_ascii_case(b"kernelbase.dll")
+                || dll.len() > 12 && dll[..12].eq_ignore_ascii_case(b"api-ms-win-"));
+        if nl == 0 || !(k32 || dll.eq_ignore_ascii_case(b"ntdll.dll")) {
             return false;
         }
         let ilt = if ilt_rva != 0 { ilt_rva } else { iat_rva };
@@ -2408,26 +2505,30 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
             let mut fname = [0u8; 48];
             // IMAGE_IMPORT_BY_NAME: u16 hint, then the name.
             let fl = read_task_str(t.pml4, p.bias + ibn + 2, &mut fname);
-            let Some(nr) = (if fl != 0 {
-                crate::nt::service_for_name(&fname[..fl])
+            if stub_next + 96 > crate::pe::STUB_VA + 0x1000 {
+                return false;
+            }
+            // ntdll exports get a direct syscall stub; kernel32 gets a
+            // Win32-signature translation thunk. Both land in the IAT.
+            let used = if k32 {
+                k32_stub(t, stub_next, &fname[..fl])
+            } else if fl != 0 {
+                crate::nt::service_for_name(&fname[..fl]).and_then(|nr| {
+                    let mut stub = [0u8; 16];
+                    stub[0..3].copy_from_slice(&[0x4c, 0x8b, 0xd1]); // mov r10,rcx
+                    stub[3] = 0xb8; // mov eax, imm32
+                    stub[4..8].copy_from_slice(&nr.to_le_bytes());
+                    stub[8] = 0x0f;
+                    stub[9] = 0x05; // syscall
+                    stub[10] = 0xc3; // ret
+                    write_task_bytes(t.pml4, stub_next, &stub).then_some(16)
+                })
             } else {
                 None
-            }) else {
+            };
+            let Some(used) = used else {
                 return false;
             };
-            if stub_next + crate::pe::STUB_SLOT > crate::pe::STUB_VA + 0x1000 {
-                return false;
-            }
-            let mut stub = [0u8; 16];
-            stub[0..3].copy_from_slice(&[0x4c, 0x8b, 0xd1]); // mov r10,rcx
-            stub[3] = 0xb8; // mov eax, imm32
-            stub[4..8].copy_from_slice(&nr.to_le_bytes());
-            stub[8] = 0x0f;
-            stub[9] = 0x05; // syscall
-            stub[10] = 0xc3; // ret
-            if !write_task_bytes(t.pml4, stub_next, &stub) {
-                return false;
-            }
             if !write_task_bytes_force(
                 t.pml4,
                 p.bias + iat_rva + j * 8,
@@ -2435,7 +2536,7 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
             ) {
                 return false;
             }
-            stub_next += crate::pe::STUB_SLOT;
+            stub_next += used;
         }
         i += 1;
     }

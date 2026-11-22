@@ -2008,3 +2008,33 @@ names bounded 32/48B unterminated-reject, stub page bounded
 256 slots. peitest+petest both pass in QEMU: 'imports resolved
 via IAT', 'DIR64 reloc patched'. 21/21 suites 0 failures, 44
 tasks, frames 108567 -> 108567 zero leak, exit 33. Ledger: 112.
+
+run-108 — real compiler-produced .exe + Win32 thunk layer:
+pe_resolve_imports now accepts kernel32.dll / kernelbase.dll /
+api-ms-win-* descriptors in addition to ntdll; each non-ntdll
+import is resolved by k32_stub, which emits a hand-encoded
+Win64 translation thunk into the STUB_VA page — a real
+kernel32 export shape that re-marshals Win32 args into the NT
+service convention (WriteFile/ReadFile/WriteConsoleA/
+ReadConsoleA -> 9-arg Nt{Read,Write}File with a stack iosb
+whose info word is copied back to &written; GetStdHandle
+-10/-11/-12 -> NT std handles 1/2/3; ExitProcess ->
+NtTerminateProcess(-1); VirtualAlloc ->
+NtAllocateVirtualMemory(-1) returning the committed base or
+NULL). Unknown names still fail the load honestly. Test is
+hello_win.exe — a REAL MinGW-gcc-produced PE32+ (gcc
+-nostdlib, committed as a binary fixture with hello_win.c
+provenance, not hand-rolled): genuine .text/.rdata/.pdata/
+.xdata/.idata sections, a real import descriptor, DIR64
+relocs, compiler-emitted call [rip+IAT] against the IAT.
+Boots in QEMU: 'hello_win: real MinGW-compiled .exe via
+kernel32' written through WriteFile -> NtWriteFile -> the
+shared console, exit via ExitProcess -> NtTerminateProcess.
+Audit run-82 quick scoped: verified thunk byte counts <= the
+96B stub-slot bound, jz/js/jmp displacement math by hand,
+iosb lands inside each thunk's own stack frame (userspace
+write, no kernel deref), dll[..12] api-ms prefix slice
+guarded by len check, unknown k32 names honest-fail, stub
+page still drops to R-X after fill. cve.now: no applicable
+class hits. 21/21 suites 0 failures, 45 tasks, frames
+108568 -> 108568 zero leak, exit 33. Ledger: 112.
