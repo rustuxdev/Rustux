@@ -2492,3 +2492,50 @@ qemu exit 33. Ledger: 120.
   approximate, not the loader's real reverse-init list; multi-threaded
   owner races remain unsynchronized (no loader lock).
 - Suite: 58 tasks, frames 108433 -> 108433 zero leak, qemu exit 33.
+
+run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
+
+- New private service RUX_THR_ENUM (0xFC): nt_thr_enum(prev, dir) is
+  a pure iterator over the owner's live module entries (pend_st == 0)
+  — dir 0 walks forward in load order for DLL_THREAD_ATTACH, dir 1
+  reverse for DLL_THREAD_DETACH. prev=0 starts the walk; a prev whose
+  slot was freed mid-drain fails the lookup and ends the walk cleanly.
+  Owner resolves via nt_owner_pid (tgid-aware), so a secondary thread
+  enumerates the leader's module table.
+- emit_thr_drain: shared emitter used by the thread-entry trampoline
+  and the ExitThread thunk — loops RUX_THR_ENUM with rbx as cursor
+  (callee-saved, survives user-mode DllMain), passes prev in r10 per
+  the ntdll arg convention (rcx is clobbered by syscall itself), and
+  calls each entry (hinst, reason, 0). Skips modules with no entry.
+- emit_thr_entry + Task.thr_entry_va: every exe gets a thread-entry
+  trampoline emitted at load; nt_thread_create sets rip to it with
+  rcx=start_fn, rdx=param (the bare-start fallback remains for
+  tasks without stubs). The trampoline normalises rsp, parks
+  start/param above the callback shadow space, drains
+  DLL_THREAD_ATTACH forward, calls the real start routine, drains
+  DLL_THREAD_DETACH reverse, then NtTerminateThread(0, status) —
+  covering the normal return path end-to-end.
+- ExitThread thunk arm now drains DLL_THREAD_DETACH (reverse) before
+  NtTerminateThread so the explicit-exit path matches.
+- Alignment fix carried over: emit_attach_drain's sub rsp,0x28 left
+  DllMain at rsp%16==0 after and rsp,-16; frames in all three sites
+  are now multiples of 16 (0x30/0x40) so the callee lands at ==8.
+- Fixture winthrnt.exe (exit 43): wbase/wchain gained thr_att/
+  thr_det counters and a seq_reg order probe (writes 'b'/'c').
+  Thread 1 (return path) must produce attach "bc", detach "cb",
+  seq "bccb", counters 1 each; thread 2 (explicit ExitThread) repeats
+  it for seq "bccbbccb" and counters 2 — exact-order and
+  exactly-once assertions, not just presence.
+- Audit run-97 quick scoped: no confirmed findings. Two development-
+  caught defects noted: prev initially travelled in rcx which
+  syscall clobbers (enum always saw garbage -> no callbacks — the
+  fail-closed direction), and the first emit buffer (160B) silently
+  truncated the trampoline causing total PE spawn failure (now 256B
+  with a hard length check). Divergences: no loader lock — a
+  concurrent FreeLibrary can unmap a module mid-drain and fault the
+  draining thread in its own address space; a detach callback that
+  frees the visited module ends the walk early; thread-vs-leader
+  load ordering unsynchronized.
+- Suite: 59 tasks, frames 108432 -> 108432 zero leak, qemu exit 33.
+  windexit 42, windetach 41, winstatic 36, winchain 34,
+  windlltest 33 all regression-clean.

@@ -1428,6 +1428,7 @@ pub struct Task {
     tls_tmpl_va: u64,
     tls_tmpl_sz: u64,
     thr_exit_va: u64,
+    thr_entry_va: u64,
     /// Thunk-stub bump cursor — the exe's import thunks start at
     /// STUB_VA and every later-mapped DLL continues from here (0 =
     /// uninitialized, lazily set to STUB_VA on first emit).
@@ -3020,6 +3021,50 @@ pub fn nt_exit_detach() -> u64 {
     0
 }
 
+/// Pure iterator the thread-notification drains loop on: returns the
+/// next live, fully-initialised (pend_st == 0) owner module base
+/// after `prev` — dir 0 forward (load order, DLL_THREAD_ATTACH),
+/// dir 1 reverse (DLL_THREAD_DETACH). prev == 0 starts the walk; a
+/// prev whose slot was cleared mid-drain ends it early (a detach
+/// callback freeing the just-visited module stops the walk — no
+/// loader lock, recorded divergence).
+pub fn nt_thr_enum(prev: u64, dir: u64) -> u64 {
+    let owner = nt_owner_pid();
+    if owner == 0 {
+        return 0;
+    }
+    let tab = unsafe { &*core::ptr::addr_of!(NT_MODS) };
+    let i = if prev == 0 {
+        None
+    } else {
+        match tab.iter().position(|e| e.0 == owner && e.1 == prev) {
+            Some(i) => Some(i),
+            None => return 0,
+        }
+    };
+    let live = |e: &(u64, u64, u64, u64, u64, u8, [u8; 32], u8, u8)| {
+        if e.0 == owner && e.1 != 0 && e.8 == 0 {
+            Some(e.1)
+        } else {
+            None
+        }
+    };
+    if dir == 0 {
+        for e in &tab[i.map_or(0, |i| i + 1)..] {
+            if let Some(b) = live(e) {
+                return b;
+            }
+        }
+    } else {
+        for e in tab[..i.unwrap_or(NT_MAX_MODS)].iter().rev() {
+            if let Some(b) = live(e) {
+                return b;
+            }
+        }
+    }
+    0
+}
+
 /// Finish a FreeLibrary after the thunk drained the DllMain(DETACH)
 /// calls: drop one ref from each surviving dep per marked importer
 /// (two freed modules sharing a dep release two refs, so a union
@@ -3179,6 +3224,94 @@ fn emit_detach_drain(e: &mut Emit, svc: u8) -> usize {
     e.fix_to(back, drain);
     e.fix(done);
     drain
+}
+
+/// Emit the thread-notification drain used by the thread-entry
+/// trampoline and ExitThread: loop RUX_THR_ENUM(prev=rbx, dir)
+/// over the owner's live modules, read each PE entry RVA, call it
+/// (hinst, reason, 0) in userland, repeat until 0. rbx is the walk
+/// cursor — callee-saved, so DllMain keeps it alive; the callers
+/// never return, so clobbering it is free. Caller owns the frame.
+fn emit_thr_drain(e: &mut Emit, dir: u8, reason: u8) {
+    let head = e.n;
+    e.raw(&[
+        0x49, 0x89, 0xda, //           mov r10,rbx     prev base
+        0xba, dir, 0, 0, 0, //         mov edx,dir
+        0xb8, 0xfc, 0, 0, 0, //        mov eax,0xFC    RUX_THR_ENUM
+        0x0f, 0x05, //                 syscall
+        0x48, 0x85, 0xc0, //           test rax,rax
+    ]);
+    let done = e.jcc(0x4);
+    e.raw(&[
+        0x48, 0x89, 0xc3, //           mov rbx,rax     next prev
+        0x8b, 0x48, 0x3c, //           mov ecx,[rax+0x3c]    peoff
+        0x8b, 0x4c, 0x08, 0x28, //     mov ecx,[rax+rcx+0x28] entry_rva
+        0x85, 0xc9, //               test ecx,ecx
+    ]);
+    let noent = e.jcc(0x4); //     no entry -> next
+    e.raw(&[
+        0x48, 0x01, 0xc1, //         add rcx,rax   entry_va
+        0x49, 0x89, 0xc9, //         mov r9,rcx
+        0x48, 0x89, 0xc1, //         mov rcx,rax   hinst
+        0xba, reason, 0, 0, 0, //   mov edx,reason
+        0x45, 0x31, 0xc0, //         xor r8d,r8d
+        0x41, 0xff, 0xd1, //         call r9       DllMain
+    ]);
+    e.fix_to(noent, head);
+    let back = e.jmp();
+    e.fix_to(back, head);
+    e.fix(done);
+}
+
+/// Emit the thread-entry trampoline — a secondary thread's initial
+/// rip: parks start_fn/param, drains DLL_THREAD_ATTACH forward
+/// (load order) like the real loader does before the start routine,
+/// calls start_fn(param), then drains DLL_THREAD_DETACH reverse and
+/// terminates via NtTerminateThread(0, status). Exe-only; the VA is
+/// published as t.thr_entry_va for nt_thread_create. Entry context:
+/// rcx=start_fn, rdx=param, rsp has a synthetic thr_exit_va on top.
+fn emit_thr_entry(t: &mut Task, stub_next: &mut u64) -> Option<()> {
+    let mut buf = [0u8; 256];
+    let mut e = Emit { b: &mut buf, n: 0 };
+    e.raw(&[
+        0x48, 0x83, 0xe4, 0xf0, //    and rsp,-16
+        // 0x40 keeps every `call` site below 16-aligned: a fresh
+        // thread rsp is normalised to 0 mod 16 first, so the frame
+        // size itself must be a multiple of 16 (0x28 would leave
+        // DllMain entered with rsp % 16 == 0 — an ABI misalign).
+        0x48, 0x83, 0xec, 0x40, //    sub rsp,0x40
+        0x48, 0x89, 0x4c, 0x24, 0x20, // mov [rsp+0x20],rcx  start
+        0x48, 0x89, 0x54, 0x24, 0x28, // mov [rsp+0x28],rdx  param
+        0x31, 0xdb, //                xor ebx,ebx          enum cursor
+    ]);
+    emit_thr_drain(&mut e, 0, 2); // DLL_THREAD_ATTACH, forward
+    e.raw(&[
+        0x48, 0x8b, 0x4c, 0x24, 0x28, // mov rcx,[rsp+0x28]  param
+        0x48, 0x8b, 0x44, 0x24, 0x20, // mov rax,[rsp+0x20]  start
+        0xff, 0xd0, //                call rax -> rax = exit code
+        0x48, 0x89, 0x44, 0x24, 0x20, // mov [rsp+0x20],rax  park code
+        0x31, 0xdb, //                xor ebx,ebx          enum cursor
+    ]);
+    emit_thr_drain(&mut e, 1, 3); // DLL_THREAD_DETACH, reverse
+    e.raw(&[
+        0x48, 0x8b, 0x54, 0x24, 0x20, // mov rdx,[rsp+0x20]  status
+        0x45, 0x31, 0xd2, //          xor r10d,r10d        self
+        0xb8, 0x53, 0, 0, 0, //      mov eax,0x53  NT_TERMINATE_THREAD
+        0x0f, 0x05, 0xcc, //          syscall; int3
+    ]);
+    let n = e.n;
+    if n > buf.len() {
+        return None;
+    }
+    let used = (n as u64 + 15) & !15;
+    if *stub_next + used > crate::pe::STUB_DATA_VA
+        || !write_task_bytes(t.pml4, *stub_next, &buf[..n])
+    {
+        return None;
+    }
+    t.thr_entry_va = *stub_next;
+    *stub_next += used;
+    Some(())
 }
 
 /// Emit the shared 9-arg NtReadFile/NtWriteFile frame: caller has
@@ -3961,11 +4094,20 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x48, 0x83, 0xc4, 0x68, 0xc3, // add rsp,0x68; ret
             ]);
         }
-        // ExitThread(code) -> NtTerminateThread(0, code) — never
+        // ExitThread(code): every live module gets DllMain(
+        // DLL_THREAD_DETACH) reverse-order first, like the real
+        // ExitThread — then NtTerminateThread(0, code). Never
         // returns; the int3 canaries any path that slips past.
         b"ExitThread" => {
             e.raw(&[
-                0x48, 0x89, 0xca, //          mov rdx,rcx (status)
+                0x48, 0x83, 0xec, 0x28, // sub rsp,0x28
+                0x48, 0x89, 0x4c, 0x24, 0x20, // mov [rsp+0x20],rcx code
+                0x31, 0xdb, //               xor ebx,ebx     enum cursor
+            ]);
+            emit_thr_drain(&mut e, 1, 3); // DLL_THREAD_DETACH reverse
+            e.raw(&[
+                0x48, 0x8b, 0x54, 0x24, 0x20, // mov rdx,[rsp+0x20] status
+                0x48, 0x83, 0xc4, 0x28, //    add rsp,0x28
                 0x45, 0x31, 0xd2, //          xor r10d,r10d (self)
                 0xb8, 0x53, 0, 0, 0, //       mov eax,0x53
                 0x0f, 0x05, 0xcc, //          syscall; int3
@@ -5494,6 +5636,12 @@ fn pe_resolve_imports(
         if emit_thr_exit(t, &mut stub_next).is_none() {
             return false;
         }
+        // Thread-entry trampoline: secondary threads start here so
+        // every loaded module sees DLL_THREAD_ATTACH before the
+        // start routine and DLL_THREAD_DETACH after it returns.
+        if emit_thr_entry(t, &mut stub_next).is_none() {
+            return false;
+        }
         // An exe that statically bound module imports has pending
         // attaches — drain them at startup so dep DllMains run
         // before the image's TLS callbacks and entry, like Windows.
@@ -5554,7 +5702,10 @@ fn emit_attach_drain(t: &mut Task, stub_next: &mut u64) -> Option<()> {
     let mut e = Emit { b: &mut buf, n: 0 };
     e.raw(&[
         0x48, 0x83, 0xe4, 0xf0, //    and rsp,-16
-        0x48, 0x83, 0xec, 0x28, //    sub rsp,0x28
+        // Multiple of 16: rsp is 0 mod 16 here, and each `call r9`
+        // below must leave DllMain at rsp % 16 == 8 like the ABI
+        // expects — a 0x28 frame would enter it misaligned.
+        0x48, 0x83, 0xec, 0x30, //    sub rsp,0x30
     ]);
     let drain = e.n;
     e.raw(&[
@@ -5928,6 +6079,7 @@ fn load(img: &[u8]) -> Option<Task> {
         tls_tmpl_va: 0,
         tls_tmpl_sz: 0,
         thr_exit_va: 0,
+        thr_entry_va: 0,
         nt_stub: 0,
         stop_sig: 0,
         cont_report: false,
@@ -9273,8 +9425,18 @@ pub fn nt_thread_create(
         tgid: p.tgid,
         ctx: {
             let mut x = *ctx;
-            x.rip = start;
-            x.rcx = param;
+            // Threads start on the emitted trampoline (DllMain
+            // THREAD_ATTACH -> start_fn -> THREAD_DETACH -> exit);
+            // rcx=start_fn, rdx=param there. A missing trampoline
+            // (older/no stub) falls back to the bare start.
+            x.rip = if p.thr_entry_va != 0 {
+                x.rcx = start;
+                x.rdx = param;
+                p.thr_entry_va
+            } else {
+                x.rcx = param;
+                start
+            };
             x.rsp = stack + ssz - 8;
             x.rax = 0;
             x
@@ -9328,6 +9490,7 @@ pub fn nt_thread_create(
         tls_tmpl_va: p.tls_tmpl_va,
         tls_tmpl_sz: p.tls_tmpl_sz,
         thr_exit_va: p.thr_exit_va,
+        thr_entry_va: p.thr_entry_va,
         nt_stub: p.nt_stub,
         stop_sig: 0,
         cont_report: false,
@@ -18088,6 +18251,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         tls_tmpl_va: p.tls_tmpl_va,
         tls_tmpl_sz: p.tls_tmpl_sz,
         thr_exit_va: p.thr_exit_va,
+        thr_entry_va: p.thr_entry_va,
         nt_stub: p.nt_stub,
         stop_sig: 0,
         cont_report: false,
@@ -18262,6 +18426,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         tls_tmpl_va: p.tls_tmpl_va,
         tls_tmpl_sz: p.tls_tmpl_sz,
         thr_exit_va: p.thr_exit_va,
+        thr_entry_va: p.thr_entry_va,
         nt_stub: p.nt_stub,
         stop_sig: 0,
         cont_report: false,

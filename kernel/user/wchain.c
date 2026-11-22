@@ -11,6 +11,11 @@ __declspec(dllexport) int chain_add(int a, int b)
 static int *detach_probe;
 __declspec(dllexport) void chain_reg(int *p) { detach_probe = p; }
 
+__declspec(dllexport) int thr_att = 0;
+__declspec(dllexport) int thr_det = 0;
+static char **seq_p;
+__declspec(dllexport) void seq_reg(char **p) { seq_p = p; }
+
 BOOL WINAPI DllMain(HMODULE h, DWORD r, LPVOID v)
 {
     (void)h; (void)v;
@@ -23,6 +28,11 @@ BOOL WINAPI DllMain(HMODULE h, DWORD r, LPVOID v)
         /* += so a second DETACH call is observable (0x86 != 0x43). */
         puts("wchain: detach");
         if (detach_probe) *detach_probe += 0x43;
+    } else if (r == DLL_THREAD_ATTACH || r == DLL_THREAD_DETACH) {
+        puts(r == DLL_THREAD_ATTACH ? "wchain: thr-attach"
+                                    : "wchain: thr-detach");
+        if (r == DLL_THREAD_ATTACH) thr_att += 1; else thr_det += 1;
+        if (seq_p) { **seq_p = 'c'; (*seq_p)++; **seq_p = 0; }
     }
     return TRUE;
 }
