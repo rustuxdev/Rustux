@@ -2272,3 +2272,44 @@ opened — and reads its exit code; exit(37). Audit run-90
 quick scoped: no confirmed findings. Suite: 21/21 0
 failures, 52 tasks, frames 108477 -> 108477 zero leak,
 qemu exit 33. Ledger: 117.
+
+Run-117 (this session): NT section objects and file mapping
+views — the kernel primitive behind CreateFileMapping/
+MapViewOfFile and, later, SEC_IMAGE DLL loading. NT_SECTIONS
+is a small ledger of (oi, size, prot, state, refs) entries;
+each NTH_SECTION handle bumps refs and NtClose refdowns.
+nt_handle_file_oi resolves an NTH_FILE handle to its OFD
+index and pins it — the section (and every view) holds a ref
+so the backing content cannot die mid-map. NtCreateSection
+takes SEC_COMMIT sections only, file-backed or anonymous
+(NULL/-1 file => MaximumSize required), rejects a READWRITE
+section on a read-only OFD up front, and now caps the size at
+the NT arena span (audit fix — an unbounded u64 made the view
+page-round wrap). NtMapViewOfSection validates off/vsz inside
+the section, never grants view prot beyond the section prot,
+commits a fresh window via nt_alloc_pages, seeds file bytes
+through write_task_bytes_force — the physical-frame fill the
+PE loader uses for RO sections, because a PAGE_READONLY PTE
+denies kernel VA writes too (CR0.WP kernel #PF, found and
+fixed this run) — and records a view entry. The view ledger
+splits va_size (committed span) from file_span (raw file
+bytes), so write-back of a short offset view can never grow
+the file to a page boundary. Only PAGE_READWRITE views on
+Ram-backed OFDs write back on unmap/flush; WRITECOPY
+discards; initrd slices are immutable by construction.
+NtUnmapViewOfSection/NtFlushVirtualMemory resolve views by
+owner pid + base and route free/ledger work through
+mm_owner, so threads unmap cleanly. Two emitted-stub
+encoding bugs found and fixed: MapViewOfFile or r8,r9 lacked
+REX.B (section handle leaked into SectionOffset), and the
+new memcmp/strncmp loads used REX.B where REX.R was needed
+— mov cl,[r9] read supervisor page 0 (the cr2=0/err=0x5
+mystery: page 0 is present+supervisor in the cloned pml4).
+nt_sec_refdown now also releases the OFD pin on last close
+(audit fix — bounded ref leak). winmap.exe (real MinGW)
+exercises RW view + writeback, FlushViewOfFile, COW discard,
+anon section, RO view of initrd content, offset view, and
+denied cases — exit(39). Audit run-91 quick scoped: 2
+confirmed findings fixed in-run, no remaining. Suite: 21/21
+0 failures, 53 tasks, frames 108475 -> 108475 zero leak,
+qemu exit 33. Ledger: 118.

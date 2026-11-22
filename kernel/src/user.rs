@@ -3367,6 +3367,159 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
         b"SwitchToThread" => {
             e.raw(&[0x31, 0xc0, 0xc3]);
         }
+        // CreateFileMappingA/W(hfile, sa, prot, sizeHi, sizeLo, name)
+        //   -> NtCreateSection(&hout, 0xF001F, 0, size, prot,
+        //      SEC_COMMIT, hfile). size64 = sizeHi<<32 | sizeLo; a
+        //      combined size of 0 passes MaximumSize=NULL which the
+        //      kernel reads as "whole file" (real semantic too).
+        //      Sections are unnamed — the name arg is ignored like a
+        //      real anonymous mapping. A and W share the marshal.
+        b"CreateFileMappingA" | b"CreateFileMappingW" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x58, // sub rsp,0x58
+                0x48, 0x89, 0x4c, 0x24, 0x08, // mov [rsp+0x08],rcx  hfile
+                0x4c, 0x89, 0x44, 0x24, 0x10, // mov [rsp+0x10],r8   prot
+                0x49, 0xc1, 0xe1, 0x20, //       shl r9,0x20        sizeHi<<32
+                0x4c, 0x0b, 0x8c, 0x24, 0x80, 0, 0, 0, // or r9,[rsp+0x80] sizeLo
+                0x4c, 0x89, 0x4c, 0x24, 0x20, // mov [rsp+0x20],r9   size64
+                0x4d, 0x85, 0xc9, //             test r9,r9
+            ]);
+            let null = e.jcc(0x4); //           jz -> pass r9=NULL
+            e.raw(&[
+                0x4c, 0x8d, 0x4c, 0x24, 0x20, // lea r9,[rsp+0x20]  &size64
+            ]);
+            let have = e.jmp();
+            e.fix(null);
+            e.raw(&[0x45, 0x31, 0xc9]); //       xor r9d,r9d
+            e.fix(have);
+            e.raw(&[
+                0x4c, 0x8d, 0x54, 0x24, 0x18, // lea r10,[rsp+0x18] &hout
+                0xba, 0x1f, 0x00, 0x0f, 0x00, // mov edx,0xF001F    all access
+                0x45, 0x31, 0xc0, //            xor r8d,r8d        oa=0
+                0x48, 0x8b, 0x44, 0x24, 0x10, // mov rax,[rsp+0x10] prot
+                0x48, 0x89, 0x44, 0x24, 0x28, // mov [rsp+0x28],rax a4
+                0x48, 0xc7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x08, // a5 SEC_COMMIT
+                0x48, 0x8b, 0x44, 0x24, 0x08, // mov rax,[rsp+0x08] hfile
+                0x48, 0x89, 0x44, 0x24, 0x38, // mov [rsp+0x38],rax a6
+                0xb8, 0x4a, 0, 0, 0, //         mov eax,0x4a
+                0x0f, 0x05, //                  syscall
+                0x85, 0xc0, //                  test eax,eax
+            ]);
+            let fail = e.jcc(0x8); //           js fail
+            e.raw(&[
+                0x48, 0x8b, 0x44, 0x24, 0x18, // mov rax,[rsp+0x18] hout
+                0x48, 0x83, 0xc4, 0x58, 0xc3, // add rsp,0x58; ret
+            ]);
+            e.fix(fail);
+            e.raw(&[
+                0x31, 0xc0, //                  xor eax,eax
+                0x48, 0x83, 0xc4, 0x58, 0xc3, // add rsp,0x58; ret
+            ]);
+        }
+        // MapViewOfFile(hsec, access, offHi, offLo, bytes)
+        //   -> NtMapViewOfSection(hsec, -1, &base, 0, 0, &off64,
+        //      &viewsize, 1, 0, prot). FILE_MAP_* access maps to
+        //      PAGE_*: WRITE(2)->READWRITE, COPY(1)->WRITECOPY,
+        //      READ(4)->READONLY; ALL_ACCESS (0xF001F) takes WRITE.
+        //   Frame: 0x08 hsec / 0x10 off64 / 0x18 viewsize /
+        //   0x20 prot / 0x58 base-out; stack args at 0x28..0x50.
+        b"MapViewOfFile" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x68, // sub rsp,0x68
+                0x48, 0x89, 0x4c, 0x24, 0x08, // mov [rsp+0x08],rcx hsec
+                0x48, 0x89, 0x54, 0x24, 0x28, // mov [rsp+0x28],rdx access(save)
+                0x49, 0xc1, 0xe0, 0x20, //       shl r8,0x20        offHi<<32
+                0x4d, 0x0b, 0xc1, //             or r8,r9           |offLo (REX.B!)
+                0x4c, 0x89, 0x44, 0x24, 0x10, // mov [rsp+0x10],r8  off64 cell
+                0x48, 0x8b, 0x84, 0x24, 0x90, 0, 0, 0, // mov rax,[rsp+0x90] bytes
+                0x48, 0x89, 0x44, 0x24, 0x18, // mov [rsp+0x18],rax viewsize cell
+                0x48, 0x8b, 0x44, 0x24, 0x28, // mov rax,[rsp+0x28] access
+                0xb9, 2, 0, 0, 0, //             mov ecx,2          RO
+                0xa8, 0x02, //                   test al,2         WRITE bit
+            ]);
+            let cow = e.jcc(0x4); //            jz -> check COPY bit
+            e.raw(&[0xb9, 4, 0, 0, 0]); //      mov ecx,4          RW
+            let pdone = e.jmp();
+            e.fix(cow);
+            e.raw(&[0xa8, 0x01]); //            test al,1          COPY bit
+            let pdone2 = e.jcc(0x4); //         jz -> keep RO
+            e.raw(&[0xb9, 8, 0, 0, 0]); //      mov ecx,8          COW
+            e.fix(pdone2);
+            e.fix(pdone);
+            e.raw(&[
+                0x48, 0x89, 0x4c, 0x24, 0x20, // mov [rsp+0x20],rcx prot cell
+                // stack args a4..a9:
+                0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0, // a4 commitsize=0
+                0x48, 0x8d, 0x44, 0x24, 0x10, // lea rax,[rsp+0x10]
+                0x48, 0x89, 0x44, 0x24, 0x30, // mov [rsp+0x30],rax a5 &off
+                0x48, 0x8d, 0x44, 0x24, 0x18, // lea rax,[rsp+0x18]
+                0x48, 0x89, 0x44, 0x24, 0x38, // mov [rsp+0x38],rax a6 &viewsize
+                0x48, 0xc7, 0x44, 0x24, 0x40, 1, 0, 0, 0, // a7 ViewShare
+                0x48, 0xc7, 0x44, 0x24, 0x48, 0, 0, 0, 0, // a8 alloctype=0
+                0x48, 0x8b, 0x44, 0x24, 0x20, // mov rax,[rsp+0x20] prot
+                0x48, 0x89, 0x44, 0x24, 0x50, // mov [rsp+0x50],rax a9
+                // register args:
+                0x4c, 0x8b, 0x54, 0x24, 0x08, // mov r10,[rsp+0x08] hsec
+                0x48, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov rdx,-1
+                0x4c, 0x8d, 0x44, 0x24, 0x58, // lea r8,[rsp+0x58]   &base
+                0x45, 0x31, 0xc9, //            xor r9d,r9d         zerobits
+                0xb8, 0x28, 0, 0, 0, //         mov eax,0x28
+                0x0f, 0x05, //                  syscall
+                0x85, 0xc0, //                  test eax,eax
+            ]);
+            let fail = e.jcc(0x8); //           js fail
+            e.raw(&[
+                0x48, 0x8b, 0x44, 0x24, 0x58, // mov rax,[rsp+0x58] mapped base
+                0x48, 0x83, 0xc4, 0x68, 0xc3, // add rsp,0x68; ret
+            ]);
+            e.fix(fail);
+            e.raw(&[
+                0x31, 0xc0, //                  xor eax,eax
+                0x48, 0x83, 0xc4, 0x68, 0xc3, // add rsp,0x68; ret
+            ]);
+        }
+        // UnmapViewOfFile(base) -> NtUnmapViewOfSection(-1, base),
+        // BOOL out.
+        b"UnmapViewOfFile" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //               mov rdx,rcx       base
+                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
+                0xb8, 0x2a, 0, 0, 0, //           mov eax,0x2a
+                0x0f, 0x05, //                     syscall
+                0x85, 0xc0, //                     test eax,eax
+            ]);
+            let fail = e.jcc(0x8); //           js fail
+            e.raw(&[0xb8, 1, 0, 0, 0, 0xc3]); // mov eax,1; ret
+            e.fix(fail);
+            e.raw(&[0x31, 0xc0, 0xc3]); //      xor eax,eax; ret
+        }
+        // FlushViewOfFile(base, size) -> NtFlushVirtualMemory(-1,
+        // &base, &size, iosb-cell), BOOL out.
+        b"FlushViewOfFile" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
+                0x48, 0x89, 0x4c, 0x24, 0x08, // mov [rsp+0x08],rcx base
+                0x48, 0x89, 0x54, 0x24, 0x10, // mov [rsp+0x10],rdx size
+                0x48, 0xc7, 0x44, 0x24, 0x18, 0, 0, 0, 0, // iosb=0
+                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
+                0x48, 0x8d, 0x54, 0x24, 0x08, // lea rdx,[rsp+0x08] &base
+                0x4c, 0x8d, 0x44, 0x24, 0x10, // lea r8,[rsp+0x10] &size
+                0x4c, 0x8d, 0x4c, 0x24, 0x18, // lea r9,[rsp+0x18] iosb
+                0xb8, 0x3b, 0, 0, 0, //         mov eax,0x3b
+                0x0f, 0x05, //                  syscall
+                0x85, 0xc0, //                  test eax,eax
+            ]);
+            let fail = e.jcc(0x8); //           js fail
+            e.raw(&[
+                0xb8, 1, 0, 0, 0, //             mov eax,1
+                0x48, 0x83, 0xc4, 0x38, 0xc3, // add rsp,0x38; ret
+            ]);
+            e.fix(fail);
+            e.raw(&[
+                0x31, 0xc0, //                  xor eax,eax
+                0x48, 0x83, 0xc4, 0x38, 0xc3, // add rsp,0x38; ret
+            ]);
+        }
         // Sleep(ms) -> NtDelayExecution(0, &(-ms*10000)).
         b"Sleep" => {
             e.raw(&[
@@ -3834,8 +3987,8 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.raw(&[0x4d, 0x85, 0xc0]); // test r8,r8
             let eq = e.jcc(0x4);
             e.raw(&[
-                0x41, 0x8a, 0x09, // mov r9b,[rcx]
-                0x41, 0x8a, 0x12, // mov r10b,[rdx]
+                0x44, 0x8a, 0x09, // mov r9b,[rcx]
+                0x44, 0x8a, 0x12, // mov r10b,[rdx]
                 0x45, 0x38, 0xd1, // cmp r9b,r10b
             ]);
             let diff = e.jcc(0x5);
@@ -3856,6 +4009,47 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x29, 0xd0, //          sub eax,edx
                 0xc3,
             ]);
+        }
+        // memcmp(a,b,n): unsigned byte compare over n — <0/0/>0.
+        b"memcmp" => {
+            let lp = e.n;
+            e.raw(&[0x4d, 0x85, 0xc0]); // test r8,r8
+            let eq = e.jcc(0x4);
+            e.raw(&[
+                0x44, 0x8a, 0x09, // mov r9b,[rcx]
+                0x44, 0x8a, 0x12, // mov r10b,[rdx]
+                0x45, 0x38, 0xd1, // cmp r9b,r10b
+            ]);
+            let diff = e.jcc(0x5);
+            e.raw(&[
+                0x48, 0xff, 0xc1, 0x48, 0xff, 0xc2, 0x49, 0xff, 0xc8,
+            ]);
+            let back = e.jmp();
+            e.fix_to(back, lp);
+            e.fix(eq);
+            e.raw(&[0x31, 0xc0, 0xc3]); // xor eax,eax; ret
+            e.fix(diff);
+            e.raw(&[
+                0x41, 0x0f, 0xb6, 0xc1, // movzx eax,r9b
+                0x41, 0x0f, 0xb6, 0xd2, // movzx edx,r10b
+                0x29, 0xd0, //          sub eax,edx
+                0xc3,
+            ]);
+        }
+        // strcpy(dst,src): byte copy through the NUL; returns dst.
+        b"strcpy" => {
+            e.raw(&[0x48, 0x89, 0xc8]); // mov rax,rcx
+            let lp = e.n;
+            e.raw(&[
+                0x44, 0x8a, 0x1a, // mov r11b,[rdx]
+                0x44, 0x88, 0x19, // mov [rcx],r11b
+                0x48, 0xff, 0xc1, // inc rcx
+                0x48, 0xff, 0xc2, // inc rdx
+                0x45, 0x84, 0xdb, // test r11b,r11b
+            ]);
+            let back = e.jcc(0x5); // jnz loop
+            e.fix_to(back, lp);
+            e.raw(&[0xc3]); //           ret
         }
         // memset(dst,c,n): rep stosb — r9 keeps dst for the return.
         b"memset" => {
@@ -7530,6 +7724,9 @@ pub fn nt_handle_close(h: u64) -> bool {
     if t.nth[i] == crate::nt::NTH_THREAD {
         nt_thr_refdown(t.nth_fd[i] as usize);
     }
+    if t.nth[i] == crate::nt::NTH_SECTION {
+        nt_sec_refdown(t.nth_fd[i] as usize);
+    }
     t.nth[i] = 0;
     t.nth_fd[i] = 0xff;
     true
@@ -7712,6 +7909,285 @@ pub fn nt_handle_thr_idx(h: u64) -> Option<usize> {
     }
     let i = h as usize - 1;
     (t.nth[i] == crate::nt::NTH_THREAD).then_some(t.nth_fd[i] as usize)
+}
+
+// ---- NT section objects + mapped views ---------------------------
+// CreateFileMapping's backing object. A section names an OFD (or
+// nothing for pagefile-backed SEC_COMMIT) and survives via handle
+// refs only — a mapped VIEW self-contains its write-back target
+// (oi + file offset) so it needs no section alive at unmap.
+const NT_MAX_SECTIONS: usize = 16;
+/// (oi_or_0xFF, max_size, win32prot, state, refs) — 0=free 1=live.
+static mut NT_SECTIONS: [(u64, u64, u8, u8, u8); NT_MAX_SECTIONS] =
+    [(0xff, 0, 0, 0, 0); NT_MAX_SECTIONS];
+
+pub fn nt_sec_new(oi: u64, size: u64, prot: u8) -> Option<usize> {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_SECTIONS) };
+    let i = tab.iter().position(|e| e.3 == 0)?;
+    tab[i] = (oi, size, prot, 1, 0);
+    Some(i)
+}
+
+/// Clear a section slot outright — used when handle allocation
+/// fails before the entry ever gains a ref.
+pub fn nt_sec_free(idx: usize) {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_SECTIONS) };
+    if let Some(e) = tab.get_mut(idx) {
+        *e = (0xff, 0, 0, 0, 0);
+    }
+}
+
+/// (oi_or_0xFF, size, prot) for a live ledger index.
+pub fn nt_sec_get(idx: usize) -> Option<(u64, u64, u8)> {
+    let tab = unsafe { &*core::ptr::addr_of!(NT_SECTIONS) };
+    let e = *tab.get(idx)?;
+    (e.3 != 0).then_some((e.0, e.1, e.2))
+}
+
+fn nt_sec_refdown(idx: usize) {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_SECTIONS) };
+    if let Some(e) = tab.get_mut(idx) {
+        if e.3 != 0 {
+            e.4 = e.4.saturating_sub(1);
+            if e.4 == 0 {
+                // The section's OFD pin dies with it — a file-backed
+                // section released its handle for good.
+                let oi = e.0;
+                *e = (0xff, 0, 0, 0, 0);
+                if oi != 0xff {
+                    nt_oi_release(oi as usize);
+                }
+            }
+        }
+    }
+}
+
+/// Bind a section handle in the process table; nth_fd carries the
+/// NT_SECTIONS index and the entry gains one handle ref.
+pub fn nt_handle_alloc_sec(idx: usize) -> Option<u64> {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_SECTIONS) };
+    let t = mm_owner_mut()?;
+    for i in 0..crate::nt::MAX_NTH {
+        if t.nth[i] == 0 {
+            t.nth[i] = crate::nt::NTH_SECTION;
+            t.nth_fd[i] = idx as u8;
+            tab[idx].4 = tab[idx].4.saturating_add(1);
+            return Some(i as u64 + 1);
+        }
+    }
+    None
+}
+
+/// The NT_SECTIONS index an NTH_SECTION handle names.
+pub fn nt_handle_sec_idx(h: u64) -> Option<usize> {
+    let t = mm_owner_mut()?;
+    if h == 0 || h > crate::nt::MAX_NTH as u64 {
+        return None;
+    }
+    let i = h as usize - 1;
+    (t.nth[i] == crate::nt::NTH_SECTION).then_some(t.nth_fd[i] as usize)
+}
+
+/// Resolve an NTH_FILE handle to (ofd_index, accmode) and bump the
+/// OFD's refcount — the section/view holds the ref until released.
+pub fn nt_handle_file_oi(h: u64) -> Option<(usize, u8)> {
+    let fd = nt_handle_fd(h)?;
+    let t = mm_owner_mut()?;
+    let oi = *fdt(t).fds.get(fd as usize)?.as_ref()? as usize;
+    let o = unsafe { (*core::ptr::addr_of_mut!(OFDS)).get_mut(oi)?.as_mut()? };
+    let ram_or_ro = matches!(o.kind, FdKind::File(_) | FdKind::Ram(_));
+    if !ram_or_ro {
+        return None;
+    }
+    o.refs += 1;
+    Some((oi, o.accmode))
+}
+
+/// (content_ptr, len, is_ram) for a live OFD's backing bytes.
+fn ofd_content(oi: usize) -> Option<(*const u8, usize, bool)> {
+    let o = unsafe { &*core::ptr::addr_of!(OFDS) }.get(oi)?.as_ref()?;
+    match &o.kind {
+        FdKind::File(d) => Some((d.as_ptr(), d.len(), false)),
+        FdKind::Ram(i) => {
+            let v = vfile(*i)?;
+            Some((v.data as *const u8, v.len, true))
+        }
+        _ => None,
+    }
+}
+
+/// Drop the ref nt_handle_file_oi/nt_view_add bumped on `oi`.
+pub fn nt_oi_release(oi: usize) {
+    ofd_release(oi);
+}
+
+/// Bump OFD `oi`'s refcount — a mapped view's own ref, held until
+/// unmap so its write-back target can't die mid-flight.
+pub fn nt_oi_addref(oi: usize) -> bool {
+    let Some(o) =
+        unsafe { &mut *core::ptr::addr_of_mut!(OFDS) }.get_mut(oi).and_then(|s| s.as_mut())
+    else {
+        return false;
+    };
+    o.refs += 1;
+    true
+}
+
+/// Current content length of OFD `oi` — the section's natural size
+/// when MaximumSize is NULL.
+pub fn nt_oi_len(oi: usize) -> u64 {
+    ofd_content(oi).map(|(_, l, _)| l as u64).unwrap_or(0)
+}
+
+/// Copy `n` bytes of OFD `oi`'s content at `off` into the committed
+/// user VA `dst` (bounds clamped to the file length). Returns the
+/// byte count actually copied — the tail beyond EOF stays zeroed.
+pub fn nt_oi_copyin(oi: usize, off: u64, dst: u64, n: u64) -> usize {
+    let Some((p, len, _)) = ofd_content(oi) else { return 0 };
+    let avail = (len as u64).saturating_sub(off);
+    let n = core::cmp::min(n, avail) as usize;
+    if n == 0 {
+        return 0;
+    }
+    // Route through the physical frame: a PAGE_READONLY view's PTEs
+    // deny the kernel's VA write too (CR0.WP), exactly like the PE
+    // loader's read-only section fill — write_task_bytes_force is
+    // that same folio-fill privilege.
+    let src = unsafe { core::slice::from_raw_parts(p.add(off as usize), n) };
+    let pml4 = mm_owner_mut().map(|t| t.pml4).unwrap_or(0);
+    if pml4 == 0 || !write_task_bytes_force(pml4, dst, src) {
+        return 0;
+    }
+    n
+}
+
+/// Per-process view ledger: (owner_pid, base, va_size, oi_or_0xFF,
+/// file_off, file_span, writable, write_back, state). va_size is the
+/// committed window (page-rounded); file_span is the count of bytes
+/// that name file content — the write-back bound, so a page-round
+/// tail can never grow the file. A view's write-back path reads the
+/// user VA at unmap/flush and writes it into the file —
+/// FILE_MAP_COPY views set write_back=0 and are discard-on-unmap.
+const NT_MAX_VIEWS: usize = 16;
+static mut NT_VIEWS: [(u64, u64, u64, u64, u64, u64, u8, u8, u8); NT_MAX_VIEWS] =
+    [(0, 0, 0, 0, 0, 0, 0, 0, 0); NT_MAX_VIEWS];
+
+/// The process id of the current task's address-space owner.
+fn nt_owner_pid() -> u64 {
+    mm_owner_i()
+        .and_then(|i| unsafe { &*core::ptr::addr_of!(TASKS) }[i].as_ref())
+        .map(|t| t.pid)
+        .unwrap_or(0)
+}
+
+/// Reclaim view entries whose owner process is fully gone — dead
+/// owners can never unmap, so their OFD refs and slots leak until
+/// the next map sweeps (same lazy pattern as thread windows).
+fn nt_view_gc() {
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_VIEWS) };
+    for e in tab.iter_mut() {
+        if e.8 == 0 {
+            continue;
+        }
+        let alive = tasks.iter().flatten().any(|t| t.pid == e.0);
+        if !alive {
+            if e.3 != 0xff {
+                nt_oi_release(e.3 as usize);
+            }
+            *e = (0, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+    }
+}
+
+/// Record a fresh view; OFD ref was bumped by the caller.
+/// `file_span` is the file-byte count the view names (bounded by
+/// the section), distinct from the page-rounded `va_size`.
+pub fn nt_view_add(
+    base: u64,
+    va_size: u64,
+    oi: u64,
+    off: u64,
+    file_span: u64,
+    wr: bool,
+    wb: bool,
+) -> bool {
+    nt_view_gc();
+    let owner = nt_owner_pid();
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_VIEWS) };
+    let Some(i) = tab.iter().position(|e| e.8 == 0) else { return false };
+    tab[i] = (owner, base, va_size, oi, off, file_span, wr as u8, wb as u8, 1);
+    true
+}
+
+/// Write a write-back view's dirty bytes into its file: grow the
+/// VFile to cover [file_off, file_off+file_span) then copy the
+/// user VA over it. No-op for anonymous/readonly views.
+fn nt_view_writeback(e: (u64, u64, u64, u64, u64, u64, u8, u8, u8)) {
+    if e.3 == 0xff || e.7 == 0 || e.5 == 0 {
+        return;
+    }
+    let oi = e.3 as usize;
+    let vi = match unsafe { &*core::ptr::addr_of!(OFDS) }
+        .get(oi)
+        .and_then(|s| s.as_ref())
+        .map(|o| &o.kind)
+    {
+        Some(FdKind::Ram(vi)) => *vi,
+        _ => return, // initrd slices are immutable — RO/COPY only
+    };
+    let Some(v) = vfile(vi) else { return };
+    let Some(need) = e.4.checked_add(e.5).map(|x| x as usize) else { return };
+    if vfile_grow(v, need) != 0 {
+        return;
+    }
+    // SAFETY: v.data owns `need` bytes post-grow; the source is the
+    // view's committed window under the current (shared) cr3.
+    unsafe {
+        core::ptr::copy_nonoverlapping(e.1 as *const u8, v.data.add(e.4 as usize), e.5 as usize)
+    };
+    v.len = v.len.max(need);
+}
+
+/// Unmap the view at `base` for the current process: write back if
+/// the view asks, free the VA window on the owner's ledger, drop
+/// the OFD ref, free the entry. Returns false for no such view.
+pub fn nt_view_unmap(base: u64) -> bool {
+    let owner = nt_owner_pid();
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_VIEWS) };
+    let Some(i) = tab.iter().position(|e| e.8 != 0 && e.0 == owner && e.1 == base) else {
+        return false;
+    };
+    let e = tab[i];
+    tab[i] = (0, 0, 0, 0, 0, 0, 0, 0, 0);
+    nt_view_writeback(e);
+    nt_free_pages(e.1, e.2);
+    if e.3 != 0xff {
+        nt_oi_release(e.3 as usize);
+    }
+    true
+}
+
+/// Flush any write-back views intersecting [base, base+size).
+/// size==0 with base inside a view names "the whole view" (the
+/// FlushViewOfFile(p,0) form); (0,0) flushes all of them.
+pub fn nt_view_flush(base: u64, size: u64) {
+    let owner = nt_owner_pid();
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_VIEWS) };
+    for i in 0..NT_MAX_VIEWS {
+        let e = tab[i];
+        if e.8 == 0 || e.0 != owner || e.7 == 0 {
+            continue;
+        }
+        let hit = if size == 0 {
+            base == 0 || (base >= e.1 && base < e.1 + e.2)
+        } else {
+            base < e.1 + e.2 && e.1 < base.saturating_add(size)
+        };
+        if hit {
+            nt_view_writeback(e);
+        }
+    }
 }
 
 /// CreateThread's kernel half: a CLONE_VM|THREAD-shaped child on the
@@ -16415,7 +16891,7 @@ fn translate(pml4: u64, va: u64) -> Option<u64> {
 /// for kernel reads of user memory (a read-only page is a legal
 /// read source even though no write path may touch it). Bounded to
 /// the user window for the same kernel-half reason as translate().
-fn translate_r(pml4: u64, va: u64) -> Option<u64> {
+pub fn translate_r(pml4: u64, va: u64) -> Option<u64> {
     if !(elf::USER_VA_LO..elf::USER_VA_HI).contains(&va) {
         return None;
     }

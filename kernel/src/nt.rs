@@ -34,6 +34,9 @@ pub const STATUS_OBJECT_NAME_COLLISION: u64 = 0xC000_0035;
 pub const STATUS_OBJECT_PATH_NOT_FOUND: u64 = 0xC000_003A;
 pub const STATUS_INSUFFICIENT_RESOURCES: u64 = 0xC000_009A;
 pub const STATUS_NO_MORE_FILES: u64 = 0x8000_0006;
+/// STATUS_MAPPED_FILE_SIZE_ZERO — file-backed section requested
+/// with no size on an empty file.
+pub const STATUS_MAPPED_FILE_SIZE_ZERO: u64 = 0xC000_011E;
 
 // Windows 10 x64 service numbers for the implemented subset.
 const NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0x04;
@@ -46,10 +49,15 @@ const NT_FREE_VIRTUAL_MEMORY: u32 = 0x1E;
 const NT_QUERY_VIRTUAL_MEMORY: u32 = 0x23;
 const NT_QUERY_INFORMATION_THREAD: u32 = 0x25;
 const NT_SET_INFORMATION_FILE: u32 = 0x27;
+const NT_MAP_VIEW_OF_SECTION: u32 = 0x28;
+const NT_UNMAP_VIEW_OF_SECTION: u32 = 0x2A;
 const NT_TERMINATE_PROCESS: u32 = 0x2C;
 const NT_DELAY_EXECUTION: u32 = 0x34;
 const NT_QUERY_DIRECTORY_FILE: u32 = 0x35;
+const NT_FLUSH_VIRTUAL_MEMORY: u32 = 0x3B;
+const NT_CREATE_SECTION: u32 = 0x4A;
 const NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x50;
+const NT_QUERY_SECTION: u32 = 0x51;
 const NT_RESUME_THREAD: u32 = 0x52;
 const NT_TERMINATE_THREAD: u32 = 0x53;
 const NT_CREATE_FILE: u32 = 0x55;
@@ -75,6 +83,9 @@ pub const NTH_STDERR: u8 = 3;
 pub const NTH_FILE: u8 = 4;
 /// A waitable thread object — `nth_fd` holds the NT_THREADS index.
 pub const NTH_THREAD: u8 = 5;
+/// A section object (CreateFileMapping) — `nth_fd` holds the
+/// NT_SECTIONS index.
+pub const NTH_SECTION: u8 = 6;
 pub const MAX_NTH: usize = 16;
 
 /// WAIT_TIMEOUT — WaitForSingleObject's deadline answer.
@@ -715,6 +726,251 @@ fn nt_free_vm(ctx: &mut UCtx) -> u64 {
     STATUS_SUCCESS
 }
 
+/// NtCreateSection(&hout, access, oa, &maxsize, protect, attributes,
+/// file): SEC_COMMIT sections only — SEC_IMAGE needs the loader.
+/// A file handle pins the OFD's backing content; a NULL/−1 file
+/// handle makes a paging-file (anonymous) section that requires a
+/// nonzero MaximumSize.
+fn nt_create_section(ctx: &mut UCtx) -> u64 {
+    const SEC_COMMIT: u64 = 0x0800_0000;
+    let hout = arg(ctx, 0);
+    let szp = arg(ctx, 3);
+    let prot = arg(ctx, 4) as u32;
+    let attrib = arg(ctx, 5);
+    let fh = arg(ctx, 6);
+    if !user::range_ok_w(hout, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if szp != 0 && !user::range_ok(szp, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if attrib & !SEC_COMMIT != 0 {
+        return STATUS_NOT_IMPLEMENTED; // SEC_IMAGE/SEC_RESERVE: later
+    }
+    // Win32 PAGE_* low byte the section remembers.
+    let page = (prot & 0xff) as u8;
+    if page != 0x02 && page != 0x04 && page != 0x08 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let (oi, accmode) = if fh == 0 || fh == u64::MAX {
+        (0xffusize, 0u8)
+    } else {
+        match user::nt_handle_file_oi(fh) {
+            Some((o, a)) => (o, a),
+            None => return STATUS_INVALID_HANDLE,
+        }
+    };
+    // A read/write section on a read-only file is denied up front.
+    if page == 0x04 && oi != 0xff && accmode == 0 {
+        user::nt_oi_release(oi);
+        return STATUS_ACCESS_DENIED;
+    }
+    let size = if szp != 0 {
+        // SAFETY: validated user window.
+        unsafe { (szp as *const u64).read_unaligned() }
+    } else {
+        user::nt_oi_len(oi)
+    };
+    if size == 0 {
+        if oi != 0xff {
+            user::nt_oi_release(oi);
+        }
+        return STATUS_MAPPED_FILE_SIZE_ZERO;
+    }
+    // A section can never name a window bigger than the NT arena —
+    // also keeps the view-size page round-up away from u64 wrap.
+    if size > crate::elf::USER_VA_HI - user::NT_ALLOC_VA {
+        if oi != 0xff {
+            user::nt_oi_release(oi);
+        }
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(idx) = user::nt_sec_new(oi as u64, size, page) else {
+        if oi != 0xff {
+            user::nt_oi_release(oi);
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+    let Some(h) = user::nt_handle_alloc_sec(idx) else {
+        user::nt_sec_free(idx);
+        if oi != 0xff {
+            user::nt_oi_release(oi);
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+    // SAFETY: validated user window.
+    unsafe { (hout as *mut u64).write_unaligned(h) };
+    STATUS_SUCCESS
+}
+
+/// NtMapViewOfSection(hsection, hprocess, &base, zerobits, commitsz,
+/// &secoff, &viewsize, inherit, alloctype, protect): commits a fresh
+/// window on the caller's ledger, seeds it from the section's file
+/// bytes, and records a view entry whose write-back on unmap reaches
+/// the file only for a READWRITE mapping.
+fn nt_map_view(ctx: &mut UCtx) -> u64 {
+    let sech = arg(ctx, 0);
+    let proch = arg(ctx, 1);
+    let bp = arg(ctx, 2);
+    let offp = arg(ctx, 5);
+    let sizep = arg(ctx, 6);
+    let prot = arg(ctx, 9) as u32;
+    if proch != 0 && proch != u64::MAX {
+        return STATUS_NOT_IMPLEMENTED; // only our own mm for now
+    }
+    if !user::range_ok_w(bp, 8) || !user::range_ok_w(sizep, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if offp != 0 && !user::range_ok(offp, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let Some(idx) = user::nt_handle_sec_idx(sech) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some((oi, ssize, sprot)) = user::nt_sec_get(idx) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    // SAFETY: all validated user windows.
+    let (hint, off, mut vsz) = unsafe {
+        (
+            (bp as *const u64).read_unaligned(),
+            if offp != 0 { (offp as *const u64).read_unaligned() } else { 0 },
+            (sizep as *const u64).read_unaligned(),
+        )
+    };
+    if off >= ssize {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if vsz == 0 {
+        vsz = ssize - off; // 0 view size maps to end of section
+    }
+    if vsz > ssize - off {
+        return STATUS_INVALID_PARAMETER;
+    }
+    vsz = (vsz + 0xfff) & !0xfff;
+    // View protection may never exceed the section's.
+    let page = (prot & 0xff) as u8;
+    let wants_w = page == 0x04 || page == 0x08;
+    if page != 0x02 && !wants_w {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if wants_w && sprot != 0x04 && sprot != 0x08 {
+        return STATUS_ACCESS_DENIED;
+    }
+    // Same flag translation VirtualAlloc uses — WRITECOPY takes the
+    // writable branch (private pages), READONLY the read one.
+    let Some((rfl, pfl)) = user::rng_from_prot(prot) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let Some(base) = user::nt_alloc_pages(hint, vsz, true, rfl, pfl) else {
+        return STATUS_NO_MEMORY;
+    };
+    let wb = page == 0x04 && oi != 0xff; // WRITECOPY views discard
+    if oi != 0xff {
+        user::nt_oi_addref(oi as usize);
+        user::nt_oi_copyin(oi as usize, off, base, vsz);
+    }
+    // file_span = file bytes the view names (pre-round, bounded by
+    // the section); vsz is the committed VA span.
+    let file_span = core::cmp::min(vsz, ssize - off);
+    if !user::nt_view_add(base, vsz, oi, off, file_span, wants_w, wb) {
+        user::nt_free_pages(base, vsz);
+        if oi != 0xff {
+            user::nt_oi_release(oi as usize);
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    // SAFETY: both pointers validated above.
+    unsafe {
+        (bp as *mut u64).write_unaligned(base);
+        (sizep as *mut u64).write_unaligned(vsz);
+    }
+    STATUS_SUCCESS
+}
+
+/// NtUnmapViewOfSection(process, base): resolves the view on the
+/// caller's ledger — write-back views flush to the file first, then
+/// the window frees and the view's OFD ref drops.
+fn nt_unmap_view(ctx: &mut UCtx) -> u64 {
+    let proch = arg(ctx, 0);
+    let base = arg(ctx, 1);
+    if proch != 0 && proch != u64::MAX {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    if user::nt_view_unmap(base) {
+        STATUS_SUCCESS
+    } else {
+        STATUS_INVALID_PARAMETER
+    }
+}
+
+/// NtFlushVirtualMemory(process, &base, &size, iosb): pushes dirty
+/// write-back view bytes to their file. base==0&&size==0 flushes
+/// every write-back view the process owns.
+fn nt_flush_vm(ctx: &mut UCtx) -> u64 {
+    let proch = arg(ctx, 0);
+    let bp = arg(ctx, 1);
+    let sp = arg(ctx, 2);
+    let iosb = arg(ctx, 3);
+    if proch != 0 && proch != u64::MAX {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    if (bp != 0 && !user::range_ok_w(bp, 8)) || (sp != 0 && !user::range_ok_w(sp, 8)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    // SAFETY: both validated above when nonzero.
+    let (base, size) = unsafe {
+        (
+            if bp != 0 { (bp as *const u64).read_unaligned() } else { 0 },
+            if sp != 0 { (sp as *const u64).read_unaligned() } else { 0 },
+        )
+    };
+    user::nt_view_flush(base, size);
+    iosb_complete(iosb, STATUS_SUCCESS, 0);
+    STATUS_SUCCESS
+}
+
+/// NtQuerySection(h, class, buf, len, &retlen): class 0
+/// SectionBasicInformation only — a 24-byte {base u64, attributes
+/// u32, pad, size u64}.
+fn nt_query_section(ctx: &mut UCtx) -> u64 {
+    let h = arg(ctx, 0);
+    let class = arg(ctx, 1);
+    let buf = arg(ctx, 2);
+    let blen = arg(ctx, 3);
+    let rsz = arg(ctx, 4);
+    if class != 0 {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    if blen < 24 {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if !user::range_ok_w(buf, 24) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if rsz != 0 && !user::range_ok_w(rsz, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let Some(idx) = user::nt_handle_sec_idx(h) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some((_, size, _)) = user::nt_sec_get(idx) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    // SAFETY: validated user window.
+    unsafe {
+        let p = buf as *mut u8;
+        (p as *mut u64).write_unaligned(0); // BaseAddress: unknown
+        (p.add(8) as *mut u32).write_unaligned(0x0800_0000); // SEC_COMMIT
+        (p.add(16) as *mut u64).write_unaligned(size);
+    }
+    if rsz != 0 {
+        // SAFETY: validated above.
+        unsafe { (rsz as *mut u64).write_unaligned(24) };
+    }
+    STATUS_SUCCESS
+}
+
 /// NtQueryVirtualMemory(process, base, class, buf, len, &retlen):
 /// class 0 MemoryBasicInformation only — a 48-byte record built
 /// from the task's ranges ledger (committed range fields, or
@@ -990,6 +1246,11 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         NT_FREE_VIRTUAL_MEMORY => nt_free_vm(ctx),
         NT_QUERY_VIRTUAL_MEMORY => nt_query_vm(ctx),
         NT_PROTECT_VIRTUAL_MEMORY => nt_protect_vm(ctx),
+        NT_CREATE_SECTION => nt_create_section(ctx),
+        NT_MAP_VIEW_OF_SECTION => nt_map_view(ctx),
+        NT_UNMAP_VIEW_OF_SECTION => nt_unmap_view(ctx),
+        NT_FLUSH_VIRTUAL_MEMORY => nt_flush_vm(ctx),
+        NT_QUERY_SECTION => nt_query_section(ctx),
         NT_DELAY_EXECUTION => nt_delay(ctx),
         NT_CREATE_THREAD_EX => nt_create_thread_ex(ctx),
         NT_WAIT_FOR_SINGLE_OBJECT => nt_wait_single(ctx),
