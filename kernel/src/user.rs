@@ -2342,42 +2342,14 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
         t.ranges[t.nranges] = (va0, va1, rfl);
         t.nranges += 1;
     }
-    // Rebase against the load bias, then bind imports — both must
-    // run before the image executes, and both honestly fail the load.
-    // The exe's dep mask is unused: implicitly loaded deps live for
-    // the process's span and sweep with it.
-    let mut exe_deps = 0u8;
-    if !pe_apply_relocs(t, p) || !pe_resolve_imports(t, p, true, 0, &mut exe_deps) {
-        return false;
-    }
-    for i in 0..USTACK_PAGES {
-        if map_page(t, USTACK_VA + i * PAGE, USER | WRITE | NX).is_none() {
-            return false;
-        }
-    }
+    // Register the fixed regions FIRST — dep images bound during
+    // import resolution place via nt_place_ok, which walks ranges[];
+    // without these entries a dep could land on the stack, stubs,
+    // or TEB before they're even mapped. Mapping still happens in
+    // order below; the ledger just reserves the spans.
     t.stack_top = USTACK_VA + USTACK_PAGES * PAGE;
-    if t.nranges >= MAX_RANGES {
-        return false;
-    }
-    t.ranges[t.nranges] = (USTACK_VA, t.stack_top, RNG_R | RNG_W);
-    t.nranges += 1;
-    if !teb_peb_init(t, p) {
-        return false;
-    }
-    // The Win32 thunk layer's writable state page (argv/envp/FILE[]/
-    // TLS) — mapped for every PE task; thunks use it, ntdll-level
-    // images just ignore it.
-    if map_page(t, crate::pe::STUB_DATA_VA, USER | WRITE | NX).is_none() {
-        return false;
-    }
-    k32_data_init(t);
-    if !pe_tls_init(t, p) {
-        return false;
-    }
-    // The fixed PE regions are real user mappings — register them
-    // in the ranges ledger like the image sections so range_ok's
-    // VMA gate covers the data page a CreateFileA thunk names.
     for r in [
+        (USTACK_VA, t.stack_top, RNG_R | RNG_W),
         (crate::pe::PEB_VA, crate::pe::PEB_VA + 0x1000, RNG_R | RNG_W),
         (crate::pe::TEB_VA, crate::pe::TEB_VA + 0x1000, RNG_R | RNG_W),
         (crate::pe::STUB_VA, crate::pe::STUB_DATA_VA, RNG_R | RNG_X),
@@ -2393,9 +2365,37 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
         t.ranges[t.nranges] = r;
         t.nranges += 1;
     }
+    // Rebase against the load bias, then bind imports — both must
+    // run before the image executes, and both honestly fail the load.
+    // The exe's dep mask is unused: implicitly loaded deps live for
+    // the process's span and sweep with it.
+    let mut exe_deps = 0u8;
+    if !pe_apply_relocs(t, p) || !pe_resolve_imports(t, p, true, 0, &mut exe_deps) {
+        return false;
+    }
+    nt_lock_stubs(t);
+    for i in 0..USTACK_PAGES {
+        if map_page(t, USTACK_VA + i * PAGE, USER | WRITE | NX).is_none() {
+            return false;
+        }
+    }
+    if !teb_peb_init(t, p) {
+        return false;
+    }
+    // The Win32 thunk layer's writable state page (argv/envp/FILE[]/
+    // TLS) — mapped for every PE task; thunks use it, ntdll-level
+    // images just ignore it.
+    if map_page(t, crate::pe::STUB_DATA_VA, USER | WRITE | NX).is_none() {
+        return false;
+    }
+    k32_data_init(t);
+    if !pe_tls_init(t, p) {
+        return false;
+    }
     t.pers = PERS_NT;
     t.gs_base = crate::pe::TEB_VA;
-    t.nt_alloc = NT_ALLOC_VA;
+    // Spawn-time deps may have already bumped the alloc cursor.
+    t.nt_alloc = t.nt_alloc.max(NT_ALLOC_VA);
     // Std handles are PEB-published NT handles, not fds — the NT
     // task's fd table stays empty (its std streams are handles
     // 1/2/3 in nth, resolved by the NT syscall layer). The table is
@@ -2470,10 +2470,9 @@ fn pe_apply_relocs(t: &mut Task, p: &crate::pe::Pe) -> bool {
 /// (base, span, dep_mask, entry_va) — dep_mask marks the
 /// module-ledger slots this image bound imports against. `depth`
 /// bounds recursive dependent-DLL loads.
-fn pe_map_image(img: &[u8], depth: u8) -> Option<(u64, u64, u8, u64)> {
+fn pe_map_image(t: &mut Task, img: &[u8], depth: u8) -> Option<(u64, u64, u8, u64)> {
     let mut p = crate::pe::parse(img)?;
 
-    let t = mm_owner_mut()?;
     let size = (p.size + 0xfff) & !0xfff;
     let mut base = p.image_base & !0xfff;
     if !(base >= elf::USER_VA_LO && nt_place_ok(t, base, size)) {
@@ -2606,10 +2605,15 @@ fn nt_mod_add(
         return false;
     }
     let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
-    // Sweep slots whose owning process is fully gone.
+    // Sweep slots whose owning process is fully gone — except the
+    // caller's own: a spawning task registers its import deps before
+    // it lands in TASKS, and a later dep's sweep must not reap the
+    // earlier deps its dep_mask is about to point at.
     let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
     for e in tab.iter_mut() {
-        if e.3 != 0 && !tasks.iter().flatten().any(|t| t.pid == e.0) {
+        if e.3 != 0 && e.0 != owner
+            && !tasks.iter().flatten().any(|t| t.pid == e.0)
+        {
             *e = (0, 0, 0, 0, 0, 0, [0; 32], 0, 0);
         }
     }
@@ -2636,26 +2640,25 @@ fn nt_mod_add(
 /// stack (ANSI, or UTF-16 when `wide`), dedup against live modules
 /// of this process, resolve backing bytes (VFILES "/name" first,
 /// then the initrd), map the image and record it. HMODULE or 0.
-pub fn nt_load_dll(name_va: u64, wide: bool) -> u64 {
-    let (pml4, owner) = match mm_owner_mut() {
-        Some(t) => (t.pml4, t.pid),
-        None => return 0,
-    };
+/// Read a module name (ANSI or UTF-16) from the caller's address
+/// space and reduce it to a basename — the flat VFS has no search
+/// path to honor. Some((buf, len)) where buf[..len] is the basename.
+fn nt_mod_name(pml4: u64, name_va: u64, wide: bool) -> Option<([u8; 64], usize)> {
     if !range_ok(name_va, 2) {
-        return 0;
+        return None;
     }
     let mut nb = [0u8; 64];
     let nl = if wide {
         let mut i = 0usize;
         while i < 63 {
             let Some(c) = read_task_u(pml4, name_va + i as u64 * 2, 2) else {
-                return 0;
+                return None;
             };
             if c == 0 {
                 break;
             }
             if c > 0x7f {
-                return 0;
+                return None;
             }
             nb[i] = c as u8;
             i += 1;
@@ -2665,20 +2668,34 @@ pub fn nt_load_dll(name_va: u64, wide: bool) -> u64 {
         read_task_str(pml4, name_va, &mut nb)
     };
     if nl == 0 {
-        return 0;
+        return None;
     }
-    // Basename only — the flat VFS has no search path to honor.
-    let name = &nb[..nl];
-    let st = name
+    let st = nb[..nl]
         .iter()
         .rposition(|&c| c == b'\\' || c == b'/')
         .map(|i| i + 1)
         .unwrap_or(0);
-    let name = &name[st..];
-    if name.is_empty() {
-        return 0;
+    if st == nl {
+        return None;
     }
-    let Some((i, fresh)) = nt_mod_resolve(owner, name, 0) else {
+    nb.copy_within(st..nl, 0);
+    Some((nb, nl - st))
+}
+
+pub fn nt_load_dll(name_va: u64, wide: bool) -> u64 {
+    let Some(t) = mm_owner_mut() else { return 0 };
+    let Some((nb, nl)) = nt_mod_name(t.pml4, name_va, wide) else {
+        return 0;
+    };
+    let name = &nb[..nl];
+    let r = nt_mod_resolve(t, name, 0);
+    // Top of the load call stack — seal the thunk pages on both
+    // outcomes. A failed resolve may have emitted thunks (and
+    // reopened the pages USER|WRITE) before bailing; leaving them
+    // unlocked would keep the shared stub region writable+executable
+    // for the rest of the process's life.
+    nt_lock_stubs(t);
+    let Some((i, fresh)) = r else {
         return 0;
     };
     let tab = unsafe { &*core::ptr::addr_of!(NT_MODS) };
@@ -2687,12 +2704,39 @@ pub fn nt_load_dll(name_va: u64, wide: bool) -> u64 {
     tab[i].1 | if fresh { 1 << 63 } else { 0 }
 }
 
+/// GetModuleHandle: return a live module's base without bumping
+/// refs — a handle lookup, not a load. A NULL name is the exe
+/// itself, always mapped at PE_LOAD_BIAS; its exports stay
+/// unreachable to nt_get_proc since the exe holds no ledger slot.
+pub fn nt_mod_handle(name_va: u64, wide: bool) -> u64 {
+    let (pml4, owner) = match mm_owner_mut() {
+        Some(t) => (t.pml4, t.pid),
+        None => return 0,
+    };
+    if name_va == 0 {
+        return crate::pe::PE_LOAD_BIAS;
+    }
+    let Some((nb, nl)) = nt_mod_name(pml4, name_va, wide) else {
+        return 0;
+    };
+    match nt_mod_find(owner, &nb[..nl]) {
+        Some(i) => {
+            let tab = unsafe { &*core::ptr::addr_of!(NT_MODS) };
+            tab[i].1
+        }
+        None => 0,
+    }
+}
+
 /// Resolve a module name to (slot index, fresh): dedup hits bump
 /// refs and return the live slot; a miss loads the image from the
-/// VFS or initrd. `depth` bounds recursive dependent-DLL loads —
-/// a chain (or cycle) deeper than 4 fails honestly rather than
-/// walking the import graph forever.
-fn nt_mod_resolve(owner: u64, name: &[u8], depth: u8) -> Option<(usize, bool)> {
+/// VFS or initrd into `t`'s address space — taken as a param, not
+/// mm_owner_mut(), because spawn-time import resolution runs before
+/// the task is current. `depth` bounds recursive dependent-DLL
+/// loads — a chain (or cycle) deeper than 4 fails honestly rather
+/// than walking the import graph forever.
+fn nt_mod_resolve(t: &mut Task, name: &[u8], depth: u8) -> Option<(usize, bool)> {
+    let owner = t.pid;
     if let Some(i) = nt_mod_find(owner, name) {
         let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
         tab[i].3 += 1;
@@ -2713,10 +2757,10 @@ fn nt_mod_resolve(owner: u64, name: &[u8], depth: u8) -> Option<(usize, bool)> {
                 .and_then(|arc| crate::cpio::find(arc, name))
         };
     let img = img?;
-    let (base, size, dep_mask, entry) = pe_map_image(img, depth + 1)?;
+    let (base, size, dep_mask, entry) = pe_map_image(t, img, depth + 1)?;
     if !nt_mod_add(owner, base, size, entry, name, dep_mask) {
         nt_deps_release(dep_mask);
-        nt_free_pages(base, size);
+        nt_free_pages_t(t, base, size);
         return None;
     }
     let tab = unsafe { &*core::ptr::addr_of!(NT_MODS) };
@@ -3476,12 +3520,25 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0xc3,
             ]);
         }
-        // GetModuleHandleA(NULL) -> PEB.ImageBaseAddress.
+        // GetModuleHandleA(name): NULL -> PEB.ImageBaseAddress; a
+        // real name -> RUX_MOD_HANDLE ledger lookup (no ref bump).
         b"GetModuleHandleA" => {
+            e.raw(&[
+                0x48, 0x85, 0xc9, // test rcx,rcx
+            ]);
+            let named = e.jcc(0x5); // jnz named
             e.raw(&[
                 0x65, 0x48, 0x8b, 0x04, 0x25, 0x60, 0, 0, 0, // mov rax,gs:[0x60]
                 0x48, 0x8b, 0x40, 0x10, // mov rax,[rax+0x10]
-                0xc3,
+                0xc3, //               ret
+            ]);
+            e.fix(named);
+            e.raw(&[
+                0x4c, 0x8b, 0xd1, //     mov r10,rcx
+                0x31, 0xd2, //           xor edx,edx
+                0xb8, 0xf8, 0, 0, 0, // mov eax,0xF8
+                0x0f, 0x05, //           syscall
+                0xc3, //                 ret
             ]);
         }
         // IsDebuggerPresent -> PEB.BeingDebugged.
@@ -3519,12 +3576,24 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
         b"GetCurrentThread" => {
             e.raw(&[0x48, 0xc7, 0xc0, 0xfe, 0xff, 0xff, 0xff, 0xc3]); // rax=-2; ret
         }
-        // GetModuleHandleW — same PEB read as the A arm.
+        // GetModuleHandleW — same shape as the A arm, wide name.
         b"GetModuleHandleW" => {
+            e.raw(&[
+                0x48, 0x85, 0xc9, // test rcx,rcx
+            ]);
+            let named = e.jcc(0x5); // jnz named
             e.raw(&[
                 0x65, 0x48, 0x8b, 0x04, 0x25, 0x60, 0, 0, 0,
                 0x48, 0x8b, 0x40, 0x10,
                 0xc3,
+            ]);
+            e.fix(named);
+            e.raw(&[
+                0x4c, 0x8b, 0xd1, //     mov r10,rcx
+                0xba, 1, 0, 0, 0, //   mov edx,1
+                0xb8, 0xf8, 0, 0, 0, // mov eax,0xF8
+                0x0f, 0x05, //           syscall
+                0xc3, //                 ret
             ]);
         }
         // Environment blocks in the data page (ANSI 0x800, UTF-16 0x820).
@@ -5055,7 +5124,11 @@ fn pe_resolve_imports(
         let mut dep_base = 0u64;
         let mut dep_span = 0u64;
         if nl != 0 && !k32 && !ntdll {
-            let Some((di, _)) = nt_mod_resolve(t.pid, dll, depth) else {
+            // The dep's own resolve bumps t.nt_stub — publish our
+            // cursor first so its thunks append past ours, then
+            // resync so ours append past its.
+            t.nt_stub = stub_next;
+            let Some((di, _)) = nt_mod_resolve(t, dll, depth) else {
                 return false;
             };
             if *dep_mask & (1 << di) != 0 {
@@ -5070,6 +5143,7 @@ fn pe_resolve_imports(
             let e = unsafe { &*core::ptr::addr_of!(NT_MODS) }[di];
             dep_base = e.1;
             dep_span = e.2;
+            stub_next = t.nt_stub;
         } else if nl == 0 {
             return false;
         }
@@ -5177,14 +5251,30 @@ fn pe_resolve_imports(
         if emit_thr_exit(t, &mut stub_next).is_none() {
             return false;
         }
+        // An exe that statically bound module imports has pending
+        // attaches — drain them at startup so dep DllMains run
+        // before the image's TLS callbacks and entry, like Windows.
+        if *dep_mask != 0 && emit_attach_drain(t, &mut stub_next).is_none() {
+            return false;
+        }
     }
-    // Fill done — drop the stub pages to read+execute and publish
-    // the cursor so the next mapped module appends, not overwrites.
-    map_page(t, crate::pe::STUB_VA, USER);
-    map_page(t, crate::pe::STUB_VA + 0x1000, USER);
-    map_page(t, crate::pe::STUB_VA + 0x2000, USER);
+    // Publish the cursor so the next mapped module appends, not
+    // overwrites. Locking the stubs to read+execute is the
+    // OUTERMOST caller's job — a dep image resolving inside the
+    // exe's (or a LoadLibrary's) descriptor loop must not seal the
+    // shared stub pages mid-fill; nt_lock_stubs runs at the top of
+    // the load call stack only.
     t.nt_stub = stub_next;
     true
+}
+
+/// Seal the thunk/trampoline pages to read+execute after a top-level
+/// image load — the exe path in pe_load_inner and LoadLibrary's
+/// nt_load_dll each call this once the whole import graph is bound.
+fn nt_lock_stubs(t: &mut Task) {
+    for i in 0..3u64 {
+        map_page(t, crate::pe::STUB_VA + i * 0x1000, USER);
+    }
 }
 
 /// Emit the shared thread-exit stub: `NtTerminateThread(0, rax)` —
@@ -5207,6 +5297,62 @@ fn emit_thr_exit(t: &mut Task, stub_next: &mut u64) -> Option<()> {
     }
     t.thr_exit_va = *stub_next;
     *stub_next += 16;
+    Some(())
+}
+
+/// Emit the startup attach drain: an exe that bound module imports
+/// runs this trampoline first — it loops RUX_DLL_ATTACH calling each
+/// pending module's DllMain(hmod, ATTACH, 0), then tail-jumps to
+/// `t.entry` (the TLS trampoline's, if one was emitted). Deps land in
+/// lower ledger slots, so they initialize before their importer —
+/// the same order the LoadLibrary thunk's drain produces.
+fn emit_attach_drain(t: &mut Task, stub_next: &mut u64) -> Option<()> {
+    let mut buf = [0u8; 96];
+    let mut e = Emit { b: &mut buf, n: 0 };
+    e.raw(&[
+        0x48, 0x83, 0xe4, 0xf0, //    and rsp,-16
+        0x48, 0x83, 0xec, 0x28, //    sub rsp,0x28
+    ]);
+    let drain = e.n;
+    e.raw(&[
+        0xb8, 0xf7, 0, 0, 0, //     mov eax,0xF7  RUX_DLL_ATTACH
+        0x0f, 0x05, //             syscall
+        0x48, 0x85, 0xc0, //       test rax,rax
+    ]);
+    let done = e.jcc(0x4); //       queue empty -> entry
+    e.raw(&[
+        0x8b, 0x48, 0x3c, //       mov ecx,[rax+0x3c]     peoff
+        0x8b, 0x4c, 0x08, 0x28, // mov ecx,[rax+rcx+0x28] entry_rva
+        0x85, 0xc9, //             test ecx,ecx
+    ]);
+    let noent = e.jcc(0x4); //     no entry -> next
+    e.raw(&[
+        0x48, 0x01, 0xc1, //       add rcx,rax    entry_va
+        0x49, 0x89, 0xc9, //       mov r9,rcx
+        0x48, 0x89, 0xc1, //       mov rcx,rax    hinst
+        0xba, 0x01, 0, 0, 0, //   mov edx,1      DLL_PROCESS_ATTACH
+        0x45, 0x31, 0xc0, //       xor r8d,r8d
+        0x41, 0xff, 0xd1, //       call r9        DllMain
+    ]);
+    e.fix_to(noent, drain);
+    let back = e.jmp();
+    e.fix_to(back, drain);
+    e.fix(done);
+    e.raw(&[0x48, 0xb8]); //        mov rax,imm64 — saved entry
+    e.raw(&t.entry.to_le_bytes());
+    e.raw(&[0xff, 0xe0]); //        jmp rax
+    let n = e.n;
+    if n > buf.len() {
+        return None;
+    }
+    let used = (n as u64 + 15) & !15;
+    if *stub_next + used > crate::pe::STUB_DATA_VA
+        || !write_task_bytes(t.pml4, *stub_next, &buf[..n])
+    {
+        return None;
+    }
+    t.entry = *stub_next;
+    *stub_next += used;
     Some(())
 }
 
@@ -5497,7 +5643,10 @@ fn load(img: &[u8]) -> Option<Task> {
 
         ctx: UCtx::ZERO,
         state: TaskState::Runnable,
-        pid: 0,
+        // Assigned here, not in spawn(): PE import resolution inside
+        // pe_load_inner registers dependent modules under the owning
+        // pid — it must exist before the image load runs.
+        pid: next_pid(),
         ppid: 0,
         exit_status: 0,
         wait_on: WaitOn::None,
@@ -17051,7 +17200,6 @@ pub fn spawn(img: &[u8], name: &str) -> bool {
         };
         t.ctx = UCtx::launch(t.entry, rsp);
     }
-    t.pid = next_pid();
     t.tgid = t.pid;
     t.pgid = t.pid; // each spawned task leads its own group in sid 1
     if t.pers == PERS_NT {

@@ -78,6 +78,7 @@ const RUX_LOAD_DLL: u32 = 0xF4;
 const RUX_GET_PROC: u32 = 0xF5;
 const RUX_FREE_DLL: u32 = 0xF6;
 const RUX_DLL_ATTACH: u32 = 0xF7;
+const RUX_MOD_HANDLE: u32 = 0xF8;
 
 /// Handle table tags — a per-task `nth` slot's object kind. Real
 /// handles are small indices (1-based) like the actual handle table;
@@ -1276,6 +1277,9 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         // LoadLibrary thunk loops on this after a fresh map so
         // dependency entry points run before their importer's.
         RUX_DLL_ATTACH => user::nt_next_attach(),
+        // GetModuleHandleA/W(name[,wide]) — HMODULE lookup without
+        // a ref bump; NULL name returns the exe's image base.
+        RUX_MOD_HANDLE => user::nt_mod_handle(arg(ctx, 0), arg(ctx, 1) != 0),
         NT_TERMINATE_PROCESS => {
             // hProcess == (HANDLE)-1 means self; anything else is a
             // kill we don't model yet — the common case is self-exit.

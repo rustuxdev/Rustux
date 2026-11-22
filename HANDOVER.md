@@ -2367,3 +2367,45 @@ qemu exit 33. Ledger: 120.
   (case variants double-load); exe-static-import dep DllMains never
   drain (no LoadLibrary thunk in the spawn path); import cycles fail
   at depth 4 rather than binding the in-progress image.
+
+## run-120 — exe-static dep attach drain + GetModuleHandle (this commit)
+
+- emit_attach_drain: an exe that statically bound module imports starts
+  on a stub trampoline that loops RUX_DLL_ATTACH calling each pending
+  module's DllMain(DLL_PROCESS_ATTACH) — dep attaches run before the
+  image's TLS callbacks and entry, closing run-119's recorded gap.
+- nt_lock_stubs split: a dep's resolve no longer seals the shared stub
+  pages mid-fill (it ran unconditionally at every resolve tail — the
+  root cause of the winstatic spawn failure); the outermost caller
+  (pe_load_inner / nt_load_dll) seals once the whole import graph is
+  bound. Audit fix: the seal also runs on the failure path — a failed
+  LoadLibrary no longer leaves stub pages RWX.
+- Stub cursor publish/resync: the exe's local cursor went stale across
+  a dep resolution, so post-dep descriptors emitted thunks over the
+  dep's and dep IATs aliased wrong code — now t.nt_stub is published
+  before recursing and resynced after.
+- Spawn-time dep ownership: pid moves into load() (was assigned after
+  image load, so spawn-time deps registered under owner=0 and never
+  drained/deduped); nt_mod_add's dead-owner sweep exempts the caller's
+  own slots — a spawning task is not in TASKS yet when its second dep
+  registers, and the sweep would have reaped the first dep's slot.
+- Fixed-region ranges[] registered BEFORE import resolution — dep
+  placement via nt_place_ok provably avoids stack/PEB/TEB/stub spans;
+  pe_map_image/nt_mod_resolve take &mut Task so spawn-time dep maps
+  land in the new task's pml4, not the running task's.
+- GetModuleHandleA/W: named-path lookup via RUX_MOD_HANDLE (0xF8) +
+  nt_mod_handle — basename-reduced, owner-keyed, no ref bump; NULL
+  keeps the PEB.ImageBaseAddress fast path. nt_mod_name shares the
+  bounded name read with nt_load_dll.
+- Fixture winstatic.exe (exit 36): statically imports wchain.dll (which
+  itself imports wbase.dll) — verifies recursive map/bind/dedup, dep
+  DllMain ordering via the startup drain (base_state=7, chain_state=20),
+  export calls, and GetModuleHandle A/W/NULL/missing/path-basename.
+- Audit run-94 quick scoped: 1 confirmed finding fixed in-diff (failed
+  resolve left stub pages RWX — sealed on both outcomes now); cve.now
+  clean. Artifacts: ~/security-audit-skill/linux-rust/run-94/.
+- Suite: 56 tasks, frames 108432 -> 108432 zero leak, qemu exit 33.
+- Known gaps (recorded, not bugs): module-name dedup byte-exact;
+  spawn-drain covers only spawn-time pending attaches (later loads
+  drain via the LoadLibrary path, as on Windows); borrowed-handle
+  semantics (no GetModuleHandleEx ref bump).
