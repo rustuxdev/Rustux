@@ -125,6 +125,20 @@ verdict in [docs/cve-matrix.md](docs/cve-matrix.md) (structurally
 absent, explicitly mitigated, or a documented divergence), gathered
 into a flat ledger of 100+ vulnerability classes so far.
 
+## Milestone timeline
+
+The git history reads like a speedrun — from the first boot proof to
+GNU bash and native `.exe` tasks in five days:
+
+| When | Milestone |
+|---|---|
+| **Nov 18** | **The porting engine.** A bootable `#![no_std]` UEFI kernel plus the first verified C→Rust port — then the `lib/` utility layer arrives in gated waves: math/div64, CRC, SipHash/xxHash/jhash, bitmap, rbtree, string, SHA-1/2 + HMAC, kfifo, llist, seqbuf — each unit `diff`'ed against the C original's recorded behavior before adoption. |
+| **Nov 19** | **The data-structure core lands.** rhashtable, xarray, idr, radix/maple tree, genradix, interval tree, assoc-array, kstrtox + string_helpers, percpu counters, printk ring — the foundational libraries every later subsystem stands on, all gate-green. |
+| **Nov 20** | **Hardware → wire → ring 3, in one day.** fbcon + boot logo, ExitBootServices, own page tables, buddy + slab/kmalloc, GDT/IDT, LAPIC timer, IST guard stack, the Rustux rename; ACPI + I/O APIC, PS/2 keyboard, PCI, e1000e TX/RX DMA + MSI-X; ARP, IPv4/ICMP ping, **world-first IPv8 on the wire**, IPv6/NDP, UDP + a real DHCP lease, TCP handshake, ChaCha20 CSPRNG — then ring 3: ELF loader, syscall boundary, initrd rootfs, preemptive scheduler, `fork`/`wait4`, pipes, signals, per-task fault isolation, FPU context, poll, UDP+TCP sockets, `brk`/`mmap`, and the glibc-startup ABI. |
+| **Nov 21** | **A real Linux userspace.** pthread-class `clone` flags + futex + `CHILD_CLEARTID` + `CLONE_VM`, hierarchical VFS, file-backed `mmap`, real `vfork` — then real **BusyBox**, `PT_INTERP` dynamic `ld.so`, Debian **dash** and **GNU bash 5.2** (interactive `-bash` on the serial console); process groups/sessions, tty line discipline + full job control (`SIGTTOU`/`TOSTOP`); epoll, eventfd, timerfd, signalfd, inotify; a generated `/proc`. |
+| **Nov 22** | **Last POSIX gaps → the second personality.** Queued signals, real `statfs`, VFS symlinks, file metadata, char devices + a real `/dev` — then the NT personality lands whole: PE32+ `.exe` loader, NT syscall table with NTSTATUS returns, TEB/PEB, handle tables, the Win32/CRT thunk layer (real MinGW exes end-to-end), NT file/dir/heap/VM services, threads with suspend/resume, section objects, `LoadLibrary` + the full `DllMain` attach/detach lifecycle, TLS callbacks, `CreateProcessA`. The suite stands at 61 tasks, all passing. |
+| **Every rung** | A scoped security audit plus a cve.now sweep of that subsystem's published kernel CVEs — 144 vulnerability classes recorded in [docs/cves-addressed.md](docs/cves-addressed.md) so far. |
+
 ## Acknowledgements
 
 - **Linus Torvalds** — for the Linux kernel itself
