@@ -47,6 +47,16 @@ const NT_DELAY_EXECUTION: u32 = 0x34;
 const NT_QUERY_DIRECTORY_FILE: u32 = 0x35;
 const NT_CREATE_FILE: u32 = 0x55;
 
+// Rustux-private services — no real NT counterparts. Real Windows
+// implements heaps in ntdll userspace (RtlAllocateHeap et al.); our
+// Win32 thunk layer marshals HeapAlloc/ReAlloc/Free/Size into these
+// so the block table lives kernel-side, where an app's heap
+// corruption can never forge block metadata.
+const RUX_HEAP_ALLOC: u32 = 0xF0;
+const RUX_HEAP_REALLOC: u32 = 0xF1;
+const RUX_HEAP_FREE: u32 = 0xF2;
+const RUX_HEAP_SIZE: u32 = 0xF3;
+
 /// Handle table tags — a per-task `nth` slot's object kind. Real
 /// handles are small indices (1-based) like the actual handle table;
 /// std handles come pre-bound from the PEB process parameters.
@@ -484,6 +494,27 @@ fn nt_query_dir(ctx: &mut UCtx) -> u64 {
     STATUS_SUCCESS
 }
 
+/// RUX_HEAP_ALLOC(f, sz) -> ptr|0: f != 0 is zero-memory.
+fn nt_heap_alloc_svc(ctx: &mut UCtx) -> u64 {
+    user::nt_heap_alloc(arg(ctx, 1), arg(ctx, 0) != 0).unwrap_or(0)
+}
+
+/// RUX_HEAP_REALLOC(p, sz, f) -> ptr|0.
+fn nt_heap_realloc_svc(ctx: &mut UCtx) -> u64 {
+    user::nt_heap_realloc(arg(ctx, 0), arg(ctx, 1), arg(ctx, 2) != 0)
+        .unwrap_or(0)
+}
+
+/// RUX_HEAP_FREE(p) -> BOOL.
+fn nt_heap_free_svc(ctx: &mut UCtx) -> u64 {
+    user::nt_heap_free(arg(ctx, 0)) as u64
+}
+
+/// RUX_HEAP_SIZE(p) -> size|SIZE_T(-1).
+fn nt_heap_size_svc(ctx: &mut UCtx) -> u64 {
+    user::nt_heap_size(arg(ctx, 0)).unwrap_or(u64::MAX)
+}
+
 /// NtSetInformationFile(handle, iosb, info, len, class):
 /// FilePositionInformation(14) sets the shared OFD position to an
 /// absolute offset — SetFilePointerEx pre-composes FILE_CURRENT /
@@ -666,6 +697,10 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         NT_ALLOCATE_VIRTUAL_MEMORY => nt_alloc_vm(ctx),
         NT_FREE_VIRTUAL_MEMORY => nt_free_vm(ctx),
         NT_DELAY_EXECUTION => nt_delay(ctx),
+        RUX_HEAP_ALLOC => nt_heap_alloc_svc(ctx),
+        RUX_HEAP_REALLOC => nt_heap_realloc_svc(ctx),
+        RUX_HEAP_FREE => nt_heap_free_svc(ctx),
+        RUX_HEAP_SIZE => nt_heap_size_svc(ctx),
         NT_TERMINATE_PROCESS => {
             // hProcess == (HANDLE)-1 means self; anything else is a
             // kill we don't model yet — the common case is self-exit.

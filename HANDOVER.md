@@ -2038,3 +2038,42 @@ guarded by len check, unknown k32 names honest-fail, stub
 page still drops to R-X after fill. cve.now: no applicable
 class hits. 21/21 suites 0 failures, 45 tasks, frames
 108568 -> 108568 zero leak, exit 33. Ledger: 112.
+
+run-112 — native Windows heap subsystem: PE tasks get a real
+process heap instead of page-per-alloc VirtualAlloc backing.
+The arena [HEAP_VA=STUB_DATA_VA+0x1000, HEAP_MAX=TEB_VA+0x40000,
+~236KiB) sits between the PE support pages and NT_ALLOC_VA
+(which moved to HEAP_MAX). Real Windows manages heaps in ntdll
+userspace (RtlAllocateHeap); ours is kernel-side: a 128-slot
+block table in Task ([addr,size,state] state 0/1/2), best-fit
+with split+coalesce, bump allocation with lazy page commit
+(USER|WRITE|NX), and only the committed prefix registered in
+ranges[] so range_ok rejects uncommitted heap VA. Win32 thunks
+marshal GetProcessHeap/HeapAlloc/HeapReAlloc/HeapFree/HeapSize
+plus HeapCreate (fake handle), inert TRUE stubs (Destroy/
+Validate/Lock/Unlock/Compact/Query/SetInformation), and
+Local/GlobalAlloc/Free; malloc/calloc/realloc/free/_msize and
+the ucrtbase _base spellings rewire onto the same private
+RUX_HEAP_* services (0xF0-0xF3), replacing the old malloc=
+VirtualAlloc-with-header path (VirtualAlloc/VirtualFree stay
+real). Double/invalid free returns FALSE — kernel metadata
+cannot be forged from userspace, so the classic heap
+exploitation class is structurally absent. Audit run-86 quick
+scoped: 3 confirmed + 1 semantic gap fixed pre-commit —
+HeapReAlloc thunk REX byte emitted `mov rax,r10` for
+`mov r8,rdx` (garbage zero-flag); nt_try_map honored a
+VirtualAlloc hint into the uncommitted heap tail (VA
+double-owner alias); heap_rng cached a ranges[] index that
+nt_free_pages compaction could silently re-point (now the
+committed range is found by arena base; field removed);
+in-place grow now zeroes the tail for HEAP_ZERO_MEMORY.
+winheap.exe is a real MinGW fixture exercising all of it
+(GetProcessHeap, HeapAlloc ZERO_MEMORY, grow-preserves,
+HeapSize, double-free rejection, block reuse, malloc/calloc/
+realloc/free+free(NULL)); it exits via the full success path
+(exit 23). Suite: 21/21 0 failures, 49 tasks, frames
+108481 -> 108481 zero leak, qemu exit 33. NOTE: winheap.exe is
+committed gzip-compressed (winheap.exe.gz, mkinitrd.py
+decompresses .gz sources) because the host AV (Kaspersky)
+quarantines the raw PE on sight — a storage workaround, not a
+kernel change. Ledger: 113.

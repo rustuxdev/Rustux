@@ -22,6 +22,12 @@ pub const STUB_VA: u64 = TEB_VA + 0x1000;
 /// FILE[], TLS slots, the ANSI->UTF-16 name scratch. Two pages of
 /// stub code: CRT-linked images resolve 40+ imports.
 pub const STUB_DATA_VA: u64 = STUB_VA + 0x3000;
+/// The process-heap arena: [HEAP_VA, HEAP_MAX), pages committed
+/// lazily as the bump allocator crosses them. Real Windows manages
+/// heaps in ntdll userspace (RtlAllocateHeap); our backing store is
+/// kernel-side — see the RUX_HEAP_* services in nt.rs.
+pub const HEAP_VA: u64 = STUB_DATA_VA + 0x1000;
+pub const HEAP_MAX: u64 = TEB_VA + 0x40000;
 
 const DOS_MAGIC: u16 = 0x5a4d; // "MZ"
 const PE_MAGIC: u32 = 0x0000_4550; // "PE\0\0"

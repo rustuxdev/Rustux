@@ -33,9 +33,9 @@ const PHYS_MASK: u64 = 0x000f_ffff_ffff_f000;
 pub const PERS_LINUX: u8 = 0;
 pub const PERS_NT: u8 = 1;
 
-/// NT anonymous-VM arena — above the PEB/TEB pages, still inside
-/// the user window and clear of the image bias.
-pub const NT_ALLOC_VA: u64 = crate::pe::TEB_VA + 0x10000;
+/// NT anonymous-VM arena — above the PEB/TEB/stub/heap pages,
+/// still inside the user window and clear of the image bias.
+pub const NT_ALLOC_VA: u64 = crate::pe::HEAP_MAX;
 
 const USTACK_VA: u64 = 0x5556_0000_0000;
 /// mmap's first-fit arena — 4 TiB of user window kept free of the
@@ -1399,6 +1399,16 @@ pub struct Task {
     /// Directory wildcard stored by the FileName arg of the first
     /// NtQueryDirectoryFile on a dir handle — [0]=len, [1..]=bytes.
     nth_dirpat: [[u8; 96]; crate::nt::MAX_NTH],
+    /// Process-heap block table: [addr, size, state] where state is
+    /// 0 empty / 1 live / 2 free-block. Kernel-side metadata means
+    /// an app can corrupt its heap CONTENTS but never the block
+    /// structure — invalid/double frees return FALSE like real
+    /// Windows instead of poisoning a userspace free list.
+    heap_blk: [[u64; 3]; 128],
+    /// Heap bump cursor (next unallocated VA) and committed top;
+    /// pages are mapped lazily as allocs cross HEAP_VA upward.
+    heap_bump: u64,
+    heap_commit: u64,
     /// NT anonymous-VM bump cursor — NtAllocateVirtualMemory
     /// hands out pages upward from NT_ALLOC_VA.
     nt_alloc: u64,
@@ -2329,6 +2339,9 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
     t.nth = [0; crate::nt::MAX_NTH];
     t.nth_fd = [0xff; crate::nt::MAX_NTH];
     t.nth_dirpat = [[0; 96]; crate::nt::MAX_NTH];
+    t.heap_blk = [[0; 3]; 128];
+    t.heap_bump = crate::pe::HEAP_VA;
+    t.heap_commit = crate::pe::HEAP_VA;
     t.nth[0] = crate::nt::NTH_STDIN;
     t.nth[1] = crate::nt::NTH_STDOUT;
     t.nth[2] = crate::nt::NTH_STDERR;
@@ -3337,52 +3350,131 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0xb8, 0x2c, 0, 0, 0, 0x0f, 0x05, 0xc3,
             ]);
         }
-        // malloc/calloc: NtAllocateVirtualMemory with a 16-byte
-        // size header so free() can recover the region extent.
-        b"malloc" => {
-            e.raw(&[0x48, 0x8d, 0x51, 0x10]); // lea rdx,[rcx+0x10]
-            e.raw(&[
-                0x48, 0x83, 0xec, 0x50,
-                0x48, 0xc7, 0x44, 0x24, 0x40, 0, 0, 0, 0,
-                0x48, 0x89, 0x54, 0x24, 0x48,
-                0x48, 0xc7, 0x44, 0x24, 0x28, 0x00, 0x30, 0, 0,
-                0x48, 0xc7, 0x44, 0x24, 0x30, 0x04, 0, 0, 0,
-            ]);
-            emit_valloc_tail(&mut e, true);
+        // --- heap: RUX_HEAP_* services back the Win32 heap API ---
+        // The block table is kernel-side; hHeap is ignored (one
+        // shared process heap, like real HeapAlloc on the default).
+        b"GetProcessHeap" => {
+            e.rax_imm(crate::pe::HEAP_VA);
+            e.raw(&[0xc3]);
         }
-        b"calloc" => {
-            e.raw(&[
-                0x48, 0x0f, 0xaf, 0xd1, // imul rdx,rcx
-                0x48, 0x83, 0xc2, 0x10, // add rdx,0x10
-                0x48, 0x83, 0xec, 0x50,
-                0x48, 0xc7, 0x44, 0x24, 0x40, 0, 0, 0, 0,
-                0x48, 0x89, 0x54, 0x24, 0x48,
-                0x48, 0xc7, 0x44, 0x24, 0x28, 0x00, 0x30, 0, 0,
-                0x48, 0xc7, 0x44, 0x24, 0x30, 0x04, 0, 0, 0,
-            ]);
-            emit_valloc_tail(&mut e, true);
+        // HeapCreate returns a fresh-looking fake handle; all our
+        // heap services ignore the handle arg (documented).
+        b"HeapCreate" => e.raw(&[0xb8, 2, 0, 0, 0, 0xc3]),
+        // Inert TRUE stubs — HeapWalk is intentionally absent so
+        // no caller can spin on a never-false iterator.
+        b"HeapDestroy" | b"HeapValidate" | b"HeapLock"
+        | b"HeapUnlock" | b"HeapCompact" | b"HeapQueryInformation"
+        | b"HeapSetInformation" => {
+            e.raw(&[0xb8, 1, 0, 0, 0, 0xc3]);
         }
-        // free(p): NtFreeVirtualMemory(-1,&base,&size,MEM_RELEASE)
-        // recovering the extent from the 16-byte malloc header.
-        b"free" => {
+        // HeapAlloc(h,f,sz) -> RUX_HEAP_ALLOC(f&HEAP_ZERO_MEMORY,sz).
+        b"HeapAlloc" => {
+            e.raw(&[
+                0x83, 0xe2, 0x08, //         and edx,8
+                0x49, 0x89, 0xd2, //         mov r10,rdx
+                0x4c, 0x89, 0xc2, //         mov rdx,r8
+                0xb8, 0xf0, 0, 0, 0, //     mov eax,0xF0
+                0x0f, 0x05, 0xc3,
+            ]);
+        }
+        // HeapReAlloc(h,f,p,s) -> RUX_HEAP_REALLOC(p,s,f&8). Order
+        // matters: save lpMem before clobbering r8 with the flag.
+        b"HeapReAlloc" => {
+            e.raw(&[
+                0x4d, 0x89, 0xc2, //         mov r10,r8
+                0x49, 0x89, 0xd0, //         mov r8,rdx
+                0x49, 0x83, 0xe0, 0x08, //   and r8,8
+                0x4c, 0x89, 0xca, //         mov rdx,r9
+                0xb8, 0xf1, 0, 0, 0, //     mov eax,0xF1
+                0x0f, 0x05, 0xc3,
+            ]);
+        }
+        // HeapFree/HeapSize(h,f,p) — ptr is the third arg.
+        b"HeapFree" => {
+            e.raw(&[
+                0x4d, 0x89, 0xc2, //         mov r10,r8
+                0xb8, 0xf2, 0, 0, 0, //     mov eax,0xF2
+                0x0f, 0x05, 0xc3,
+            ]);
+        }
+        b"HeapSize" => {
+            e.raw(&[
+                0x4d, 0x89, 0xc2, //         mov r10,r8
+                0xb8, 0xf3, 0, 0, 0, //     mov eax,0xF3
+                0x0f, 0x05, 0xc3,
+            ]);
+        }
+        // Local/GlobalAlloc(uFlags, uBytes): LMEM_ZEROINIT is 0x40.
+        b"LocalAlloc" | b"GlobalAlloc" => {
+            e.raw(&[
+                0x83, 0xe1, 0x40, //         and ecx,0x40
+                0x49, 0x89, 0xca, //         mov r10,rcx
+                0xb8, 0xf0, 0, 0, 0, //     mov eax,0xF0
+                0x0f, 0x05, 0xc3,
+            ]);
+        }
+        b"LocalFree" | b"GlobalFree" => {
             e.raw(&[0x48, 0x85, 0xc9]); // test rcx,rcx
-            let done = e.jcc(0x4); //       jz ret
+            let done = e.jcc(0x4); //       jz ret (NULL is a no-op)
             e.raw(&[
-                0x48, 0x8d, 0x41, 0xf0, // lea rax,[rcx-0x10]
-                0x48, 0x8b, 0x49, 0xf8, // mov rcx,[rcx-8]
-                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
-                0x48, 0x89, 0x44, 0x24, 0x28, // base cell
-                0x48, 0x89, 0x4c, 0x24, 0x30, // size cell
-                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // r10=-1
-                0x48, 0x8d, 0x54, 0x24, 0x28, // lea rdx,[rsp+0x28]
-                0x4c, 0x8d, 0x44, 0x24, 0x30, // lea r8,[rsp+0x30]
-                0x41, 0xb9, 0x00, 0x80, 0, 0, // mov r9d,0x8000
-                0xb8, 0x1e, 0, 0, 0, //       mov eax,0x1E
-                0x0f, 0x05, //                syscall
-                0x48, 0x83, 0xc4, 0x38, //    add rsp,0x38
+                0x49, 0x89, 0xca, //         mov r10,rcx
+                0xb8, 0xf2, 0, 0, 0, //     mov eax,0xF2
+                0x0f, 0x05,
             ]);
             e.fix(done);
             e.raw(&[0xc3]);
+        }
+        // msvcrt allocators — same heap, plus the ucrtbase _base
+        // spellings real CRTs also import.
+        // malloc(sz) -> alloc(0, sz).
+        b"malloc" | b"_malloc_base" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //         mov rdx,rcx
+                0x45, 0x31, 0xd2, //         xor r10d,r10d
+                0xb8, 0xf0, 0, 0, 0, //     mov eax,0xF0
+                0x0f, 0x05, 0xc3,
+            ]);
+        }
+        // calloc(n,sz) -> alloc(1, n*sz) with an overflow trap.
+        b"calloc" | b"_calloc_base" => {
+            e.raw(&[0x48, 0x0f, 0xaf, 0xd1]); // imul rdx,rcx
+            let ovf = e.jcc(0x0); //           jo fail
+            e.raw(&[
+                0x41, 0xba, 1, 0, 0, 0, //   mov r10d,1
+                0xb8, 0xf0, 0, 0, 0, //     mov eax,0xF0
+                0x0f, 0x05, 0xc3,
+            ]);
+            e.fix(ovf);
+            e.raw(&[0x31, 0xc0, 0xc3]);
+        }
+        // realloc(p,s) -> realloc(p, s, 0).
+        b"realloc" | b"_realloc_base" => {
+            e.raw(&[
+                0x49, 0x89, 0xca, //         mov r10,rcx
+                0x45, 0x31, 0xc0, //         xor r8d,r8d
+                0xb8, 0xf1, 0, 0, 0, //     mov eax,0xF1
+                0x0f, 0x05, 0xc3,
+            ]);
+        }
+        // free(p): NULL is a no-op before the syscall.
+        b"free" | b"_free_base" => {
+            e.raw(&[0x48, 0x85, 0xc9]); // test rcx,rcx
+            let done = e.jcc(0x4); //       jz ret
+            e.raw(&[
+                0x49, 0x89, 0xca, //         mov r10,rcx
+                0xb8, 0xf2, 0, 0, 0, //     mov eax,0xF2
+                0x0f, 0x05,
+            ]);
+            e.fix(done);
+            e.raw(&[0xc3]);
+        }
+        // _msize(p) -> HeapSize equivalent.
+        b"_msize" => {
+            e.raw(&[
+                0x49, 0x89, 0xca, //         mov r10,rcx
+                0xb8, 0xf3, 0, 0, 0, //     mov eax,0xF3
+                0x0f, 0x05, 0xc3,
+            ]);
         }
         // strlen/memcpy/strncmp — real C-string routines.
         b"strlen" => {
@@ -3946,6 +4038,9 @@ fn load(img: &[u8]) -> Option<Task> {
         nth: [0; crate::nt::MAX_NTH],
         nth_fd: [0xff; crate::nt::MAX_NTH],
         nth_dirpat: [[0; 96]; crate::nt::MAX_NTH],
+        heap_blk: [[0; 3]; 128],
+        heap_bump: 0,
+        heap_commit: 0,
         nt_alloc: 0,
         stop_sig: 0,
         cont_report: false,
@@ -6954,6 +7049,12 @@ fn nt_try_map(t: &mut Task, va: u64, size: u64) -> Option<u64> {
     if va < elf::USER_VA_LO || va + size >= elf::USER_VA_HI || va + size <= va {
         return None;
     }
+    // The heap owns its whole arena, committed or not — a
+    // VirtualAlloc hint must never alias a future heap block
+    // (only the committed prefix is a registered range).
+    if va < crate::pe::HEAP_MAX && va + size > crate::pe::HEAP_VA {
+        return None;
+    }
     // Reject any overlap with an existing range -- mmap's arena
     // must not hand the NT layer a page a VMA already owns.
     for i in 0..t.nranges {
@@ -7014,6 +7115,12 @@ pub fn nt_free_pages(base: u64, size: u64) {
             i += 1;
             continue;
         }
+        // The heap arena is owned by HeapAlloc/HeapFree, not
+        // VirtualFree — a range inside [HEAP_VA,HEAP_MAX) skips.
+        if lo >= crate::pe::HEAP_VA && hi <= crate::pe::HEAP_MAX {
+            i += 1;
+            continue;
+        }
         let mut va = lo.max(base);
         let vend = hi.min(end);
         while va < vend {
@@ -7046,6 +7153,219 @@ pub fn nt_free_pages(base: u64, size: u64) {
             t.nranges -= 1;
         }
     }
+}
+
+/// Map heap pages up to `to` (page-rounded) and grow the registered
+/// arena range so range_ok sees exactly the committed region —
+/// never the reserved tail, so a bad pointer can't make the kernel
+/// write an uncommitted heap page on the task's behalf.
+fn heap_commit_to(t: &mut Task, to: u64) -> bool {
+    let to = (to + PAGE - 1) & !(PAGE - 1);
+    if to <= t.heap_commit {
+        return true;
+    }
+    if to > crate::pe::HEAP_MAX {
+        return false;
+    }
+    let mut va = t.heap_commit;
+    while va < to {
+        if map_page(t, va, USER | WRITE | NX).is_none() {
+            return false;
+        }
+        va += PAGE;
+    }
+    t.heap_commit = to;
+    // The committed-prefix range is found by its arena base, not a
+    // cached index — nt_free_pages compacts the ledger and would
+    // silently re-point any slot index we stored.
+    if let Some(i) = t.ranges[..t.nranges]
+        .iter()
+        .position(|r| r.0 == crate::pe::HEAP_VA)
+    {
+        t.ranges[i].1 = to;
+    } else {
+        if t.nranges >= MAX_RANGES {
+            return false;
+        }
+        t.ranges[t.nranges] = (crate::pe::HEAP_VA, to, RNG_R | RNG_W);
+        t.nranges += 1;
+    }
+    true
+}
+
+/// HeapAlloc backing: best-fit over free blocks in the kernel block
+/// table, else bump-allocate while lazily committing pages. `zero`
+/// implements HEAP_ZERO_MEMORY. The arena lives at
+/// [HEAP_VA,HEAP_MAX) — block metadata stays kernel-side, so heap
+/// structure is unforgeable from user space.
+pub fn nt_heap_alloc(size: u64, zero: bool) -> Option<u64> {
+    if size >= crate::pe::HEAP_MAX - crate::pe::HEAP_VA {
+        return None;
+    }
+    let want = size.max(1) + 15 & !15;
+    let t = cur_mut()?;
+    let mut best = usize::MAX;
+    for i in 0..t.heap_blk.len() {
+        let b = t.heap_blk[i];
+        if b[2] == 2
+            && b[1] >= want
+            && (best == usize::MAX || b[1] < t.heap_blk[best][1])
+        {
+            best = i;
+        }
+    }
+    if best != usize::MAX {
+        let b = t.heap_blk[best];
+        let rem = b[1] - want;
+        if rem >= 32 {
+            // Split: this entry becomes the live `want` block, the
+            // remainder lands in an empty slot — or the whole block
+            // is taken when the table is full.
+            if let Some(slot) =
+                t.heap_blk.iter().position(|e| e[2] == 0)
+            {
+                t.heap_blk[best] = [b[0], want, 1];
+                t.heap_blk[slot] = [b[0] + want, rem, 2];
+            } else {
+                t.heap_blk[best][2] = 1;
+            }
+        } else {
+            t.heap_blk[best][2] = 1;
+        }
+        if zero {
+            // SAFETY: inside the committed heap arena, our cr3.
+            unsafe { core::ptr::write_bytes(b[0] as *mut u8, 0, want as usize) };
+        }
+        return Some(b[0]);
+    }
+    let slot = t.heap_blk.iter().position(|e| e[2] == 0)?;
+    let va = t.heap_bump;
+    if va + want > crate::pe::HEAP_MAX || !heap_commit_to(t, va + want) {
+        return None;
+    }
+    t.heap_blk[slot] = [va, want, 1];
+    t.heap_bump = va + want;
+    if zero {
+        unsafe { core::ptr::write_bytes(va as *mut u8, 0, want as usize) };
+    }
+    Some(va)
+}
+
+/// HeapFree: mark the live block free and coalesce with adjacent
+/// free blocks — the table scan is bounded by the fixed 128 slots.
+/// FALSE when `ptr` isn't a live heap block, which is also real
+/// Windows' answer to an invalid or double free.
+pub fn nt_heap_free(ptr: u64) -> bool {
+    if ptr == 0 {
+        return false;
+    }
+    let Some(t) = cur_mut() else { return false };
+    let Some(i) = t
+        .heap_blk
+        .iter()
+        .position(|e| e[2] == 1 && e[0] == ptr)
+    else {
+        return false;
+    };
+    t.heap_blk[i][2] = 2;
+    loop {
+        let (a, s) = (t.heap_blk[i][0], t.heap_blk[i][1]);
+        let mut merged = false;
+        for j in 0..t.heap_blk.len() {
+            if j == i || t.heap_blk[j][2] != 2 {
+                continue;
+            }
+            let (ja, js) = (t.heap_blk[j][0], t.heap_blk[j][1]);
+            if ja + js == a {
+                t.heap_blk[i] = [ja, s + js, 2];
+            } else if a + s == ja {
+                t.heap_blk[i][1] = s + js;
+            } else {
+                continue;
+            }
+            t.heap_blk[j][2] = 0;
+            merged = true;
+            break;
+        }
+        if !merged {
+            return true;
+        }
+    }
+}
+
+/// HeapSize: the live block's granted size, or None when `ptr`
+/// isn't a live heap block (the thunk maps that to SIZE_T(-1)).
+pub fn nt_heap_size(ptr: u64) -> Option<u64> {
+    let t = cur_mut()?;
+    t.heap_blk
+        .iter()
+        .find(|e| e[2] == 1 && e[0] == ptr)
+        .map(|e| e[1])
+}
+
+/// HeapReAlloc: shrink splits the tail into a free block; grow
+/// absorbs the adjacent free block when it covers the delta, else
+/// alloc-copy-free. `size == 0` collapses to the minimum block
+/// (real Windows' treatment is implementation-defined — ours keeps
+/// a valid pointer, the least surprising answer for callers that
+/// use realloc(p,0) as shrink-to-fit).
+pub fn nt_heap_realloc(ptr: u64, size: u64, zero: bool) -> Option<u64> {
+    if ptr == 0 {
+        return nt_heap_alloc(size, zero);
+    }
+    let want = size.max(1) + 15 & !15;
+    // Shrink/grow-in-place paths return early; needing a move
+    // falls through with `old` bound for the copy.
+    let old = {
+        let t = cur_mut()?;
+        let i = t.heap_blk.iter().position(|e| e[2] == 1 && e[0] == ptr)?;
+        let old = t.heap_blk[i][1];
+        if want <= old {
+            if old - want >= 32 {
+                if let Some(slot) =
+                    t.heap_blk.iter().position(|e| e[2] == 0)
+                {
+                    t.heap_blk[slot] = [ptr + want, old - want, 2];
+                    t.heap_blk[i][1] = want;
+                }
+            }
+            return Some(ptr);
+        }
+        if let Some(j) = t
+            .heap_blk
+            .iter()
+            .position(|e| e[2] == 2 && e[0] == ptr + old)
+        {
+            if t.heap_blk[j][1] >= want - old {
+                let rem = t.heap_blk[j][1] - (want - old);
+                if rem >= 32 {
+                    t.heap_blk[j] = [ptr + want, rem, 2];
+                    t.heap_blk[i][1] = want;
+                } else {
+                    t.heap_blk[i][1] = old + t.heap_blk[j][1];
+                    t.heap_blk[j][2] = 0;
+                }
+                if zero {
+                    // HEAP_ZERO_MEMORY zeroes the grown tail.
+                    // SAFETY: inside the committed heap arena.
+                    unsafe {
+                        core::ptr::write_bytes(
+                            (ptr + old) as *mut u8,
+                            0,
+                            (want - old) as usize,
+                        )
+                    };
+                }
+                return Some(ptr);
+            }
+        }
+        old
+    };
+    let n = nt_heap_alloc(size, zero)?;
+    // SAFETY: both blocks live in the committed heap arena.
+    unsafe { core::ptr::copy(ptr as *const u8, n as *mut u8, old.min(size) as usize) };
+    nt_heap_free(ptr);
+    Some(n)
 }
 
 /// NtDelayExecution backing: pure deadline wait in 10ms ticks, the
@@ -14798,6 +15118,9 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         nth: p.nth,
         nth_fd: p.nth_fd,
         nth_dirpat: p.nth_dirpat,
+        heap_blk: p.heap_blk,
+        heap_bump: p.heap_bump,
+        heap_commit: p.heap_commit,
         nt_alloc: p.nt_alloc,
         stop_sig: 0,
         cont_report: false,
@@ -14965,6 +15288,9 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         nth: p.nth,
         nth_fd: p.nth_fd,
         nth_dirpat: p.nth_dirpat,
+        heap_blk: p.heap_blk,
+        heap_bump: p.heap_bump,
+        heap_commit: p.heap_commit,
         nt_alloc: p.nt_alloc,
         stop_sig: 0,
         cont_report: false,
