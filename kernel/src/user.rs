@@ -7502,8 +7502,10 @@ pub fn task_is_nt() -> bool {
 }
 
 /// nt::NTH_* tag for handle h (1-based slot), 0 when free/invalid.
+/// Windows handles are process objects: an NT thread resolves the
+/// leader's table so a handle opened by any thread works for all.
 pub fn nt_handle_kind(h: u64) -> u8 {
-    let Some(t) = cur_mut() else { return 0 };
+    let Some(t) = mm_owner_mut() else { return 0 };
     if h == 0 || h > crate::nt::MAX_NTH as u64 {
         return 0;
     }
@@ -7514,7 +7516,7 @@ pub fn nt_handle_kind(h: u64) -> u8 {
 /// slot owns first. Free slots and out-of-range handles fail
 /// like a real INVALID_HANDLE.
 pub fn nt_handle_close(h: u64) -> bool {
-    let Some(t) = cur_mut() else { return false };
+    let Some(t) = mm_owner_mut() else { return false };
     if h == 0 || h > crate::nt::MAX_NTH as u64 {
         return false;
     }
@@ -7536,7 +7538,7 @@ pub fn nt_handle_close(h: u64) -> bool {
 /// Bind the first free handle slot to task fd `fd` (NTH_FILE) and
 /// return its 1-based handle, or None when the table is full.
 pub fn nt_handle_alloc_file(fd: u64) -> Option<u64> {
-    let t = cur_mut()?;
+    let t = mm_owner_mut()?;
     for i in 0..crate::nt::MAX_NTH {
         if t.nth[i] == 0 {
             t.nth[i] = crate::nt::NTH_FILE;
@@ -7550,7 +7552,7 @@ pub fn nt_handle_alloc_file(fd: u64) -> Option<u64> {
 
 /// The task fd an NTH_FILE handle resolves to.
 pub fn nt_handle_fd(h: u64) -> Option<u64> {
-    let t = cur_mut()?;
+    let t = mm_owner_mut()?;
     if h == 0 || h > crate::nt::MAX_NTH as u64 {
         return None;
     }
@@ -7683,14 +7685,14 @@ pub fn nt_thr_resume(tid: u64) -> u64 {
 /// True while at least one handle slot is free — CreateThreadEx
 /// pre-checks so a created thread can't outlive its missing handle.
 pub fn nt_handle_free_slot() -> bool {
-    cur_mut().is_some_and(|t| t.nth.iter().any(|&s| s == 0))
+    mm_owner_mut().is_some_and(|t| t.nth.iter().any(|&s| s == 0))
 }
 
-/// Bind a thread-object handle in the current task's nth table; the
+/// Bind a thread-object handle in the process handle table; the
 /// slot's nth_fd byte carries the NT_THREADS ledger index.
 pub fn nt_handle_alloc_thread(idx: usize) -> Option<u64> {
     let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_THREADS) };
-    let t = cur_mut()?;
+    let t = mm_owner_mut()?;
     for i in 0..crate::nt::MAX_NTH {
         if t.nth[i] == 0 {
             t.nth[i] = crate::nt::NTH_THREAD;
@@ -7704,7 +7706,7 @@ pub fn nt_handle_alloc_thread(idx: usize) -> Option<u64> {
 
 /// The NT_THREADS index an NTH_THREAD handle names.
 pub fn nt_handle_thr_idx(h: u64) -> Option<usize> {
-    let t = cur_mut()?;
+    let t = mm_owner_mut()?;
     if h == 0 || h > crate::nt::MAX_NTH as u64 {
         return None;
     }
@@ -7840,9 +7842,13 @@ pub fn nt_thread_create(
         did_exec: false,
         pers: p.pers,
         gs_base: teb,
-        nth: p.nth,
-        nth_fd: p.nth_fd,
-        nth_dirpat: p.nth_dirpat,
+        // Windows handles are process objects: the table lives on
+        // the leader only (mm_owner routes there), so a thread's
+        // own nth must stay empty — a copied snapshot could be
+        // consulted by nothing but would look alive.
+        nth: [0; crate::nt::MAX_NTH],
+        nth_fd: [0xff; crate::nt::MAX_NTH],
+        nth_dirpat: [[0; 96]; crate::nt::MAX_NTH],
         heap_blk: p.heap_blk,
         heap_bump: p.heap_bump,
         heap_commit: p.heap_commit,
@@ -7989,7 +7995,7 @@ fn wild_match(pat: &[u8], name: &[u8]) -> bool {
 /// Store the FileName wildcard an NtQueryDirectoryFile carried on
 /// dir handle `h` — later pattern-less calls reuse it.
 pub fn nt_dir_pattern_set(h: u64, pat: &[u8]) {
-    let Some(t) = cur_mut() else { return };
+    let Some(t) = mm_owner_mut() else { return };
     let i = h as usize;
     if i == 0
         || i > crate::nt::MAX_NTH
@@ -8005,7 +8011,7 @@ pub fn nt_dir_pattern_set(h: u64, pat: &[u8]) {
 /// Copy the stored wildcard out; 0 len when unset — wild_match
 /// treats that as match-all, which is the right default anyway.
 pub fn nt_dir_pattern(h: u64, out: &mut [u8; 96]) -> usize {
-    let Some(t) = cur_mut() else { return 0 };
+    let Some(t) = mm_owner_mut() else { return 0 };
     let i = h as usize;
     if i == 0 || i > crate::nt::MAX_NTH || t.nth[i - 1] != crate::nt::NTH_FILE
     {

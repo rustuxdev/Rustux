@@ -2245,3 +2245,30 @@ CREATE_SUSPENDED times out at 50ms then ResumeThread runs it to
 exit 9, CloseHandle on all handles. Suite: 21/21 0 failures,
 52 tasks, frames 108475 -> 108475 zero leak, qemu exit 33.
 Ledger: 116.
+
+Run-116 (this session): process-wide NT handle table.
+Windows handles are process objects, but run-115 left them
+per-task — a thread got INVALID_HANDLE for anything the leader
+opened. All nine nth helpers (nt_handle_kind/close/alloc_file/
+fd/free_slot/alloc_thread/thr_idx plus nt_dir_pattern{,_set})
+now resolve through mm_owner_mut, so an NT non-leader defers
+to the task slot whose pid == tgid — the same routing the
+run-115 ledger fix established for ranges/heap. The child's
+own nth is zeroed at create instead of snapshotting the
+parent's: nothing can consult it, and a table that looked
+alive but wasn't would be worse than an honest empty one.
+NTH_FILE close works unchanged because fd_close resolves the
+calling task's shared fdi — same OFD slot, ref drops once.
+Verified by construction: leader-reaped resolves None ->
+INVALID_HANDLE rather than a freed-slot touch; NtClose is
+atomic on the single CPU so close-vs-close can't double
+refdown; a waiter holds the ledger IDX so close-vs-wait
+yields STATUS_INVALID_HANDLE, never a UAF. One honest
+divergence recorded: leader reaped while threads still run
+drops the whole handle table (real Windows keeps it in the
+process object until the last thread dies). The joiner
+thread in winthr now Waits on h0 — a handle the leader
+opened — and reads its exit code; exit(37). Audit run-90
+quick scoped: no confirmed findings. Suite: 21/21 0
+failures, 52 tasks, frames 108477 -> 108477 zero leak,
+qemu exit 33. Ledger: 117.
