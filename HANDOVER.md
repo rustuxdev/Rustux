@@ -2539,3 +2539,60 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
 - Suite: 59 tasks, frames 108432 -> 108432 zero leak, qemu exit 33.
   windexit 42, windetach 41, winstatic 36, winchain 34,
   windlltest 33 all regression-clean.
+
+## run-123b/123c — module-table hygiene (a99cf48, 5d7dba5)
+
+- 123b: NT module slots are released at leader exit — without it the
+  8-slot ledger filled with zombie-owned entries across fixtures.
+- 123c: NT_MODS widened 8 -> 16 and dep_mask u8 -> u32; six concurrent
+  DLL fixtures holding ~2 modules each exceeded 8 live slots even with
+  the exit-time release.
+
+## run-124 — PE TLS callbacks through process/thread lifecycle (this commit)
+
+- MinGW's CRT keeps its __thread destructor list behind a TLS callback;
+  without firing PIMAGE_TLS_CALLBACK arrays the loader diverged from
+  real ntdll on every notification. New emitted helpers:
+  emit_tls_walk (generic NULL-terminated PIMAGE_TLS_CALLBACK walk),
+  emit_tls_cb_walk (per-module: reads the TLS directory at
+  peoff+0xd0, relocates AddressOfCallBacks, bounds-checks the array
+  inside the image — lower bound cbs>=base plus wrap-safe size compare),
+  emit_exe_tls (exe array published at STUB_DATA_VA+0x108 by
+  pe_tls_init, cleared when tls_rva==0).
+- Callbacks run BEFORE the matching DllMain on every notification:
+  process attach/detach and thread attach/detach, for statically
+  imported deps and LoadLibrary modules alike. Verified against real
+  Win11 ntdll with a purpose-built PE (exe + 2 DLLs logging order):
+  per-module TLS-before-DllMain, forward attach / reverse detach, and
+  exe callbacks LAST on both thread reasons (the loader skips the exe's
+  ldr entry and handles it separately).
+- TLS index allocation moved to a process-global bitmap at
+  STUB_DATA_VA+0x1f8 (lock bts / lock btr). The old per-thread bitmap
+  let a worker re-issue index 1 already owned by the CRT's dtor list —
+  TlsSetValue then corrupted the list and the detach destructor
+  dereferenced a raw integer (winthr crash, cr2=0xa0). TlsAlloc and
+  TlsFree now also zero the freed/allocated slot in the calling thread
+  (kills stale-value reuse); TlsFree honors btr's CF and fails on an
+  unallocated index. Divergence: Windows clears the slot in EVERY
+  thread; ours clears only the freeing thread's (needs a TEB walk —
+  recorded as audit NV).
+- nt_mod_add now inserts after the owner's last LIVE module instead of
+  the first free slot — slot reuse from dead-owner sweeps could place a
+  later LoadLibrary ahead of an earlier one, flipping drain order
+  nondeterministically (winthrnt's seq probe caught "CcBbBbCc").
+  Free test tightened refs==0 -> base==0.
+- pe_tls_init / emit_tls_tramp bounds rewritten in subtract form
+  (x>=bias && x-bias<=size-k) — the add form could wrap u64 for
+  file-controlled VAs near 2^64.
+- die_signal gained a sig-death printk — signal-killed tasks previously
+  exited with no log line at all.
+- Suite: qemu exit 33; all PE fixtures green incl winthrnt exit(43)
+  and winthr exit(37) across repeated runs. The intermittent
+  "wait failed"/vanished-fixture mysteries were resolved: ordering bug
+  above + a serial ring-buffer replay artifact (duplicated lines share
+  pid/timestamp), not task deaths.
+- Audit run-80 standard scoped: clean, 7/7 coverage units, 0 confirmed.
+  needs_validation: pre-existing nt_detach_fin unreachable-promotion
+  slot leak (DllMain(DETACH) re-entrant FreeLibrary drops a dep to
+  refs==0 mid-cascade; promoted entries are unreachable — unchanged
+  adjacent code); TlsFree cross-thread slot clear divergence.
