@@ -1928,3 +1928,47 @@ EEXIST + EINVAL + a working mknod'd node, getdents DT_CHR.
 21/21 suites 0 failures, 42 tasks, frames 108572 -> 108572
 zero leak, exit 33. Ledger: 111.
 
+run-106 — Windows-personality groundwork: a real PE32+ .exe
+now spawns under a second syscall personality. Task gains
+pers (PERS_LINUX/PERS_NT), gs_base, an 8-slot NT handle
+table (nth), and nt_alloc (NT VA bump arena). load()/exec()
+detect MZ and branch to pe_load_inner: headers page at
+PE_LOAD_BIAS (= elf::USER_VA_LO), sections mapped per
+IMAGE_SCN flags (W->WRITE, !X->NX), USTACK stack, then
+teb_peb_init mints TEB (gs:[0x30]=Self, gs:[0x60]=PEB) and
+PEB (ImageBaseAddress, ProcessParameters block with std
+handles + a real UNICODE_STRING command line). gs_base is
+restored on every context switch beside fs_base — Windows
+reads TEB via GS, Linux keeps FS for TLS. syscall.rs routes
+on pers before the Linux table unpacks rdi-args: NT calls
+carry r10=arg1, rdx/r8/r9, stack args at rsp+0x28, and get
+NTSTATUS back — the REAL ntdll stub convention (ntdll does
+mov r10,rcx so syscall entry sees arg1 in r10). nt.rs is a
+Win10-x64-numbered service table: NtReadFile(6)/NtWriteFile
+(8)/NtClose(15)/NtAllocateVirtualMemory(24)/NtTerminate
+Process(44)/NtDelayExecution(52); everything else answers
+STATUS_NOT_IMPLEMENTED. Std handles 1/2/3 are PEB-published
+and share the Linux ldisc/console paths — no parallel I/O
+stack. exec-of-.exe swaps personalities mid-task (mm_release
+prologue shared, PE branch after did_exec). tools/mkpe.py
+wraps a flat blob into a minimal PE32+ (MZ, PE sig, COFF,
+PE32+ opt header, one RWX .text); petest.S assembles to
+that blob. Audit (run-80, quick, scoped): 2 fixes —
+NtAllocateVirtualMemory's out-pointers were probe-checked
+read-only (range_ok) but written through — now range_ok_w;
+the PE loader's kernel fill used write_task_bytes which only
+translates writable pages — now _force for headers+sections
+(else read-only .text rejects the copy). nth table zeroed
+per image so exec can't leak handles. cve.now: no PE-loader
+class CVEs apply (single hit CVE-2025-22060 is a NIC TCAM
+race, n/a). Divergences noted: imports/relocs rejected at
+parse (import-less images only), image loads at PE_LOAD_BIAS
+not ImageBase (reloc-aware rebasing deferred), NtReadFile
+on an NT stdin handle still runs the POSIX pgrp gate inside
+tty_input_read (kill_pgrp could signal an NT task — logged,
+not reachable without a real NT console reader yet).
+petest boots in QEMU: 'NT personality + TEB OK' (gs:[0x30]
+read), NtAllocateVirtualMemory commit touched+verified,
+NtDelayExecution 10ms sleep, NtTerminateProcess — real .exe,
+no shim, no Wine. 21/21 suites 0 failures, 43 tasks, frames
+108572 -> 108572 zero leak, exit 33. Ledger: 112.

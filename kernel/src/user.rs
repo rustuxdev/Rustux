@@ -29,6 +29,14 @@ const NX: u64 = 1 << 63;
 const PHYS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 /// User stack: 16 pages high in the user window.
+/// Syscall personalities — Task.pers selects the dispatch table.
+pub const PERS_LINUX: u8 = 0;
+pub const PERS_NT: u8 = 1;
+
+/// NT anonymous-VM arena — above the PEB/TEB pages, still inside
+/// the user window and clear of the image bias.
+pub const NT_ALLOC_VA: u64 = crate::pe::TEB_VA + 0x10000;
+
 const USTACK_VA: u64 = 0x5556_0000_0000;
 /// mmap's first-fit arena — 4 TiB of user window kept free of the
 /// ELF image (~0x4000…) and the stack (0x5556…).
@@ -1374,6 +1382,21 @@ pub struct Task {
     /// Exec'd at least once since fork — blocks a parent's later
     /// setpgid on it (Linux's EACCES rule).
     did_exec: bool,
+    /// Syscall personality: PERS_LINUX (the whole table above) or
+    /// PERS_NT (nt::dispatch — NTSTATUS, r10-arg1, stack args at
+    /// rsp+0x28). Set by the image format at exec/spawn.
+    pers: u8,
+    /// The task's user GS base — NT tasks point it at their TEB
+    /// page (Windows threads read TEB fields via gs:[]); restored
+    /// to MSR_GS_BASE on every switch like fs_base.
+    gs_base: u64,
+    /// NT handle table — small indices like the real one; slots
+    /// hold nt::NTH_* object tags. Fork copies it (a cloned
+    /// handle stays open in the child like DuplicateHandle).
+    nth: [u8; crate::nt::MAX_NTH],
+    /// NT anonymous-VM bump cursor — NtAllocateVirtualMemory
+    /// hands out pages upward from NT_ALLOC_VA.
+    nt_alloc: u64,
     /// The signal that stopped this task (0 = not stop-reported).
     /// wait4 WUNTRACED consumes it once per stop.
     stop_sig: u8,
@@ -2167,6 +2190,145 @@ fn load_inner(t: &mut Task, e: &elf::Elf, img: &[u8]) -> bool {
     true
 }
 
+/// PE32+ counterpart to load_inner: sections map at the image bias
+/// with per-section permissions, then TEB/PEB pages + a stack land
+/// above it. The NT task gets no auxv — it reads its own PEB.
+fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
+    t.brk_base = 0;
+    t.brk_cur = 0;
+    let kpml4 = cpu::read_cr3() & !0xfff;
+    for i in 0..512u64 {
+        let ent = rd64(kpml4 + 8 * i);
+        if ent & PRESENT != 0 {
+            wr64(t.pml4 + 8 * i, ent);
+        }
+    }
+    // The headers page maps too — real Windows maps the whole image
+    // including DOS/PE headers at the base.
+    if map_page(t, p.bias, USER | NX).is_none() {
+        return false;
+    }
+    let hdrlen = (p.sections[0].raw as usize).min(img.len()).min(4096);
+    if !write_task_bytes_force(t.pml4, p.bias, &img[..hdrlen]) {
+        return false;
+    }
+    for s in p.sections.iter().take(p.nsec) {
+        let va0 = (p.bias + s.va) & !0xfff;
+        let va1 = (p.bias + s.va + s.vsize.max(1) + 0xfff) & !0xfff;
+        // IMAGE_SCN_MEM_{EXECUTE,READ,WRITE} → our page flags.
+        let mut fl = USER;
+        if s.chars & 0x8000_0000 != 0 {
+            fl |= WRITE;
+        }
+        if s.chars & 0x2000_0000 == 0 {
+            fl |= NX;
+        }
+        for va in (va0..va1).step_by(4096) {
+            if map_page(t, va, fl).is_none() {
+                return false;
+            }
+        }
+        if !write_task_bytes_force(
+            t.pml4,
+            p.bias + s.va,
+            &img[s.raw as usize..(s.raw + s.raw_len) as usize],
+        ) {
+            return false;
+        }
+        if t.nranges >= MAX_RANGES {
+            return false;
+        }
+        let mut rfl = 0u8;
+        if s.chars & 0x4000_0000 != 0 {
+            rfl |= RNG_R;
+        }
+        if s.chars & 0x8000_0000 != 0 {
+            rfl |= RNG_W;
+        }
+        if s.chars & 0x2000_0000 != 0 {
+            rfl |= RNG_X;
+        }
+        t.ranges[t.nranges] = (va0, va1, rfl);
+        t.nranges += 1;
+    }
+    for i in 0..USTACK_PAGES {
+        if map_page(t, USTACK_VA + i * PAGE, USER | WRITE | NX).is_none() {
+            return false;
+        }
+    }
+    t.stack_top = USTACK_VA + USTACK_PAGES * PAGE;
+    if t.nranges >= MAX_RANGES {
+        return false;
+    }
+    t.ranges[t.nranges] = (USTACK_VA, t.stack_top, RNG_R | RNG_W);
+    t.nranges += 1;
+    if !teb_peb_init(t, p) {
+        return false;
+    }
+    t.pers = PERS_NT;
+    t.gs_base = crate::pe::TEB_VA;
+    t.nt_alloc = NT_ALLOC_VA;
+    // Std handles are PEB-published NT handles, not fds — the NT
+    // task's fd table stays empty (its std streams are handles
+    // 1/2/3 in nth, resolved by the NT syscall layer). The table is
+    // zeroed first: exec reuses the task and must not leak a prior
+    // image's handles into the new one.
+    t.nth = [0; crate::nt::MAX_NTH];
+    t.nth[0] = crate::nt::NTH_STDIN;
+    t.nth[1] = crate::nt::NTH_STDOUT;
+    t.nth[2] = crate::nt::NTH_STDERR;
+    true
+}
+
+/// Write the minimal TEB/PEB a Windows binary's startup reads:
+/// TEB.Self @0x30, TEB.Peb @0x60; PEB.ImageBaseAddress @0x10,
+/// PEB.ProcessParameters @0x20 → a params block carrying the std
+/// handles and a real UNICODE_STRING command line.
+fn teb_peb_init(t: &mut Task, p: &crate::pe::Pe) -> bool {
+    if map_page(t, crate::pe::PEB_VA, USER | WRITE | NX).is_none()
+        || map_page(t, crate::pe::TEB_VA, USER | WRITE | NX).is_none()
+    {
+        return false;
+    }
+    let teb = crate::pe::TEB_VA;
+    let peb = crate::pe::PEB_VA;
+    if !write_task_bytes(t.pml4, teb + 0x30, &teb.to_le_bytes())
+        || !write_task_bytes(t.pml4, teb + 0x60, &peb.to_le_bytes())
+        || !write_task_bytes(t.pml4, peb + 0x10, &p.bias.to_le_bytes())
+        || !write_task_bytes(t.pml4, peb + 0x20, &(peb + 0x400).to_le_bytes())
+    {
+        return false;
+    }
+    let params = peb + 0x400;
+    for (off, v) in [
+        (0x020u64, 1u64), // StandardInput
+        (0x028, 2),       // StandardOutput
+        (0x030, 3),       // StandardError
+    ] {
+        if !write_task_bytes(t.pml4, params + off, &v.to_le_bytes()) {
+            return false;
+        }
+    }
+    // CommandLine: UNICODE_STRING at params+0x80 → UTF-16 text at
+    // peb+0x600, built from the task's exe name.
+    let mut u16b = [0u8; 256];
+    let wl = (t.exe_len as usize).min(127);
+    for (i, &c) in t.exe[..wl].iter().enumerate() {
+        u16b[i * 2..i * 2 + 2].copy_from_slice(&(c as u16).to_le_bytes());
+    }
+    if !write_task_bytes(t.pml4, peb + 0x600, &u16b[..wl * 2]) {
+        return false;
+    }
+    let cmdlen = (wl * 2) as u16;
+    let cmdptr = peb + 0x600;
+    // UNICODE_STRING is {u16 len, u16 maxlen, pad, *ptr} — pack it.
+    let mut usb = [0u8; 16];
+    usb[0..2].copy_from_slice(&cmdlen.to_le_bytes());
+    usb[2..4].copy_from_slice(&(cmdlen + 2).to_le_bytes());
+    usb[8..16].copy_from_slice(&cmdptr.to_le_bytes());
+    write_task_bytes(t.pml4, params + 0x80, &usb)
+}
+
 /// PT_INTERP: when `e` names an interpreter, load that ELF too —
 /// Linux's load_elf_interp analogue. The interp is another ET_DYN
 /// image; it goes into the mmap arena via the same first-fit VMA
@@ -2216,7 +2378,18 @@ fn interp_load(t: &mut Task, e: &elf::Elf, img: &[u8]) -> Option<(u64, u64)> {
 /// Load `img` into a fresh Task. Any malformed input or allocation
 /// failure reaps the partial task — nothing half-allocated escapes.
 fn load(img: &[u8]) -> Option<Task> {
-    let e = elf::parse(img)?;
+    // Image format selects the personality: MZ → PE32+/NT, else the
+    // ELF path. Both leave `entry` filled for the literal below.
+    let pe_img = if img.starts_with(b"MZ") {
+        crate::pe::parse(img)
+    } else {
+        None
+    };
+    let elf_img = if pe_img.is_none() { elf::parse(img) } else { None };
+    let entry = pe_img
+        .as_ref()
+        .map(|p| p.entry)
+        .or(elf_img.as_ref().map(|e| e.entry))?;
     let pml4 = kalloc::alloc_frame()?;
     let Some(fdi) = fdtab_alloc() else {
         kalloc::free_frame(pml4);
@@ -2239,7 +2412,7 @@ fn load(img: &[u8]) -> Option<Task> {
         sigh,
         fsi,
         tgid: 0, // spawn() sets tgid = pid once the pid exists
-        entry: e.entry,
+        entry,
         stack_top: 0,
         kstack_base: 0,
         kstack_top: 0,
@@ -2277,6 +2450,10 @@ fn load(img: &[u8]) -> Option<Task> {
         pgid: 0,
         sid: 1,
         did_exec: true,
+        pers: PERS_LINUX,
+        gs_base: 0,
+        nth: [0; crate::nt::MAX_NTH],
+        nt_alloc: 0,
         stop_sig: 0,
         cont_report: false,
         start_ticks: crate::apic::TICKS
@@ -2305,7 +2482,12 @@ fn load(img: &[u8]) -> Option<Task> {
             fdt(&t).fds[i] = Some(oi as u8);
         }
     }
-    if !load_inner(&mut t, &e, img) {
+    let ok = if let Some(p) = &pe_img {
+        pe_load_inner(&mut t, p, img)
+    } else {
+        load_inner(&mut t, elf_img.as_ref().unwrap(), img)
+    };
+    if !ok {
         t.reap();
         return None;
     }
@@ -2322,6 +2504,7 @@ fn load(img: &[u8]) -> Option<Task> {
 /// Range-table access bits — mirror PROT_READ/PROT_WRITE.
 const RNG_R: u8 = 1;
 const RNG_W: u8 = 2;
+const RNG_X: u8 = 4;
 
 /// Is `[va, va+len)` wholly inside a mapped user range? This is THE
 /// user-pointer gate for the syscall layer — checked arithmetic only.
@@ -3084,7 +3267,7 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     }
 }
 
-/// uname(buf): Linux struct utsname — 6 fields × 65 bytes.
+/// uname(buf): Linux struct utsname — 6 fields ?-- 65 bytes.
 pub fn sys_uname(buf: u64) -> u64 {
     if !range_ok_w(buf, 390) {
         return EFAULT;
@@ -4987,6 +5170,151 @@ fn tty_input_read(
             n as u64
         }
     }
+}
+
+// --- NT personality helpers ----------------------------------------
+// Backing functions for nt.rs handlers — they share the Linux side's
+// primitives (ldisc queue, console printk, WaitOn::Timer) rather than
+// growing a parallel I/O stack.
+
+/// The running task's syscall personality — syscall.rs routes on it.
+pub fn task_is_nt() -> bool {
+    cur_mut().is_some_and(|t| t.pers == PERS_NT)
+}
+
+/// nt::NTH_* tag for handle h (1-based slot), 0 when free/invalid.
+pub fn nt_handle_kind(h: u64) -> u8 {
+    let Some(t) = cur_mut() else { return 0 };
+    if h == 0 || h > crate::nt::MAX_NTH as u64 {
+        return 0;
+    }
+    t.nth[h as usize - 1]
+}
+
+/// NtClose: drop the handle's slot. Free slots and out-of-range
+/// handles fail like a real INVALID_HANDLE.
+pub fn nt_handle_close(h: u64) -> bool {
+    let Some(t) = cur_mut() else { return false };
+    if h == 0 || h > crate::nt::MAX_NTH as u64 {
+        return false;
+    }
+    let s = &mut t.nth[h as usize - 1];
+    if *s == 0 {
+        return false;
+    }
+    *s = 0;
+    true
+}
+
+/// NtWriteFile on a console handle — the same printk path
+/// sys_write's Console arm uses, minus POSIX job-control gates
+/// (NT tasks carry no pgrp).
+pub fn nt_console_write(_ctx: &mut UCtx, buf: u64, len: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    if len > 4096 || !range_ok(buf, len) {
+        return 0;
+    }
+    let s = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+    match core::str::from_utf8(s) {
+        Ok(txt) => crate::log::printk(format_args!("{txt}")),
+        Err(_) => crate::log::printk(format_args!("rustux: nt write: {len}B non-utf8")),
+    }
+    len
+}
+
+/// NtReadFile on the stdin handle — shares the ldisc queue with
+/// fd 0. Returns (NTSTATUS, bytes); a block parks ctx inside
+/// tty_input_read exactly like a Linux read() would.
+pub fn nt_stdin_read(ctx: &mut UCtx, buf: u64, len: u64) -> (u64, u64) {
+    if len > 0 && !range_ok_w(buf, len) {
+        return (crate::nt::STATUS_ACCESS_VIOLATION, 0);
+    }
+    let Some(t) = cur_mut() else {
+        return (crate::nt::STATUS_END_OF_FILE, 0);
+    };
+    // tty_input_read returns a count, a negative-errno u64, or parks
+    // ctx and switches away on an empty queue. NT reads have no
+    // POSIX signal layer to interrupt them, so the only non-count
+    // outcome that can surface is a fault pre-check — already done.
+    let n = tty_input_read(t, ctx, buf, len);
+    if n == 0 {
+        return (crate::nt::STATUS_END_OF_FILE, 0);
+    }
+    if n > i32::MAX as u64 {
+        // -errno leaked through (unreachable for NT tasks: no
+        // deliverable POSIX signals, buf pre-validated).
+        return (crate::nt::STATUS_ACCESS_VIOLATION, 0);
+    }
+    (crate::nt::STATUS_SUCCESS, n)
+}
+
+/// NtAllocateVirtualMemory backing: commit `size` zeroed bytes at
+/// `hint` if the window is free, else bump-allocate upward from
+/// t.nt_alloc (the NT arena, disjoint from mmap/brk space).
+fn nt_try_map(t: &mut Task, va: u64, size: u64) -> Option<u64> {
+    if va < elf::USER_VA_LO || va + size >= elf::USER_VA_HI || va + size <= va {
+        return None;
+    }
+    // Reject any overlap with an existing range -- mmap's arena
+    // must not hand the NT layer a page a VMA already owns.
+    for i in 0..t.nranges {
+        let (a, b, _) = t.ranges[i];
+        if va < b && va + size > a {
+            return None;
+        }
+    }
+    let mut va_cur = va;
+    while va_cur < va + size {
+        map_page(t, va_cur, USER | WRITE | NX)?;
+        va_cur += PAGE;
+    }
+    Some(va)
+}
+
+pub fn nt_alloc_pages(hint: u64, size: u64) -> Option<u64> {
+    let t = cur_mut()?;
+    if hint != 0 {
+        if let Some(va) = nt_try_map(t, hint & !0xfff, size) {
+            return Some(va);
+        }
+    }
+    let mut va = t.nt_alloc.max(NT_ALLOC_VA);
+    loop {
+        if let Some(got) = nt_try_map(t, va, size) {
+            t.nt_alloc = got + size;
+            if t.nranges < MAX_RANGES {
+                t.ranges[t.nranges] = (got, got + size, RNG_R | RNG_W);
+                t.nranges += 1;
+            }
+            return Some(got);
+        }
+        va += size;
+        if va + size >= elf::USER_VA_HI || va < NT_ALLOC_VA {
+            return None;
+        }
+    }
+}
+
+/// NtDelayExecution backing: pure deadline wait in 10ms ticks, the
+/// WaitOn::Timer mechanism nanosleep uses. NT sleeps aren't
+/// signal-interruptible on this stack.
+pub fn sleep_ms(ctx: &mut UCtx, ms: u64) {
+    let Some(t) = cur_mut() else { return };
+    let ticks = ms.div_ceil(10);
+    if ticks == 0 {
+        return;
+    }
+    t.wait_on = WaitOn::Timer;
+    t.wait_ptr = 0;
+    t.wait_ptr2 = 0;
+    t.wait_deadline = crate::apic::TICKS
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .saturating_add(ticks);
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch();
 }
 
 /// read(fd, buf, len): File yields up to `len` bytes from its shared
@@ -11876,7 +12204,17 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
 /// old program's code pages are already gone.
 pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     let Some(t) = cur_mut() else { return false };
-    let Some(e) = elf::parse(img) else { return false };
+    // execve on a .exe swaps personalities mid-task — the image
+    // format check mirrors load(): MZ → PE32+/NT, else ELF.
+    let pe_img = if img.starts_with(b"MZ") {
+        crate::pe::parse(img)
+    } else {
+        None
+    };
+    let e = if pe_img.is_none() { elf::parse(img) } else { None };
+    if e.is_none() && pe_img.is_none() {
+        return false;
+    }
     // O_CLOEXEC dies here: drop each marked fd before the image
     // swap — Linux semantics, and a real leak otherwise (a pipe or
     // socket would survive into a binary that never opened it).
@@ -11940,6 +12278,28 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     t.fs_base = 0; // TLS dies with the old image — new one SET_FSs
     t.rseq_va = 0; // exec implicitly unregisters rseq
     t.did_exec = true; // pgid/sid persist; parent setpgid now EACCES
+    if let Some(p) = &pe_img {
+        if !pe_load_inner(t, p, img) {
+            return false;
+        }
+        t.name = [0; 16];
+        let nl = name.len().min(15);
+        t.name[..nl].copy_from_slice(&name[..nl]);
+        t.exe = [0; 128];
+        let el = name.len().min(128);
+        t.exe[..el].copy_from_slice(&name[..el]);
+        t.exe_len = el as u8;
+        unsafe { core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _) };
+        for h in sigt(t).handlers.iter_mut() {
+            if *h != SIG_IGN {
+                *h = SIG_DFL;
+            }
+        }
+        t.fx = unsafe { *core::ptr::addr_of!(INIT_FX) };
+        *ctx = UCtx::launch(t.entry, t.stack_top - 0x28);
+        return true;
+    }
+    let e = e.unwrap();
     if !load_inner(t, &e, img) {
         return false;
     }
@@ -12004,9 +12364,11 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
 /// (argv0 = `name`, no env) and take the first free table slot.
 /// False on bad image or full table.
 pub fn spawn(img: &[u8], name: &str) -> bool {
-    let Some(e) = elf::parse(img) else {
+    let is_pe = img.starts_with(b"MZ");
+    let e = elf::parse(img);
+    if e.is_none() && !is_pe {
         return false;
-    };
+    }
     let Some(mut t) = load(img) else {
         return false;
     };
@@ -12024,16 +12386,24 @@ pub fn spawn(img: &[u8], name: &str) -> bool {
     let cl = (el + 1).min(255);
     t.cmdline[..el.min(255)].copy_from_slice(&name.as_bytes()[..el.min(255)]);
     t.cmdline_len = cl as u8;
-    let Some((entry, at_base)) = interp_load(&mut t, &e, img) else {
-        t.reap();
-        return false;
-    };
-    t.entry = entry;
-    let Some(rsp) = setup_stack(&mut t, &e, img, &args, at_base) else {
-        t.reap();
-        return false;
-    };
-    t.ctx = UCtx::launch(t.entry, rsp);
+    if t.pers == PERS_NT {
+        // NT tasks start at the PE entry on a bare stack — no
+        // argv/auxv, they read their PEB (gs:[] already points
+        // at the TEB via t.gs_base).
+        t.ctx = UCtx::launch(t.entry, t.stack_top - 0x28);
+    } else {
+        let e = e.unwrap();
+        let Some((entry, at_base)) = interp_load(&mut t, &e, img) else {
+            t.reap();
+            return false;
+        };
+        t.entry = entry;
+        let Some(rsp) = setup_stack(&mut t, &e, img, &args, at_base) else {
+            t.reap();
+            return false;
+        };
+        t.ctx = UCtx::launch(t.entry, rsp);
+    }
     t.pid = next_pid();
     t.tgid = t.pid;
     t.pgid = t.pid; // each spawned task leads its own group in sid 1
@@ -12102,6 +12472,7 @@ pub fn launch() {
         fxrstor(&t.fx);
         // SAFETY: MSR write of a task-owned user FS base.
         unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
+        unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
         (&t.ctx as *const UCtx, t.pml4, t.kstack_top)
     };
     syscall::set_kstack(kst);
@@ -12123,6 +12494,7 @@ fn switch_to(n: usize) -> ! {
         fxrstor(&t.fx);
         // SAFETY: MSR write of a task-owned user FS base.
         unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
+        unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
         (&t.ctx as *const UCtx, t.pml4, t.kstack_top)
     };
     syscall::set_kstack(kst);
@@ -12366,6 +12738,7 @@ fn resume_ctx(n: usize) -> *const UCtx {
     // SAFETY: MSR write of a task-owned user FS base — TLS follows
     // the task across switches, same as launch/switch_to.
     unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
+    unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
     &t.ctx
 }
 
@@ -12656,6 +13029,10 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         pgid: p.pgid,
         sid: p.sid,
         did_exec: false, // fork resets the child-exec'd flag
+        pers: p.pers,
+        gs_base: p.gs_base,
+        nth: p.nth,
+        nt_alloc: p.nt_alloc,
         stop_sig: 0,
         cont_report: false,
         start_ticks: crate::apic::TICKS
@@ -12817,6 +13194,10 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         pgid: p.pgid,
         sid: p.sid,
         did_exec: false,
+        pers: p.pers,
+        gs_base: p.gs_base,
+        nth: p.nth,
+        nt_alloc: p.nt_alloc,
         stop_sig: 0,
         cont_report: false,
         start_ticks: crate::apic::TICKS

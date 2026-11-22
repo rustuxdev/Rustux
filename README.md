@@ -98,6 +98,16 @@ real Debian **dash**, and dynamically linked **GNU bash 5.2** — 42
 tasks, all passing, zero frame leaks; `make run-bash` boots an
 interactive `-bash` login shell on the serial console.
 
+The kernel also lays early groundwork for a second syscall
+personality: a real PE32+ `.exe` spawns as an **NT-personality** task —
+its own Windows-x64 service-number table (`NtReadFile`/`NtWriteFile`/
+`NtClose`/`NtAllocateVirtualMemory`/`NtTerminateProcess`/`NtDelayExecution`),
+NTSTATUS returns, the `r10`-arg1/stack-args convention, a TEB/PEB
+mapped into the process (`gs:[0x30]` reads the TEB), and a per-task
+handle table — so `.exe` is a first-class executable format next to
+ELF, no Wine-style shim. Import-bearing PEs are rejected until a
+resolver lands; Linux compatibility remains the primary target.
+
 Every rung is also security-reviewed: a scoped audit of the diff plus a
 check of that subsystem's published kernel CVEs — each gets a written
 verdict in [docs/cve-matrix.md](docs/cve-matrix.md) (structurally

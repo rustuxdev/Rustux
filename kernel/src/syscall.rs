@@ -324,6 +324,13 @@ const MAX_COPY: u64 = 4096;
 extern "C" fn handle_syscall(c: *mut user::UCtx) {
     // SAFETY: the stub built this UCtx on the current task's kstack.
     let ctx = unsafe { &mut *c };
+    // NT-personality tasks share this stub but speak the Windows
+    // convention (r10=arg1, stack args, NTSTATUS in rax) — route
+    // before the Linux number table reads rdi-args that aren't set.
+    if user::task_is_nt() {
+        ctx.rax = crate::nt::dispatch(ctx, ctx.rax as u32);
+        return;
+    }
     let (nr, a1, a2, a3) = (ctx.rax, ctx.rdi, ctx.rsi, ctx.rdx);
     // Args 4-6 ride r10/r8/r9 per the syscall ABI (arg4 is r10,
     // never rcx — that's the CPU-clobbered return address).

@@ -19,6 +19,8 @@ mod cpio;
 mod e1000;
 mod elf;
 mod net;
+mod nt;
+mod pe;
 mod fbcon;
 mod kalloc;
 mod kbd;
@@ -1032,8 +1034,11 @@ fn main() -> Status {
         for (name, img) in cpio::entries(arc) {
             let nm = core::str::from_utf8(name).unwrap_or("?");
             // '/' names are support files (lib64/ld-linux...,
-            // lib/.../libc.so.6) — ELFs, but not tasks.
-            if !img.starts_with(b"\x7fELF") || name.contains(&b'/') {
+            // lib/.../libc.so.6) — ELFs, but not tasks. MZ marks a
+            // PE32+ image — those spawn under the NT personality.
+            if !(img.starts_with(b"\x7fELF") || img.starts_with(b"MZ"))
+                || name.contains(&b'/')
+            {
                 kprintln!(con, "rustux: task {nm}: skipped (data file)");
                 continue;
             }

@@ -661,7 +661,7 @@ const MSR_STAR: u32 = 0xc000_0081;
 const MSR_LSTAR: u32 = 0xc000_0082;
 const MSR_SFMASK: u32 = 0xc000_0084;
 pub const MSR_FS_BASE: u32 = 0xc000_0100;
-const MSR_GS_BASE: u32 = 0xc000_0101;
+pub const MSR_GS_BASE: u32 = 0xc000_0101;
 const MSR_KGS_BASE: u32 = 0xc000_0102;
 
 /// Enable the SYSCALL/SYSRET path: STAR segment bases, LSTAR entry
