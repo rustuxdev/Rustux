@@ -5,8 +5,9 @@
 </p>
 
 An incremental reimplementation of the Linux kernel in Rust, verified against
-the original C kernel's recorded behavior — and the first kernel to speak
-IPv8 on the wire.
+the original C kernel's recorded behavior — the first kernel to speak
+IPv8 on the wire, and already running native Windows `.exe` binaries
+alongside Linux ELF with no Wine in sight.
 
 The C kernel source is the reference and stays untouched in a separate tree
 (`$LINUX_REF`, default `~/linux-ref`). Each unit is ported one at a time with
@@ -98,32 +99,66 @@ real Debian **dash**, and dynamically linked **GNU bash 5.2** — 61
 tasks, all passing; `make run-bash` boots an
 interactive `-bash` login shell on the serial console.
 
-The kernel also lays early groundwork for a second syscall
-personality: a real PE32+ `.exe` spawns as an **NT-personality** task —
-its own Windows-x64 service-number table (`NtReadFile`/`NtWriteFile`/
-`NtClose`/`NtAllocateVirtualMemory`/`NtTerminateProcess`/`NtDelayExecution`),
-NTSTATUS returns, the `r10`-arg1/stack-args convention, a TEB/PEB
-mapped into the process (`gs:[0x30]` reads the TEB), and a per-task
-handle table — so `.exe` is a first-class executable format next to
-ELF, no Wine-style shim. Imports resolve against synthetic DLL stubs — `ntdll.dll` names map
-to service stubs, and `kernel32.dll`/`kernelbase.dll`/`api-ms-win-*`
-names map to hand-encoded Win32 translation thunks
-(`GetStdHandle`/`WriteFile`/`ReadFile`/`ExitProcess`/`VirtualAlloc`/TLS/
-`GetCommandLine`/`VirtualQuery`/`VirtualProtect`/`CreateThread`/
-`WaitForSingleObject`/`ResumeThread`/`CreateProcessA`/`GetExitCodeProcess`)
-that re-marshal Win32 args into the NT convention, and `msvcrt.dll`/
-`ucrtbase.dll` imports resolve against a CRT surface
-(`__getmainargs`/`_initterm`/`malloc`/`free`/`_errno`/`puts`/`fwrite`/
-`strlen`/`memcpy`/...) backed by a writable thunk-state page for
-argv/envp/`FILE[]`/TLS slots — a normal CRT-linked MinGW `.exe`
-(`gcc -O2`, real startup code calling `puts`) runs end-to-end;
-Linux compatibility remains the primary target.
+And the kernel is **dual-personality**: next to the Linux ABI sits a
+native NT personality — real PE32+ `.exe` binaries running on a
+kernel-owned Windows syscall table, with no Wine-style userspace shim
+(its own section below).
 
 Every rung is also security-reviewed: a scoped audit of the diff plus a
 check of that subsystem's published kernel CVEs — each gets a written
 verdict in [docs/cve-matrix.md](docs/cve-matrix.md) (structurally
 absent, explicitly mitigated, or a documented divergence), gathered
-into a flat ledger of 100+ vulnerability classes so far.
+into a flat ledger of 120+ unique CVEs so far.
+
+## A second personality: native Windows `.exe`, no Wine
+
+Wine exists because the kernel underneath it can't speak NT — so an
+entire reimplementation of the Win32 stack has to live in userspace.
+Rustux speaks NT itself. A PE32+ `.exe` is a first-class executable
+format next to ELF: the kernel loads the image, dispatches a
+Windows-x64 syscall table, and answers in NTSTATUS. The Win32 layer
+shrinks to a thin argument-marshalling thunk instead of a
+compatibility tower.
+
+What runs today, end to end:
+
+- **PE32+ loader** — imports, relocations, TLS directory; a normal
+  `gcc -O2` MinGW binary with real CRT startup runs its `main` and
+  returns.
+- **NT syscall surface** — a Windows-x64 service-number table with
+  NTSTATUS returns and the `r10`-arg1/stack-args convention:
+  `NtReadFile`/`NtWriteFile`/`NtClose`, `NtAllocateVirtualMemory`,
+  `NtDelayExecution`, `NtTerminateProcess`/`NtTerminateThread`, plus
+  kernel services for files, directories, sections and VM.
+- **Real NT object model** — TEB/PEB mapped per process
+  (`gs:[0x30]` reads the TEB), per-process handle tables, waitable
+  process and thread objects carrying real exit codes.
+- **Threads and processes** — `CreateThread` with suspend/resume,
+  `CreateProcessA` with `CREATE_SUSPENDED` + `ResumeThread`,
+  `WaitForSingleObject` on thread *and* process handles,
+  `GetExitCodeProcess`. A Win32 parent spawns a child `.exe`, waits
+  on its handle and reads its exit code — natively.
+- **The DLL stack Windows binaries link against** — imports resolve
+  against synthetic `ntdll.dll`, `kernel32.dll`, `kernelbase.dll` and
+  `api-ms-win-*` sets, served by generated Win32→NT translation
+  thunks; `msvcrt.dll`/`ucrtbase.dll` resolve against a CRT surface
+  (`__getmainargs`, `_initterm`, `malloc`/`free`, `_errno`,
+  `puts`/`fwrite`, ...) backed by a writable thunk-state page for
+  argv/envp/`FILE[]`/TLS.
+- **`LoadLibrary` + the full `DllMain` lifecycle** — dependent-DLL
+  loading with a real reference graph, `DLL_PROCESS_ATTACH`/`DETACH`
+  and `DLL_THREAD_ATTACH`/`DETACH` in Windows order, and
+  `PIMAGE_TLS_CALLBACK` arrays fired through the same notifications —
+  MinGW's `__thread` destructor list works.
+- **Native NT heap, VM and file services** — reserve/commit/decommit
+  virtual memory, section objects, NT file and directory APIs.
+
+Honest scope: this is groundwork, not Windows compatibility — the
+surface is a growing subset proved by real MinGW-compiled fixtures
+(spawn/wait/exit-code/suspend-resume all verified in the suite), not
+arbitrary Windows applications. Ordering details are checked against
+real `ntdll` behavior so the architecture is right before the surface
+is wide. Linux remains the primary target.
 
 ## Milestone timeline
 
@@ -137,7 +172,7 @@ GNU bash and native `.exe` tasks in five days:
 | **Nov 20** | **Hardware → wire → ring 3, in one day.** fbcon + boot logo, ExitBootServices, own page tables, buddy + slab/kmalloc, GDT/IDT, LAPIC timer, IST guard stack, the Rustux rename; ACPI + I/O APIC, PS/2 keyboard, PCI, e1000e TX/RX DMA + MSI-X; ARP, IPv4/ICMP ping, **world-first IPv8 on the wire**, IPv6/NDP, UDP + a real DHCP lease, TCP handshake, ChaCha20 CSPRNG — then ring 3: ELF loader, syscall boundary, initrd rootfs, preemptive scheduler, `fork`/`wait4`, pipes, signals, per-task fault isolation, FPU context, poll, UDP+TCP sockets, `brk`/`mmap`, and the glibc-startup ABI. |
 | **Nov 21** | **A real Linux userspace.** pthread-class `clone` flags + futex + `CHILD_CLEARTID` + `CLONE_VM`, hierarchical VFS, file-backed `mmap`, real `vfork` — then real **BusyBox**, `PT_INTERP` dynamic `ld.so`, Debian **dash** and **GNU bash 5.2** (interactive `-bash` on the serial console); process groups/sessions, tty line discipline + full job control (`SIGTTOU`/`TOSTOP`); epoll, eventfd, timerfd, signalfd, inotify; a generated `/proc`. |
 | **Nov 22** | **Last POSIX gaps → the second personality.** Queued signals, real `statfs`, VFS symlinks, file metadata, char devices + a real `/dev` — then the NT personality lands whole: PE32+ `.exe` loader, NT syscall table with NTSTATUS returns, TEB/PEB, handle tables, the Win32/CRT thunk layer (real MinGW exes end-to-end), NT file/dir/heap/VM services, threads with suspend/resume, section objects, `LoadLibrary` + the full `DllMain` attach/detach lifecycle, TLS callbacks, `CreateProcessA`. The suite stands at 61 tasks, all passing. |
-| **Every rung** | A scoped security audit plus a cve.now sweep of that subsystem's published kernel CVEs — 144 vulnerability classes recorded in [docs/cves-addressed.md](docs/cves-addressed.md) so far. |
+| **Every rung** | A scoped security audit plus a cve.now sweep of that subsystem's published kernel CVEs — 120 unique CVEs recorded in [docs/cves-addressed.md](docs/cves-addressed.md) so far. |
 
 ## Acknowledgements
 

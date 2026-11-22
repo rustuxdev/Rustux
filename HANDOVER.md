@@ -2596,3 +2596,45 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   slot leak (DllMain(DETACH) re-entrant FreeLibrary drops a dep to
   refs==0 mid-cascade; promoted entries are unreachable — unchanged
   adjacent code); TlsFree cross-thread slot clear divergence.
+
+## run-125 — NT process objects, CreateProcessA, kstack underflow fix (this commit)
+
+- The intermittent page-table corruption / stale-mapping / triple-fault
+  mystery is resolved: Task is ~0x4d00 bytes but KSTACK_SIZE was 16384.
+  Large stack-local Task construction plus load() -> Option<Task>
+  by-value returns underflowed the stack into adjacent physical frames —
+  sometimes live page-table frames. KSTACK_SIZE is now 49152 (order-4;
+  a 128KiB order-6 attempt made spawn fail under fragmentation).
+- NT process objects: NT_PROCS ledger (tgid/refs/state/exit), NTH_PROCESS
+  handle kind, RUX_SPAWN_PROC 0xFD and RUX_PROC_QUERY 0xFE services.
+  CreateProcessA works through the generated Win32 thunk layer and
+  returns real process/thread handles + ids via PROCESS_INFORMATION;
+  wait on the process handle (NtWaitForSingleObject) and
+  GetExitCodeProcess are implemented.
+- CREATE_SUSPENDED + ResumeThread: spawn_idx(..., hold) stages the child
+  suspended while its ledgers and handles are installed — it cannot
+  exit and reuse a slot mid-setup. Process object signals only when the
+  last thread in the group exits; handle refs keep the object alive.
+- Audit run-98 quick scoped: 2 confirmed findings fixed — sys_brk
+  grow-rollback unmapped without flush_tlb (stale-TLB UAF,
+  CVE-2018-18281 class; now flushes at user.rs:6722) and
+  WaitOn::NtWaitProc raw-index ABA (a freed+reused ledger slot could
+  satisfy a stale wait; now tgid-pinned, INVALID_HANDLE on identity
+  mismatch). Verified by a fresh-eyes verifier: all 10 unmap_page
+  sites flush, wake identity check precedes state check.
+- Address-space fix kept from the debug hunt: new pml4s copy only
+  (0..128).chain(256..512) — the caller's user PML4 slots were leaking
+  into fresh address spaces.
+- Fixtures: winchild.exe / winspawn.exe real MinGW PEs — spawn, wait,
+  exit-code, suspend/resume, cmdline via both ANSI args and PEB
+  parameters all verified.
+- Suite: qemu exit 33, 61 tasks, frames 108425 -> 108425 zero leak,
+  6/6 clean runs including post-diagnostic-strip.
+- Diagnostics stripped before commit: DR0 watchpoint + register dumps
+  (cpu.rs), allocator kind/ownership tags (kalloc.rs), FREEDANGL/PDUMP/
+  MAPWALKBAD printks (user.rs).
+- needs_validation: WaitOn::NtWait(thread) keeps the raw ledger index —
+  same un-pinned ABA pattern, pre-existing; 48KiB stacks have no guard
+  page (headroom margin only, CVE-2017-1000364 class).
+- Next: run the README GIF regeneration (QMP screendump scripts), then
+  the next ABI gap — see roadmap.
