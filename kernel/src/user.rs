@@ -2251,6 +2251,11 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
         t.ranges[t.nranges] = (va0, va1, rfl);
         t.nranges += 1;
     }
+    // Rebase against the load bias, then bind imports — both must
+    // run before the image executes, and both honestly fail the load.
+    if !pe_apply_relocs(t, p) || !pe_resolve_imports(t, p) {
+        return false;
+    }
     for i in 0..USTACK_PAGES {
         if map_page(t, USTACK_VA + i * PAGE, USER | WRITE | NX).is_none() {
             return false;
@@ -2277,6 +2282,165 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
     t.nth[0] = crate::nt::NTH_STDIN;
     t.nth[1] = crate::nt::NTH_STDOUT;
     t.nth[2] = crate::nt::NTH_STDERR;
+    true
+}
+
+/// .reloc rebase: walk base-relocation blocks, adding
+/// (bias - image_base) to each DIR64 slot. Blocks/entries read
+/// through the task's own tables; type-10 is the only real x64
+/// fixup, anything else is an honest load failure.
+fn pe_apply_relocs(t: &mut Task, p: &crate::pe::Pe) -> bool {
+    if p.reloc_size == 0 {
+        return true;
+    }
+    let delta = p.bias.wrapping_sub(p.image_base);
+    let mut va = p.bias + p.reloc_rva;
+    let end = va + p.reloc_size;
+    while va + 8 <= end {
+        let (Some(page), Some(bsz)) =
+            (read_task_u(t.pml4, va, 4), read_task_u(t.pml4, va + 4, 4))
+        else {
+            return false;
+        };
+        if bsz < 8 || va + bsz > end {
+            return false;
+        }
+        for i in 0..(bsz - 8) / 2 {
+            let Some(e) = read_task_u(t.pml4, va + 8 + i * 2, 2) else {
+                return false;
+            };
+            match e >> 12 {
+                0 => {} // ABSOLUTE — alignment padding
+                10 => {
+                    let off = page + (e & 0xfff);
+                    if off + 8 > p.size {
+                        return false;
+                    }
+                    let slot = p.bias + off;
+                    let Some(v) = read_task_u(t.pml4, slot, 8) else {
+                        return false;
+                    };
+                    let nv = v.wrapping_add(delta).to_le_bytes();
+                    if !write_task_bytes_force(t.pml4, slot, &nv) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        va += bsz;
+    }
+    true
+}
+
+/// Read a NUL-terminated string out of a task's space into `out`;
+/// returns the string length, 0 on unmapped/unterminated.
+fn read_task_str(pml4: u64, va: u64, out: &mut [u8]) -> usize {
+    for (i, o) in out.iter_mut().enumerate() {
+        let Some(pa) = translate_r(pml4, va + i as u64) else {
+            return 0;
+        };
+        // SAFETY: pa is a present user frame in pml4.
+        let b = unsafe { (pa as *const u8).read() };
+        if b == 0 {
+            return i;
+        }
+        *o = b;
+    }
+    0
+}
+
+/// Import resolution against the synthetic ntdll stub page: walk
+/// IMAGE_IMPORT_DESCRIPTORs (ntdll.dll only — other DLLs are an
+/// honest load failure), map each ILT name to a service number, emit
+/// `mov r10,rcx; mov eax,nr; syscall; ret` (the real ntdll shape),
+/// and patch the IAT so compiled `call [rip+IAT]` code just works.
+fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
+    if p.import_size == 0 {
+        return true;
+    }
+    if map_page(t, crate::pe::STUB_VA, USER | WRITE).is_none() {
+        return false;
+    }
+    let mut stub_next = crate::pe::STUB_VA;
+    let mut i = 0u64;
+    loop {
+        if i >= 64 {
+            return false;
+        }
+        let d = p.bias + p.import_rva + i * 20;
+        let (Some(ilt_rva), Some(name_rva), Some(iat_rva)) = (
+            read_task_u(t.pml4, d, 4),
+            read_task_u(t.pml4, d + 12, 4),
+            read_task_u(t.pml4, d + 16, 4),
+        ) else {
+            return false;
+        };
+        if ilt_rva == 0 && name_rva == 0 && iat_rva == 0 {
+            break;
+        }
+        // All descriptor RVAs must name bytes inside the image --
+        // a descriptor pointing elsewhere is malformed, not a
+        // request to patch arbitrary task memory.
+        if name_rva >= p.size || ilt_rva >= p.size || iat_rva >= p.size {
+            return false;
+        }
+        let mut nb = [0u8; 32];
+        let nl = read_task_str(t.pml4, p.bias + name_rva, &mut nb);
+        if nl == 0 || !nb[..nl].eq_ignore_ascii_case(b"ntdll.dll") {
+            return false;
+        }
+        let ilt = if ilt_rva != 0 { ilt_rva } else { iat_rva };
+        for j in 0..256u64 {
+            let Some(e) = read_task_u(t.pml4, p.bias + ilt + j * 8, 8) else {
+                return false;
+            };
+            if e == 0 {
+                break;
+            }
+            if e & (1 << 63) != 0 {
+                return false; // ordinal imports unsupported
+            }
+            let ibn = e & 0x7fff_ffff;
+            if ibn + 3 > p.size {
+                return false;
+            }
+            let mut fname = [0u8; 48];
+            // IMAGE_IMPORT_BY_NAME: u16 hint, then the name.
+            let fl = read_task_str(t.pml4, p.bias + ibn + 2, &mut fname);
+            let Some(nr) = (if fl != 0 {
+                crate::nt::service_for_name(&fname[..fl])
+            } else {
+                None
+            }) else {
+                return false;
+            };
+            if stub_next + crate::pe::STUB_SLOT > crate::pe::STUB_VA + 0x1000 {
+                return false;
+            }
+            let mut stub = [0u8; 16];
+            stub[0..3].copy_from_slice(&[0x4c, 0x8b, 0xd1]); // mov r10,rcx
+            stub[3] = 0xb8; // mov eax, imm32
+            stub[4..8].copy_from_slice(&nr.to_le_bytes());
+            stub[8] = 0x0f;
+            stub[9] = 0x05; // syscall
+            stub[10] = 0xc3; // ret
+            if !write_task_bytes(t.pml4, stub_next, &stub) {
+                return false;
+            }
+            if !write_task_bytes_force(
+                t.pml4,
+                p.bias + iat_rva + j * 8,
+                &stub_next.to_le_bytes(),
+            ) {
+                return false;
+            }
+            stub_next += crate::pe::STUB_SLOT;
+        }
+        i += 1;
+    }
+    // Fill done — drop the stub page to read+execute.
+    map_page(t, crate::pe::STUB_VA, USER);
     true
 }
 

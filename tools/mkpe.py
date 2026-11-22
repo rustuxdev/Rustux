@@ -46,6 +46,17 @@ def main():
     struct.pack_into("<Q", opt, 88, 0x100000)   # SizeOfHeapReserve
     struct.pack_into("<Q", opt, 96, 0x1000)     # SizeOfHeapCommit
     struct.pack_into("<I", opt, 108, 16)        # NumberOfRvaAndSizes
+    # Data directories: test images embed marker tags (IMPDIR00,
+    # RELOC\0\0\0) before their tables — find them and publish RVAs.
+    imp = data.find(b"IMPDIR00")
+    if imp >= 0:
+        rva = sect_va + imp + 8                    # descriptor after tag
+        struct.pack_into("<II", opt, 112 + 1 * 8, rva, 40)
+    rl = data.find(b"RELOC\0\0\0")
+    if rl >= 0:
+        rva = sect_va + rl + 8
+        bsz = struct.unpack_from("<I", data, rl + 8 + 4)[0]
+        struct.pack_into("<II", opt, 112 + 5 * 8, rva, bsz)
     b += opt
     # Section header: .text, all permissions (test image — real
     # binaries split .text/.data and keep W^X).

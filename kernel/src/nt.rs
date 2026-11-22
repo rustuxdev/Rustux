@@ -169,6 +169,26 @@ fn nt_delay(ctx: &mut UCtx) -> u64 {
     STATUS_SUCCESS
 }
 
+/// Import resolver: an export name from a PE's ILT to its service
+/// number. Only ntdll's syscall stubs exist — the names a real
+/// ntdll.dll exports (Zw* aliases included, they share numbers).
+pub fn service_for_name(name: &[u8]) -> Option<u32> {
+    // Strip the Nt/Zw prefix — both are the same service.
+    let n = name
+        .strip_prefix(b"Nt")
+        .or(name.strip_prefix(b"Zw"))
+        .unwrap_or(name);
+    Some(match n {
+        b"ReadFile" => NT_READ_FILE,
+        b"WriteFile" => NT_WRITE_FILE,
+        b"Close" => NT_CLOSE,
+        b"AllocateVirtualMemory" => NT_ALLOCATE_VIRTUAL_MEMORY,
+        b"TerminateProcess" => NT_TERMINATE_PROCESS,
+        b"DelayExecution" => NT_DELAY_EXECUTION,
+        _ => return None,
+    })
+}
+
 /// Entry from the syscall stub: `nr` is ctx.rax. The return goes
 /// back through ctx.rax as NTSTATUS.
 pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {

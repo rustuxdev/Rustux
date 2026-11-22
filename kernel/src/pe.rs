@@ -14,6 +14,11 @@ pub const PE_LOAD_BIAS: u64 = super::elf::USER_VA_LO;
 /// TEB and PEB get dedicated pages just above the image arena.
 pub const PEB_VA: u64 = PE_LOAD_BIAS + 0x0100_0000;
 pub const TEB_VA: u64 = PEB_VA + 0x1000;
+/// Synthetic-ntdll stub page: one 16-byte slot per resolved import ?
+/// `mov r10,rcx; mov eax,svc; syscall; ret`, the real ntdll shape.
+pub const STUB_VA: u64 = TEB_VA + 0x1000;
+/// 16-byte stride per import stub.
+pub const STUB_SLOT: u64 = 16;
 
 const DOS_MAGIC: u16 = 0x5a4d; // "MZ"
 const PE_MAGIC: u32 = 0x0000_4550; // "PE\0\0"
@@ -56,10 +61,12 @@ pub struct Pe {
     pub bias: u64,
     pub sections: [Section; MAX_SECTIONS],
     pub nsec: usize,
-    /// Import/reloc directory presence — import-less images run
-    /// today; imports without a resolver are an honest load failure.
-    pub has_imports: bool,
-    pub has_relocs: bool,
+    /// Import directory extent (IMAGE_DIRECTORY_ENTRY_IMPORT).
+    pub import_rva: u64,
+    pub import_size: u64,
+    /// Base-relocation directory extent (IMAGE_DIRECTORY_ENTRY_BASERELOC).
+    pub reloc_rva: u64,
+    pub reloc_size: u64,
 }
 
 fn u16le(b: &[u8], off: usize) -> Option<u16> {
@@ -73,17 +80,9 @@ fn u64le(b: &[u8], off: usize) -> Option<u64> {
 }
 
 /// Parse a PE32+ image — None on anything that isn't a well-formed
-/// AMD64 executable. `parse` rejects images with imports (no resolver
-/// exists yet) — `parse_loose` keeps them for future wiring.
+/// AMD64 executable. Import and .reloc extents are carried for the
+/// loader; resolution/rebasing happen (or honestly fail) there.
 pub fn parse(b: &[u8]) -> Option<Pe> {
-    let p = parse_loose(b)?;
-    if p.has_imports {
-        return None;
-    }
-    Some(p)
-}
-
-pub fn parse_loose(b: &[u8]) -> Option<Pe> {
     if u16le(b, 0)? != DOS_MAGIC {
         return None;
     }
@@ -114,9 +113,24 @@ pub fn parse_loose(b: &[u8]) -> Option<Pe> {
     let subsystem = u16le(b, opt + 68)?;
     let ndirs = u32le(b, opt + 108)? as usize;
     let dir_base = opt + 112;
-    let dir = |i: usize| -> u64 {
-        if i < ndirs { u32le(b, dir_base + i * 8).unwrap_or(0) as u64 } else { 0 }
+    let dir = |i: usize| -> (u64, u64) {
+        if i < ndirs {
+            (
+                u32le(b, dir_base + i * 8).unwrap_or(0) as u64,
+                u32le(b, dir_base + i * 8 + 4).unwrap_or(0) as u64,
+            )
+        } else {
+            (0, 0)
+        }
     };
+    let (import_rva, import_size) = dir(DIR_IMPORT);
+    let (reloc_rva, reloc_size) = dir(DIR_RELOC);
+    // Directory extents must lie inside the image span when present.
+    for (r, sz) in [(import_rva, import_size), (reloc_rva, reloc_size)] {
+        if sz != 0 && r.checked_add(sz).is_none_or(|e| e > size) {
+            return None;
+        }
+    }
     let bias = PE_LOAD_BIAS;
     if size == 0 || size > (PEB_VA - bias) {
         return None;
@@ -150,7 +164,9 @@ pub fn parse_loose(b: &[u8]) -> Option<Pe> {
         bias,
         sections,
         nsec,
-        has_imports: dir(DIR_IMPORT) != 0,
-        has_relocs: dir(DIR_RELOC) != 0,
+        import_rva,
+        import_size,
+        reloc_rva,
+        reloc_size,
     })
 }

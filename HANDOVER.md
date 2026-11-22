@@ -1972,3 +1972,39 @@ read), NtAllocateVirtualMemory commit touched+verified,
 NtDelayExecution 10ms sleep, NtTerminateProcess — real .exe,
 no shim, no Wine. 21/21 suites 0 failures, 43 tasks, frames
 108572 -> 108572 zero leak, exit 33. Ledger: 112.
+
+run-107 — real PE imports + base relocations: pe.rs now carries
+the IMPORT/BASERELOC directory extents (rva+size, both bounds-
+checked against SizeOfImage) instead of rejecting them.
+pe_apply_relocs walks .reloc blocks and adds (bias - image_base)
+to each DIR64 slot — the image still links at 0x140000000 but
+runs at PE_LOAD_BIAS; non-DIR64/ABSOLUTE types fail honestly.
+pe_resolve_imports walks IMAGE_IMPORT_DESCRIPTORs: only
+ntdll.dll resolves (other DLLs fail the load), ILT names map
+through nt::service_for_name (Nt/Zw prefixes both accepted,
+ordinals rejected), each import gets a 16-byte stub on STUB_VA
+(mov r10,rcx; mov eax,nr; syscall; ret — the real ntdll shape)
+written into the IAT, so compiled `call [rip+IAT]` code just
+runs. The stub page is RWX during fill then dropped to R-X.
+peitest.S is a real import-bearing PE: descriptor+ILT+IAT+name
+strings all in .text (IMPDIR00/RELOC markers let mkpe.py fill
+the data dirs), calls NtWriteFile/NtTerminateProcess via the
+IAT using the standard Win64 ABI (rcx-arg1, stack args at
+rsp+0x20), and checks a DIR64-relocated pointer by printing
+the string it points at. Audit (run-81, quick, scoped): 2
+fixes — reloc slot RVA was bounded only by page-off math
+(could rewrite mapped-but-foreign task pages like the stub
+page/TEB on malformed input), now every slot must land inside
+SizeOfImage; descriptor/thunk RVAs likewise bounded (name_rva,
+ilt_rva, iat_rva, IMAGE_IMPORT_BY_NAME rva all < p.size) so a
+crafted image can't make the loader read/patch memory outside
+its own span (self-corruption only anyway — translate_r stays
+inside the task's own maps). Also fixed service_for_name's
+Zw-strip dropping the Nt prefix match (imports literally
+named NtWriteFile never resolved). cve.now: PE-loader class
+has no applicable CVEs (only CVE-2025-22060 NIC TCAM race,
+n/a). Verified: descriptor walk capped 64, thunks capped 256,
+names bounded 32/48B unterminated-reject, stub page bounded
+256 slots. peitest+petest both pass in QEMU: 'imports resolved
+via IAT', 'DIR64 reloc patched'. 21/21 suites 0 failures, 44
+tasks, frames 108567 -> 108567 zero leak, exit 33. Ledger: 112.
