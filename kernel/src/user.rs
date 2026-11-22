@@ -2991,6 +2991,35 @@ pub fn nt_next_detach() -> u64 {
     0
 }
 
+/// ExitProcess drain: mark every live module this owner still holds
+/// pend_detach (never-attached ones skip their call via state 3),
+/// then pop the next pending — the ExitProcess thunk loops this
+/// calling DllMain(DETACH) in reverse-load order before terminating.
+/// Each pop returns a base once (2 -> 3); the images stay mapped —
+/// the whole address space dies with the task anyway.
+pub fn nt_exit_detach() -> u64 {
+    let owner = nt_owner_pid();
+    if owner == 0 {
+        return 0;
+    }
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
+    for e in tab.iter_mut() {
+        if e.0 == owner && e.1 != 0 && e.3 != 0 && e.8 < 2 {
+            e.8 = match e.8 {
+                1 => 3,
+                _ => 2,
+            };
+        }
+    }
+    for e in tab.iter_mut().rev() {
+        if e.3 != 0 && e.0 == owner && e.8 == 2 {
+            e.8 = 3;
+            return e.1;
+        }
+    }
+    0
+}
+
 /// Finish a FreeLibrary after the thunk drained the DllMain(DETACH)
 /// calls: drop one ref from each surviving dep per marked importer
 /// (two freed modules sharing a dep release two refs, so a union
@@ -3115,6 +3144,41 @@ impl<'a> Emit<'a> {
     fn fix(&mut self, at: usize) {
         self.fix_to(at, self.n);
     }
+}
+
+/// Emit the shared detach drain used by the FreeLibrary and
+/// ExitProcess thunks: loop `svc` (RUX_DLL_DETACH / RUX_EXIT_DETACH)
+/// popping a pending-detach module base, read its PE entry RVA, call
+/// it (hinst, DETACH, 0) in userland, repeat until 0. Returns the
+/// loop head so a caller can re-enter after a finalize pass. The
+/// caller owns the stack frame and what runs after the drain.
+fn emit_detach_drain(e: &mut Emit, svc: u8) -> usize {
+    let drain = e.n;
+    e.raw(&[
+        0xb8, svc, 0, 0, 0, //           mov eax,svc
+        0x0f, 0x05, //                   syscall
+        0x48, 0x85, 0xc0, //             test rax,rax
+    ]);
+    let done = e.jcc(0x4);
+    e.raw(&[
+        0x8b, 0x48, 0x3c, //             mov ecx,[rax+0x3c]    peoff
+        0x8b, 0x4c, 0x08, 0x28, //       mov ecx,[rax+rcx+0x28] entry_rva
+        0x85, 0xc9, //                   test ecx,ecx
+    ]);
+    let noent = e.jcc(0x4); //       no entry -> next
+    e.raw(&[
+        0x48, 0x01, 0xc1, //           add rcx,rax   entry_va
+        0x49, 0x89, 0xc9, //           mov r9,rcx
+        0x48, 0x89, 0xc1, //           mov rcx,rax   hinst
+        0x31, 0xd2, //                 xor edx,edx   DLL_PROCESS_DETACH
+        0x45, 0x31, 0xc0, //           xor r8d,r8d
+        0x41, 0xff, 0xd1, //           call r9       DllMain
+    ]);
+    e.fix_to(noent, drain);
+    let back = e.jmp();
+    e.fix_to(back, drain);
+    e.fix(done);
+    drain
 }
 
 /// Emit the shared 9-arg NtReadFile/NtWriteFile frame: caller has
@@ -4282,31 +4346,7 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.raw(&[
                 0x48, 0x83, 0xec, 0x28, // sub rsp,0x28
             ]);
-            let drain = e.n;
-            e.raw(&[
-                0xb8, 0xf9, 0, 0, 0, //   mov eax,0xF9  RUX_DLL_DETACH
-                0x0f, 0x05, //             syscall
-                0x48, 0x85, 0xc0, //       test rax,rax
-            ]);
-            let done = e.jcc(0x4);
-            e.raw(&[
-                0x8b, 0x48, 0x3c, //        mov ecx,[rax+0x3c]    peoff
-                0x8b, 0x4c, 0x08, 0x28, // mov ecx,[rax+rcx+0x28] entry_rva
-                0x85, 0xc9, //             test ecx,ecx
-            ]);
-            let noent = e.jcc(0x4); //    no entry -> next
-            e.raw(&[
-                0x48, 0x01, 0xc1, //     add rcx,rax   entry_va
-                0x49, 0x89, 0xc9, //     mov r9,rcx
-                0x48, 0x89, 0xc1, //     mov rcx,rax   hinst
-                0x31, 0xd2, //           xor edx,edx   DLL_PROCESS_DETACH
-                0x45, 0x31, 0xc0, //     xor r8d,r8d
-                0x41, 0xff, 0xd1, //     call r9       DllMain
-            ]);
-            e.fix_to(noent, drain);
-            let back = e.jmp();
-            e.fix_to(back, drain);
-            e.fix(done);
+            let drain = emit_detach_drain(&mut e, 0xf9);
             e.raw(&[
                 0xb8, 0xfa, 0, 0, 0, //   mov eax,0xFA  RUX_FREE_FIN
                 0x0f, 0x05, //             syscall
@@ -4606,10 +4646,21 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             ]);
         }
         b"exit" | b"_amsg_exit" | b"ExitProcess" => {
+            // ExitProcess runs every surviving module's
+            // DllMain(DETACH) reverse-load-order before terminating
+            // (TerminateProcess deliberately does not). The exit
+            // code rides rcx — park it across the drain calls.
             e.raw(&[
-                0x89, 0xca,
-                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff,
-                0xb8, 0x2c, 0, 0, 0, 0x0f, 0x05, 0xc3,
+                0x48, 0x83, 0xec, 0x28, // sub rsp,0x28
+                0x48, 0x89, 0x4c, 0x24, 0x20, // mov [rsp+0x20],rcx
+            ]);
+            emit_detach_drain(&mut e, 0xfb); // RUX_EXIT_DETACH
+            e.raw(&[
+                0x48, 0x8b, 0x54, 0x24, 0x20, // mov rdx,[rsp+0x20]  code
+                0x48, 0x83, 0xc4, 0x28, //    add rsp,0x28
+                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
+                0xb8, 0x2c, 0, 0, 0, //    mov eax,0x2C
+                0x0f, 0x05, 0xc3,
             ]);
         }
         // --- heap: RUX_HEAP_* services back the Win32 heap API ---

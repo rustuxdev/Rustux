@@ -81,6 +81,7 @@ const RUX_DLL_ATTACH: u32 = 0xF7;
 const RUX_MOD_HANDLE: u32 = 0xF8;
 const RUX_DLL_DETACH: u32 = 0xF9;
 const RUX_FREE_FIN: u32 = 0xFA;
+const RUX_EXIT_DETACH: u32 = 0xFB;
 
 /// Handle table tags — a per-task `nth` slot's object kind. Real
 /// handles are small indices (1-based) like the actual handle table;
@@ -1287,6 +1288,10 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         // RUX_FREE_FIN performs the unmaps + surviving dep refdowns.
         RUX_DLL_DETACH => user::nt_next_detach(),
         RUX_FREE_FIN => user::nt_detach_fin(),
+        // ExitProcess thunk loops on this before terminating —
+        // surviving modules get their DllMain(DETACH) calls in
+        // reverse-load order, like the real ExitProcess.
+        RUX_EXIT_DETACH => user::nt_exit_detach(),
         NT_TERMINATE_PROCESS => {
             // hProcess == (HANDLE)-1 means self; anything else is a
             // kill we don't model yet — the common case is self-exit.

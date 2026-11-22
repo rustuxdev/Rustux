@@ -2453,3 +2453,42 @@ qemu exit 33. Ledger: 120.
   process exit still does not run detaches for surviving modules;
   a dep zeroed by a re-entrant free gets its detach from the re-drain
   with approximate ordering.
+
+## run-122 — exit-time DllMain(DLL_PROCESS_DETACH) (this commit)
+
+- RUX_EXIT_DETACH (0xFB) -> nt_exit_detach: one service does both
+  halves of the exit drain — mark every still-live module this owner
+  holds pend_detach (state 2), except attach-pending state-1 entries
+  which go straight to 3 (a DllMain whose ATTACH never ran gets no
+  DETACH — same rule Windows applies), then pop the next pending entry
+  descending slot order = reverse-load order. Idempotent and
+  re-entrancy-safe: entries at state >= 2 are never re-armed, each pop
+  flips 2 -> 3 before the call returns.
+- emit_detach_drain: the detach-callback loop shared by FreeLibrary
+  (0xF9) and ExitProcess (0xFB) — identical emit to the run-121
+  drain (syscall -> test -> peoff/entryRVA read -> null-entry skip ->
+  call r9 with (hinst, DETACH, 0)), parameterised on the service id;
+  returns the loop head so FreeLibrary's fin-loop can re-enter.
+- ExitProcess/exit/_amsg_exit thunk: sub rsp,0x28; park the exit code
+  at [rsp+0x20] (above the callee's shadow space so DllMain cannot
+  clobber it); drain; restore the code into rdx; NtTerminateProcess
+  as before. TerminateProcess and abort keep the old straight path —
+  no detach callbacks on forced termination, matching Windows.
+- Fixture windexit.exe (exit 42): loads wchain+wbase, FreeLibrary on
+  wchain proves the explicit-unload detach still fires exactly once,
+  then exits with wbase still mapped — its detach is owed at exit and
+  runs in the drain; probe counters would fail any double call.
+  winstatic now also exercises exit-detach for a statically-loaded
+  dep chain.
+- Audit run-96 quick scoped: no confirmed findings. The one candidate
+  (a nested FreeLibrary inside an exit-drain DllMain unmapping the
+  running image through nt_detach_fin's all-owner sweep) is closed by
+  the run-121 in-flight check — the executing module is at state >= 2
+  during its own callback, so the nested free merges into the live
+  pipeline and skips drain/fin entirely. Divergences recorded:
+  LoadLibrary inside an exit-drain detach is skipped entirely (marked
+  3, never attached); exit drain does not unmap images — task
+  teardown owns the address space; ordering is descending-slot
+  approximate, not the loader's real reverse-init list; multi-threaded
+  owner races remain unsynchronized (no loader lock).
+- Suite: 58 tasks, frames 108433 -> 108433 zero leak, qemu exit 33.
