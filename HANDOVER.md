@@ -2638,3 +2638,16 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   page (headroom margin only, CVE-2017-1000364 class).
 - Next: run the README GIF regeneration (QMP screendump scripts), then
   the next ABI gap — see roadmap.
+
+## run-125b — getdents enumeration cap (this commit)
+
+- fd_getdents dedupes dir first-components into names[96]; '/' crossed
+  ~100 components (initrd + sl_* + concurrent tasks), so entries past
+  slot 96 were silently dropped — the iotest DT_LNK FAIL on VM-3.
+  Same latent cap in the NT dir-listing path; /proc (64 pid dirs +
+  globals) was approaching it too. Cap now 384.
+- iotest's two getdents d_type checks did a single 2048B read of '/'
+  with no continuation; both now loop until EOF (fd_getdents o.pos
+  skip index supports it).
+- Verified failing 2/2 on VM-3 pre-fix at both e3df0fd and e59445b
+  (pre-existing flake, not a run-125 regression), passing after.
