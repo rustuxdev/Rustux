@@ -17,14 +17,15 @@ pub const TEB_VA: u64 = PEB_VA + 0x1000;
 /// Synthetic-ntdll stub page: one 16-byte slot per resolved import ?
 /// `mov r10,rcx; mov eax,svc; syscall; ret`, the real ntdll shape.
 pub const STUB_VA: u64 = TEB_VA + 0x1000;
-/// 16-byte stride per import stub.
-pub const STUB_SLOT: u64 = 16;
+/// Writable data page beside the stub code page — the Win32 thunk
+/// layer's runtime state: argv/envp arrays, fake FILE[], TLS slots.
+pub const STUB_DATA_VA: u64 = STUB_VA + 0x1000;
 
 const DOS_MAGIC: u16 = 0x5a4d; // "MZ"
 const PE_MAGIC: u32 = 0x0000_4550; // "PE\0\0"
 const OPT_MAGIC: u16 = 0x020b; // PE32+
 const MACHINE_AMD64: u16 = 0x8664;
-const MAX_SECTIONS: usize = 16;
+const MAX_SECTIONS: usize = 32;
 
 /// Image File Header Characteristics we care about.
 const CHAR_EXEC: u16 = 0x0002;

@@ -30,6 +30,7 @@ const NT_READ_FILE: u32 = 0x06;
 const NT_WRITE_FILE: u32 = 0x08;
 const NT_CLOSE: u32 = 0x0F;
 const NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0x18;
+const NT_FREE_VIRTUAL_MEMORY: u32 = 0x1E;
 const NT_TERMINATE_PROCESS: u32 = 0x2C;
 const NT_DELAY_EXECUTION: u32 = 0x34;
 
@@ -151,6 +152,37 @@ fn nt_alloc_vm(ctx: &mut UCtx) -> u64 {
     STATUS_SUCCESS
 }
 
+/// NtFreeVirtualMemory(process, &base, &size, type): MEM_RELEASE
+/// (0x8000) unmaps every page in [base, base+size) — the Win32
+/// layer's free()/HeapFree path recovers the extent from the
+/// malloc header the VirtualAlloc thunk wrote. MEM_DECOMMIT alone
+/// isn't honored (no reserve/commit split in our mm).
+fn nt_free_vm(ctx: &mut UCtx) -> u64 {
+    if arg(ctx, 0) != u64::MAX {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let bp = arg(ctx, 1);
+    let sp = arg(ctx, 2);
+    if !user::range_ok_w(bp, 8) || !user::range_ok_w(sp, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if arg(ctx, 3) & 0x8000 == 0 {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    // SAFETY: both pointers validated above.
+    let (base, size) = unsafe {
+        (
+            (bp as *const u64).read_unaligned(),
+            (sp as *const u64).read_unaligned(),
+        )
+    };
+    if base == 0 || base & 0xfff != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    user::nt_free_pages(base, size);
+    STATUS_SUCCESS
+}
+
 /// NtDelayExecution(alertable, &interval): interval is a signed
 /// 100-ns duration — negative means relative to now, the common
 /// form. Alertable sleeps end early on APC delivery; we have none,
@@ -183,6 +215,7 @@ pub fn service_for_name(name: &[u8]) -> Option<u32> {
         b"WriteFile" => NT_WRITE_FILE,
         b"Close" => NT_CLOSE,
         b"AllocateVirtualMemory" => NT_ALLOCATE_VIRTUAL_MEMORY,
+        b"FreeVirtualMemory" => NT_FREE_VIRTUAL_MEMORY,
         b"TerminateProcess" => NT_TERMINATE_PROCESS,
         b"DelayExecution" => NT_DELAY_EXECUTION,
         _ => return None,
@@ -197,6 +230,7 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         NT_WRITE_FILE => rw_file(ctx, true),
         NT_CLOSE => nt_close(ctx),
         NT_ALLOCATE_VIRTUAL_MEMORY => nt_alloc_vm(ctx),
+        NT_FREE_VIRTUAL_MEMORY => nt_free_vm(ctx),
         NT_DELAY_EXECUTION => nt_delay(ctx),
         NT_TERMINATE_PROCESS => {
             // hProcess == (HANDLE)-1 means self; anything else is a

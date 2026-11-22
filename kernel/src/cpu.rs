@@ -239,10 +239,11 @@ extern "C" fn report_frame(f: &mut TrapFrame, regs: *mut SavedRegs) {
                     _ => 0,
                 };
                 if signo != 0 {
+                    let tn = crate::user::cur_exe();
                     let _ = writeln!(
                         u,
-                        "rustux: cpu: user fault {} rip={:#x} err={:#x} cr2={:#x} -> sig {}",
-                        name, f.rip, f.err, cr2, signo
+                        "rustux: cpu: user fault {} task={} rip={:#x} err={:#x} cr2={:#x} -> sig {}",
+                        name, tn, f.rip, f.err, cr2, signo
                     );
                     // Rebuild the complete interrupted context from
                     // the stubs' saved registers — a caught

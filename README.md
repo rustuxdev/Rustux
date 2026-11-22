@@ -108,10 +108,15 @@ handle table — so `.exe` is a first-class executable format next to
 ELF, no Wine-style shim. Imports resolve against synthetic DLL stubs — `ntdll.dll` names map
 to service stubs, and `kernel32.dll`/`kernelbase.dll`/`api-ms-win-*`
 names map to hand-encoded Win32 translation thunks
-(`GetStdHandle`/`WriteFile`/`ReadFile`/`ExitProcess`/`VirtualAlloc`)
-that re-marshal Win32 args into the NT convention. A real
-MinGW-compiled console `.exe` runs end-to-end; Linux compatibility
-remains the primary target.
+(`GetStdHandle`/`WriteFile`/`ReadFile`/`ExitProcess`/`VirtualAlloc`/TLS/
+`GetCommandLine`/`VirtualQuery`/`VirtualProtect`)
+that re-marshal Win32 args into the NT convention, and `msvcrt.dll`/
+`ucrtbase.dll` imports resolve against a CRT surface
+(`__getmainargs`/`_initterm`/`malloc`/`free`/`_errno`/`puts`/`fwrite`/
+`strlen`/`memcpy`/...) backed by a writable thunk-state page for
+argv/envp/`FILE[]`/TLS slots — a normal CRT-linked MinGW `.exe`
+(`gcc -O2`, real startup code calling `puts`) runs end-to-end;
+Linux compatibility remains the primary target.
 
 Every rung is also security-reviewed: a scoped audit of the diff plus a
 check of that subsystem's published kernel CVEs — each gets a written

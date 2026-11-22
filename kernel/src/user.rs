@@ -2023,6 +2023,18 @@ pub fn fs_lookup(name: &[u8]) -> Option<&'static [u8]> {
     crate::cpio::find(arc, name)
 }
 
+/// Borrow the running task immutably — fault/log-path accessor.
+pub(crate) fn cur_exe() -> &'static str {
+    let i = unsafe { *core::ptr::addr_of!(CUR_I) };
+    unsafe {
+        match (*core::ptr::addr_of!(TASKS)).get(i).and_then(|t| t.as_ref()) {
+            Some(t) => core::str::from_utf8(&t.exe[..(t.exe_len as usize).min(128)])
+                .unwrap_or("?"),
+            None => "?",
+        }
+    }
+}
+
 /// Borrow the running task mutably — syscall-context accessor.
 fn cur_mut() -> Option<&'static mut Task> {
     // SAFETY: single CPU, IF-masked syscall path — sole accessor.
@@ -2270,6 +2282,13 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
     if !teb_peb_init(t, p) {
         return false;
     }
+    // The Win32 thunk layer's writable state page (argv/envp/FILE[]/
+    // TLS) — mapped for every PE task; thunks use it, ntdll-level
+    // images just ignore it.
+    if map_page(t, crate::pe::STUB_DATA_VA, USER | WRITE | NX).is_none() {
+        return false;
+    }
+    k32_data_init(t);
     t.pers = PERS_NT;
     t.gs_base = crate::pe::TEB_VA;
     t.nt_alloc = NT_ALLOC_VA;
@@ -2350,96 +2369,614 @@ fn read_task_str(pml4: u64, va: u64, out: &mut [u8]) -> usize {
     0
 }
 
-/// kernel32/kernelbase/api-ms-* translation thunks: each is a
-/// hand-encoded Win64 function that re-marshals the caller's Win32
-/// arguments into the NT service convention — a real kernel32
-/// import (compiler-emitted call [rip+IAT]) lands on native code
-/// that behaves like the exported function, no DLL needed.
-fn k32_stub(t: &mut Task, va: u64, name: &[u8]) -> Option<u64> {
-    let code: &[u8] = match name {
-        // GetStdHandle(ecx): STD_INPUT/OUTPUT/ERROR (-10/-11/-12)
-        // map to NT std handles 1/2/3; anything else -> NULL.
-        b"GetStdHandle" => &[
-            0x83, 0xf9, 0xf6, 0x74, 0x0d, // cmp ecx,-10; je h1
-            0x83, 0xf9, 0xf5, 0x74, 0x0e, // cmp ecx,-11; je h2
-            0x83, 0xf9, 0xf4, 0x74, 0x0f, // cmp ecx,-12; je h3
-            0x31, 0xc0, 0xc3, //           xor eax,eax; ret
-            0xb8, 1, 0, 0, 0, 0xc3, //     mov eax,1; ret
-            0xb8, 2, 0, 0, 0, 0xc3, //     mov eax,2; ret
-            0xb8, 3, 0, 0, 0, 0xc3, //     mov eax,3; ret
-        ],
-        // WriteFile(h, buf, len, &written, ovl) and WriteConsoleA —
-        // same signature, both land on 9-arg NtWriteFile. The stack
-        // iosb lives on the thunk's own frame; its info word is the
-        // byte count written back to &written (NULL tolerated).
-        b"WriteFile" | b"WriteConsoleA" => &[
-            0x4c, 0x8b, 0xd9, //           mov r11, r9        (&written)
-            0x48, 0x83, 0xec, 0x60, //     sub rsp, 0x60
-            0x48, 0x8d, 0x44, 0x24, 0x50, // lea rax,[rsp+0x50] (iosb)
-            0x48, 0x89, 0x44, 0x24, 0x28, // mov [rsp+0x28],rax
-            0x48, 0x89, 0x54, 0x24, 0x30, // mov [rsp+0x30],rdx (buf)
-            0x4c, 0x89, 0x44, 0x24, 0x38, // mov [rsp+0x38],r8  (len)
-            0x48, 0xc7, 0x44, 0x24, 0x40, 0, 0, 0, 0, // byteoffset=0
-            0x48, 0xc7, 0x44, 0x24, 0x48, 0, 0, 0, 0, // key=0
-            0x4c, 0x8b, 0xd1, //           mov r10, rcx       (handle)
-            0x31, 0xd2, //                xor edx,edx        (event)
-            0x45, 0x31, 0xc0, //          xor r8d,r8d        (apc)
-            0x45, 0x31, 0xc9, //          xor r9d,r9d        (apcctx)
-            0xb8, 8, 0, 0, 0, //          mov eax, NtWriteFile
-            0x0f, 0x05, //                syscall
-            0x4d, 0x85, 0xdb, //          test r11,r11
-            0x74, 0x07, //                jz +7
-            0x8b, 0x4c, 0x24, 0x58, //    mov ecx,[rsp+0x58] (iosb.info)
-            0x41, 0x89, 0x09, //          mov [r11],ecx
-            0x48, 0x83, 0xc4, 0x60, //    add rsp,0x60
-            0xc3, //                      ret
-        ],
-        // ReadFile(h, buf, len, &read, ovl) and ReadConsoleA — the
-        // WriteFile shape on NtReadFile's service number.
-        b"ReadFile" | b"ReadConsoleA" => &[
-            0x4c, 0x8b, 0xd9, 0x48, 0x83, 0xec, 0x60, 0x48, 0x8d, 0x44,
-            0x24, 0x50, 0x48, 0x89, 0x44, 0x24, 0x28, 0x48, 0x89, 0x54,
-            0x24, 0x30, 0x4c, 0x89, 0x44, 0x24, 0x38, 0x48, 0xc7, 0x44,
-            0x24, 0x40, 0, 0, 0, 0, 0x48, 0xc7, 0x44, 0x24, 0x48, 0, 0,
-            0, 0, 0x4c, 0x8b, 0xd1, 0x31, 0xd2, 0x45, 0x31, 0xc0, 0x45,
-            0x31, 0xc9, 0xb8, 6, 0, 0, 0, 0x0f, 0x05, 0x4d, 0x85, 0xdb,
-            0x74, 0x07, 0x8b, 0x4c, 0x24, 0x58, 0x41, 0x89, 0x09, 0x48,
-            0x83, 0xc4, 0x60, 0xc3,
-        ],
-        // ExitProcess(code) -> NtTerminateProcess(-1, code).
-        b"ExitProcess" => &[
-            0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
-            0x89, 0xca, //                            mov edx,ecx
-            0xb8, 0x2c, 0, 0, 0, //                   mov eax,0x2C
-            0x0f, 0x05, //                            syscall
-            0xc3, //                                 ret (unreached)
-        ],
-        // VirtualAlloc(addr, size, type, prot) ->
-        // NtAllocateVirtualMemory(-1, &slot, 0, &sz, type, prot);
-        // returns the committed base, NULL on failure.
-        b"VirtualAlloc" => &[
-            0x48, 0x83, 0xec, 0x50, //    sub rsp,0x50
-            0x48, 0x89, 0x4c, 0x24, 0x40, // mov [rsp+0x40],rcx  (base)
-            0x48, 0x89, 0x54, 0x24, 0x48, // mov [rsp+0x48],rdx  (size)
-            0x4c, 0x89, 0x44, 0x24, 0x28, // mov [rsp+0x28],r8   (type)
-            0x4c, 0x89, 0x4c, 0x24, 0x30, // mov [rsp+0x30],r9   (prot)
-            0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
-            0x48, 0x8d, 0x54, 0x24, 0x40, // lea rdx,[rsp+0x40]
-            0x45, 0x31, 0xc0, //          xor r8d,r8d
-            0x4c, 0x8d, 0x4c, 0x24, 0x48, // lea r9,[rsp+0x48]
-            0xb8, 0x18, 0, 0, 0, //      mov eax,0x18
-            0x0f, 0x05, //               syscall
-            0x85, 0xc0, //               test eax,eax
-            0x78, 0x07, //               js fail
-            0x48, 0x8b, 0x44, 0x24, 0x40, // mov rax,[rsp+0x40]
-            0xeb, 0x02, //               jmp done
-            0x31, 0xc0, //               fail: xor eax,eax
-            0x48, 0x83, 0xc4, 0x50, //   done: add rsp,0x50
-            0xc3, //                     ret
-        ],
+/// Byte emitter for the Win32 thunk bodies — lets immediates bake
+/// real constants (STUB_DATA_VA fields, TEB offsets) and patches
+/// short branches after their targets are known.
+struct Emit<'a> {
+    b: &'a mut [u8],
+    n: usize,
+}
+impl<'a> Emit<'a> {
+    fn raw(&mut self, s: &[u8]) {
+        self.b[self.n..self.n + s.len()].copy_from_slice(s);
+        self.n += s.len();
+    }
+    /// mov rax, imm64
+    fn rax_imm(&mut self, v: u64) {
+        self.raw(&[0x48, 0xb8]);
+        self.raw(&v.to_le_bytes());
+    }
+    /// jcc rel8 (cc = low nibble of 0x70|cc) with a fix-up slot.
+    fn jcc(&mut self, cc: u8) -> usize {
+        self.raw(&[0x70 | cc, 0]);
+        self.n - 1
+    }
+    /// jmp rel8 with a fix-up slot (backward jumps too).
+    fn jmp8(&mut self) -> usize {
+        self.raw(&[0xeb, 0]);
+        self.n - 1
+    }
+    fn fix(&mut self, at: usize) {
+        self.b[at] = (self.n as i64 - at as i64 - 1) as i8 as u8;
+    }
+}
+
+/// Emit the shared 9-arg NtReadFile/NtWriteFile frame: caller has
+/// already placed handle in r10, buf VA in [rsp+0x30], length in
+/// [rsp+0x38], and subbed 0x60 of frame. Finishes with the syscall;
+/// the iosb pointer at [rsp+0x28] names a 16-byte scratch at
+/// [rsp+0x50]. `nr` = 8 write, 6 read.
+fn emit_xfile_tail(e: &mut Emit, nr: u32) {
+    e.raw(&[
+        0x48, 0x8d, 0x44, 0x24, 0x50, // lea rax,[rsp+0x50] iosb
+        0x48, 0x89, 0x44, 0x24, 0x28, // mov [rsp+0x28],rax
+        0x48, 0xc7, 0x44, 0x24, 0x40, 0, 0, 0, 0, // byteoffset=0
+        0x48, 0xc7, 0x44, 0x24, 0x48, 0, 0, 0, 0, // key=0
+        0x31, 0xd2, //                xor edx,edx   (event)
+        0x45, 0x31, 0xc0, //          xor r8d,r8d   (apc)
+        0x45, 0x31, 0xc9, //          xor r9d,r9d   (apcctx)
+    ]);
+    e.raw(&[0xb8]);
+    e.raw(&nr.to_le_bytes()); // mov eax,nr
+    e.raw(&[0x0f, 0x05]); //     syscall
+}
+
+/// Emit the NtAllocateVirtualMemory block: (base cell,size cell)
+/// at [rsp+0x40/+0x48] inside a sub-rsp-0x50 frame, args r10=-1,
+/// zerobits=0, type/protect from the caller's stack slots.
+/// Shared tail of VirtualAlloc/malloc/calloc. With `hdr` the
+/// success path also writes the page-aligned size at base+8 and
+/// returns base+16 — the 16-byte header free() reads back.
+fn emit_valloc_tail(e: &mut Emit, hdr: bool) {
+    e.raw(&[
+        0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
+        0x48, 0x8d, 0x54, 0x24, 0x40, // lea rdx,[rsp+0x40] &base
+        0x45, 0x31, 0xc0, //          xor r8d,r8d
+        0x4c, 0x8d, 0x4c, 0x24, 0x48, // lea r9,[rsp+0x48] &size
+        0xb8, 0x18, 0, 0, 0, //       mov eax,0x18
+        0x0f, 0x05, //                syscall
+        0x85, 0xc0, //                test eax,eax
+    ]);
+    let fail = e.jcc(0x8); // js fail
+    e.raw(&[0x48, 0x8b, 0x44, 0x24, 0x40]); // mov rax,[rsp+0x40]
+    if hdr {
+        e.raw(&[
+            0x48, 0x8b, 0x4c, 0x24, 0x48, // mov rcx,[rsp+0x48]
+            0x48, 0x89, 0x48, 0x08, //     mov [rax+8],rcx
+            0x48, 0x83, 0xc0, 0x10, //     add rax,0x10
+        ]);
+    }
+    let done = e.jmp8();
+    e.fix(fail);
+    e.raw(&[0x31, 0xc0]); //           xor eax,eax
+    e.fix(done);
+    e.raw(&[0x48, 0x83, 0xc4, 0x50, 0xc3]); // add rsp,0x50; ret
+}
+
+/// Emit a repne-scasb strlen reading the pointer in rcx, leaving
+/// the length in rcx. rdi is callee-saved in the Win64 ABI — the
+/// callers' loop bounds live in it — so it is saved/restored
+/// around scasb. Clobbers rax/rcx (caller-saved).
+fn emit_strlen_rcx(e: &mut Emit) {
+    e.raw(&[
+        0x57, //                            push rdi
+        0x48, 0x89, 0xcf, //                mov rdi,rcx
+        0x48, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff, // mov rcx,-1
+        0x31, 0xc0, //                      xor eax,eax
+        0xf2, 0xae, //                      repne scasb
+        0x48, 0xf7, 0xd1, //                not rcx
+        0x48, 0xff, 0xc9, //                dec rcx  (len, sans NUL)
+        0x5f, //                            pop rdi
+    ]);
+}
+
+/// Win32 translation thunk emitter: given a kernel32/kernelbase/
+/// api-ms-*/msvcrt export name, emits a real Win64 function that
+/// re-marshals the caller's arguments into the NT service
+/// convention — compiled `call [rip+IAT]` code lands on native code
+/// behaving like the export. Returns the byte count (not aligned).
+/// The data-page constants (argv/envp/FILE[]/TLS slots) live at
+/// STUB_DATA_VA, laid out by k32_data_init below.
+fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
+    let d = crate::pe::STUB_DATA_VA;
+    let mut e = Emit { b: buf, n: 0 };
+    match name {
+        // --- void functions: nothing to marshal -----------------
+        b"DeleteCriticalSection" | b"EnterCriticalSection"
+        | b"LeaveCriticalSection" | b"InitializeCriticalSection"
+        | b"__set_app_type" | b"__setusermatherr" | b"_cexit" => {
+            e.raw(&[0xc3]);
+        }
+        // --- inert stubs: resolve but are never expected to run.
+        // fprintf/vfprintf take varargs a thunk cannot format —
+        // CRT startup imports them without calling on this path.
+        b"__C_specific_handler" | b"fprintf" | b"vfprintf" | b"signal" => {
+            e.raw(&[0x31, 0xc0, 0xc3]);
+        }
+        // TEB LastErrorValue lives at gs:[0x68] (real TEB offset).
+        b"GetLastError" => e.raw(&[0x65, 0x8b, 0x04, 0x25, 0x68, 0, 0, 0, 0xc3]),
+        b"SetLastError" => e.raw(&[0x65, 0x89, 0x0c, 0x25, 0x68, 0, 0, 0, 0xc3]),
+        // SetUnhandledExceptionFilter(f) -> previous at data+0x100.
+        b"SetUnhandledExceptionFilter" => {
+            e.rax_imm(d + 0x100);
+            e.raw(&[0x48, 0x8b, 0x10, 0x48, 0x89, 0x08, 0x48, 0x89, 0xd0, 0xc3]);
+        }
+        // GetStdHandle(-10/-11/-12) -> NT std handles 1/2/3.
+        b"GetStdHandle" => {
+            e.raw(&[
+                0x83, 0xf9, 0xf6, 0x74, 0x0d, 0x83, 0xf9, 0xf5, 0x74, 0x0e,
+                0x83, 0xf9, 0xf4, 0x74, 0x0f, 0x31, 0xc0, 0xc3, 0xb8, 1,
+                0, 0, 0, 0xc3, 0xb8, 2, 0, 0, 0, 0xc3, 0xb8, 3, 0, 0, 0,
+                0xc3,
+            ]);
+        }
+        // GetModuleHandleA(NULL) -> PEB.ImageBaseAddress.
+        b"GetModuleHandleA" => {
+            e.raw(&[
+                0x65, 0x48, 0x8b, 0x04, 0x25, 0x60, 0, 0, 0, // mov rax,gs:[0x60]
+                0x48, 0x8b, 0x40, 0x10, // mov rax,[rax+0x10]
+                0xc3,
+            ]);
+        }
+        // IsDebuggerPresent -> PEB.BeingDebugged.
+        b"IsDebuggerPresent" => {
+            e.raw(&[
+                0x65, 0x48, 0x8b, 0x04, 0x25, 0x60, 0, 0, 0,
+                0x0f, 0xb6, 0x40, 0x02, 0xc3,
+            ]);
+        }
+        // GetCommandLineA -> ANSI argv0 in the data page.
+        b"GetCommandLineA" | b"GetCommandLineW" => {
+            e.rax_imm(d + 0x40);
+            e.raw(&[0xc3]);
+        }
+        // TLS: 8 slots at data+0xc0, bitmap byte at data+0x108.
+        b"TlsGetValue" | b"FlsGetValue" => {
+            e.raw(&[0x83, 0xf9, 0x08]);
+            let fail = e.jcc(0x3); // jae
+            e.rax_imm(d + 0xc0);
+            e.raw(&[0x48, 0x8b, 0x04, 0xc8, 0xc3]); // mov rax,[rax+rcx*8]; ret
+            e.fix(fail);
+            e.raw(&[0x31, 0xc0, 0xc3]);
+        }
+        b"TlsSetValue" | b"FlsSetValue" => {
+            e.raw(&[0x83, 0xf9, 0x08]);
+            let fail = e.jcc(0x3);
+            e.rax_imm(d + 0xc0);
+            e.raw(&[
+                0x48, 0x89, 0x14, 0xc8, // mov [rax+rcx*8],rdx
+                0xb8, 1, 0, 0, 0, 0xc3, // mov eax,1; ret
+            ]);
+            e.fix(fail);
+            e.raw(&[0x31, 0xc0, 0xc3]);
+        }
+        b"TlsAlloc" | b"FlsAlloc" => {
+            e.rax_imm(d + 0x108);
+            e.raw(&[
+                0x0f, 0xb6, 0x08, // movzx ecx,byte[rax]
+                0x31, 0xd2, //    xor edx,edx
+            ]);
+            let lp = e.n;
+            e.raw(&[0x0f, 0xa3, 0xd1]); // bt ecx,edx
+            let found = e.jcc(0x3); //   jae found
+            e.raw(&[0xff, 0xc2, 0x83, 0xfa, 0x08]); // inc edx; cmp edx,8
+            let back = e.jcc(0x2); //   jb loop
+            e.b[back] = (lp as i64 - back as i64 - 1) as i8 as u8;
+            e.raw(&[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3]); // mov eax,-1; ret
+            e.fix(found);
+            e.raw(&[
+                0x0f, 0xab, 0xd1, // bts ecx,edx
+                0x88, 0x08, //      mov [rax],cl
+                0x89, 0xd0, //      mov eax,edx
+                0xc3,
+            ]);
+        }
+        b"TlsFree" | b"FlsFree" => {
+            e.raw(&[0x83, 0xf9, 0x08]);
+            let fail = e.jcc(0x3);
+            e.rax_imm(d + 0x108);
+            e.raw(&[
+                0x0f, 0xb6, 0x10, // movzx edx,byte[rax]
+                0x0f, 0xb3, 0xd1, // btr edx,ecx
+                0x88, 0x10, //      mov [rax],dl
+                0xb8, 1, 0, 0, 0, 0xc3,
+            ]);
+            e.fix(fail);
+            e.raw(&[0x31, 0xc0, 0xc3]);
+        }
+        // Sleep(ms) -> NtDelayExecution(0, &(-ms*10000)).
+        b"Sleep" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
+                0x89, 0xc8, //           mov eax,ecx
+                0x48, 0xf7, 0xd8, //     neg rax
+                0x48, 0x69, 0xc0, 0x10, 0x27, 0, 0, // imul rax,rax,10000
+                0x48, 0x89, 0x44, 0x24, 0x30, // mov [rsp+0x30],rax
+                0x48, 0x8d, 0x54, 0x24, 0x30, // lea rdx,[rsp+0x30]
+                0x45, 0x31, 0xd2, //    xor r10d,r10d
+                0xb8, 0x34, 0, 0, 0, // mov eax,0x34
+                0x0f, 0x05, //          syscall
+                0x48, 0x83, 0xc4, 0x38, 0xc3, // add rsp,0x38; ret
+            ]);
+        }
+        // VirtualProtect: reports old prot as PAGE_READWRITE(4) and
+        // claims success — we don't model per-page prot changes yet.
+        b"VirtualProtect" => {
+            e.raw(&[0x4d, 0x85, 0xc9]); // test r9,r9
+            let skip = e.jcc(0x4); //    jz skip
+            e.raw(&[0x41, 0xc7, 0x01, 0x04, 0, 0, 0]); // mov dword[r9],4
+            e.fix(skip);
+            e.raw(&[0xb8, 1, 0, 0, 0, 0xc3]);
+        }
+        // VirtualQuery(addr,buf,len) -> a plausible committed-page
+        // MEMORY_BASIC_INFORMATION; returns 48 (sizeof).
+        b"VirtualQuery" => {
+            e.raw(&[0x49, 0x83, 0xf8, 0x30]); // cmp r8,48
+            let fail = e.jcc(0x2); //          jb fail
+            e.raw(&[
+                0x48, 0x89, 0x0a, //                   mov [rdx],rcx
+                0x48, 0x81, 0xe1, 0x00, 0xf0, 0xff, 0xff, // and rcx,-0x1000
+                0x48, 0x89, 0x4a, 0x08, //              mov [rdx+8],rcx
+                0xc7, 0x42, 0x10, 0x04, 0, 0, 0, //    AllocProtect=4
+                0xc7, 0x42, 0x18, 0x04, 0, 0, 0, //    Protect=4
+                0x48, 0xc7, 0x42, 0x20, 0x00, 0x10, 0, 0, // RegionSize=4K
+                0xc7, 0x42, 0x28, 0x00, 0x10, 0, 0, //  State=COMMIT
+                0xc7, 0x42, 0x2c, 0x00, 0x00, 0x02, 0, // Type=PRIVATE
+                0xb8, 0x30, 0, 0, 0, //                mov eax,48
+                0xc3,
+            ]);
+            e.fix(fail);
+            e.raw(&[0x31, 0xc0, 0xc3]);
+        }
+        // --- msvcrt startup ------------------------------------
+        // __getmainargs(&argc,&argv,&envp,dowildcard,si).
+        b"__getmainargs" => {
+            e.raw(&[0xc7, 0x01, 0x01, 0, 0, 0]); // mov dword[rcx],1
+            e.rax_imm(d); //                      argv array
+            e.raw(&[0x48, 0x89, 0x02]); //        mov [rdx],rax
+            e.rax_imm(d + 0x150); //              envp array
+            e.raw(&[0x49, 0x89, 0x00, 0x31, 0xc0, 0xc3]);
+        }
+        // __iob_func -> fake FILE[3] of {u64 fd} at data+0x20.
+        b"__iob_func" => {
+            e.rax_imm(d + 0x20);
+            e.raw(&[0xc3]);
+        }
+        // __p__* accessors return addresses of the data cells.
+        b"__p__fmode" => {
+            e.rax_imm(d + 0x1c);
+            e.raw(&[0xc3]);
+        }
+        b"__p__commode" => {
+            e.rax_imm(d + 0x18);
+            e.raw(&[0xc3]);
+        }
+        b"__p__environ" | b"__p__initenv" => {
+            e.rax_imm(d + 0x10);
+            e.raw(&[0xc3]);
+        }
+        b"_errno" | b"__errno" => {
+            e.rax_imm(d + 0x138);
+            e.raw(&[0xc3]);
+        }
+        b"__doserrno" => {
+            e.rax_imm(d + 0x13c);
+            e.raw(&[0xc3]);
+        }
+        // _initterm(first,last): call each non-null fn ptr — real
+        // ctor dispatch so static initializers actually run.
+        b"_initterm" => {
+            e.raw(&[0x53, 0x48, 0x89, 0xcb]); // push rbx; mov rbx,rcx
+            let lp = e.n;
+            e.raw(&[0x48, 0x39, 0xd3]); // cmp rbx,rdx
+            let done = e.jcc(0x3); //      jae done
+            e.raw(&[
+                0x48, 0x8b, 0x03, // mov rax,[rbx]
+                0x48, 0x85, 0xc0, // test rax,rax
+            ]);
+            let sk = e.jcc(0x4); //        jz +2
+            e.raw(&[0xff, 0xd0]); //      call rax
+            e.fix(sk);
+            e.raw(&[0x48, 0x83, 0xc3, 0x08]); // add rbx,8
+            let back = e.jmp8();
+            e.b[back] = (lp as i64 - back as i64 - 1) as i8 as u8;
+            e.fix(done);
+            e.raw(&[0x5b, 0x31, 0xc0, 0xc3]);
+        }
+        // _onexit(f) -> f (registration accepted; atexit calls are
+        // skipped — a groundwork divergence).
+        b"_onexit" | b"__dllonexit" => e.raw(&[0x48, 0x89, 0xc8, 0xc3]),
+        // abort -> exit(3); _amsg_exit/exit -> ExitProcess(code).
+        b"abort" => {
+            e.raw(&[0xb9, 3, 0, 0, 0]); // mov ecx,3
+            e.raw(&[
+                0x89, 0xca, //             mov edx,ecx
+                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov r10,-1
+                0xb8, 0x2c, 0, 0, 0, //    mov eax,0x2C
+                0x0f, 0x05, 0xc3,
+            ]);
+        }
+        b"exit" | b"_amsg_exit" | b"ExitProcess" => {
+            e.raw(&[
+                0x89, 0xca,
+                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff,
+                0xb8, 0x2c, 0, 0, 0, 0x0f, 0x05, 0xc3,
+            ]);
+        }
+        // malloc/calloc: NtAllocateVirtualMemory with a 16-byte
+        // size header so free() can recover the region extent.
+        b"malloc" => {
+            e.raw(&[0x48, 0x8d, 0x51, 0x10]); // lea rdx,[rcx+0x10]
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x50,
+                0x48, 0xc7, 0x44, 0x24, 0x40, 0, 0, 0, 0,
+                0x48, 0x89, 0x54, 0x24, 0x48,
+                0x48, 0xc7, 0x44, 0x24, 0x28, 0x00, 0x30, 0, 0,
+                0x48, 0xc7, 0x44, 0x24, 0x30, 0x04, 0, 0, 0,
+            ]);
+            emit_valloc_tail(&mut e, true);
+        }
+        b"calloc" => {
+            e.raw(&[
+                0x48, 0x0f, 0xaf, 0xd1, // imul rdx,rcx
+                0x48, 0x83, 0xc2, 0x10, // add rdx,0x10
+                0x48, 0x83, 0xec, 0x50,
+                0x48, 0xc7, 0x44, 0x24, 0x40, 0, 0, 0, 0,
+                0x48, 0x89, 0x54, 0x24, 0x48,
+                0x48, 0xc7, 0x44, 0x24, 0x28, 0x00, 0x30, 0, 0,
+                0x48, 0xc7, 0x44, 0x24, 0x30, 0x04, 0, 0, 0,
+            ]);
+            emit_valloc_tail(&mut e, true);
+        }
+        // free(p): NtFreeVirtualMemory(-1,&base,&size,MEM_RELEASE)
+        // recovering the extent from the 16-byte malloc header.
+        b"free" => {
+            e.raw(&[0x48, 0x85, 0xc9]); // test rcx,rcx
+            let done = e.jcc(0x4); //       jz ret
+            e.raw(&[
+                0x48, 0x8d, 0x41, 0xf0, // lea rax,[rcx-0x10]
+                0x48, 0x8b, 0x49, 0xf8, // mov rcx,[rcx-8]
+                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
+                0x48, 0x89, 0x44, 0x24, 0x28, // base cell
+                0x48, 0x89, 0x4c, 0x24, 0x30, // size cell
+                0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // r10=-1
+                0x48, 0x8d, 0x54, 0x24, 0x28, // lea rdx,[rsp+0x28]
+                0x4c, 0x8d, 0x44, 0x24, 0x30, // lea r8,[rsp+0x30]
+                0x41, 0xb9, 0x00, 0x80, 0, 0, // mov r9d,0x8000
+                0xb8, 0x1e, 0, 0, 0, //       mov eax,0x1E
+                0x0f, 0x05, //                syscall
+                0x48, 0x83, 0xc4, 0x38, //    add rsp,0x38
+            ]);
+            e.fix(done);
+            e.raw(&[0xc3]);
+        }
+        // strlen/memcpy/strncmp — real C-string routines.
+        b"strlen" => {
+            emit_strlen_rcx(&mut e);
+            e.raw(&[0xc3]);
+        }
+        b"memcpy" => {
+            e.raw(&[
+                0x56, 0x57, //          push rsi; push rdi
+                0x48, 0x89, 0xc8, // mov rax,rcx (dst -> ret)
+                0x48, 0x89, 0xd6, // mov rsi,rdx (src)
+                0x48, 0x89, 0xcf, // mov rdi,rcx (dst)
+                0x4c, 0x89, 0xc1, // mov rcx,r8  (n)
+                0xf3, 0xa4, //      rep movsb
+                0x5f, 0x5e, //      pop rdi; pop rsi
+                0xc3,
+            ]);
+        }
+        b"strncmp" => {
+            let lp = e.n;
+            e.raw(&[0x4d, 0x85, 0xc0]); // test r8,r8
+            let eq = e.jcc(0x4);
+            e.raw(&[
+                0x41, 0x8a, 0x09, // mov r9b,[rcx]
+                0x41, 0x8a, 0x12, // mov r10b,[rdx]
+                0x45, 0x38, 0xd1, // cmp r9b,r10b
+            ]);
+            let diff = e.jcc(0x5);
+            e.raw(&[0x45, 0x84, 0xc9]); // test r9b,r9b
+            let eq2 = e.jcc(0x4);
+            e.raw(&[
+                0x48, 0xff, 0xc1, 0x48, 0xff, 0xc2, 0x49, 0xff, 0xc8,
+            ]);
+            let back = e.jmp8();
+            e.b[back] = (lp as i64 - back as i64 - 1) as i8 as u8;
+            e.fix(eq);
+            e.fix(eq2);
+            e.raw(&[0x31, 0xc0, 0xc3]); // xor eax,eax; ret
+            e.fix(diff);
+            e.raw(&[
+                0x41, 0x0f, 0xb6, 0xc1, // movzx eax,r9b
+                0x41, 0x0f, 0xb6, 0xd2, // movzx edx,r10b
+                0x29, 0xd0, //          sub eax,edx
+                0xc3,
+            ]);
+        }
+        // WriteFile(h,buf,len,&w,ovl)/WriteConsoleA — 9-arg
+        // NtWriteFile, iosb.info written back to &written.
+        b"WriteFile" | b"WriteConsoleA" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x60, //     sub rsp,0x60
+                // &written must outlive the syscall — r11 is dead
+                // (syscall sets r11=rflags), so it parks at +0x20.
+                0x4c, 0x89, 0x4c, 0x24, 0x20, // mov [rsp+0x20],r9
+                0x48, 0x89, 0x54, 0x24, 0x30, // buf
+                0x4c, 0x89, 0x44, 0x24, 0x38, // len
+                0x4c, 0x8b, 0xd1, //           mov r10,rcx (handle)
+            ]);
+            emit_xfile_tail(&mut e, 8);
+            e.raw(&[
+                0x48, 0x8b, 0x4c, 0x24, 0x20, // mov rcx,[rsp+0x20]
+                0x48, 0x85, 0xc9, 0x74, 0x06, // test rcx,rcx; jz +6
+                0x8b, 0x44, 0x24, 0x58, //      mov eax,[rsp+0x58] iosb.info
+                0x89, 0x01, //                 mov [rcx],eax
+                0x48, 0x83, 0xc4, 0x60, 0xc3,
+            ]);
+        }
+        // ReadFile/ReadConsoleA — same shape on NtReadFile.
+        b"ReadFile" | b"ReadConsoleA" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x60,
+                0x4c, 0x89, 0x4c, 0x24, 0x20,
+                0x48, 0x89, 0x54, 0x24, 0x30,
+                0x4c, 0x89, 0x44, 0x24, 0x38,
+                0x4c, 0x8b, 0xd1,
+            ]);
+            emit_xfile_tail(&mut e, 6);
+            e.raw(&[
+                0x48, 0x8b, 0x4c, 0x24, 0x20,
+                0x48, 0x85, 0xc9, 0x74, 0x06,
+                0x8b, 0x44, 0x24, 0x58,
+                0x89, 0x01,
+                0x48, 0x83, 0xc4, 0x60, 0xc3,
+            ]);
+        }
+        // VirtualAlloc(addr,size,type,prot) -> committed base.
+        b"VirtualAlloc" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x50,
+                0x48, 0x89, 0x4c, 0x24, 0x40,
+                0x48, 0x89, 0x54, 0x24, 0x48,
+                0x4c, 0x89, 0x44, 0x24, 0x28,
+                0x4c, 0x89, 0x4c, 0x24, 0x30,
+            ]);
+            emit_valloc_tail(&mut e, false);
+        }
+        // fwrite(ptr,size,nmemb,stream) -> items written; FILE* is
+        // our fake {u64 fd} record.
+        b"fwrite" => {
+            e.raw(&[
+                0x53, //                push rbx
+                0x41, 0x54, //          push r12
+                0x48, 0x89, 0xcb, //    mov rbx,rcx   (buf)
+                0x49, 0x89, 0xc4, //    mov r12,r8    (nmemb)
+                0x48, 0x89, 0xd0, //    mov rax,rdx
+                0x49, 0x0f, 0xaf, 0xc0, // imul rax,r8 (total)
+                0x49, 0x89, 0xc0, //    mov r8,rax
+                0x4d, 0x8b, 0x11, //    mov r10,[r9]  (fd)
+                0x48, 0x83, 0xec, 0x60, // sub rsp,0x60
+                0x48, 0x89, 0x5c, 0x24, 0x30,
+                0x4c, 0x89, 0x44, 0x24, 0x38,
+            ]);
+            emit_xfile_tail(&mut e, 8);
+            e.raw(&[0x85, 0xc0]); // test eax,eax
+            let fail = e.jcc(0x8); // js fail
+            e.raw(&[0x4c, 0x89, 0xe0]); // mov rax,r12
+            let done = e.jmp8();
+            e.fix(fail);
+            e.raw(&[0x31, 0xc0]); // xor eax,eax
+            e.fix(done);
+            e.raw(&[
+                0x48, 0x83, 0xc4, 0x60, 0x41, 0x5c, 0x5b, 0xc3,
+            ]);
+        }
+        // fputs(str,stream) -> strlen + write to stream's fd.
+        b"fputs" => {
+            e.raw(&[
+                0x53, 0x48, 0x89, 0xcb, // push rbx; mov rbx,rcx
+                0x4c, 0x8b, 0x12, //       mov r10,[rdx]  (fd)
+            ]);
+            emit_strlen_rcx(&mut e); // len -> rcx (rdi=rax clobbered)
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x60,
+                0x48, 0x89, 0x5c, 0x24, 0x30,
+                0x48, 0x89, 0x4c, 0x24, 0x38,
+            ]);
+            emit_xfile_tail(&mut e, 8);
+            e.raw(&[0x48, 0x83, 0xc4, 0x60, 0x5b, 0xc3]);
+        }
+        // puts(str) -> write str + '\n' to stdout handle 2.
+        b"puts" => {
+            e.raw(&[0x53, 0x48, 0x89, 0xcb]); // push rbx; mov rbx,rcx
+            emit_strlen_rcx(&mut e);
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x60,
+                0x48, 0x89, 0x5c, 0x24, 0x30,
+                0x48, 0x89, 0x4c, 0x24, 0x38,
+            ]);
+            e.raw(&[0x41, 0xba, 0x02, 0, 0, 0]); // mov r10d,2
+            emit_xfile_tail(&mut e, 8);
+            e.rax_imm(d + 0x38); //              newline byte
+            e.raw(&[
+                0x48, 0x89, 0x44, 0x24, 0x30,
+                0x48, 0xc7, 0x44, 0x24, 0x38, 0x01, 0, 0, 0,
+                0xb8, 0x08, 0, 0, 0,
+                0x0f, 0x05, //                    syscall (r10 still 2)
+                0x48, 0x83, 0xc4, 0x60, 0x5b, 0xc3,
+            ]);
+        }
         _ => return None,
-    };
-    write_task_bytes(t.pml4, va, code).then(|| (code.len() as u64 + 15) & !15)
+    }
+    Some(e.n)
+}
+
+/// msvcrt's DATA exports: the IAT slot must hold the variable's
+/// own address, not a thunk — CRT code does `mov rax,[__imp_X]`
+/// then dereferences/writes rax as the global. Each name maps to a
+/// cell in the data page holding the right value/shape.
+fn k32_data_sym(name: &[u8]) -> Option<u64> {
+    let d = crate::pe::STUB_DATA_VA;
+    Some(match name {
+        // int globals — the cell IS the variable.
+        b"_fmode" => d + 0x1c,
+        b"_commode" => d + 0x18,
+        b"__argc" => d + 0x118,
+        // pointer globals — cell holds a pointer into the page.
+        b"__initenv" | b"_environ" | b"_wenviron" => d + 0x10,
+        b"__argv" | b"__wargv" => d + 0x120,
+        b"_pgmptr" | b"_wpgmptr" => d + 0x128,
+        b"_acmdln" | b"_wcmdln" => d + 0x130,
+        _ => return None,
+    })
+}
+
+/// Data-page init for the Win32 thunk layer: argv = {&argv0,NULL},
+/// envp = {NULL}, commode/fmode ints, fake FILE[3] carrying NT std
+/// fds, the '\n' byte puts writes, and argv0 = "<exe>\0" (ANSI —
+/// good enough for ASCII names; GetCommandLineW currently aliases
+/// the same buffer, a documented groundwork divergence).
+fn k32_data_init(t: &mut Task) {
+    let d = crate::pe::STUB_DATA_VA;
+    // argv[0] pointer + terminator. envp = {"RUSTUX=1", NULL} at
+    // 0x150 (0x10 only holds the unused envp pointer slot) — CRT's
+    // env walk strlen()s each entry, so a bare {NULL} envp is a
+    // latent strlen(NULL); one harmless var keeps it honest.
+    let _ = write_task_bytes(t.pml4, d, &(d + 0x40).to_le_bytes());
+    let _ = write_task_bytes(t.pml4, d + 0x08, &0u64.to_le_bytes());
+    let _ = write_task_bytes(t.pml4, d + 0x10, &(d + 0x150).to_le_bytes());
+    let _ = write_task_bytes(t.pml4, d + 0x150, &(d + 0x140).to_le_bytes());
+    let _ = write_task_bytes(t.pml4, d + 0x158, &0u64.to_le_bytes());
+    let _ = write_task_bytes(t.pml4, d + 0x140, b"RUSTUX=1\0");
+    // commode/fmode.
+    let _ = write_task_bytes(t.pml4, d + 0x18, &0u32.to_le_bytes());
+    let _ = write_task_bytes(t.pml4, d + 0x1c, &0u32.to_le_bytes());
+    // Fake FILE[3]: {u64 fd} — stdin 1, stdout 2, stderr 3.
+    for (i, fd) in [1u64, 2, 3].iter().enumerate() {
+        let _ = write_task_bytes(t.pml4, d + 0x20 + i as u64 * 8, &fd.to_le_bytes());
+    }
+    // putc newline byte.
+    let _ = write_task_bytes(t.pml4, d + 0x38, &[0x0au8]);
+    // argv0 = exe name + ".exe" (already NUL-free), clamped.
+    let mut a0 = [0u8; 120];
+    let el = (t.exe_len as usize).min(115);
+    a0[..el].copy_from_slice(&t.exe[..el]);
+    a0[el..el + 4].copy_from_slice(b".exe");
+    let _ = write_task_bytes(t.pml4, d + 0x40, &a0[..el + 5]);
+    // Data-export cells (see k32_data_sym): environ ptr, argc=1,
+    // argv ptr, pgmptr, acmdln, errno/doserrno ints.
+    for (off, v) in [
+        (0x118, 1u64),
+        (0x120, d),
+        (0x128, d + 0x40),
+        (0x130, d + 0x40),
+        (0x138, 0),
+        (0x13c, 0),
+    ] {
+        let _ = write_task_bytes(t.pml4, d + off, &v.to_le_bytes());
+    }
 }
 
 /// Import resolution against the synthetic ntdll stub page: walk
@@ -2483,6 +3020,8 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
         let k32 = nl != 0
             && (dll.eq_ignore_ascii_case(b"kernel32.dll")
                 || dll.eq_ignore_ascii_case(b"kernelbase.dll")
+                || dll.eq_ignore_ascii_case(b"msvcrt.dll")
+                || dll.eq_ignore_ascii_case(b"ucrtbase.dll")
                 || dll.len() > 12 && dll[..12].eq_ignore_ascii_case(b"api-ms-win-"));
         if nl == 0 || !(k32 || dll.eq_ignore_ascii_case(b"ntdll.dll")) {
             return false;
@@ -2505,23 +3044,34 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
             let mut fname = [0u8; 48];
             // IMAGE_IMPORT_BY_NAME: u16 hint, then the name.
             let fl = read_task_str(t.pml4, p.bias + ibn + 2, &mut fname);
-            if stub_next + 96 > crate::pe::STUB_VA + 0x1000 {
-                return false;
+            // ntdll exports get a direct syscall stub; kernel32 /
+            // msvcrt get a Win32-signature translation thunk — except
+            // DATA exports, whose IAT slot must hold the variable's
+            // own address (a cell in the data page), not code.
+            if k32 && fl != 0 {
+                if let Some(dv) = k32_data_sym(&fname[..fl]) {
+                    if !write_task_bytes_force(
+                        t.pml4,
+                        p.bias + iat_rva + j * 8,
+                        &dv.to_le_bytes(),
+                    ) {
+                        return false;
+                    }
+                    continue;
+                }
             }
-            // ntdll exports get a direct syscall stub; kernel32 gets a
-            // Win32-signature translation thunk. Both land in the IAT.
+            let mut buf = [0u8; 160];
             let used = if k32 {
-                k32_stub(t, stub_next, &fname[..fl])
+                k32_emit(&mut buf, &fname[..fl])
             } else if fl != 0 {
-                crate::nt::service_for_name(&fname[..fl]).and_then(|nr| {
-                    let mut stub = [0u8; 16];
-                    stub[0..3].copy_from_slice(&[0x4c, 0x8b, 0xd1]); // mov r10,rcx
-                    stub[3] = 0xb8; // mov eax, imm32
-                    stub[4..8].copy_from_slice(&nr.to_le_bytes());
-                    stub[8] = 0x0f;
-                    stub[9] = 0x05; // syscall
-                    stub[10] = 0xc3; // ret
-                    write_task_bytes(t.pml4, stub_next, &stub).then_some(16)
+                crate::nt::service_for_name(&fname[..fl]).map(|nr| {
+                    buf[0..3].copy_from_slice(&[0x4c, 0x8b, 0xd1]); // mov r10,rcx
+                    buf[3] = 0xb8; // mov eax, imm32
+                    buf[4..8].copy_from_slice(&nr.to_le_bytes());
+                    buf[8] = 0x0f;
+                    buf[9] = 0x05; // syscall
+                    buf[10] = 0xc3; // ret
+                    16
                 })
             } else {
                 None
@@ -2529,6 +3079,12 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
             let Some(used) = used else {
                 return false;
             };
+            let used = ((used as u64) + 15) & !15;
+            if stub_next + used > crate::pe::STUB_VA + 0x1000
+                || !write_task_bytes(t.pml4, stub_next, &buf[..used as usize])
+            {
+                return false;
+            }
             if !write_task_bytes_force(
                 t.pml4,
                 p.bias + iat_rva + j * 8,
@@ -5558,6 +6114,60 @@ pub fn nt_alloc_pages(hint: u64, size: u64) -> Option<u64> {
         va += size;
         if va + size >= elf::USER_VA_HI || va < NT_ALLOC_VA {
             return None;
+        }
+    }
+}
+
+/// NtFreeVirtualMemory backing: unmap every page in
+/// [base, base+size). Work walks the task's mapping ledger, so it
+/// is proportional to pages actually mapped — never to the
+/// user-supplied extent (a u64::MAX size would otherwise walk the
+/// entire user window page by page inside the IF-masked syscall
+/// path, a one-syscall machine hang). Freed range entries are
+/// shrunk/split rather than dropped so the reap ledger still
+/// accounts for their still-mapped remnants. The nt_alloc bump
+/// cursor is NOT rewound (real heaps don't reclaim VA space on
+/// free either — only the frames).
+pub fn nt_free_pages(base: u64, size: u64) {
+    let Some(t) = cur_mut() else { return };
+    let end = base.saturating_add(size);
+    let mut i = 0;
+    while i < t.nranges {
+        let (lo, hi, fl) = t.ranges[i];
+        if hi <= base || lo >= end {
+            i += 1;
+            continue;
+        }
+        let mut va = lo.max(base);
+        let vend = hi.min(end);
+        while va < vend {
+            unmap_page(t, va);
+            va += PAGE;
+        }
+        // Adjust the entry to cover only the still-mapped
+        // remainder: left remnant [lo,base), right remnant
+        // [end,hi). A middle free splits the entry when the table
+        // has room; if it's full we keep the wider entry —
+        // over-tracking is safe (reap's unmap is idempotent),
+        // under-tracking leaks frames.
+        if lo < base && end < hi {
+            t.ranges[i] = (lo, base, fl);
+            if t.nranges < MAX_RANGES {
+                t.ranges[t.nranges] = (end, hi, fl);
+                t.nranges += 1;
+            } else {
+                t.ranges[i] = (lo, hi, fl);
+            }
+            i += 1;
+        } else if lo < base {
+            t.ranges[i].1 = base;
+            i += 1;
+        } else if end < hi {
+            t.ranges[i].0 = end;
+            i += 1;
+        } else {
+            t.ranges.copy_within(i + 1..t.nranges, i);
+            t.nranges -= 1;
         }
     }
 }
