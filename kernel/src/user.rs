@@ -3278,9 +3278,6 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x0f, 0x05, 0xcc, //          syscall; int3
             ]);
         }
-        b"GetCurrentThread" => {
-            e.raw(&[0x48, 0xc7, 0xc0, 0xfe, 0xff, 0xff, 0xff, 0xc3]); // rax=-2
-        }
         // GetThreadId(h) -> TBI.UniqueThread via the query service.
         b"GetThreadId" => {
             e.raw(&[
