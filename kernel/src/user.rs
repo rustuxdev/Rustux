@@ -2618,11 +2618,17 @@ fn nt_mod_add(
     // Sweep slots whose owning process is fully gone — except the
     // caller's own: a spawning task registers its import deps before
     // it lands in TASKS, and a later dep's sweep must not reap the
-    // earlier deps its dep_mask is about to point at.
+    // earlier deps its dep_mask is about to point at. "Gone" means
+    // no live task in the thread group: an exited-but-unreaped
+    // leader already ran its exit detaches and can never touch the
+    // table again, so zombie slots must not hold the (tiny) ledger
+    // hostage until a reaper gets scheduled.
     let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
     for e in tab.iter_mut() {
         if e.3 != 0 && e.0 != owner
-            && !tasks.iter().flatten().any(|t| t.pid == e.0)
+            && !tasks.iter().flatten().any(|t| {
+                t.tgid == e.0 && t.state != TaskState::Exited
+            })
         {
             *e = (0, 0, 0, 0, 0, 0, [0; 32], 0, 0);
         }
@@ -17790,6 +17796,21 @@ fn exit_bookkeeping(n: usize) {
             t.ppid = 0; // never a waitable zombie
         }
         return;
+    }
+    // NT module ledger: a dead leader's entries are inert — its
+    // detaches already ran in the ExitProcess drain, or never will
+    // on a forced kill. Free the slots now unless a same-tgid thread
+    // still runs; a zombie must not hold the 8-slot table hostage
+    // until some reaper pass gets scheduled.
+    if !tasks.iter().flatten().any(|t| {
+        t.pid != cpid && t.tgid == cpid && t.state != TaskState::Exited
+    }) {
+        let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_MODS) };
+        for e in tab.iter_mut() {
+            if e.0 == cpid {
+                *e = (0, 0, 0, 0, 0, 0, [0; 32], 0, 0);
+            }
+        }
     }
     // Wake a wait-blocked parent whose target just exited.
     let mut collected = false;
