@@ -1883,4 +1883,48 @@ fchmod/fchmodat stored + dir, chown/fchown/lchown through-link vs
 on-link, -1 keeps, utime/utimensat explicit + NOW + OMIT keeps
 atime, futimens AT_EMPTY_PATH, futimesat, bad nsec/usec EINVAL,
 NOFOLLOW vs follow on link, archive/proc EROFS. 42 tasks, frames
-108587 -> 108587 zero leak, exit 33. Ledger: 111.
+108587 -> 108587 zero leak, exit 33. Ledger: 112.
+
+## run-105 — char devices: real /dev namespace, mknod/mknodat
+
+VFile gains fmt (S_IF* tag) + rdev; device nodes ride the same
+machinery as regular files (name/meta/unlink/rename/inotify/
+stat/getdents) with a new FdKind::Dev OFD carrying the vfile
+index. mknod(133)/mknodat(259): canon + resolve_links(final=
+false), EEXIST on existing name incl. links, EROFS under
+/proc, fmt whitelist {0,S_IFREG,S_IFCHR,S_IFBLK,S_IFIFO,
+S_IFSOCK} — S_IFDIR/S_IFLNK EINVAL like Linux. dev_init() at
+boot mints dev/ + null(1:3)/zero(1:5)/full(1:7)/random(1:8)/
+urandom(1:9)/tty(5:0)/console(5:1) plus the /dev/{fd,stdin,
+stdout,stderr} links to /proc/self/fd — the old one-off
+dev/tty path hack is gone. Open() dispatches on rdev: known
+minors only (major1: 3/5/7/8/9, major5: 0 with the
+t.sid==CONSOLE_SID ctty check, 1 console) else ENXIO, other
+majors ENODEV, block/fifo/sock nodes ENODEV/ENXIO — a crafted
+mknod can't reach a driver that isn't there. Read arms: null
+EOF, zero+full zero-fill, random/urandom xorshift (nonzero-
+seeded from rdtsc), tty/console share tty_input_read (job-
+control gate and all). Writes: full ENOSPC, rest sink;
+major-5 writes route through sys_write's fd_is_console path.
+Dev fds integrate poll/FIONREAD/ioctl/fstat-meta/getdents
+DT_CHR/proc fd-links/fchmod/fchown/futimens; lseek is
+noop_llseek; O_TRUNC skips dev nodes; unlink-while-open
+storage dies with last OFD like regular files.
+Audit (run-79, quick, scoped): 1 confirmed defect fixed
+pre-commit — the open() major whitelist was missing and
+fd_read's catch-all routed ANY unhandled rdev to the tty
+input queue, so a crafted mknod(1:99) read console input
+without the ctty session check; now whitelisted open +
+explicit rdev match + EINVAL floor. cve.now: CVE-2026-89560
+(landlock mknod-whiteout guard) n/a — no overlayfs/LSM;
+no-CAP_MKNOD recorded as the same standing no-credential-
+model divergence as run-104. Also fixed: dev_init moved
+before the frame baseline (boot objects aren't task leaks)
+and the iotest mknod-type probe corrected to S_IFDIR (Linux
+does allow S_IFSOCK nodes). iotest +25 checks: stat/fstat
+S_IFCHR+rdev, open/read/write on null/zero/full/urandom,
+/dev/tty open, poll readiness, lseek, mknod+mknodat types +
+EEXIST + EINVAL + a working mknod'd node, getdents DT_CHR.
+21/21 suites 0 failures, 42 tasks, frames 108572 -> 108572
+zero leak, exit 33. Ledger: 111.
+

@@ -81,7 +81,9 @@ pipes, sockets (`socket`/`bind`/
 `listen`/`accept`/`connect`, `poll`/`ppoll`/`pselect6`, `epoll`,
 `eventfd`, `timerfd`, `signalfd`, `inotify`, `getsockname`/
 `getpeername`, `sendfile`), real `statfs`/`fstatfs` capacity
-(`df` prints the frame allocator's numbers), file metadata
+(`df` prints the frame allocator's numbers), a real `/dev` with character
+devices (`mknod`, `/dev/null`/`zero`/`full`/`{,u}random`/`tty`/
+`console`, `st_rdev`, `DT_CHR`), file metadata
 (`chmod`/`chown`/`lchown`/`utimensat`, umask-applied modes,
 real atime/mtime/ctime — `ls -l` shows it), `rseq`, a keyboard- and
 UART-driven terminal
