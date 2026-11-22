@@ -1396,6 +1396,9 @@ pub struct Task {
     nth: [u8; crate::nt::MAX_NTH],
     /// The task fd a NTH_FILE handle slot owns (0xff = none).
     nth_fd: [u8; crate::nt::MAX_NTH],
+    /// Directory wildcard stored by the FileName arg of the first
+    /// NtQueryDirectoryFile on a dir handle — [0]=len, [1..]=bytes.
+    nth_dirpat: [[u8; 96]; crate::nt::MAX_NTH],
     /// NT anonymous-VM bump cursor — NtAllocateVirtualMemory
     /// hands out pages upward from NT_ALLOC_VA.
     nt_alloc: u64,
@@ -2325,6 +2328,7 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
     // image's handles into the new one.
     t.nth = [0; crate::nt::MAX_NTH];
     t.nth_fd = [0xff; crate::nt::MAX_NTH];
+    t.nth_dirpat = [[0; 96]; crate::nt::MAX_NTH];
     t.nth[0] = crate::nt::NTH_STDIN;
     t.nth[1] = crate::nt::NTH_STDOUT;
     t.nth[2] = crate::nt::NTH_STDERR;
@@ -2425,18 +2429,32 @@ impl<'a> Emit<'a> {
         self.raw(&[0x48, 0xba]);
         self.raw(&v.to_le_bytes());
     }
-    /// jcc rel8 (cc = low nibble of 0x70|cc) with a fix-up slot.
+    /// jcc rel32 (0x0f 0x8|cc) with a 4-byte fix-up slot. Always the
+    /// near form: a thunk past ~127 bytes between branch and target
+    /// silently truncates a short-jcc displacement into a backward
+    /// jump mid-instruction — there is no cheap range check at emit
+    /// time, so every conditional here pays 4 bytes for correctness.
     fn jcc(&mut self, cc: u8) -> usize {
-        self.raw(&[0x70 | cc, 0]);
-        self.n - 1
+        self.raw(&[0x0f, 0x80 | cc, 0, 0, 0, 0]);
+        self.n - 4
     }
-    /// jmp rel8 with a fix-up slot (backward jumps too).
-    fn jmp8(&mut self) -> usize {
-        self.raw(&[0xeb, 0]);
-        self.n - 1
+    /// jmp rel32 with a 4-byte fix-up slot (backward jumps too).
+    fn jmp(&mut self) -> usize {
+        self.raw(&[0xe9, 0, 0, 0, 0]);
+        self.n - 4
     }
+    /// Patch the rel32 at `at` (first displacement byte) so the
+    /// branch lands on `target` — either direction.
+    fn fix_to(&mut self, at: usize, target: usize) {
+        if at + 4 > self.b.len() {
+            return;
+        }
+        let d = (target as i64 - at as i64 - 4) as i32;
+        self.b[at..at + 4].copy_from_slice(&d.to_le_bytes());
+    }
+    /// Patch a slot to land on the emit head — the usual case.
     fn fix(&mut self, at: usize) {
-        self.b[at] = (self.n as i64 - at as i64 - 1) as i8 as u8;
+        self.fix_to(at, self.n);
     }
 }
 
@@ -2485,7 +2503,7 @@ fn emit_valloc_tail(e: &mut Emit, hdr: bool) {
             0x48, 0x83, 0xc0, 0x10, //     add rax,0x10
         ]);
     }
-    let done = e.jmp8();
+    let done = e.jmp();
     e.fix(fail);
     e.raw(&[0x31, 0xc0]); //           xor eax,eax
     e.fix(done);
@@ -2566,8 +2584,8 @@ fn emit_openpath(e: &mut Emit, wide: bool, d: u64, delete: bool) {
         e.raw(&[0x66, 0x83, 0x3c, 0x41, 0x00]); // cmp word[rcx+rax*2],0
         let dn = e.jcc(0x4); //                   je done
         e.raw(&[0x48, 0x83, 0xc0, 0x01]); //     add rax,1
-        let back = e.jmp8();
-        e.b[back] = (lp as i64 - back as i64 - 1) as i8 as u8;
+        let back = e.jmp();
+        e.fix_to(back, lp);
         e.fix(dn);
         e.raw(&[
             0x48, 0x89, 0xca, // mov rdx,rcx       buf=name
@@ -2588,8 +2606,8 @@ fn emit_openpath(e: &mut Emit, wide: bool, d: u64, delete: bool) {
             0x48, 0x83, 0xf8, 0x7e, // cmp rax,0x7e  (126-char cap)
         ]);
         let capped = e.jcc(0x3); // jae done
-        let back = e.jmp8();
-        e.b[back] = (lp as i64 - back as i64 - 1) as i8 as u8;
+        let back = e.jmp();
+        e.fix_to(back, lp);
         e.fix(dn);
         e.fix(capped);
         e.raw(&[
@@ -2673,6 +2691,278 @@ fn emit_openpath(e: &mut Emit, wide: bool, d: u64, delete: bool) {
         0x48, 0x81, 0xc4, 0xc8, 0, 0, 0, // add rsp,0xc8
         0xc3,
     ]);
+}
+
+/// Emit the FILE_DIRECTORY_INFORMATION -> WIN32_FIND_DATA copy for
+/// the record at data+0x600; wfd is the pointer at [rsp+0x60].
+/// A converts the name to ANSI (cFileName@0x30, alt@0x134), W
+/// passes it through as UTF-16 (cFileName@0x30, alt@0x238).
+/// Clobbers only caller-saved registers.
+fn emit_find_xlat(e: &mut Emit, wide: bool, d: u64) {
+    e.raw(&[0x49, 0xba]);
+    e.raw(&(d + 0x600).to_le_bytes()); // mov r10,data+0x600 rec
+    e.raw(&[
+        0x4c, 0x8b, 0x44, 0x24, 0x60, // mov r8,[rsp+0x60] wfd
+        0x41, 0x8b, 0x42, 0x38, //       mov eax,[r10+0x38] attrs
+        0x41, 0x89, 0x00, //             mov [r8],eax
+        0x41, 0x8b, 0x42, 0x08, //       mov eax,[r10+8]
+        0x41, 0x89, 0x40, 0x04, //       mov [r8+4],eax lo creation
+        0x41, 0x8b, 0x42, 0x0c,
+        0x41, 0x89, 0x40, 0x08,
+        0x41, 0x8b, 0x42, 0x10,
+        0x41, 0x89, 0x40, 0x0c, //       last access
+        0x41, 0x8b, 0x42, 0x14,
+        0x41, 0x89, 0x40, 0x10,
+        0x41, 0x8b, 0x42, 0x18,
+        0x41, 0x89, 0x40, 0x14, //       last write
+        0x41, 0x8b, 0x42, 0x1c,
+        0x41, 0x89, 0x40, 0x18,
+        0x41, 0x8b, 0x42, 0x28, //       mov eax,[r10+0x28] size lo
+        0x89, 0xc2, //                   mov edx,eax
+        0x41, 0x8b, 0x42, 0x2c, //       mov eax,[r10+0x2c] size hi
+        0x41, 0x89, 0x40, 0x1c, //       mov [r8+0x1c],eax nFileSizeHigh
+        0x41, 0x89, 0x50, 0x20, //       mov [r8+0x20],edx nFileSizeLow
+        0x41, 0x8b, 0x4a, 0x3c, //       mov ecx,[r10+0x3c] namelen bytes
+        0xd1, 0xe9, //                   shr ecx,1  -> chars
+        0x81, 0xf9, 0x03, 0x01, 0, 0, // cmp ecx,259
+    ]);
+    let ok = e.jcc(0x6); // jbe ok
+    e.raw(&[0xb9, 0x03, 0x01, 0, 0]); // mov ecx,259
+    e.fix(ok);
+    e.raw(&[
+        0x4d, 0x8d, 0x4a, 0x40, //       lea r9,[r10+0x40] name src
+        0x4d, 0x8d, 0x58, 0x2c, //       lea r11,[r8+0x2c] cFileName
+        0x31, 0xc0, //                   xor eax,eax
+    ]);
+    let lp = e.n;
+    e.raw(&[0x39, 0xc8]); // cmp eax,ecx
+    let dn = e.jcc(0x3); // jae done
+    if wide {
+        e.raw(&[
+            0x66, 0x41, 0x8b, 0x14, 0x41, // mov dx,[r9+rax*2]
+            0x66, 0x43, 0x89, 0x14, 0x43, // mov [r11+rax*2],dx
+        ]);
+    } else {
+        e.raw(&[
+            0x41, 0x0f, 0xb7, 0x14, 0x41, // movzx edx,word[r9+rax*2]
+            0x41, 0x88, 0x14, 0x03, //       mov [r11+rax],dl
+        ]);
+    }
+    e.raw(&[0x48, 0xff, 0xc0]); // inc rax
+    let back = e.jmp();
+    e.fix_to(back, lp);
+    e.fix(dn);
+    if wide {
+        e.raw(&[
+            0x66, 0x41, 0xc7, 0x04, 0x43, 0, 0, // word[r11+rax*2]=0
+            0x66, 0x41, 0xc7, 0x80, 0x30, 0x02, 0, 0, 0, 0, // alt NUL
+        ]);
+    } else {
+        e.raw(&[
+            0x41, 0xc6, 0x04, 0x03, 0x00, // byte[r11+rax]=0
+            0x41, 0xc6, 0x80, 0x30, 0x01, 0, 0, 0, // alt NUL
+        ]);
+    }
+}
+
+/// Emit FindFirstFileA/W (first=true) or FindNextFileA/W — the
+/// Win32 find layer over NtCreateFile + NtQueryDirectoryFile.
+/// FindFirst opens "." with FILE_DIRECTORY_FILE, stores the
+/// pattern via the FileName UNICODE_STRING arg, and returns the
+/// dir handle itself as the find handle; FindNextFile re-queries
+/// it pattern-less. Frame 0x1d0: wfd@0x60, pattern@0x68, dir h@0x70,
+/// pattern US@0x88, OA@0x98, "." US@0xd0, A's UTF-16 buf@0xe0.
+fn emit_find(e: &mut Emit, wide: bool, first: bool, d: u64) {
+    e.raw(&[
+        0x48, 0x81, 0xec, 0xd0, 0x01, 0, 0, // sub rsp,0x1d0
+        0x48, 0x89, 0x54, 0x24, 0x60, //   mov [rsp+0x60],rdx wfd
+    ]);
+    let mut ofail = usize::MAX;
+    if first {
+        e.raw(&[
+            0x48, 0x89, 0x4c, 0x24, 0x68, // mov [rsp+0x68],rcx pattern
+            // US "." at [rsp+0xd0]: {len 2, cap 2, pad, buf}
+            0x66, 0xc7, 0x84, 0x24, 0xd0, 0, 0, 0, 2, 0,
+            0x66, 0xc7, 0x84, 0x24, 0xd2, 0, 0, 0, 2, 0,
+            0xc7, 0x84, 0x24, 0xd4, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        e.rax_imm(d + 0x780);
+        e.raw(&[
+            0x48, 0x89, 0x84, 0x24, 0xd8, 0, 0, 0, // buf=d+0x780
+            // OA at [rsp+0x98]: len 48, root 0, name=&"." US
+            0xc7, 0x84, 0x24, 0x98, 0, 0, 0, 0x30, 0, 0, 0,
+            0x48, 0xc7, 0x84, 0x24, 0xa0, 0, 0, 0, 0, 0, 0, 0,
+            0x48, 0x8d, 0x84, 0x24, 0xd0, 0, 0, 0,
+            0x48, 0x89, 0x84, 0x24, 0xa8, 0, 0, 0,
+            0xc7, 0x84, 0x24, 0xb0, 0, 0, 0, 0, 0, 0, 0,
+            0x48, 0xc7, 0x84, 0x24, 0xb8, 0, 0, 0, 0, 0, 0, 0,
+            0x48, 0xc7, 0x84, 0x24, 0xc0, 0, 0, 0, 0, 0, 0, 0,
+            // hout + iosb zeroed; 7 NT stack args
+            0x48, 0xc7, 0x44, 0x24, 0x08, 0, 0, 0, 0,
+            0x48, 0xc7, 0x44, 0x24, 0x10, 0, 0, 0, 0,
+            0x48, 0xc7, 0x44, 0x24, 0x18, 0, 0, 0, 0,
+            0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0,
+            0x48, 0xc7, 0x44, 0x24, 0x30, 0, 0, 0, 0,
+            0x48, 0xc7, 0x44, 0x24, 0x38, 0, 0, 0, 0,
+            0x48, 0xc7, 0x44, 0x24, 0x40, 3, 0, 0, 0, // disp
+            0x48, 0xc7, 0x44, 0x24, 0x48, 1, 0, 0, 0, // DIR opt
+            0x48, 0xc7, 0x44, 0x24, 0x50, 0, 0, 0, 0,
+            0x48, 0xc7, 0x44, 0x24, 0x58, 0, 0, 0, 0,
+            0x4c, 0x8d, 0x54, 0x24, 0x08, // lea r10,[rsp+0x08] hout
+            0xba, 0, 0, 0, 0x80, //       mov edx,0x80000000
+            0x4c, 0x8d, 0x84, 0x24, 0x98, 0, 0, 0, // lea r8,&oa
+            0x4c, 0x8d, 0x4c, 0x24, 0x10, // lea r9,&iosb
+            0xb8, 0x55, 0, 0, 0, //       mov eax,0x55
+            0x0f, 0x05, //                syscall
+            0x85, 0xc0, //                test eax,eax
+        ]);
+        ofail = e.jcc(0x8); // js open_fail
+        e.raw(&[
+            0x48, 0x8b, 0x44, 0x24, 0x08, // mov rax,[rsp+0x08] h
+            0x48, 0x89, 0x44, 0x24, 0x70, // [rsp+0x70]=dir handle
+        ]);
+        // Pattern UNICODE_STRING at [rsp+0x88]; buf=[rsp+0xe0].
+        if wide {
+            e.raw(&[
+                0x48, 0x8b, 0x4c, 0x24, 0x68, // mov rcx,[rsp+0x68]
+                0x31, 0xc0,
+            ]);
+            let lp = e.n;
+            e.raw(&[0x66, 0x83, 0x3c, 0x41, 0x00]); // cmp word[rcx+rax*2]
+            let dn = e.jcc(0x4);
+            e.raw(&[0x48, 0x83, 0xc0, 0x01]);
+            let back = e.jmp();
+            e.fix_to(back, lp);
+            e.fix(dn);
+            e.raw(&[
+                0x48, 0x89, 0xca, // mov rdx,rcx  buf = caller's
+                0x48, 0xd1, 0xe0, // shl rax,1
+            ]);
+        } else {
+            e.raw(&[
+                0x48, 0x8b, 0x4c, 0x24, 0x68, // mov rcx,[rsp+0x68]
+                0x48, 0x8d, 0x94, 0x24, 0xe0, 0, 0, 0, // lea rdx,[+0xe0]
+                0x31, 0xc0,
+            ]);
+            let lp = e.n;
+            e.raw(&[
+                0x44, 0x0f, 0xb6, 0x1c, 0x01, // movzx r11d,[rcx+rax]
+                0x66, 0x44, 0x89, 0x1c, 0x42, // mov [rdx+rax*2],r11w
+                0x45, 0x84, 0xdb,
+            ]);
+            let dn = e.jcc(0x4);
+            e.raw(&[
+                0x48, 0xff, 0xc0,
+                0x48, 0x83, 0xf8, 0x5e, // cap 94 chars
+            ]);
+            let capped = e.jcc(0x3);
+            let back = e.jmp();
+            e.fix_to(back, lp);
+            e.fix(dn);
+            e.fix(capped);
+            e.raw(&[
+                0x66, 0xc7, 0x04, 0x42, 0, 0, // mov word[rdx+rax*2],0
+                0x48, 0xd1, 0xe0, //             shl rax,1
+            ]);
+        }
+        e.raw(&[
+            0x66, 0x89, 0x84, 0x24, 0x88, 0, 0, 0, // [+0x88]=ax len
+            0x66, 0x89, 0x84, 0x24, 0x8a, 0, 0, 0, // cap
+            0xc7, 0x84, 0x24, 0x8c, 0, 0, 0, 0, 0, 0, 0,
+            0x48, 0x89, 0x94, 0x24, 0x90, 0, 0, 0, // buf
+        ]);
+    } else {
+        // FindNextFile: handle arrives in rcx, no pattern arg.
+        e.raw(&[
+            0x48, 0x89, 0x4c, 0x24, 0x70, // mov [rsp+0x70],rcx h
+        ]);
+    }
+    // Shared NtQueryDirectoryFile call: r10=h, rdx/r8/r9=0,
+    // stack args iosb/info/len/class/single/fname/restart.
+    e.raw(&[
+        0x48, 0xc7, 0x44, 0x24, 0x10, 0, 0, 0, 0, // iosb=0
+        0x48, 0xc7, 0x44, 0x24, 0x18, 0, 0, 0, 0,
+        0x4c, 0x8b, 0x54, 0x24, 0x70, //   mov r10,[rsp+0x70] h
+        0x31, 0xd2, //                    xor edx,edx
+        0x45, 0x31, 0xc0, //              xor r8d,r8d
+        0x45, 0x31, 0xc9, //              xor r9d,r9d
+        0x48, 0x8d, 0x44, 0x24, 0x10, //   lea rax,[rsp+0x10]
+        0x48, 0x89, 0x44, 0x24, 0x28, //   [+0x28]=&iosb
+    ]);
+    e.rax_imm(d + 0x600);
+    e.raw(&[
+        0x48, 0x89, 0x44, 0x24, 0x30, //   [+0x30]=info d+0x600
+        0x48, 0xc7, 0x44, 0x24, 0x38, 0, 0x02, 0, 0, // len 0x200
+        0x48, 0xc7, 0x44, 0x24, 0x40, 1, 0, 0, 0, // class 1
+        0x48, 0xc7, 0x44, 0x24, 0x48, 1, 0, 0, 0, // single
+    ]);
+    if first {
+        e.raw(&[
+            0x48, 0x8d, 0x84, 0x24, 0x88, 0, 0, 0, // lea rax,[+0x88]
+            0x48, 0x89, 0x44, 0x24, 0x50, // [+0x50]=&us_pattern
+            0x48, 0xc7, 0x44, 0x24, 0x58, 1, 0, 0, 0, // restart 1
+        ]);
+    } else {
+        e.raw(&[
+            0x48, 0xc7, 0x44, 0x24, 0x50, 0, 0, 0, 0, // fname 0
+            0x48, 0xc7, 0x44, 0x24, 0x58, 0, 0, 0, 0, // restart 0
+        ]);
+    }
+    e.raw(&[
+        0xb8, 0x35, 0, 0, 0, // mov eax,0x35
+        0x0f, 0x05, //         syscall
+        0x85, 0xc0, //         test eax,eax
+    ]);
+    let qfail = e.jcc(0x8); // js qfail
+    emit_find_xlat(e, wide, d);
+    if first {
+        e.raw(&[0x48, 0x8b, 0x44, 0x24, 0x70]); // rax = dir handle
+    } else {
+        e.raw(&[0xb8, 1, 0, 0, 0]); // mov eax,1
+    }
+    let done = e.jmp();
+    e.fix(qfail);
+    e.raw(&[0x65, 0x89, 0x04, 0x25, 0x68, 0, 0, 0]); // mov gs:[0x68],eax
+    if first {
+        // The dir handle we opened dies with the failed find —
+        // real FindFirstFile leaves nothing behind on failure.
+        e.raw(&[
+            0x4c, 0x8b, 0x54, 0x24, 0x70, // mov r10,[rsp+0x70]
+            0xb8, 0x0f, 0, 0, 0, //       mov eax,0x0f
+            0x0f, 0x05, //                syscall
+            0x48, 0x83, 0xc8, 0xff, //    or rax,-1 (INVALID_HANDLE)
+        ]);
+    } else {
+        e.raw(&[0x31, 0xc0]); // xor eax,eax
+    }
+    e.fix(done);
+    e.raw(&[
+        0x48, 0x81, 0xc4, 0xd0, 0x01, 0, 0, // add rsp,0x1d0
+        0xc3,
+    ]);
+    if first {
+        e.fix(ofail);
+        e.raw(&[
+            0x65, 0x89, 0x04, 0x25, 0x68, 0, 0, 0, // gs:[0x68]=eax
+            0x48, 0x83, 0xc8, 0xff, //              or rax,-1
+            0x48, 0x81, 0xc4, 0xd0, 0x01, 0, 0,
+            0xc3,
+        ]);
+    }
+}
+
+/// Emit FindClose(h): NtClose — the dir handle IS the find handle.
+fn emit_findclose(e: &mut Emit) {
+    e.raw(&[
+        0x49, 0x89, 0xca, // mov r10,rcx
+        0xb8, 0x0f, 0, 0, 0, // mov eax,0x0f
+        0x0f, 0x05,
+        0x85, 0xc0,
+    ]);
+    let fail = e.jcc(0x8);
+    e.raw(&[0xb8, 1, 0, 0, 0, 0xc3]);
+    e.fix(fail);
+    e.raw(&[0x31, 0xc0, 0xc3]);
 }
 
 /// Win32 translation thunk emitter: given a kernel32/kernelbase/
@@ -2766,7 +3056,7 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             let found = e.jcc(0x3); //   jae found
             e.raw(&[0xff, 0xc2, 0x83, 0xfa, 0x08]); // inc edx; cmp edx,8
             let back = e.jcc(0x2); //   jb loop
-            e.b[back] = (lp as i64 - back as i64 - 1) as i8 as u8;
+            e.fix_to(back, lp);
             e.raw(&[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3]); // mov eax,-1; ret
             e.fix(found);
             e.raw(&[
@@ -2902,7 +3192,7 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             fails[nf] = e.jcc(0x8); // js fail
             nf += 1;
             e.raw(&[0x48, 0x8b, 0x44, 0x24, 0x50]); // mov rax,[+0x50] eof
-            let to_add1 = e.jmp8();
+            let to_add1 = e.jmp();
             // FILE_CURRENT: query FilePositionInformation(8B).
             e.fix(cur);
             emit_qinfo(&mut e, 0x48, 8, 14);
@@ -2913,7 +3203,7 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.raw(&[
                 0x48, 0x03, 0x44, 0x24, 0x70, // add rax,[rsp+0x70]
             ]);
-            let to_set = e.jmp8();
+            let to_set = e.jmp();
             // FILE_BEGIN: pos = li.
             e.fix(begin);
             e.raw(&[0x48, 0x8b, 0x44, 0x24, 0x70]); // mov rax,[+0x70]
@@ -2964,6 +3254,14 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
         // constant args — open + FileDispositionInformation + close.
         b"DeleteFileA" => emit_openpath(&mut e, false, d, true),
         b"DeleteFileW" => emit_openpath(&mut e, true, d, true),
+        // FindFirstFile* opens "." and stores its pattern via the
+        // query's FileName arg; the returned handle IS the dir
+        // handle FindNextFile/FindClose talk to.
+        b"FindFirstFileA" => emit_find(&mut e, false, true, d),
+        b"FindFirstFileW" => emit_find(&mut e, true, true, d),
+        b"FindNextFileA" => emit_find(&mut e, false, false, d),
+        b"FindNextFileW" => emit_find(&mut e, true, false, d),
+        b"FindClose" => emit_findclose(&mut e),
         // --- msvcrt startup ------------------------------------
         // __getmainargs(&argc,&argv,&envp,dowildcard,si).
         b"__getmainargs" => {
@@ -3014,8 +3312,8 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.raw(&[0xff, 0xd0]); //      call rax
             e.fix(sk);
             e.raw(&[0x48, 0x83, 0xc3, 0x08]); // add rbx,8
-            let back = e.jmp8();
-            e.b[back] = (lp as i64 - back as i64 - 1) as i8 as u8;
+            let back = e.jmp();
+            e.fix_to(back, lp);
             e.fix(done);
             e.raw(&[0x5b, 0x31, 0xc0, 0xc3]);
         }
@@ -3103,6 +3401,33 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0xc3,
             ]);
         }
+        // strcmp(a,b): unsigned byte compare — <0/0/>0.
+        b"strcmp" => {
+            let lp = e.n;
+            e.raw(&[
+                0x8a, 0x01, //       mov al,[rcx]
+                0x44, 0x8a, 0x1a, // mov r11b,[rdx]
+                0x44, 0x38, 0xd8, // cmp al,r11b
+            ]);
+            let diff = e.jcc(0x5);
+            e.raw(&[0x84, 0xc0]); // test al,al
+            let eq = e.jcc(0x4);
+            e.raw(&[
+                0x48, 0xff, 0xc1, // inc rcx
+                0x48, 0xff, 0xc2, // inc rdx
+            ]);
+            let back = e.jmp();
+            e.fix_to(back, lp);
+            e.fix(eq);
+            e.raw(&[0x31, 0xc0, 0xc3]);
+            e.fix(diff);
+            e.raw(&[
+                0x0f, 0xb6, 0xc0, // movzx eax,al
+                0x44, 0x0f, 0xb6, 0xda, // movzx r11d,r11b
+                0x44, 0x29, 0xd8, // sub eax,r11d
+                0xc3,
+            ]);
+        }
         b"strncmp" => {
             let lp = e.n;
             e.raw(&[0x4d, 0x85, 0xc0]); // test r8,r8
@@ -3118,8 +3443,8 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.raw(&[
                 0x48, 0xff, 0xc1, 0x48, 0xff, 0xc2, 0x49, 0xff, 0xc8,
             ]);
-            let back = e.jmp8();
-            e.b[back] = (lp as i64 - back as i64 - 1) as i8 as u8;
+            let back = e.jmp();
+            e.fix_to(back, lp);
             e.fix(eq);
             e.fix(eq2);
             e.raw(&[0x31, 0xc0, 0xc3]); // xor eax,eax; ret
@@ -3201,7 +3526,7 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.raw(&[0x85, 0xc0]); // test eax,eax
             let fail = e.jcc(0x8); // js fail
             e.raw(&[0x4c, 0x89, 0xe0]); // mov rax,r12
-            let done = e.jmp8();
+            let done = e.jmp();
             e.fix(fail);
             e.raw(&[0x31, 0xc0]); // xor eax,eax
             e.fix(done);
@@ -3313,6 +3638,8 @@ fn k32_data_init(t: &mut Task) {
     ] {
         let _ = write_task_bytes(t.pml4, d + off, &v.to_le_bytes());
     }
+    // UTF-16 "." at 0x780 — FindFirstFile's NtCreateFile name.
+    let _ = write_task_bytes(t.pml4, d + 0x780, &[0x2e, 0]);
 }
 
 /// Import resolution against the synthetic ntdll stub page: walk
@@ -3326,6 +3653,8 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
     }
     if map_page(t, crate::pe::STUB_VA, USER | WRITE).is_none()
         || map_page(t, crate::pe::STUB_VA + 0x1000, USER | WRITE)
+            .is_none()
+        || map_page(t, crate::pe::STUB_VA + 0x2000, USER | WRITE)
             .is_none()
     {
         return false;
@@ -3399,7 +3728,7 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
                     continue;
                 }
             }
-            let mut buf = [0u8; 512];
+            let mut buf = [0u8; 768];
             let used = if k32 {
                 k32_emit(&mut buf, &fname[..fl])
             } else if fl != 0 {
@@ -3438,6 +3767,7 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
     // Fill done — drop the stub pages to read+execute.
     map_page(t, crate::pe::STUB_VA, USER);
     map_page(t, crate::pe::STUB_VA + 0x1000, USER);
+    map_page(t, crate::pe::STUB_VA + 0x2000, USER);
     true
 }
 
@@ -3615,6 +3945,7 @@ fn load(img: &[u8]) -> Option<Task> {
         gs_base: 0,
         nth: [0; crate::nt::MAX_NTH],
         nth_fd: [0xff; crate::nt::MAX_NTH],
+        nth_dirpat: [[0; 96]; crate::nt::MAX_NTH],
         nt_alloc: 0,
         stop_sig: 0,
         cont_report: false,
@@ -6381,6 +6712,7 @@ pub fn nt_handle_alloc_file(fd: u64) -> Option<u64> {
         if t.nth[i] == 0 {
             t.nth[i] = crate::nt::NTH_FILE;
             t.nth_fd[i] = fd as u8;
+            t.nth_dirpat[i][0] = 0;
             return Some(i as u64 + 1);
         }
     }
@@ -6417,6 +6749,158 @@ pub fn nt_fd_delete_pending(fd: u64, on: bool) -> bool {
     };
     unsafe { OFD_DEL[oi as usize] = on as u8 };
     true
+}
+
+/// Windows wildcard match: `*` any run, `?` one char, ASCII
+/// case-insensitive — the FindFirstFile pattern language. An
+/// empty pattern matches everything.
+fn wild_match(pat: &[u8], name: &[u8]) -> bool {
+    let (mut p, mut s, mut star, mut mark) =
+        (0usize, 0usize, usize::MAX, 0usize);
+    while s < name.len() {
+        if p < pat.len()
+            && (pat[p] == b'?'
+                || pat[p].to_ascii_lowercase() == name[s].to_ascii_lowercase())
+        {
+            p += 1;
+            s += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = p;
+            mark = s;
+            p += 1;
+        } else if star != usize::MAX {
+            p = star + 1;
+            mark += 1;
+            s = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// Store the FileName wildcard an NtQueryDirectoryFile carried on
+/// dir handle `h` — later pattern-less calls reuse it.
+pub fn nt_dir_pattern_set(h: u64, pat: &[u8]) {
+    let Some(t) = cur_mut() else { return };
+    let i = h as usize;
+    if i == 0
+        || i > crate::nt::MAX_NTH
+        || t.nth[i - 1] != crate::nt::NTH_FILE
+        || pat.len() > 95
+    {
+        return;
+    }
+    t.nth_dirpat[i - 1][0] = pat.len() as u8;
+    t.nth_dirpat[i - 1][1..1 + pat.len()].copy_from_slice(pat);
+}
+
+/// Copy the stored wildcard out; 0 len when unset — wild_match
+/// treats that as match-all, which is the right default anyway.
+pub fn nt_dir_pattern(h: u64, out: &mut [u8; 96]) -> usize {
+    let Some(t) = cur_mut() else { return 0 };
+    let i = h as usize;
+    if i == 0 || i > crate::nt::MAX_NTH || t.nth[i - 1] != crate::nt::NTH_FILE
+    {
+        return 0;
+    }
+    let n = (t.nth_dirpat[i - 1][0] as usize).min(95);
+    out[..n].copy_from_slice(&t.nth_dirpat[i - 1][1..1 + n]);
+    n
+}
+
+/// The dir OFD's stream cursor — None for non-dirs.
+pub fn nt_dir_pos(fd: u64) -> Option<usize> {
+    let t = cur_mut()?;
+    let o = ofd(t, fd)?;
+    matches!(o.kind, FdKind::Dir(_)).then_some(o.pos)
+}
+
+/// Seek the dir stream — RestartScan resets it to 0.
+pub fn nt_dir_seek(fd: u64, pos: usize) {
+    let Some(t) = cur_mut() else { return };
+    let Some(o) = ofd(t, fd) else { return };
+    if matches!(o.kind, FdKind::Dir(_)) {
+        o.pos = pos;
+    }
+}
+
+/// The first entry at stream index >= idx matching the wildcard:
+/// the same first-component enumeration getdents64 synthesizes,
+/// minus the /proc pid expansion (POSIX-side only). Does not move
+/// the cursor — the caller commits it via nt_dir_seek once the
+/// record actually fit the user buffer. Returns (name bytes, size,
+/// is_dir, next_idx).
+pub fn nt_dir_next(
+    fd: u64,
+    idx: usize,
+    pat: &[u8],
+    out: &mut [u8; 256],
+) -> Option<(usize, u64, bool, usize)> {
+    let t = cur_mut()?;
+    let o = ofd(t, fd)?;
+    let FdKind::Dir(dp) = &o.kind else { return None };
+    let dpath = dp.bytes();
+    let mut names: [Option<&[u8]>; 96] = [None; 96];
+    names[0] = Some(b".");
+    names[1] = Some(b"..");
+    let mut n = 2usize;
+    dir_add(dpath, &mut names, &mut n, b"proc");
+    dir_add(dpath, &mut names, &mut n, b"proc/self");
+    dir_add(dpath, &mut names, &mut n, b"proc/self/exe");
+    if let Some(arc) = unsafe { *core::ptr::addr_of!(INITRD) } {
+        for (name, _) in crate::cpio::entries(arc) {
+            dir_add(dpath, &mut names, &mut n, name);
+        }
+    }
+    for v in unsafe { &*core::ptr::addr_of!(VFILES) }.iter().flatten() {
+        if !v.unlinked {
+            dir_add(dpath, &mut names, &mut n, &v.name[..v.nlen]);
+        }
+    }
+    for d in unsafe { &*core::ptr::addr_of!(VDIRS) }.iter().flatten() {
+        dir_add(dpath, &mut names, &mut n, &d.path[..d.nlen]);
+    }
+    let mut i = idx;
+    while i < n {
+        let name = names[i]?;
+        i += 1;
+        if name.len() > 250 || !wild_match(pat, name) {
+            continue;
+        }
+        // Same probes getdents uses for type: canonical full path,
+        // dir_exists, then a size lookup (vfiles first, archive).
+        let mut full = [0u8; 256];
+        let mut fn_ = dpath.len();
+        if fn_ + 1 + name.len() > 256 {
+            continue;
+        }
+        full[..fn_].copy_from_slice(dpath);
+        if fn_ > 0 {
+            full[fn_] = b'/';
+            fn_ += 1;
+        }
+        full[fn_..fn_ + name.len()].copy_from_slice(name);
+        fn_ += name.len();
+        let full = &full[..fn_];
+        let isdir = i - 1 < 2 || dir_exists(full);
+        let size = if isdir {
+            0
+        } else if let Some(v) = vfile_find(full).and_then(vfile) {
+            v.len as u64
+        } else if let Some(arc) = unsafe { *core::ptr::addr_of!(INITRD) }
+        {
+            crate::cpio::find(arc, full).map_or(0, |d| d.len() as u64)
+        } else {
+            0
+        };
+        out[..name.len()].copy_from_slice(name);
+        return Some((name.len(), size, isdir, i));
+    }
+    None
 }
 
 /// NtWriteFile on a console handle — the same printk path
@@ -13240,6 +13724,43 @@ fn tcp_sock_close(si: usize) {
     }
 }
 
+/// First path component of `name` under `dir` ("" = root) — the
+/// dedup unit for flat-VFS directory enumeration.
+fn dir_child<'a>(dir: &[u8], name: &'a [u8]) -> Option<&'a [u8]> {
+    let rest = if dir.is_empty() {
+        name
+    } else if name.len() > dir.len()
+        && name.starts_with(dir)
+        && name[dir.len()] == b'/'
+    {
+        &name[dir.len() + 1..]
+    } else {
+        return None;
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let end = rest.iter().position(|&c| c == b'/').unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Push name's first component under dir into the dedup'd list.
+fn dir_add<'a>(
+    dir: &[u8],
+    names: &mut [Option<&'a [u8]>; 96],
+    n: &mut usize,
+    name: &'a [u8],
+) {
+    if let Some(comp) = dir_child(dir, name) {
+        if *n < names.len()
+            && !names[..*n].iter().flatten().any(|e| *e == comp)
+        {
+            names[*n] = Some(comp);
+            *n += 1;
+        }
+    }
+}
+
 /// getdents64(fd, dirp, count): emit linux_dirent64 records for the
 /// archive entries from `pos` on, filling at most `count` bytes. The
 /// whole user buffer is validated writable up front — a record is
@@ -13271,41 +13792,9 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
     names[0] = Some(b".");
     names[1] = Some(b"..");
     let mut n = 2usize;
-    fn child<'a>(dir: &[u8], name: &'a [u8]) -> Option<&'a [u8]> {
-        let rest = if dir.is_empty() {
-            name
-        } else if name.len() > dir.len()
-            && name.starts_with(dir)
-            && name[dir.len()] == b'/'
-        {
-            &name[dir.len() + 1..]
-        } else {
-            return None;
-        };
-        if rest.is_empty() {
-            return None;
-        }
-        let end = rest.iter().position(|&c| c == b'/').unwrap_or(rest.len());
-        Some(&rest[..end])
-    }
-    fn add<'a>(
-        dir: &[u8],
-        names: &mut [Option<&'a [u8]>; 96],
-        n: &mut usize,
-        name: &'a [u8],
-    ) {
-        if let Some(comp) = child(dir, name) {
-            if *n < names.len()
-                && !names[..*n].iter().flatten().any(|e| *e == comp)
-            {
-                names[*n] = Some(comp);
-                *n += 1;
-            }
-        }
-    }
-    add(dpath, &mut names, &mut n, b"proc");
-    add(dpath, &mut names, &mut n, b"proc/self");
-    add(dpath, &mut names, &mut n, b"proc/self/exe");
+    dir_add(dpath, &mut names, &mut n, b"proc");
+    dir_add(dpath, &mut names, &mut n, b"proc/self");
+    dir_add(dpath, &mut names, &mut n, b"proc/self/exe");
     // /proc enumeration — task slots can't be reaped mid-syscall, so
     // the pid set is stable across this pass. pidbuf backs the
     // rendered pid names names[] borrows; files under a pid dir are
@@ -13346,7 +13835,7 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
                 b[m] = d[dl];
                 m += 1;
             }
-            add(dpath, &mut names, &mut n, &pb[..m]);
+            dir_add(dpath, &mut names, &mut n, &pb[..m]);
         }
     } else if let Some(rest) = dpath.strip_prefix(b"proc/") {
         // "proc/<pid>" lists the static leaves; "proc/<pid>/fd" and
@@ -13393,16 +13882,16 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
     }
     if let Some(arc) = unsafe { *core::ptr::addr_of!(INITRD) } {
         for (name, _data) in crate::cpio::entries(arc) {
-            add(dpath, &mut names, &mut n, name);
+            dir_add(dpath, &mut names, &mut n, name);
         }
     }
     for v in unsafe { &*core::ptr::addr_of!(VFILES) }.iter().flatten() {
         if !v.unlinked {
-            add(dpath, &mut names, &mut n, &v.name[..v.nlen]);
+            dir_add(dpath, &mut names, &mut n, &v.name[..v.nlen]);
         }
     }
     for d in unsafe { &*core::ptr::addr_of!(VDIRS) }.iter().flatten() {
-        add(dpath, &mut names, &mut n, &d.path[..d.nlen]);
+        dir_add(dpath, &mut names, &mut n, &d.path[..d.nlen]);
     }
     for name in names[..n].iter().flatten().skip(o.pos) {
         // linux_dirent64: ino@0 u64, off@8 u64, reclen@16 u16,
@@ -14308,6 +14797,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         gs_base: p.gs_base,
         nth: p.nth,
         nth_fd: p.nth_fd,
+        nth_dirpat: p.nth_dirpat,
         nt_alloc: p.nt_alloc,
         stop_sig: 0,
         cont_report: false,
@@ -14474,6 +14964,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         gs_base: p.gs_base,
         nth: p.nth,
         nth_fd: p.nth_fd,
+        nth_dirpat: p.nth_dirpat,
         nt_alloc: p.nt_alloc,
         stop_sig: 0,
         cont_report: false,

@@ -21,7 +21,7 @@ pub const STUB_VA: u64 = TEB_VA + 0x1000;
 /// Win32 thunk layer's runtime state: argv/envp arrays, fake
 /// FILE[], TLS slots, the ANSI->UTF-16 name scratch. Two pages of
 /// stub code: CRT-linked images resolve 40+ imports.
-pub const STUB_DATA_VA: u64 = STUB_VA + 0x2000;
+pub const STUB_DATA_VA: u64 = STUB_VA + 0x3000;
 
 const DOS_MAGIC: u16 = 0x5a4d; // "MZ"
 const PE_MAGIC: u32 = 0x0000_4550; // "PE\0\0"

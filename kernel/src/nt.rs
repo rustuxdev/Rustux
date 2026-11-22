@@ -32,6 +32,7 @@ pub const STATUS_OBJECT_NAME_NOT_FOUND: u64 = 0xC000_0034;
 pub const STATUS_OBJECT_NAME_COLLISION: u64 = 0xC000_0035;
 pub const STATUS_OBJECT_PATH_NOT_FOUND: u64 = 0xC000_003A;
 pub const STATUS_INSUFFICIENT_RESOURCES: u64 = 0xC000_009A;
+pub const STATUS_NO_MORE_FILES: u64 = 0x8000_0006;
 
 // Windows 10 x64 service numbers for the implemented subset.
 const NT_READ_FILE: u32 = 0x06;
@@ -43,6 +44,7 @@ const NT_FREE_VIRTUAL_MEMORY: u32 = 0x1E;
 const NT_SET_INFORMATION_FILE: u32 = 0x27;
 const NT_TERMINATE_PROCESS: u32 = 0x2C;
 const NT_DELAY_EXECUTION: u32 = 0x34;
+const NT_QUERY_DIRECTORY_FILE: u32 = 0x35;
 const NT_CREATE_FILE: u32 = 0x55;
 
 /// Handle table tags — a per-task `nth` slot's object kind. Real
@@ -272,7 +274,16 @@ fn nt_create_file(ctx: &mut UCtx) -> u64 {
     if options & 1 != 0 {
         oflags |= 0o200000; // FILE_DIRECTORY_FILE -> O_DIRECTORY
     }
-    let r = user::fd_open(&path[st..n], oflags, 0o644);
+    // NT names go through the same `.`/`..` canon as the Linux open
+    // path — without it `.` never resolves to the root dir.
+    let (cpath, cn) = match user::canon_path(u64::MAX, &path[st..n]) {
+        Ok(x) => x,
+        Err(e) => {
+            iosb_complete(iosb, errno_status(e), 0);
+            return errno_status(e);
+        }
+    };
+    let r = user::fd_open(&cpath[..cn], oflags, 0o644);
     if (r as i64) < 0 {
         iosb_complete(iosb, errno_status(r), 0);
         return errno_status(r);
@@ -339,6 +350,137 @@ fn nt_query_info(ctx: &mut UCtx) -> u64 {
             return STATUS_INVALID_INFO_CLASS;
         }
     }
+    STATUS_SUCCESS
+}
+
+/// UNICODE_STRING → ASCII bytes: probes the US struct and its
+/// buffer, rejects non-ASCII, maps '\\' → '/'. `out`'s capacity
+/// doubles as the length bound. Only Length is authoritative.
+fn us_to_ascii(us: u64, out: &mut [u8]) -> Option<usize> {
+    if !user::range_ok(us, 16) {
+        return None;
+    }
+    // SAFETY: US window validated above.
+    let (ulen, ubuf) = unsafe {
+        (
+            (us as *const u16).read_unaligned() as u64,
+            (us as *const u64).add(1).read_unaligned(),
+        )
+    };
+    if ulen == 0 || ulen & 1 != 0 || ulen as usize > out.len() * 2 {
+        return None;
+    }
+    if !user::range_ok(ubuf, ulen) {
+        return None;
+    }
+    for i in 0..(ulen / 2) as usize {
+        // SAFETY: ubuf window validated for ulen bytes.
+        let c = unsafe { (ubuf as *const u16).add(i).read_unaligned() };
+        if c > 0x7f {
+            return None;
+        }
+        out[i] = if c == b'\\' as u16 { b'/' } else { c as u8 };
+    }
+    Some((ulen / 2) as usize)
+}
+
+/// NtQueryDirectoryFile(h, event, apc_r, apc_c, iosb, info, len,
+/// class, single, fname, restart): class 1 FileDirectoryInformation
+/// only. A FileName UNICODE_STRING stores the wildcard on the
+/// handle; the OFD stream cursor walks the flat-VFS component list.
+fn nt_query_dir(ctx: &mut UCtx) -> u64 {
+    let h = arg(ctx, 0);
+    let iosb = arg(ctx, 4);
+    let info = arg(ctx, 5);
+    let ilen = arg(ctx, 6);
+    let class = arg(ctx, 7) as u32;
+    let single = arg(ctx, 8) != 0;
+    let fname = arg(ctx, 9);
+    let restart = arg(ctx, 10) != 0;
+    let Some(fd) = user::nt_handle_fd(h) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    if class != 1 {
+        iosb_complete(iosb, STATUS_INVALID_INFO_CLASS, 0);
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if ilen == 0 || ilen > 0x100_000 || !user::range_ok_w(info, ilen) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if fname != 0 {
+        let mut pat = [0u8; 96];
+        let Some(n) = us_to_ascii(fname, &mut pat[1..]) else {
+            return STATUS_OBJECT_NAME_INVALID;
+        };
+        user::nt_dir_pattern_set(h, &pat[1..1 + n]);
+    }
+    if restart {
+        user::nt_dir_seek(fd, 0);
+    }
+    let mut pat = [0u8; 96];
+    let plen = user::nt_dir_pattern(h, &mut pat);
+    let pat = &pat[..plen];
+    let Some(mut idx) = user::nt_dir_pos(fd) else {
+        iosb_complete(iosb, STATUS_INVALID_HANDLE, 0);
+        return STATUS_INVALID_HANDLE;
+    };
+    let mut name = [0u8; 256];
+    let mut off = 0usize;
+    let mut prev: Option<usize> = None;
+    loop {
+        let Some((nlen, size, isdir, next)) =
+            user::nt_dir_next(fd, idx, pat, &mut name)
+        else {
+            break;
+        };
+        let rec = (64 + nlen * 2 + 7) & !7;
+        if off + rec > ilen as usize {
+            break; // cursor not committed — entry stays pending
+        }
+        let base = info + off as u64;
+        // Backpatch the previous record's NextEntryOffset — it is
+        // followed by this one.
+        if let Some(p) = prev {
+            // SAFETY: [info, info+ilen) validated; p+4 <= off < ilen.
+            unsafe {
+                ((info + p as u64) as *mut u32)
+                    .write_unaligned((off - p) as u32)
+            };
+        }
+        // SAFETY: off+rec <= ilen inside the validated window; all
+        // writes land in the record's own 64+2*nlen span.
+        unsafe {
+            ((base) as *mut u32).write_unaligned(0); // NextEntryOffset
+            ((base + 4) as *mut u32).write_unaligned(idx as u32);
+            for t in 0..4u64 {
+                ((base + 8 + t * 8) as *mut u64).write_unaligned(0);
+            }
+            ((base + 40) as *mut u64).write_unaligned(size);
+            ((base + 48) as *mut u64).write_unaligned(size);
+            ((base + 56) as *mut u32).write_unaligned(if isdir {
+                0x10 // FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                0x80 // FILE_ATTRIBUTE_NORMAL
+            });
+            ((base + 60) as *mut u32).write_unaligned((nlen * 2) as u32);
+            for (i, &c) in name[..nlen].iter().enumerate() {
+                ((base + 64 + i as u64 * 2) as *mut u16)
+                    .write_unaligned(c as u16);
+            }
+        }
+        prev = Some(off);
+        off += rec;
+        idx = next;
+        if single {
+            break;
+        }
+    }
+    user::nt_dir_seek(fd, idx);
+    if off == 0 {
+        iosb_complete(iosb, STATUS_NO_MORE_FILES, 0);
+        return STATUS_NO_MORE_FILES;
+    }
+    iosb_complete(iosb, STATUS_SUCCESS, off as u64);
     STATUS_SUCCESS
 }
 
@@ -505,6 +647,7 @@ pub fn service_for_name(name: &[u8]) -> Option<u32> {
         b"FreeVirtualMemory" => NT_FREE_VIRTUAL_MEMORY,
         b"TerminateProcess" => NT_TERMINATE_PROCESS,
         b"DelayExecution" => NT_DELAY_EXECUTION,
+        b"QueryDirectoryFile" => NT_QUERY_DIRECTORY_FILE,
         _ => return None,
     })
 }
@@ -517,6 +660,7 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         NT_WRITE_FILE => rw_file(ctx, true),
         NT_CLOSE => nt_close(ctx),
         NT_CREATE_FILE => nt_create_file(ctx),
+        NT_QUERY_DIRECTORY_FILE => nt_query_dir(ctx),
         NT_QUERY_INFORMATION_FILE => nt_query_info(ctx),
         NT_SET_INFORMATION_FILE => nt_set_info(ctx),
         NT_ALLOCATE_VIRTUAL_MEMORY => nt_alloc_vm(ctx),
