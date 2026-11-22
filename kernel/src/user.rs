@@ -2633,7 +2633,24 @@ fn nt_mod_add(
             *e = (0, 0, 0, 0, 0, 0, [0; 32], 0, 0);
         }
     }
-    let Some(i) = tab.iter().position(|e| e.3 == 0) else {
+    // Slot order IS load order: the thr/detach enums walk the table
+    // linearly, so a fresh module must land after the owner's last
+    // live entry — a swept low slot reused early would invert the
+    // attach/detach sequences for every later drain. "Free" is
+    // base==0, not refs==0: a zero-ref module still owns its slot
+    // until the detach pipeline unmaps it.
+    let start = tab
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.0 == owner && e.1 != 0)
+        .map(|(i, _)| i + 1)
+        .max()
+        .unwrap_or(0);
+    let Some(i) = tab[start..]
+        .iter()
+        .position(|e| e.1 == 0)
+        .map(|p| p + start)
+    else {
         return false;
     };
     let mut nm = [0u8; 32];
@@ -3212,15 +3229,21 @@ fn emit_detach_drain(e: &mut Emit, svc: u8) -> usize {
     ]);
     let done = e.jcc(0x4);
     e.raw(&[
-        0x8b, 0x48, 0x3c, //             mov ecx,[rax+0x3c]    peoff
-        0x8b, 0x4c, 0x08, 0x28, //       mov ecx,[rax+rcx+0x28] entry_rva
+        0x48, 0x89, 0xc3, //             mov rbx,rax    module base
+    ]);
+    // The loader calls LdrpCallTlsInitializers before the init
+    // routine for EVERY reason — detach included.
+    emit_tls_cb_walk(e, 0);
+    e.raw(&[
+        0x8b, 0x4b, 0x3c, //             mov ecx,[rbx+0x3c]     peoff
+        0x8b, 0x4c, 0x0b, 0x28, //       mov ecx,[rbx+rcx+0x28] entry_rva
         0x85, 0xc9, //                   test ecx,ecx
     ]);
     let noent = e.jcc(0x4); //       no entry -> next
     e.raw(&[
-        0x48, 0x01, 0xc1, //           add rcx,rax   entry_va
+        0x48, 0x01, 0xd9, //           add rcx,rbx   entry_va
         0x49, 0x89, 0xc9, //           mov r9,rcx
-        0x48, 0x89, 0xc1, //           mov rcx,rax   hinst
+        0x48, 0x89, 0xd9, //           mov rcx,rbx   hinst
         0x31, 0xd2, //                 xor edx,edx   DLL_PROCESS_DETACH
         0x45, 0x31, 0xc0, //           xor r8d,r8d
         0x41, 0xff, 0xd1, //           call r9       DllMain
@@ -3230,6 +3253,88 @@ fn emit_detach_drain(e: &mut Emit, svc: u8) -> usize {
     e.fix_to(back, drain);
     e.fix(done);
     drain
+}
+
+/// Emit the PIMAGE_TLS_CALLBACK array walk shared by every drain:
+/// r14 = the module's AddressOfCallBacks VA (NULL-terminated),
+/// r15 = hinst - both callee-saved so the callbacks keep them
+/// alive. Calls each cb (hinst, reason, 0) in userland. Caller
+/// owns the frame and the registers.
+fn emit_tls_walk(e: &mut Emit, reason: u8) {
+    e.raw(&[0x4d, 0x85, 0xf6]); //        test r14,r14
+    let empty = e.jcc(0x4);
+    let lp = e.n;
+    e.raw(&[
+        0x49, 0x8b, 0x06, //             mov rax,[r14]
+        0x48, 0x85, 0xc0, //             test rax,rax
+    ]);
+    let done = e.jcc(0x4);
+    e.raw(&[
+        0x4c, 0x89, 0xf9, //             mov rcx,r15   hinst
+        0xba, reason, 0, 0, 0, //       mov edx,reason
+        0x45, 0x31, 0xc0, //             xor r8d,r8d
+        0xff, 0xd0, //                   call rax
+        0x49, 0x83, 0xc6, 0x08, //       add r14,8
+    ]);
+    let back = e.jmp();
+    e.fix_to(back, lp);
+    e.fix(empty);
+    e.fix(done);
+}
+
+/// Emit the per-module TLS-callback walk used by the DllMain
+/// drains: rbx = module base - read the image's TLS directory
+/// (optional-header directory 9, at peoff+0xd0 for PE32+) for its
+/// AddressOfCallBacks array, then walk it like the loader does.
+/// A module with no TLS directory skips cleanly.
+fn emit_tls_cb_walk(e: &mut Emit, reason: u8) {
+    e.raw(&[
+        0x8b, 0x4b, 0x3c, //                mov ecx,[rbx+0x3c]    peoff
+        0x8b, 0x8c, 0x0b, 0xd0, 0, 0, 0, // mov ecx,[rbx+rcx+0xd0] tls rva
+        0x85, 0xc9, //                      test ecx,ecx
+    ]);
+    let nodir = e.jcc(0x4);
+    e.raw(&[
+        0x4c, 0x8d, 0x34, 0x0b, //          lea r14,[rbx+rcx]     &dir
+        0x4d, 0x8b, 0x76, 0x18, //          mov r14,[r14+0x18]    cbs VA
+        // The array must name bytes inside the image: a malformed
+        // directory could point the walk at anything else. The
+        // compare against the base rejects undershoot; size vs
+        // (cbs+8-base) rejects overshoot — wrap-safe since a wrapped
+        // r11 is huge and fails the size test.
+        0x49, 0x39, 0xde, //                cmp r14,rbx
+    ]);
+    let under = e.jcc(0x2); //              jb nodir (cbs < base)
+    e.raw(&[
+        0x8b, 0x4b, 0x3c, //                mov ecx,[rbx+0x3c]    peoff
+        0x8b, 0x44, 0x0b, 0x50, //          mov eax,[rbx+rcx+0x50] imgsize
+        0x4d, 0x8d, 0x5e, 0x08, //          lea r11,[r14+8]
+        0x49, 0x29, 0xdb, //                sub r11,rbx
+        0x4c, 0x39, 0xd8, //                cmp rax,r11
+    ]);
+    let oob = e.jcc(0x2); //                jb nodir (carry: size < off+8)
+    e.raw(&[
+        0x4c, 0x8b, 0xfb, //                mov r15,rbx           hinst
+    ]);
+    emit_tls_walk(e, reason);
+    e.fix(nodir);
+    e.fix(under);
+    e.fix(oob);
+}
+
+/// Emit the exe's own TLS-callback walk for paths where the exe -
+/// which holds no ledger slot - needs its callbacks run: the array
+/// VA lives at data+0x108 (published by pe_tls_init), hinst is the
+/// PEB's ImageBaseAddress. Both reads go through r11 since the
+/// data page and PEB sit above the 4G line disp32 can't reach.
+fn emit_exe_tls(e: &mut Emit, reason: u8) {
+    e.raw(&[0x49, 0xbb]); //              mov r11,imm64 - cbs slot
+    e.raw(&(crate::pe::STUB_DATA_VA + 0x108).to_le_bytes());
+    e.raw(&[0x4d, 0x8b, 0x33]); //        mov r14,[r11]
+    e.raw(&[0x49, 0xbb]); //              mov r11,imm64 - peb+0x10
+    e.raw(&(crate::pe::PEB_VA + 0x10).to_le_bytes());
+    e.raw(&[0x4d, 0x8b, 0x3b]); //        mov r15,[r11]
+    emit_tls_walk(e, reason);
 }
 
 /// Emit the thread-notification drain used by the thread-entry
@@ -3248,17 +3353,20 @@ fn emit_thr_drain(e: &mut Emit, dir: u8, reason: u8) {
         0x48, 0x85, 0xc0, //           test rax,rax
     ]);
     let done = e.jcc(0x4);
+    e.raw(&[0x48, 0x89, 0xc3]); //     mov rbx,rax     next prev
+    // The loader calls LdrpCallTlsInitializers before the init
+    // routine for EVERY reason — detach included.
+    emit_tls_cb_walk(e, reason);
     e.raw(&[
-        0x48, 0x89, 0xc3, //           mov rbx,rax     next prev
-        0x8b, 0x48, 0x3c, //           mov ecx,[rax+0x3c]    peoff
-        0x8b, 0x4c, 0x08, 0x28, //     mov ecx,[rax+rcx+0x28] entry_rva
+        0x8b, 0x4b, 0x3c, //           mov ecx,[rbx+0x3c]    peoff
+        0x8b, 0x4c, 0x0b, 0x28, //     mov ecx,[rbx+rcx+0x28] entry_rva
         0x85, 0xc9, //               test ecx,ecx
     ]);
     let noent = e.jcc(0x4); //     no entry -> next
     e.raw(&[
-        0x48, 0x01, 0xc1, //         add rcx,rax   entry_va
+        0x48, 0x01, 0xd9, //         add rcx,rbx   entry_va
         0x49, 0x89, 0xc9, //         mov r9,rcx
-        0x48, 0x89, 0xc1, //         mov rcx,rax   hinst
+        0x48, 0x89, 0xd9, //         mov rcx,rbx   hinst
         0xba, reason, 0, 0, 0, //   mov edx,reason
         0x45, 0x31, 0xc0, //         xor r8d,r8d
         0x41, 0xff, 0xd1, //         call r9       DllMain
@@ -3277,7 +3385,7 @@ fn emit_thr_drain(e: &mut Emit, dir: u8, reason: u8) {
 /// published as t.thr_entry_va for nt_thread_create. Entry context:
 /// rcx=start_fn, rdx=param, rsp has a synthetic thr_exit_va on top.
 fn emit_thr_entry(t: &mut Task, stub_next: &mut u64) -> Option<()> {
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; 768];
     let mut e = Emit { b: &mut buf, n: 0 };
     e.raw(&[
         0x48, 0x83, 0xe4, 0xf0, //    and rsp,-16
@@ -3291,6 +3399,9 @@ fn emit_thr_entry(t: &mut Task, stub_next: &mut u64) -> Option<()> {
         0x31, 0xdb, //                xor ebx,ebx          enum cursor
     ]);
     emit_thr_drain(&mut e, 0, 2); // DLL_THREAD_ATTACH, forward
+    // The loader skips the exe's ldr entry in its module walk and
+    // fires its TLS callbacks last — after every module's.
+    emit_exe_tls(&mut e, 2);
     e.raw(&[
         0x48, 0x8b, 0x4c, 0x24, 0x28, // mov rcx,[rsp+0x28]  param
         0x48, 0x8b, 0x44, 0x24, 0x20, // mov rax,[rsp+0x20]  start
@@ -3299,6 +3410,7 @@ fn emit_thr_entry(t: &mut Task, stub_next: &mut u64) -> Option<()> {
         0x31, 0xdb, //                xor ebx,ebx          enum cursor
     ]);
     emit_thr_drain(&mut e, 1, 3); // DLL_THREAD_DETACH, reverse
+    emit_exe_tls(&mut e, 3); // exe TLS cbs run last (reverse order)
     e.raw(&[
         0x48, 0x8b, 0x54, 0x24, 0x20, // mov rdx,[rsp+0x20]  status
         0x45, 0x31, 0xd2, //          xor r10d,r10d        self
@@ -3850,6 +3962,11 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
         b"__C_specific_handler" | b"fprintf" | b"vfprintf" | b"signal" => {
             e.raw(&[0x31, 0xc0, 0xc3]);
         }
+        // _fpreset: CRT's FPU reset — real msvcrt fninit+mxcsr reset;
+        // fninit restores the INIT_FX x87 state tasks already run.
+        b"_fpreset" => {
+            e.raw(&[0xdb, 0xe3, 0xc3]); // fninit; ret
+        }
         // TEB LastErrorValue lives at gs:[0x68] (real TEB offset).
         b"GetLastError" => e.raw(&[0x65, 0x8b, 0x04, 0x25, 0x68, 0, 0, 0, 0xc3]),
         b"SetLastError" => e.raw(&[0x65, 0x89, 0x0c, 0x25, 0x68, 0, 0, 0, 0xc3]),
@@ -3977,9 +4094,9 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             ]);
         }
         // TLS: 64 slots — the pointer array gs:[0x58] points at
-        // (data+0x200, the TEB.ThreadLocalStoragePointer layout
-        // compiled __thread/TLS access also uses), 64-bit alloc
-        // bitmap at data+0x108.
+        // (leader: data+0x200; worker TEB: teb+0x200 — values are
+        // per-thread), process-global 64-bit alloc bitmap at
+        // data+0x1f8 shared by every thread's TlsAlloc/TlsFree.
         b"TlsGetValue" | b"FlsGetValue" => {
             e.raw(&[0x83, 0xf9, 0x40]); // cmp ecx,0x40
             let fail = e.jcc(0x3); //       jae
@@ -4002,46 +4119,57 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.raw(&[0x31, 0xc0, 0xc3]);
         }
         b"TlsAlloc" | b"FlsAlloc" => {
-            // Per-thread bitmap lives 8 bytes before the slot array
-            // gs:[0x58] points at (leader: data+0x1f8; a CreateThread
-            // TEB: teb+0x1f8) so each thread owns its own map.
-            e.raw(&[
-                0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0, 0, 0, // mov rax,gs:[0x58]
-                0x48, 0x83, 0xe8, 8, // sub rax,8 -> the bitmap cell
-            ]);
-            e.raw(&[
-                0x48, 0x8b, 0x08, // mov rcx,[rax]
-                0x31, 0xd2, //    xor edx,edx
-            ]);
+            // TLS indexes are process-global on Windows — only the
+            // slot VALUES are per-thread. Allocate out of the shared
+            // bitmap in the data page (STUB_DATA_VA+0x1f8): a worker
+            // thread consulting its own map would re-issue an index
+            // the CRT (or another thread) already owns, and the CRT's
+            // TLS-detach destructor pass would then deref the foreign
+            // value as a pointer. lock bts keeps concurrent allocs
+            // from two threads from returning the same index.
+            e.rax_imm(crate::pe::STUB_DATA_VA + 0x1f8);
+            e.raw(&[0x31, 0xd2]); // xor edx,edx
             let lp = e.n;
-            e.raw(&[0x48, 0x0f, 0xa3, 0xd1]); // bt rcx,rdx
-            let found = e.jcc(0x3); //          jae found
-            e.raw(&[0xff, 0xc2, 0x83, 0xfa, 0x40]); // inc edx; cmp edx,0x40
-            let back = e.jcc(0x2); //   jb loop
+            e.raw(&[0x83, 0xfa, 0x40]); // cmp edx,0x40
+            let full = e.jcc(0x3); //       jae full
+            e.raw(&[0xf0, 0x48, 0x0f, 0xab, 0x10]); // lock bts [rax],rdx
+            let got = e.jcc(0x3); //         jae/jnc got (CF = old bit)
+            e.raw(&[0xff, 0xc2]); //         inc edx
+            let back = e.jmp(); //           jmp lp
             e.fix_to(back, lp);
-            e.raw(&[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3]); // mov eax,-1; ret
-            e.fix(found);
+            e.fix(got);
+            // A fresh index reads NULL in the calling thread — stale
+            // values left by a freed index must not leak into the
+            // next owner (CRT detach machinery derefs its slots).
             e.raw(&[
-                0x48, 0x0f, 0xab, 0xd1, // bts rcx,rdx
-                0x48, 0x89, 0x08, //      mov [rax],rcx
-                0x89, 0xd0, //      mov eax,edx
-                0xc3,
+                0x65, 0x4c, 0x8b, 0x1c, 0x25, 0x58, 0, 0, 0, // mov r11,gs:[0x58]
+                0x49, 0xc7, 0x44, 0xd3, 0x00, 0, 0, 0, 0, // mov qword [r11+rdx*8],0
+                0x89, 0xd0, 0xc3, //      mov eax,edx; ret
             ]);
+            e.fix(full);
+            e.raw(&[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3]); // mov eax,-1; ret
         }
         b"TlsFree" | b"FlsFree" => {
             e.raw(&[0x83, 0xf9, 0x40]);
             let fail = e.jcc(0x3);
+            e.rax_imm(crate::pe::STUB_DATA_VA + 0x1f8);
             e.raw(&[
-                0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0, 0, 0, // mov rax,gs:[0x58]
-                0x48, 0x83, 0xe8, 8,
+                0xf0, 0x48, 0x0f, 0xb3, 0x08, // lock btr [rax],rcx
             ]);
+            // Windows fails TlsFree on an index that was never
+            // allocated — btr's CF carries the old bit.
+            let unset = e.jcc(0x3); //         jnc fail
+            // Clear the slot value in the freeing thread too — a
+            // stale pointer must not survive into a later owner of
+            // the reissued index. (Windows also clears it in every
+            // other thread; that sweep needs a TEB walk we don't do.)
             e.raw(&[
-                0x48, 0x8b, 0x10, // mov rdx,[rax]
-                0x48, 0x0f, 0xb3, 0xd1, // btr rdx,rcx
-                0x48, 0x89, 0x10, // mov [rax],rdx
-                0xb8, 1, 0, 0, 0, 0xc3,
+                0x65, 0x4c, 0x8b, 0x1c, 0x25, 0x58, 0, 0, 0, // mov r11,gs:[0x58]
+                0x49, 0xc7, 0x44, 0xcb, 0x00, 0, 0, 0, 0, // mov qword [r11+rcx*8],0
+                0xb8, 1, 0, 0, 0, 0xc3, //       mov eax,1; ret
             ]);
             e.fix(fail);
+            e.fix(unset);
             e.raw(&[0x31, 0xc0, 0xc3]);
         }
         // ---- threads ------------------------------------------------
@@ -4111,6 +4239,7 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x31, 0xdb, //               xor ebx,ebx     enum cursor
             ]);
             emit_thr_drain(&mut e, 1, 3); // DLL_THREAD_DETACH reverse
+            emit_exe_tls(&mut e, 3); //       exe TLS cbs last
             e.raw(&[
                 0x48, 0x8b, 0x54, 0x24, 0x20, // mov rdx,[rsp+0x20] status
                 0x48, 0x83, 0xc4, 0x28, //    add rsp,0x28
@@ -4382,7 +4511,15 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.fix(fresh);
             e.raw(&[
                 0x48, 0x0f, 0xba, 0xf0, 0x3f, // btr rax,63  clear FRESH
-                0x48, 0x83, 0xec, 0x38, //    sub rsp,0x38
+                // The drain calls DllMain plus the module's TLS
+                // callbacks and then returns - preserve the
+                // callee-saved registers it walks with.
+                0x53, //                     push rbx
+                0x41, 0x56, //               push r14
+                0x41, 0x57, //               push r15
+                // 3 pushes + 0x30 keeps every call site 16-aligned
+                // from a call-entered (rsp%16==8) thunk.
+                0x48, 0x83, 0xec, 0x30, //   sub rsp,0x30
                 0x48, 0x89, 0x44, 0x24, 0x20, // mov [rsp+0x20],rax hmod
             ]);
             let drain = e.n; //              drain: next pending attach
@@ -4392,16 +4529,19 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x48, 0x85, 0xc0, //       test rax,rax
             ]);
             let done = e.jcc(0x4); //       queue empty -> done
+            e.raw(&[0x48, 0x89, 0xc3]); // mov rbx,rax  module base
+            // Load order per module: TLS cbs before DllMain(ATTACH).
+            emit_tls_cb_walk(&mut e, 1);
             e.raw(&[
-                0x8b, 0x48, 0x3c, //          mov ecx,[rax+0x3c]    peoff
-                0x8b, 0x4c, 0x08, 0x28, //    mov ecx,[rax+rcx+0x28] entry_rva
+                0x8b, 0x4b, 0x3c, //          mov ecx,[rbx+0x3c]    peoff
+                0x8b, 0x4c, 0x0b, 0x28, //    mov ecx,[rbx+rcx+0x28] entry_rva
                 0x85, 0xc9, //                test ecx,ecx
             ]);
             let noent = e.jcc(0x4); //      no entry -> next
             e.raw(&[
-                0x48, 0x01, 0xc1, //       add rcx,rax   entry_va
+                0x48, 0x01, 0xd9, //       add rcx,rbx   entry_va
                 0x49, 0x89, 0xc9, //       mov r9,rcx
-                0x48, 0x89, 0xc1, //       mov rcx,rax   hinst
+                0x48, 0x89, 0xd9, //       mov rcx,rbx   hinst
                 0xba, 0x01, 0, 0, 0, //   mov edx,1     DLL_PROCESS_ATTACH
                 0x45, 0x31, 0xc0, //       xor r8d,r8d
                 0x41, 0xff, 0xd1, //       call r9       DllMain
@@ -4412,7 +4552,10 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.fix(done);
             e.raw(&[
                 0x48, 0x8b, 0x44, 0x24, 0x20, // mov rax,[rsp+0x20]
-                0x48, 0x83, 0xc4, 0x38, //    add rsp,0x38
+                0x48, 0x83, 0xc4, 0x30, //    add rsp,0x30
+                0x41, 0x5f, //                pop r15
+                0x41, 0x5e, //                pop r14
+                0x5b, //                      pop rbx
             ]);
             e.fix(nul);
             e.raw(&[0xc3]); //             ret
@@ -4431,7 +4574,15 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.fix(fresh);
             e.raw(&[
                 0x48, 0x0f, 0xba, 0xf0, 0x3f, // btr rax,63  clear FRESH
-                0x48, 0x83, 0xec, 0x38, //    sub rsp,0x38
+                // The drain calls DllMain plus the module's TLS
+                // callbacks and then returns - preserve the
+                // callee-saved registers it walks with.
+                0x53, //                     push rbx
+                0x41, 0x56, //               push r14
+                0x41, 0x57, //               push r15
+                // 3 pushes + 0x30 keeps every call site 16-aligned
+                // from a call-entered (rsp%16==8) thunk.
+                0x48, 0x83, 0xec, 0x30, //   sub rsp,0x30
                 0x48, 0x89, 0x44, 0x24, 0x20, // mov [rsp+0x20],rax hmod
             ]);
             let drain = e.n;
@@ -4441,16 +4592,19 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x48, 0x85, 0xc0, //       test rax,rax
             ]);
             let done = e.jcc(0x4);
+            e.raw(&[0x48, 0x89, 0xc3]); // mov rbx,rax  module base
+            // Load order per module: TLS cbs before DllMain(ATTACH).
+            emit_tls_cb_walk(&mut e, 1);
             e.raw(&[
-                0x8b, 0x48, 0x3c, //          mov ecx,[rax+0x3c]
-                0x8b, 0x4c, 0x08, 0x28, //    mov ecx,[rax+rcx+0x28]
+                0x8b, 0x4b, 0x3c, //          mov ecx,[rbx+0x3c]
+                0x8b, 0x4c, 0x0b, 0x28, //    mov ecx,[rbx+rcx+0x28]
                 0x85, 0xc9, //                test ecx,ecx
             ]);
             let noent = e.jcc(0x4);
             e.raw(&[
-                0x48, 0x01, 0xc1, //       add rcx,rax
+                0x48, 0x01, 0xd9, //       add rcx,rbx
                 0x49, 0x89, 0xc9, //       mov r9,rcx
-                0x48, 0x89, 0xc1, //       mov rcx,rax
+                0x48, 0x89, 0xd9, //       mov rcx,rbx
                 0xba, 0x01, 0, 0, 0, //   mov edx,1
                 0x45, 0x31, 0xc0, //       xor r8d,r8d
                 0x41, 0xff, 0xd1, //       call r9
@@ -4461,7 +4615,10 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.fix(done);
             e.raw(&[
                 0x48, 0x8b, 0x44, 0x24, 0x20, // mov rax,[rsp+0x20]
-                0x48, 0x83, 0xc4, 0x38, //    add rsp,0x38
+                0x48, 0x83, 0xc4, 0x30, //    add rsp,0x30
+                0x41, 0x5f, //                pop r15
+                0x41, 0x5e, //                pop r14
+                0x5b, //                      pop rbx
             ]);
             e.fix(nul);
             e.raw(&[0xc3]); //             ret
@@ -4492,7 +4649,14 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.raw(&[0xc3]); //              refdown only -> ret TRUE
             e.fix(pend);
             e.raw(&[
-                0x48, 0x83, 0xec, 0x28, // sub rsp,0x28
+                // The drain walks TLS arrays too - rbx/r14/r15 are
+                // callee-saved and this thunk returns to its caller.
+                0x53, //                     push rbx
+                0x41, 0x56, //               push r14
+                0x41, 0x57, //               push r15
+                // 3 pushes + 0x30 keeps the drain's call sites
+                // 16-aligned from a call-entered (rsp%16==8) thunk.
+                0x48, 0x83, 0xec, 0x30, //   sub rsp,0x30
             ]);
             let drain = emit_detach_drain(&mut e, 0xf9);
             e.raw(&[
@@ -4503,8 +4667,11 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             let again = e.jcc(0x5); //   deps hit zero late -> re-drain
             e.fix_to(again, drain);
             e.raw(&[
+                0x48, 0x83, 0xc4, 0x30, // add rsp,0x30
+                0x41, 0x5f, //             pop r15
+                0x41, 0x5e, //             pop r14
+                0x5b, //                   pop rbx
                 0xb8, 1, 0, 0, 0, //       mov eax,1   TRUE
-                0x48, 0x83, 0xc4, 0x28, // add rsp,0x28
             ]);
             e.fix(fail);
             e.raw(&[0xc3]); //             ret
@@ -4803,6 +4970,7 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x48, 0x89, 0x4c, 0x24, 0x20, // mov [rsp+0x20],rcx
             ]);
             emit_detach_drain(&mut e, 0xfb); // RUX_EXIT_DETACH
+            emit_exe_tls(&mut e, 0); //        exe TLS cbs last
             e.raw(&[
                 0x48, 0x8b, 0x54, 0x24, 0x20, // mov rdx,[rsp+0x20]  code
                 0x48, 0x83, 0xc4, 0x28, //    add rsp,0x28
@@ -5704,7 +5872,7 @@ fn emit_thr_exit(t: &mut Task, stub_next: &mut u64) -> Option<()> {
 /// lower ledger slots, so they initialize before their importer —
 /// the same order the LoadLibrary thunk's drain produces.
 fn emit_attach_drain(t: &mut Task, stub_next: &mut u64) -> Option<()> {
-    let mut buf = [0u8; 96];
+    let mut buf = [0u8; 192];
     let mut e = Emit { b: &mut buf, n: 0 };
     e.raw(&[
         0x48, 0x83, 0xe4, 0xf0, //    and rsp,-16
@@ -5720,16 +5888,20 @@ fn emit_attach_drain(t: &mut Task, stub_next: &mut u64) -> Option<()> {
         0x48, 0x85, 0xc0, //       test rax,rax
     ]);
     let done = e.jcc(0x4); //       queue empty -> entry
+    e.raw(&[0x48, 0x89, 0xc3]); // mov rbx,rax    module base
+    // Same per-module order as the runtime-load drains: each dep's
+    // TLS callbacks run before its DllMain(DLL_PROCESS_ATTACH).
+    emit_tls_cb_walk(&mut e, 1);
     e.raw(&[
-        0x8b, 0x48, 0x3c, //       mov ecx,[rax+0x3c]     peoff
-        0x8b, 0x4c, 0x08, 0x28, // mov ecx,[rax+rcx+0x28] entry_rva
+        0x8b, 0x4b, 0x3c, //       mov ecx,[rbx+0x3c]     peoff
+        0x8b, 0x4c, 0x0b, 0x28, // mov ecx,[rbx+rcx+0x28] entry_rva
         0x85, 0xc9, //             test ecx,ecx
     ]);
     let noent = e.jcc(0x4); //     no entry -> next
     e.raw(&[
-        0x48, 0x01, 0xc1, //       add rcx,rax    entry_va
+        0x48, 0x01, 0xd9, //       add rcx,rbx    entry_va
         0x49, 0x89, 0xc9, //       mov r9,rcx
-        0x48, 0x89, 0xc1, //       mov rcx,rax    hinst
+        0x48, 0x89, 0xd9, //       mov rcx,rbx    hinst
         0xba, 0x01, 0, 0, 0, //   mov edx,1      DLL_PROCESS_ATTACH
         0x45, 0x31, 0xc0, //       xor r8d,r8d
         0x41, 0xff, 0xd1, //       call r9        DllMain
@@ -5773,8 +5945,9 @@ fn emit_tls_tramp(t: &mut Task, p: &crate::pe::Pe, stub_next: &mut u64) -> Optio
         return Some(());
     }
     // The callback array must live inside the image — anything else
-    // is malformed, not a request to run arbitrary VA.
-    if cb < p.bias || cb + 8 > p.bias + p.size {
+    // is malformed, not a request to run arbitrary VA. Subtract
+    // rather than add so a bias-sized cb can't wrap the compare.
+    if !(p.size >= 8 && cb >= p.bias && cb - p.bias <= p.size - 8) {
         return None;
     }
     let mut buf = [0u8; 128];
@@ -5830,6 +6003,9 @@ fn emit_tls_tramp(t: &mut Task, p: &crate::pe::Pe, stub_next: &mut u64) -> Optio
 /// pe_resolve_imports.
 fn pe_tls_init(t: &mut Task, p: &crate::pe::Pe) -> bool {
     if p.tls_rva == 0 {
+        // No TLS directory — make sure the exe-callback slot is 0 so
+        // a stale array pointer can never be walked on detach paths.
+        let _ = write_task_bytes(t.pml4, crate::pe::STUB_DATA_VA + 0x108, &0u64.to_le_bytes());
         return true;
     }
     if p.tls_size < 0x18 {
@@ -5843,8 +6019,27 @@ fn pe_tls_init(t: &mut Task, p: &crate::pe::Pe) -> bool {
     ) else {
         return false;
     };
+    // Publish the exe's TLS-callback array for the thread and
+    // process-detach notification paths, which invoke it with
+    // hinst = image base. A missing or out-of-image array just
+    // means no callbacks (emit_tls_tramp does the strict check).
+    let cbs = if p.tls_size >= 0x20 {
+        read_task_u(t.pml4, dir + 0x18, 8).unwrap_or(0)
+    } else {
+        0
+    };
+    let cbs = if p.size >= 8 && cbs >= p.bias && cbs - p.bias <= p.size - 8 {
+        cbs
+    } else {
+        0
+    };
+    let _ = write_task_bytes(
+        t.pml4,
+        crate::pe::STUB_DATA_VA + 0x108,
+        &cbs.to_le_bytes(),
+    );
     // Every VA the directory names must land inside the image.
-    if idx != 0 && (idx < p.bias || idx + 4 > p.bias + p.size) {
+    if idx != 0 && !(p.size >= 4 && idx >= p.bias && idx - p.bias <= p.size - 4) {
         return false;
     }
     if end > start && (start < p.bias || end > p.bias + p.size) {
@@ -5863,9 +6058,9 @@ fn pe_tls_init(t: &mut Task, p: &crate::pe::Pe) -> bool {
         }
         // Slot 0 is the compiled-TLS index — TlsAlloc must never
         // hand it back out or it would clobber the template ptr.
-        // Bitmap sits 8B before the slot array the leader's gs:[0x58]
-        // points at (data+0x200 -> bitmap data+0x1f8), matching where
-        // the Tls* thunks look and the per-thread TEB layout.
+        // The bitmap at data+0x1f8 is the process-global map every
+        // thread's TlsAlloc/TlsFree shares (slot values stay
+        // per-thread under each thread's own gs:[0x58] array).
         let _ = write_task_bytes(t.pml4, crate::pe::STUB_DATA_VA + 0x1f8, &1u64.to_le_bytes());
         t.tls_tmpl_va = start;
         t.tls_tmpl_sz = end - start;
@@ -9517,11 +9712,7 @@ pub fn nt_thread_create(
         && write_task_bytes(pml4, teb + 0x40, &p.tgid.to_le_bytes())
         && write_task_bytes(pml4, teb + 0x48, &tid.to_le_bytes())
         && write_task_bytes(pml4, teb + 0x58, &(teb + 0x200).to_le_bytes())
-        && write_task_bytes(pml4, teb + 0x60, &crate::pe::PEB_VA.to_le_bytes())
-        // Own TLS bitmap (bit0 = template index reserved) at
-        // teb+0x1f8 — right before the slot array, same layout as
-        // the leader's data-page arrangement.
-        && write_task_bytes(pml4, teb + 0x1f8, &1u64.to_le_bytes());
+        && write_task_bytes(pml4, teb + 0x60, &crate::pe::PEB_VA.to_le_bytes());
     if !okw {
         nt_free_pages(win, total);
         fstab_release(cfsi);
@@ -17734,6 +17925,11 @@ pub fn task_exit(code: u64) -> ! {
 /// wait status is the bare signo in the low byte — real wstatus.
 fn die_signal(signo: u64) -> ! {
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
+    crate::log::printk(format_args!(
+        "rustux: user: pid {} {} sig-death({signo})",
+        getpid(),
+        cur_exe()
+    ));
     if let Some(t) = unsafe { (*core::ptr::addr_of_mut!(TASKS))[cur].as_mut() } {
         t.exit_status = signo;
     }
