@@ -2172,3 +2172,76 @@ in-reservation commit, Query RESERVE->COMMIT->RESERVE->FREE,
 protect-on-reserved fails, decommit and both release forms
 work — exits 29. Suite: 21/21 0 failures, 51 tasks, frames
 108477 -> 108477 zero leak, qemu exit 33. Ledger: 115.
+
+Run-115 (this session): real NT threads and per-thread TLS.
+CreateThread now builds a genuine CLONE_VM-shaped task — shared
+pml4 via mm_share, shared files/sighand/fs table refs, own kernel
+stack, and one contiguous committed VA window per thread holding
+[user stack | TEB | TLS copy] so the range ledger spends exactly
+one entry per live thread (the first design spent three and the
+32-slot ledger died after ~10 creates; dead threads
+windows are reclaimed on the next create via owner bookkeeping).
+The new task gets a unique pid under the shared tgid, rip=start,
+rcx=param (Win64 first arg), rsp aimed at a synthetic return
+address into the thread-exit stub, gs_base=its own TEB, and
+state=Blocked+WaitOn::NtSuspend for CREATE_SUSPENDED.
+Thread handles live in a global 16-entry NT_THREADS ledger
+keyed by ledger idx (stored in nth_fd): handles stay valid
+after the task slot reaps, refs bump at bind and drop on
+CloseHandle, dead+unreferenced entries free themselves;
+task_exit records the raw exit code there for
+GetExitCodeThread/NtQueryInformationThread (ThreadBasicInformation:
+ExitStatus or STILL_ACTIVE, TebBase, ClientId pid/tid).
+The subtle one: this kernels
+
+Run-115 (this session): real NT threads and per-thread TLS.
+CreateThread now builds a genuine CLONE_VM-shaped task - shared
+pml4 via mm_share, shared files/sighand/fs table refs, own kernel
+stack, and one contiguous committed VA window per thread holding
+[user stack | TEB | TLS copy] so the range ledger spends exactly
+one entry per live thread (the first design spent three and the
+32-slot ledger died after ~10 creates; dead threads windows are
+reclaimed on the next create via owner bookkeeping). The new task
+gets a unique pid under the shared tgid, rip=start, rcx=param
+(Win64 first arg), rsp aimed at a synthetic return address into
+the thread-exit stub, gs_base=its own TEB, and state=Blocked+
+WaitOn::NtSuspend for CREATE_SUSPENDED. Thread handles live in a
+global 16-entry NT_THREADS ledger keyed by ledger idx (stored in
+nth_fd): handles stay valid after the task slot reaps, refs bump
+at bind and drop on CloseHandle, dead+unreferenced entries free
+themselves; task_exit records the raw exit code there for
+GetExitCodeThread/NtQueryInformationThread
+(ThreadBasicInformation: ExitStatus or STILL_ACTIVE, TebBase,
+ClientId pid/tid). The subtle one: this kernel's blocking model
+abandons the syscall kernel frame - a blocked task resumes in
+userland at ctx.rip with a waker-written rax - so a poll-and-
+sleep loop inside the handler was wrong twice over (it returned
+rax=0 == WAIT_OBJECT_0 on the timer wake regardless of the
+object). NtWaitForSingleObject now parks on WaitOn::NtWait(idx)
+serviced per tick by nt_wait_expire: dead entry ->
+ctx.rax=SUCCESS, expired wait_deadline -> STATUS_TIMEOUT, NULL
+interval = infinite. WaitForSingleObject marshals a negative
+relative LARGE_INTEGER in r8; INFINITE becomes NULL. ResumeThread
+is the only wake for WaitOn::NtSuspend. TLS went genuinely
+per-thread: each TEB carries its own 64-slot array at +0x200 and
+bitmap at +0x1f8 (gs:[0x58] points at the array; the bitmap sits
+at array-8), slot 0 is the compiled .tls template copied per
+thread, and TlsAlloc/TlsFree/TlsGet/Set operate on the current
+thread's bitmap - __thread copies are private per worker (fixture
+verifies 100+idx does not leak into the leader). Audit run-89
+quick scoped: one confirmed-class issue found and fixed in-run -
+the copied ranges/heap ledger would go stale when a sibling
+mutates the shared map (probe passes on freed VA -> kernel #PF);
+mm_owner_i/mm_owner_mut now routes every NT non-leader ledger
+access (probes, alloc/free/commit/decommit/query/protect, heap
+ops) to the process leader. Also recorded: nth handles are
+per-task (Windows handles are process-wide - honest
+INVALID_HANDLE divergence), and the probe->raw-deref atomicity
+invariant is now load-bearing (no syscall handler yields mid
+user-VA access; verified). winthr.exe.gz (real MinGW) exits 37:
+two workers run/join with exit codes 41/42, STILL_ACTIVE while
+running, TlsAlloc slot isolation, __thread privacy, unique tids,
+CREATE_SUSPENDED times out at 50ms then ResumeThread runs it to
+exit 9, CloseHandle on all handles. Suite: 21/21 0 failures,
+52 tasks, frames 108475 -> 108475 zero leak, qemu exit 33.
+Ledger: 116.

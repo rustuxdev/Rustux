@@ -209,6 +209,14 @@ enum WaitOn {
     /// inotify read on an empty queue — ino_report wakes the sleeper
     /// by depositing the head event's record like PipeRead.
     Inotify(usize),
+    /// CREATE_SUSPENDED NT thread — created Blocked and only
+    /// NtResumeThread flips it Runnable; nothing else wakes it.
+    NtSuspend,
+    /// NtWaitForSingleObject on an NT thread object — the payload
+    /// is the NT_THREADS ledger index, wait_deadline bounds it
+    /// (0 = infinite). nt_wait_expire re-checks the object each
+    /// tick: dead -> STATUS_SUCCESS, expired -> STATUS_TIMEOUT.
+    NtWait(usize),
 }
 
 /// Max fds per task — a hard bound so a hostile process cannot
@@ -1412,6 +1420,12 @@ pub struct Task {
     /// NT anonymous-VM bump cursor — NtAllocateVirtualMemory
     /// hands out pages upward from NT_ALLOC_VA.
     nt_alloc: u64,
+    /// .tls template VA/span for per-thread copies (0 when the
+    /// image has no TLS directory) and the emitted thread-exit
+    /// stub's VA — set at PE load, used by nt_thread_create.
+    tls_tmpl_va: u64,
+    tls_tmpl_sz: u64,
+    thr_exit_va: u64,
     /// The signal that stopped this task (0 = not stop-reported).
     /// wait4 WUNTRACED consumes it once per stop.
     stop_sig: u8,
@@ -2060,6 +2074,31 @@ fn cur_mut() -> Option<&'static mut Task> {
     // SAFETY: single CPU, IF-masked syscall path — sole accessor.
     let i = unsafe { *core::ptr::addr_of!(CUR_I) };
     unsafe { (*core::ptr::addr_of_mut!(TASKS)).get_mut(i)?.as_mut() }
+}
+
+/// The task index whose ranges/heap ledger is authoritative for
+/// the running task's address space: an NT thread (pers==NT,
+/// tgid != pid) defers to its process leader. Threads share the
+/// pml4 — a ledger copied at create would go stale the moment a
+/// sibling mutates the map, letting a probe pass on freed VA.
+fn mm_owner_i() -> Option<usize> {
+    let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    let ct = tasks.get(cur)?.as_ref()?;
+    if ct.pers == PERS_NT && ct.tgid != ct.pid {
+        let want = ct.tgid;
+        tasks
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|t| t.pid == want))
+    } else {
+        Some(cur)
+    }
+}
+
+/// mm_owner_i resolved to a mutable Task ref.
+fn mm_owner_mut() -> Option<&'static mut Task> {
+    let i = mm_owner_i()?;
+    unsafe { (*core::ptr::addr_of_mut!(TASKS))[i].as_mut() }
 }
 
 fn rd64(p: u64) -> u64 {
@@ -3131,7 +3170,13 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
             e.raw(&[0x31, 0xc0, 0xc3]);
         }
         b"TlsAlloc" | b"FlsAlloc" => {
-            e.rax_imm(d + 0x108);
+            // Per-thread bitmap lives 8 bytes before the slot array
+            // gs:[0x58] points at (leader: data+0x1f8; a CreateThread
+            // TEB: teb+0x1f8) so each thread owns its own map.
+            e.raw(&[
+                0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0, 0, 0, // mov rax,gs:[0x58]
+                0x48, 0x83, 0xe8, 8, // sub rax,8 -> the bitmap cell
+            ]);
             e.raw(&[
                 0x48, 0x8b, 0x08, // mov rcx,[rax]
                 0x31, 0xd2, //    xor edx,edx
@@ -3154,7 +3199,10 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
         b"TlsFree" | b"FlsFree" => {
             e.raw(&[0x83, 0xf9, 0x40]);
             let fail = e.jcc(0x3);
-            e.rax_imm(d + 0x108);
+            e.raw(&[
+                0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0, 0, 0, // mov rax,gs:[0x58]
+                0x48, 0x83, 0xe8, 8,
+            ]);
             e.raw(&[
                 0x48, 0x8b, 0x10, // mov rdx,[rax]
                 0x48, 0x0f, 0xb3, 0xd1, // btr rdx,rcx
@@ -3162,6 +3210,164 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0xb8, 1, 0, 0, 0, 0xc3,
             ]);
             e.fix(fail);
+            e.raw(&[0x31, 0xc0, 0xc3]);
+        }
+        // ---- threads ------------------------------------------------
+        // CreateThread(sa, stacksz, fn, param, flags, &tid) and the
+        // msvcrt _beginthreadex (same ABI): marshal onto
+        // NtCreateThreadEx(&h, 0x1fffff, 0, -1, fn, param, flags, 0,
+        // 0, stacksz, 0), then NtQueryInformationThread for the
+        // caller's tid out-param. The new thread's own stack carries
+        // a synthetic return address into the thread-exit stub.
+        b"CreateThread" | b"_beginthreadex" | b"_beginthread" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x68, // sub rsp,0x68
+                0x4c, 0x89, 0x44, 0x24, 0x28, // mov [rsp+0x28],r8 (start)
+                0x4c, 0x89, 0x4c, 0x24, 0x30, // mov [rsp+0x30],r9 (param)
+                0x48, 0x8b, 0x84, 0x24, 0x90, 0, 0, 0, // mov rax,[rsp+0x90] flags
+                0x48, 0x89, 0x44, 0x24, 0x38, // mov [rsp+0x38],rax
+                0x48, 0xc7, 0x44, 0x24, 0x40, 0, 0, 0, 0, // arg8 zerobits=0
+                0x48, 0x89, 0x54, 0x24, 0x48, // mov [rsp+0x48],rdx (reserve)
+                0x48, 0xc7, 0x44, 0x24, 0x50, 0, 0, 0, 0, // arg11 attr=0
+                0x4c, 0x8d, 0x54, 0x24, 0x60, // lea r10,[rsp+0x60] &h
+                0xba, 0xff, 0xff, 0x1f, 0, // mov edx,0x1fffff access
+                0x45, 0x31, 0xc0, //          xor r8d,r8d    oa=0
+                0x49, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff, // mov r9,-1 proch
+                0xb8, 0xc1, 0, 0, 0, //       mov eax,0xc1
+                0x0f, 0x05, //               syscall
+            ]);
+            let fail = e.jcc(0x8); //          js fail
+            // ThreadBasicInformation query for the tid out-param.
+            e.raw(&[
+                0x4c, 0x8b, 0x54, 0x24, 0x60, // mov r10,[rsp+0x60] h
+                0x31, 0xd2, //               xor edx,edx  class 0
+                0x4c, 0x8d, 0x44, 0x24, 0x10, // lea r8,[rsp+0x10] tbi
+                0x41, 0xb9, 0x30, 0, 0, 0, // mov r9d,48
+                0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0, // arg5 retsz=0
+                0xb8, 0x25, 0, 0, 0, //       mov eax,0x25
+                0x0f, 0x05, //               syscall
+            ]);
+            let skip = e.jcc(0x8); //          js skip tid store
+            e.raw(&[
+                0x48, 0x8b, 0x84, 0x24, 0x98, 0, 0, 0, // mov rax,[rsp+0x98] &tid
+                0x48, 0x85, 0xc0, //          test rax,rax
+            ]);
+            let null = e.jcc(0x4); //          jz null
+            e.raw(&[
+                0x48, 0x8b, 0x54, 0x24, 0x28, // mov rdx,[rsp+0x28] UniqueThread
+                0x89, 0x10, //               mov [rax],edx
+            ]);
+            e.fix(null);
+            e.fix(skip);
+            e.raw(&[0x48, 0x8b, 0x44, 0x24, 0x60]); // mov rax,[rsp+0x60] h
+            e.fix(fail); // on create failure rax is already 0? No —
+            // NTSTATUS sits in rax; force 0 like Win32's NULL return.
+            e.raw(&[
+                0x0f, 0x89, 2, 0, 0, 0, //    jns +2 (success keeps rax)
+                0x31, 0xc0, //               xor eax,eax
+                0x48, 0x83, 0xc4, 0x68, 0xc3, // add rsp,0x68; ret
+            ]);
+        }
+        // ExitThread(code) -> NtTerminateThread(0, code) — never
+        // returns; the int3 canaries any path that slips past.
+        b"ExitThread" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //          mov rdx,rcx (status)
+                0x45, 0x31, 0xd2, //          xor r10d,r10d (self)
+                0xb8, 0x53, 0, 0, 0, //       mov eax,0x53
+                0x0f, 0x05, 0xcc, //          syscall; int3
+            ]);
+        }
+        b"GetCurrentThread" => {
+            e.raw(&[0x48, 0xc7, 0xc0, 0xfe, 0xff, 0xff, 0xff, 0xc3]); // rax=-2
+        }
+        // GetThreadId(h) -> TBI.UniqueThread via the query service.
+        b"GetThreadId" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x48, // sub rsp,0x48
+                0x49, 0x89, 0xca, //          mov r10,rcx   handle
+                0x31, 0xd2, //               xor edx,edx   class 0
+                0x4c, 0x8d, 0x44, 0x24, 0x08, // lea r8,[rsp+8] tbi
+                0x41, 0xb9, 0x30, 0, 0, 0, // mov r9d,48
+                0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0, // retsz=0
+                0xb8, 0x25, 0, 0, 0, 0x0f, 0x05, // mov eax,0x25; syscall
+            ]);
+            let fail = e.jcc(0x8); //          js fail
+            e.raw(&[0x48, 0x8b, 0x44, 0x24, 0x20]); // rax=[tbi+0x18] tid
+            e.fix(fail);
+            e.raw(&[
+                0x0f, 0x89, 2, 0, 0, 0, 0x31, 0xc0, // jns +2; xor eax,eax
+                0x48, 0x83, 0xc4, 0x48, 0xc3, // add rsp,0x48; ret
+            ]);
+        }
+        // GetExitCodeThread(h, &code) -> ExitStatus (or STILL_ACTIVE
+        // 0x103 for a running thread) via the same TBI query.
+        b"GetExitCodeThread" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x50, // sub rsp,0x50
+                0x48, 0x89, 0x54, 0x24, 0x48, // mov [rsp+0x48],rdx &code
+                0x49, 0x89, 0xca, //          mov r10,rcx
+                0x31, 0xd2, //               xor edx,edx
+                0x4c, 0x8d, 0x44, 0x24, 0x10, // lea r8,[rsp+0x10] tbi
+                0x41, 0xb9, 0x30, 0, 0, 0, // mov r9d,48
+                0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0, // retsz=0
+                0xb8, 0x25, 0, 0, 0, 0x0f, 0x05,
+            ]);
+            let fail = e.jcc(0x8); //          js fail
+            e.raw(&[
+                0x48, 0x8b, 0x44, 0x24, 0x48, // mov rax,[rsp+0x48] &code
+                0x48, 0x8b, 0x54, 0x24, 0x10, // mov rdx,[tbi+0] ExitStatus
+                0x89, 0x10, //               mov [rax],edx
+                0xb8, 1, 0, 0, 0, //          mov eax,1
+            ]);
+            e.fix(fail);
+            e.raw(&[
+                0x0f, 0x89, 2, 0, 0, 0, 0x31, 0xc0, // jns +2; xor eax,eax
+                0x48, 0x83, 0xc4, 0x50, 0xc3,
+            ]);
+        }
+        // WaitForSingleObject(h, ms) -> NtWaitForSingleObject(h, 0,
+        // &tmo|NULL). INFINITE (0xffffffff) means a NULL interval ptr.
+        b"WaitForSingleObject" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
+                0x49, 0x89, 0xca, //          mov r10,rcx   handle
+                0x83, 0xfa, 0xff, //          cmp edx,-1    INFINITE?
+            ]);
+            let tmo = e.jcc(0x5); //           jne tmo
+            e.raw(&[
+                0x31, 0xd2, //               xor edx,edx   alertable=0
+                0x45, 0x31, 0xc0, //          xor r8d,r8d   timeout=NULL
+                0xb8, 4, 0, 0, 0, 0x0f, 0x05, // mov eax,4; syscall
+                0x48, 0x83, 0xc4, 0x38, 0xc3, // add rsp,0x38; ret
+            ]);
+            e.fix(tmo);
+            e.raw(&[
+                0x89, 0xd0, //               mov eax,edx
+                0x48, 0xf7, 0xd8, //          neg rax
+                0x48, 0x69, 0xc0, 0x10, 0x27, 0, 0, // imul rax,rax,10000
+                0x48, 0x89, 0x44, 0x24, 0x30, // mov [rsp+0x30],rax
+                0x4c, 0x8d, 0x44, 0x24, 0x30, // lea r8,[rsp+0x30] &tmo
+                0x31, 0xd2, //               xor edx,edx   alertable=0
+                0xb8, 4, 0, 0, 0, 0x0f, 0x05, // mov eax,4; syscall
+                0x48, 0x83, 0xc4, 0x38, 0xc3, // add rsp,0x38; ret
+            ]);
+        }
+        // ResumeThread(h) -> previous suspend count, -1 on failure.
+        b"ResumeThread" => {
+            e.raw(&[
+                0x48, 0x83, 0xec, 0x38, // sub rsp,0x38
+                0x49, 0x89, 0xca, //          mov r10,rcx
+                0x48, 0x8d, 0x54, 0x24, 0x30, // lea rdx,[rsp+0x30] &prev
+                0xb8, 0x52, 0, 0, 0, 0x0f, 0x05, // mov eax,0x52; syscall
+                0x85, 0xc0, //               test eax,eax
+                0x0f, 0x89, 5, 0, 0, 0, //    jns +5 keep eax
+                0xb8, 0xff, 0xff, 0xff, 0xff, // mov eax,-1
+                0x48, 0x83, 0xc4, 0x38, 0xc3,
+            ]);
+        }
+        // SwitchToThread: honest "no hint" — 0 like a missed yield.
+        b"SwitchToThread" => {
             e.raw(&[0x31, 0xc0, 0xc3]);
         }
         // Sleep(ms) -> NtDelayExecution(0, &(-ms*10000)).
@@ -4174,11 +4380,40 @@ fn pe_resolve_imports(t: &mut Task, p: &crate::pe::Pe) -> bool {
     if emit_tls_tramp(t, p, &mut stub_next).is_none() {
         return false;
     }
+    // The thread-exit stub too: a secondary thread's start_fn
+    // "returns" here — rax's value becomes the thread exit status
+    // via NtTerminateThread(0, status).
+    if emit_thr_exit(t, &mut stub_next).is_none() {
+        return false;
+    }
     // Fill done — drop the stub pages to read+execute.
     map_page(t, crate::pe::STUB_VA, USER);
     map_page(t, crate::pe::STUB_VA + 0x1000, USER);
     map_page(t, crate::pe::STUB_VA + 0x2000, USER);
     true
+}
+
+/// Emit the shared thread-exit stub: `NtTerminateThread(0, rax)` —
+/// a secondary thread's synthetic return address points here so a
+/// start_fn that returns dies with its return value as the status.
+/// NtTerminateThread never returns; the trailing int3 is a canary.
+fn emit_thr_exit(t: &mut Task, stub_next: &mut u64) -> Option<()> {
+    const NT_TERMINATE_THREAD: u8 = 0x53;
+    let code = [
+        0x48, 0x89, 0xc2, //             mov rdx,rax  (status)
+        0x45, 0x31, 0xd2, //             xor r10d,r10d (self)
+        0xb8, NT_TERMINATE_THREAD, 0, 0, 0, // mov eax,0x53
+        0x0f, 0x05, //                   syscall
+        0xcc, //                         int3 (unreachable)
+    ];
+    if *stub_next + 16 > crate::pe::STUB_DATA_VA
+        || !write_task_bytes(t.pml4, *stub_next, &code)
+    {
+        return None;
+    }
+    t.thr_exit_va = *stub_next;
+    *stub_next += 16;
+    Some(())
 }
 
 /// TLS directory (IMAGE_TLS_DIRECTORY32/64): emit a process-attach
@@ -4278,14 +4513,22 @@ fn pe_tls_init(t: &mut Task, p: &crate::pe::Pe) -> bool {
     if idx != 0 && !write_task_bytes_force(t.pml4, idx, &0u32.to_le_bytes()) {
         return false;
     }
-    if end > start
-        && !write_task_bytes(
+    if end > start {
+        if !write_task_bytes(
             t.pml4,
             crate::pe::STUB_DATA_VA + 0x200,
             &start.to_le_bytes(),
-        )
-    {
-        return false;
+        ) {
+            return false;
+        }
+        // Slot 0 is the compiled-TLS index — TlsAlloc must never
+        // hand it back out or it would clobber the template ptr.
+        // Bitmap sits 8B before the slot array the leader's gs:[0x58]
+        // points at (data+0x200 -> bitmap data+0x1f8), matching where
+        // the Tls* thunks look and the per-thread TEB layout.
+        let _ = write_task_bytes(t.pml4, crate::pe::STUB_DATA_VA + 0x1f8, &1u64.to_le_bytes());
+        t.tls_tmpl_va = start;
+        t.tls_tmpl_sz = end - start;
     }
     true
 }
@@ -4496,6 +4739,9 @@ fn load(img: &[u8]) -> Option<Task> {
         heap_bump: 0,
         heap_commit: 0,
         nt_alloc: 0,
+        tls_tmpl_va: 0,
+        tls_tmpl_sz: 0,
+        thr_exit_va: 0,
         stop_sig: 0,
         cont_report: false,
         start_ticks: crate::apic::TICKS
@@ -4566,8 +4812,9 @@ fn range_check(va: u64, len: u64, need_write: bool) -> bool {
     let Some(end) = va.checked_add(len) else {
         return false;
     };
-    // SAFETY: read-only walk of the task table.
-    let i = unsafe { *core::ptr::addr_of!(CUR_I) };
+    // SAFETY: read-only walk of the task table; NT threads probe
+    // the leader's ledger — the shared mm's authoritative map.
+    let Some(i) = mm_owner_i() else { return false };
     let cur = unsafe { (*core::ptr::addr_of!(TASKS)).get(i).and_then(|s| s.as_ref()) };
     let want = if need_write { RNG_W } else { RNG_R };
     cur.is_some_and(|p| {
@@ -7281,6 +7528,9 @@ pub fn nt_handle_close(h: u64) -> bool {
     if t.nth[i] == crate::nt::NTH_FILE {
         fd_close(t.nth_fd[i] as u64);
     }
+    if t.nth[i] == crate::nt::NTH_THREAD {
+        nt_thr_refdown(t.nth_fd[i] as usize);
+    }
     t.nth[i] = 0;
     t.nth_fd[i] = 0xff;
     true
@@ -7309,6 +7559,381 @@ pub fn nt_handle_fd(h: u64) -> Option<u64> {
     }
     let i = h as usize - 1;
     (t.nth[i] == crate::nt::NTH_FILE).then_some(t.nth_fd[i] as u64)
+}
+
+// ---- NT thread objects --------------------------------------------
+// A Windows thread handle must stay valid after the thread's task
+// slot is reaped (a waiter can hold it indefinitely), so the
+// waitable object's state lives in this small global ledger keyed
+// by tid — task slots may be recycled, entries here are not, and a
+// handle slot stores the ledger index in `nth_fd`.
+const NT_MAX_THREADS: usize = 16;
+/// (tgid, tid, teb, exit_status, state, handle_refs, stack_va,
+/// window_sz, owner_pid) — state 0=free 1=alive 2=dead; refs counts
+/// open handles. stack_va/window_sz name the single contiguous
+/// [stack|teb|tls] window so the creator's ledger can free it once
+/// the thread is dead (task slots reap, ranges don't).
+static mut NT_THREADS: [(u64, u64, u64, u64, u8, u8, u64, u64, u64); NT_MAX_THREADS] =
+    [(0, 0, 0, 0, 0, 0, 0, 0, 0); NT_MAX_THREADS];
+
+fn nt_thr_alloc(tgid: u64, tid: u64, teb: u64, stk: u64, stksz: u64, owner: u64) -> Option<usize> {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_THREADS) };
+    let i = tab.iter().position(|e| e.4 == 0)?;
+    tab[i] = (tgid, tid, teb, 0, 1, 0, stk, stksz, owner);
+    Some(i)
+}
+
+/// A dying NT thread records its raw exit status here — task slots
+/// recycle, thread handles don't. Called from task_exit with the
+/// pre-wstatus code.
+pub fn nt_thread_dead(tid: u64, status: u64) {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_THREADS) };
+    for e in tab.iter_mut() {
+        if e.1 == tid && e.4 == 1 {
+            e.3 = status;
+            e.4 = 2;
+            if e.5 == 0 {
+                *e = (0, 0, 0, 0, 0, 0, 0, 0, 0);
+            }
+            return;
+        }
+    }
+}
+
+/// (tgid, tid, teb, status, alive) for a ledger index.
+pub fn nt_thr_info(idx: usize) -> Option<(u64, u64, u64, u64, bool)> {
+    let tab = unsafe { &*core::ptr::addr_of!(NT_THREADS) };
+    let e = *tab.get(idx)?;
+    (e.4 != 0).then_some((e.0, e.1, e.2, e.3, e.4 == 1))
+}
+
+/// One fewer handle on the object; frees a dead unreferenced entry.
+fn nt_thr_refdown(idx: usize) {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_THREADS) };
+    if let Some(e) = tab.get_mut(idx) {
+        if e.4 != 0 {
+            e.5 = e.5.saturating_sub(1);
+            if e.4 == 2 && e.5 == 0 {
+                *e = (0, 0, 0, 0, 0, 0, 0, 0, 0);
+            }
+        }
+    }
+}
+
+/// NtWaitForSingleObject's tick service: a blocked NtWait(idx)
+/// sleeper wakes with STATUS_SUCCESS in ctx.rax when its object
+/// dies, STATUS_TIMEOUT when wait_deadline expires, or
+/// STATUS_INVALID_HANDLE if the ledger entry ever vanishes. The
+/// sleeper resumes in userland with that rax — the same
+/// abandoned-kernel-frame wake model every blocking call uses.
+pub fn nt_wait_expire() {
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let tab = unsafe { &*core::ptr::addr_of!(NT_THREADS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked {
+            continue;
+        }
+        let WaitOn::NtWait(idx) = t.wait_on else { continue };
+        let rax = match tab.get(idx) {
+            Some(e) if e.4 == 2 => crate::nt::STATUS_SUCCESS,
+            Some(e) if e.4 == 1 => {
+                if t.wait_deadline != 0 && now >= t.wait_deadline {
+                    crate::nt::STATUS_TIMEOUT
+                } else {
+                    continue;
+                }
+            }
+            _ => crate::nt::STATUS_INVALID_HANDLE,
+        };
+        t.ctx.rax = rax;
+        t.wait_on = WaitOn::None;
+        t.wait_deadline = 0;
+        t.state = TaskState::Runnable;
+    }
+}
+
+/// Block the current task on an NT thread object (ledger idx):
+/// deadline_ticks bounds it (0 = infinite). Never returns — the
+/// wake resumes userland with nt_wait_expire's ctx.rax.
+pub fn nt_wait_block(ctx: &mut UCtx, idx: usize, deadline_ticks: u64) -> ! {
+    if let Some(t) = cur_mut() {
+        t.wait_on = WaitOn::NtWait(idx);
+        t.wait_deadline = deadline_ticks;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+    }
+    block_switch()
+}
+
+/// Resume a CREATE_SUSPENDED thread: blocked-on-NtSuspend -> Runnable.
+/// Returns the previous suspend count (1 resumed, 0 wasn't suspended).
+pub fn nt_thr_resume(tid: u64) -> u64 {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        if let Some(t) = s.as_mut() {
+            if t.pid == tid && t.state == TaskState::Blocked && t.wait_on == WaitOn::NtSuspend {
+                t.wait_on = WaitOn::None;
+                t.state = TaskState::Runnable;
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// True while at least one handle slot is free — CreateThreadEx
+/// pre-checks so a created thread can't outlive its missing handle.
+pub fn nt_handle_free_slot() -> bool {
+    cur_mut().is_some_and(|t| t.nth.iter().any(|&s| s == 0))
+}
+
+/// Bind a thread-object handle in the current task's nth table; the
+/// slot's nth_fd byte carries the NT_THREADS ledger index.
+pub fn nt_handle_alloc_thread(idx: usize) -> Option<u64> {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_THREADS) };
+    let t = cur_mut()?;
+    for i in 0..crate::nt::MAX_NTH {
+        if t.nth[i] == 0 {
+            t.nth[i] = crate::nt::NTH_THREAD;
+            t.nth_fd[i] = idx as u8;
+            tab[idx].5 = tab[idx].5.saturating_add(1);
+            return Some(i as u64 + 1);
+        }
+    }
+    None
+}
+
+/// The NT_THREADS index an NTH_THREAD handle names.
+pub fn nt_handle_thr_idx(h: u64) -> Option<usize> {
+    let t = cur_mut()?;
+    if h == 0 || h > crate::nt::MAX_NTH as u64 {
+        return None;
+    }
+    let i = h as usize - 1;
+    (t.nth[i] == crate::nt::NTH_THREAD).then_some(t.nth_fd[i] as usize)
+}
+
+/// CreateThread's kernel half: a CLONE_VM|THREAD-shaped child on the
+/// shared pml4 with its own kernel stack, user stack, TEB and TLS
+/// copy. Returns (NT_THREADS index, tid) or None on failure.
+/// `cflags` understands CREATE_SUSPENDED (4) only — everything else
+/// fails honestly.
+pub fn nt_thread_create(
+    ctx: &mut UCtx,
+    start: u64,
+    param: u64,
+    cflags: u64,
+    stack_sz: u64,
+) -> Option<(usize, u64)> {
+    if !(elf::USER_VA_LO..elf::USER_VA_HI).contains(&start) || cflags & !4 != 0 {
+        return None;
+    }
+    reap_dead_threads();
+    let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let Some(slot) = tasks.iter().position(Option::is_none) else {
+        return None;
+    };
+    let p = tasks.get_mut(cur)?.as_mut()?;
+    let ks = kalloc::kmalloc(KSTACK_SIZE) as u64;
+    if ks == 0 {
+        return None;
+    }
+    if !mm_share(p.pml4) {
+        unsafe { kalloc::kfree(ks as *mut u8) };
+        return None;
+    }
+    // Threads share every refcounted table: files, signal
+    // dispositions, fs root/cwd (the CLONE_FILES|SIGHAND|FS shape
+    // CLONE_THREAD implies).
+    sigtab_share(p.sigh);
+    let csigh = p.sigh;
+    fdtab_share(p.fdi);
+    let cfdi = p.fdi;
+    fstab_share(p.fsi);
+    let cfsi = p.fsi;
+    // First: reclaim dead threads' VA windows on THIS task's ledger —
+    // a dead thread's task slot is reaped but its shared-mm pages
+    // and range entries persist until the owner frees them here.
+    {
+        let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_THREADS) };
+        for e in tab.iter_mut() {
+            if e.8 == p.pid && e.4 == 2 && e.6 != 0 {
+                nt_free_pages(e.6, e.7);
+                e.6 = 0;
+                e.7 = 0;
+            }
+        }
+    }
+    // Stack + TEB + TLS copy land in ONE contiguous window in the
+    // shared address space — a single range-ledger entry per live
+    // thread, allocated before the Task build so the child's copied
+    // ledger already covers its own stack probes.
+    let (rfl, pfl) = (RNG_R | RNG_W, USER | WRITE | NX);
+    let ssz = if stack_sz == 0 { 0x1_0000 } else { stack_sz };
+    let ssz = ssz.clamp(0x1000, 0x10_0000) & !0xfff;
+    let tls_sz = (p.tls_tmpl_sz + 0xfff) & !0xfff;
+    let total = ssz + 0x1000 + tls_sz;
+    let Some(win) = nt_alloc_pages(0, total, true, rfl, pfl) else {
+        fstab_release(cfsi);
+        fdtab_release(cfdi);
+        sigtab_release(csigh);
+        mm_release(p.pml4);
+        unsafe { kalloc::kfree(ks as *mut u8) };
+        return None;
+    };
+    let (stack, teb) = (win, win + ssz);
+    let tls_pg = if tls_sz != 0 { win + ssz + 0x1000 } else { 0 };
+    let mut c = Task {
+        pml4: p.pml4,
+        entry: p.entry,
+        stack_top: stack + ssz,
+        kstack_base: ks,
+        kstack_top: ks + KSTACK_SIZE as u64,
+        ranges: p.ranges,
+        nranges: p.nranges,
+        brk_base: p.brk_base,
+        brk_cur: p.brk_cur,
+        fdi: cfdi,
+        sigh: csigh,
+        fsi: cfsi,
+        tgid: p.tgid,
+        ctx: {
+            let mut x = *ctx;
+            x.rip = start;
+            x.rcx = param;
+            x.rsp = stack + ssz - 8;
+            x.rax = 0;
+            x
+        },
+        state: if cflags & 4 != 0 {
+            TaskState::Blocked
+        } else {
+            TaskState::Runnable
+        },
+        pid: next_pid(),
+        ppid: p.ppid,
+        exit_status: 0,
+        wait_on: if cflags & 4 != 0 {
+            WaitOn::NtSuspend
+        } else {
+            WaitOn::None
+        },
+        wait_ptr: 0,
+        wait_ptr2: 0,
+        wait_ptr3: 0,
+        psel_mask: u64::MAX,
+        frame_mask: u64::MAX,
+        wait_len: 0,
+        wait_deadline: 0,
+        pending: 0,
+        pend_src: [SIGSRC_NONE; 31],
+        sigmask: p.sigmask,
+        fx: p.fx,
+        name: p.name,
+        exe: p.exe,
+        exe_len: p.exe_len,
+        fs_base: p.fs_base,
+        rseq_va: 0,
+        clear_ctid: 0,
+        pgid: p.pgid,
+        sid: p.sid,
+        did_exec: false,
+        pers: p.pers,
+        gs_base: teb,
+        nth: p.nth,
+        nth_fd: p.nth_fd,
+        nth_dirpat: p.nth_dirpat,
+        heap_blk: p.heap_blk,
+        heap_bump: p.heap_bump,
+        heap_commit: p.heap_commit,
+        nt_alloc: p.nt_alloc,
+        tls_tmpl_va: p.tls_tmpl_va,
+        tls_tmpl_sz: p.tls_tmpl_sz,
+        thr_exit_va: p.thr_exit_va,
+        stop_sig: 0,
+        cont_report: false,
+        start_ticks: crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed),
+        utime: 0,
+        stime: 0,
+        cmdline: p.cmdline,
+        cmdline_len: p.cmdline_len,
+    };
+    let tid = c.pid;
+    // Synthetic return address: start_fn "returns" into the
+    // thread-exit stub -> NtTerminateThread(0, rax).
+    let pml4 = p.pml4;
+    let okw = write_task_bytes(pml4, c.ctx.rsp, &p.thr_exit_va.to_le_bytes())
+        // TEB: Self @0x30, ClientId (pid,tid) @0x40/0x48, TLS slots
+        // ptr @0x58 -> teb+0x200, PEB @0x60, lasterr @0x68.
+        && write_task_bytes(pml4, teb + 0x30, &teb.to_le_bytes())
+        && write_task_bytes(pml4, teb + 0x40, &p.tgid.to_le_bytes())
+        && write_task_bytes(pml4, teb + 0x48, &tid.to_le_bytes())
+        && write_task_bytes(pml4, teb + 0x58, &(teb + 0x200).to_le_bytes())
+        && write_task_bytes(pml4, teb + 0x60, &crate::pe::PEB_VA.to_le_bytes())
+        // Own TLS bitmap (bit0 = template index reserved) at
+        // teb+0x1f8 — right before the slot array, same layout as
+        // the leader's data-page arrangement.
+        && write_task_bytes(pml4, teb + 0x1f8, &1u64.to_le_bytes());
+    if !okw {
+        nt_free_pages(win, total);
+        fstab_release(cfsi);
+        fdtab_release(cfdi);
+        sigtab_release(csigh);
+        mm_release(pml4);
+        unsafe { kalloc::kfree(ks as *mut u8) };
+        return None;
+    }
+    // Per-thread copy of the PE .tls template into the TLS page;
+    // slot 0 names it (compiled __thread reads gs:[0x58] -> [0]).
+    if tls_pg != 0 {
+        let mut i = 0u64;
+        let mut cp_ok = true;
+        while i < p.tls_tmpl_sz {
+            let w = read_task_u64(pml4, p.tls_tmpl_va + i).unwrap_or(0);
+            if !write_task_bytes(pml4, tls_pg + i, &w.to_le_bytes()) {
+                cp_ok = false;
+                break;
+            }
+            i += 8;
+        }
+        if !cp_ok || !write_task_bytes(pml4, teb + 0x200, &tls_pg.to_le_bytes()) {
+            nt_free_pages(win, total);
+            fstab_release(cfsi);
+            fdtab_release(cfdi);
+            sigtab_release(csigh);
+            mm_release(pml4);
+            unsafe { kalloc::kfree(ks as *mut u8) };
+            return None;
+        }
+    }
+    let Some(idx) = nt_thr_alloc(p.tgid, tid, teb, win, total, p.pid) else {
+        nt_free_pages(win, total);
+        fstab_release(cfsi);
+        fdtab_release(cfdi);
+        sigtab_release(csigh);
+        mm_release(pml4);
+        unsafe { kalloc::kfree(ks as *mut u8) };
+        return None;
+    };
+    c.stack_top = c.ctx.rsp;
+    tasks[slot] = Some(c);
+    PROCS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Some((idx, tid))
+}
+
+/// Read one aligned qword out of a task's address space (the TLS
+/// template copy reads the shared mm).
+fn read_task_u64(pml4: u64, va: u64) -> Option<u64> {
+    let mut v = 0u64;
+    for i in 0..8u64 {
+        let pa = translate_r(pml4, va + i)?;
+        // SAFETY: pa is a present user frame in pml4.
+        v |= ((unsafe { (pa as *const u8).read() }) as u64) << (i * 8);
+    }
+    Some(v)
 }
 
 /// (size, OFD position, is-dir) for an open fd — the
@@ -7555,7 +8180,7 @@ fn nt_place_ok(t: &Task, va: u64, size: u64) -> bool {
 /// `commit` maps pages now (`pfl` leaf flags, `rfl` ledger access);
 /// otherwise the entry is RNG_RES|placeholder — VA held, no frames.
 pub fn nt_alloc_pages(hint: u64, size: u64, commit: bool, rfl: u8, pfl: u64) -> Option<u64> {
-    let t = cur_mut()?;
+    let t = mm_owner_mut()?;
     let mut va = hint & !0xfff;
     if hint == 0 || !nt_place_ok(t, va, size) {
         va = t.nt_alloc.max(NT_ALLOC_VA);
@@ -7774,19 +8399,19 @@ pub fn nt_decommit_window(t: &mut Task, base: u64, size: u64) -> bool {
 
 /// nt_commit_window on the current task.
 pub fn nt_commit_window_cur(base: u64, size: u64, rfl: u8, pfl: u64) -> bool {
-    cur_mut().is_some_and(|t| nt_commit_window(t, base, size, rfl, pfl))
+    mm_owner_mut().is_some_and(|t| nt_commit_window(t, base, size, rfl, pfl))
 }
 
 /// nt_decommit_window on the current task.
 pub fn nt_decommit_window_cur(base: u64, size: u64) -> bool {
-    cur_mut().is_some_and(|t| nt_decommit_window(t, base, size))
+    mm_owner_mut().is_some_and(|t| nt_decommit_window(t, base, size))
 }
 
 /// Extent of the ledger region containing `base` — for a
 /// MEM_RELEASE whose caller passed size 0 (the common form: the
 /// runtime hands back only the base it was given).
 pub fn nt_region_extent(base: u64) -> Option<u64> {
-    let t = cur_mut()?;
+    let t = mm_owner_mut()?;
     t.ranges[..t.nranges]
         .iter()
         .find(|&&(lo, hi, _)| base >= lo && base < hi)
@@ -7804,7 +8429,7 @@ pub fn nt_region_extent(base: u64) -> Option<u64> {
 /// cursor is NOT rewound (real heaps don't reclaim VA space on
 /// free either — only the frames).
 pub fn nt_free_pages(base: u64, size: u64) {
-    let Some(t) = cur_mut() else { return };
+    let Some(t) = mm_owner_mut() else { return };
     let end = base.saturating_add(size);
     let mut i = 0;
     while i < t.nranges {
@@ -7896,7 +8521,7 @@ pub fn rng_from_prot(prot: u32) -> Option<(u8, u64)> {
 /// ranges ledger: committed range fields, or MEM_FREE up to the
 /// next registered region.
 pub fn nt_query_vm(base: u64, buf: u64) {
-    let Some(t) = cur_mut() else { return };
+    let Some(t) = mm_owner_mut() else { return };
     let mut hit: Option<(u64, u64, u8)> = None;
     let mut next_lo = u64::MAX;
     for &(lo, hi, fl) in &t.ranges[..t.nranges] {
@@ -7966,7 +8591,7 @@ pub fn nt_protect_vm(base: u64, size: u64, prot: u32, old_ptr: u64) -> u64 {
     if lo < crate::pe::HEAP_MAX && hi > crate::pe::HEAP_VA {
         return crate::nt::STATUS_INVALID_PARAMETER;
     }
-    let Some(t) = cur_mut() else {
+    let Some(t) = mm_owner_mut() else {
         return crate::nt::STATUS_INVALID_HANDLE;
     };
     if !range_committed(t, lo, hi)
@@ -8048,7 +8673,7 @@ pub fn nt_heap_alloc(size: u64, zero: bool) -> Option<u64> {
         return None;
     }
     let want = size.max(1) + 15 & !15;
-    let t = cur_mut()?;
+    let t = mm_owner_mut()?;
     let mut best = usize::MAX;
     for i in 0..t.heap_blk.len() {
         let b = t.heap_blk[i];
@@ -8104,7 +8729,7 @@ pub fn nt_heap_free(ptr: u64) -> bool {
     if ptr == 0 {
         return false;
     }
-    let Some(t) = cur_mut() else { return false };
+    let Some(t) = mm_owner_mut() else { return false };
     let Some(i) = t
         .heap_blk
         .iter()
@@ -8141,7 +8766,7 @@ pub fn nt_heap_free(ptr: u64) -> bool {
 /// HeapSize: the live block's granted size, or None when `ptr`
 /// isn't a live heap block (the thunk maps that to SIZE_T(-1)).
 pub fn nt_heap_size(ptr: u64) -> Option<u64> {
-    let t = cur_mut()?;
+    let t = mm_owner_mut()?;
     t.heap_blk
         .iter()
         .find(|e| e[2] == 1 && e[0] == ptr)
@@ -8162,7 +8787,7 @@ pub fn nt_heap_realloc(ptr: u64, size: u64, zero: bool) -> Option<u64> {
     // Shrink/grow-in-place paths return early; needing a move
     // falls through with `old` bound for the copy.
     let old = {
-        let t = cur_mut()?;
+        let t = mm_owner_mut()?;
         let i = t.heap_blk.iter().position(|e| e[2] == 1 && e[0] == ptr)?;
         let old = t.heap_blk[i][1];
         if want <= old {
@@ -15445,6 +16070,11 @@ fn switch_to(n: usize) -> ! {
 pub fn task_exit(code: u64) -> ! {
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     if let Some(t) = unsafe { (*core::ptr::addr_of_mut!(TASKS))[cur].as_mut() } {
+        if t.pers == PERS_NT && t.tgid != t.pid {
+            // A secondary NT thread: record the RAW status for
+            // GetExitCodeThread before it gets waitstatus-encoded.
+            nt_thread_dead(t.pid, code & 0xffff_ffff);
+        }
         t.exit_status = (code & 0xff) << 8;
     }
     task_exit_inner()
@@ -15689,6 +16319,7 @@ pub fn tick(img: &mut UCtx) -> *const UCtx {
     // would freeze every Blocked task's deadline and input feed.
     poll_expire(); // timed poll waits age one tick
     timerfd_expire(); // armed timerfds fire + wake their readers
+    nt_wait_expire(); // NT thread-object waits: dead/timeout wakes
     crate::e1000::rx_drain(); // feed socket queues from the live ring
     stdin_pump(); // feed the tty input queue from the scancode ring
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
@@ -15973,6 +16604,9 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         heap_bump: p.heap_bump,
         heap_commit: p.heap_commit,
         nt_alloc: p.nt_alloc,
+        tls_tmpl_va: p.tls_tmpl_va,
+        tls_tmpl_sz: p.tls_tmpl_sz,
+        thr_exit_va: p.thr_exit_va,
         stop_sig: 0,
         cont_report: false,
         start_ticks: crate::apic::TICKS
@@ -16143,6 +16777,9 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         heap_bump: p.heap_bump,
         heap_commit: p.heap_commit,
         nt_alloc: p.nt_alloc,
+        tls_tmpl_va: p.tls_tmpl_va,
+        tls_tmpl_sz: p.tls_tmpl_sz,
+        thr_exit_va: p.thr_exit_va,
         stop_sig: 0,
         cont_report: false,
         start_ticks: crate::apic::TICKS

@@ -36,6 +36,7 @@ pub const STATUS_INSUFFICIENT_RESOURCES: u64 = 0xC000_009A;
 pub const STATUS_NO_MORE_FILES: u64 = 0x8000_0006;
 
 // Windows 10 x64 service numbers for the implemented subset.
+const NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0x04;
 const NT_READ_FILE: u32 = 0x06;
 const NT_WRITE_FILE: u32 = 0x08;
 const NT_CLOSE: u32 = 0x0F;
@@ -43,12 +44,16 @@ const NT_QUERY_INFORMATION_FILE: u32 = 0x11;
 const NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0x18;
 const NT_FREE_VIRTUAL_MEMORY: u32 = 0x1E;
 const NT_QUERY_VIRTUAL_MEMORY: u32 = 0x23;
+const NT_QUERY_INFORMATION_THREAD: u32 = 0x25;
 const NT_SET_INFORMATION_FILE: u32 = 0x27;
-const NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x50;
 const NT_TERMINATE_PROCESS: u32 = 0x2C;
 const NT_DELAY_EXECUTION: u32 = 0x34;
 const NT_QUERY_DIRECTORY_FILE: u32 = 0x35;
+const NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x50;
+const NT_RESUME_THREAD: u32 = 0x52;
+const NT_TERMINATE_THREAD: u32 = 0x53;
 const NT_CREATE_FILE: u32 = 0x55;
+const NT_CREATE_THREAD_EX: u32 = 0xC1;
 
 // Rustux-private services — no real NT counterparts. Real Windows
 // implements heaps in ntdll userspace (RtlAllocateHeap et al.); our
@@ -68,7 +73,15 @@ pub const NTH_STDOUT: u8 = 2;
 pub const NTH_STDERR: u8 = 3;
 /// An open file — the slot's `nth_fd` holds the task fd.
 pub const NTH_FILE: u8 = 4;
+/// A waitable thread object — `nth_fd` holds the NT_THREADS index.
+pub const NTH_THREAD: u8 = 5;
 pub const MAX_NTH: usize = 16;
+
+/// WAIT_TIMEOUT — WaitForSingleObject's deadline answer.
+pub const STATUS_TIMEOUT: u64 = 0x0000_0102;
+/// The "still running" pseudo-status THREAD_BASIC_INFORMATION
+/// reports — Win32's STILL_ACTIVE.
+pub const STATUS_STILL_ACTIVE: u64 = 0x0000_0103;
 
 /// Read arg `i` (0-based) off the NT syscall frame: r10/rdx/r8/r9
 /// then the user stack at rsp+0x28 like real KiSystemCall64.
@@ -782,6 +795,154 @@ fn nt_delay(ctx: &mut UCtx) -> u64 {
     STATUS_SUCCESS
 }
 
+/// NtCreateThreadEx(&handle, access, oa, proch, start, param,
+/// cflags, zero, commit_sz, reserve_sz, attr): a shared-mm thread —
+/// own kernel stack, own user stack (reserve_sz or 64K default),
+/// own TEB/TLS, param in rcx, a synthetic return address that
+/// ExitThread's the start routine's return value. proch must be
+/// the pseudo-handle -1; cflags honours CREATE_SUSPENDED (4) only.
+fn nt_create_thread_ex(ctx: &mut UCtx) -> u64 {
+    let ph = arg(ctx, 0);
+    let proch = arg(ctx, 3);
+    let (start, param, cflags, rsz) = (arg(ctx, 4), arg(ctx, 5), arg(ctx, 6), arg(ctx, 9));
+    if !user::range_ok_w(ph, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if proch != u64::MAX {
+        return STATUS_INVALID_HANDLE;
+    }
+    if cflags & !4 != 0 {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    // A handle slot is claimed AFTER the task exists; pre-check one
+    // is free so a created thread can't leak without its handle.
+    if !user::nt_handle_free_slot() {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    let Some((idx, _tid)) = user::nt_thread_create(ctx, start, param, cflags, rsz) else {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+    let Some(h) = user::nt_handle_alloc_thread(idx) else {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+    // SAFETY: ph probed writable above.
+    unsafe { (ph as *mut u64).write_unaligned(h) };
+    STATUS_SUCCESS
+}
+
+/// NtWaitForSingleObject(handle, alertable, &timeout): thread
+/// objects are our only waitable kind. timeout is an NT interval
+/// (negative 100-ns units = relative, NULL = infinite). The wait
+/// polls the ledger between 1ms sleeps — the task slot may be
+/// reaped, the entry survives it.
+fn nt_wait_single(ctx: &mut UCtx) -> u64 {
+    let h = arg(ctx, 0);
+    let tp = arg(ctx, 2);
+    // timeout is an NT interval (negative 100-ns = relative,
+    // NULL = infinite, 0 = poll).
+    let ms = if tp == 0 {
+        None
+    } else {
+        if !user::range_ok(tp, 8) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        // SAFETY: validated window.
+        let iv = unsafe { (tp as *const i64).read_unaligned() };
+        Some(if iv < 0 { (-iv / 10_000) as u64 } else { 0 })
+    };
+    let Some(idx) = user::nt_handle_thr_idx(h) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some((_, _, _, _, alive)) = user::nt_thr_info(idx) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    if !alive {
+        return STATUS_SUCCESS; // WAIT_OBJECT_0
+    }
+    let Some(ms) = ms else {
+        // Infinite wait: no deadline, nt_wait_expire wakes on death.
+        user::nt_wait_block(ctx, idx, 0)
+    };
+    if ms == 0 {
+        return STATUS_TIMEOUT; // zero-time poll of a live object
+    }
+    let ticks = crate::apic::TICKS
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .saturating_add(ms.div_ceil(10));
+    user::nt_wait_block(ctx, idx, ticks)
+}
+
+/// NtQueryInformationThread(handle, class, buf, len, &retsz):
+/// ThreadBasicInformation (0) — exit status or STILL_ACTIVE, TEB
+/// base, and the (process, thread) ClientId pair GetThreadId reads.
+fn nt_query_thread(ctx: &mut UCtx) -> u64 {
+    let h = arg(ctx, 0);
+    let (class, buf, len, ret) = (arg(ctx, 1), arg(ctx, 2), arg(ctx, 3), arg(ctx, 4));
+    if class != 0 {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if len < 48 {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if !user::range_ok_w(buf, 48) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let Some(idx) = user::nt_handle_thr_idx(h) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some((tgid, tid, teb, status, alive)) = user::nt_thr_info(idx) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let mut info = [0u8; 48];
+    info[0..8].copy_from_slice(&(if alive { STATUS_STILL_ACTIVE } else { status }).to_le_bytes());
+    info[8..16].copy_from_slice(&teb.to_le_bytes());
+    info[16..24].copy_from_slice(&tgid.to_le_bytes());
+    info[24..32].copy_from_slice(&tid.to_le_bytes());
+    info[32..40].copy_from_slice(&1u64.to_le_bytes()); // affinity
+    // SAFETY: buf probed writable for 48 bytes.
+    unsafe { core::ptr::copy_nonoverlapping(info.as_ptr(), buf as *mut u8, 48) };
+    if ret != 0 && user::range_ok_w(ret, 8) {
+        // SAFETY: ret probed writable.
+        unsafe { (ret as *mut u64).write_unaligned(48) };
+    }
+    STATUS_SUCCESS
+}
+
+/// NtResumeThread(handle, &prevcount): clears a CREATE_SUSPENDED
+/// block; prevcount (optional) gets 1 if it was suspended, else 0.
+fn nt_resume_thread(ctx: &mut UCtx) -> u64 {
+    let h = arg(ctx, 0);
+    let cnt = arg(ctx, 1);
+    let Some(idx) = user::nt_handle_thr_idx(h) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some((_, tid, _, _, _)) = user::nt_thr_info(idx) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let prev = user::nt_thr_resume(tid);
+    if cnt != 0 {
+        if !user::range_ok_w(cnt, 8) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        // SAFETY: cnt probed writable.
+        unsafe { (cnt as *mut u64).write_unaligned(prev) };
+    }
+    STATUS_SUCCESS
+}
+
+/// NtTerminateThread(handle, status): handle 0 or the -2
+/// pseudo-handle ends THIS thread (ExitThread's path). Killing a
+/// sibling thread is honest NOT_IMPLEMENTED — remote teardown needs
+/// the victim's own bookkeeping, not a mark-and-reap shortcut.
+fn nt_terminate_thread(ctx: &mut UCtx) -> u64 {
+    let h = arg(ctx, 0);
+    let status = arg(ctx, 1);
+    if h == 0 || h == u64::MAX - 1 {
+        user::task_exit(status);
+    }
+    STATUS_NOT_IMPLEMENTED
+}
+
 /// Import resolver: an export name from a PE's ILT to its service
 /// number. Only ntdll's syscall stubs exist — the names a real
 /// ntdll.dll exports (Zw* aliases included, they share numbers).
@@ -805,6 +966,11 @@ pub fn service_for_name(name: &[u8]) -> Option<u32> {
         b"TerminateProcess" => NT_TERMINATE_PROCESS,
         b"DelayExecution" => NT_DELAY_EXECUTION,
         b"QueryDirectoryFile" => NT_QUERY_DIRECTORY_FILE,
+        b"WaitForSingleObject" => NT_WAIT_FOR_SINGLE_OBJECT,
+        b"QueryInformationThread" => NT_QUERY_INFORMATION_THREAD,
+        b"ResumeThread" => NT_RESUME_THREAD,
+        b"TerminateThread" => NT_TERMINATE_THREAD,
+        b"CreateThreadEx" => NT_CREATE_THREAD_EX,
         _ => return None,
     })
 }
@@ -825,6 +991,11 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         NT_QUERY_VIRTUAL_MEMORY => nt_query_vm(ctx),
         NT_PROTECT_VIRTUAL_MEMORY => nt_protect_vm(ctx),
         NT_DELAY_EXECUTION => nt_delay(ctx),
+        NT_CREATE_THREAD_EX => nt_create_thread_ex(ctx),
+        NT_WAIT_FOR_SINGLE_OBJECT => nt_wait_single(ctx),
+        NT_QUERY_INFORMATION_THREAD => nt_query_thread(ctx),
+        NT_RESUME_THREAD => nt_resume_thread(ctx),
+        NT_TERMINATE_THREAD => nt_terminate_thread(ctx),
         RUX_HEAP_ALLOC => nt_heap_alloc_svc(ctx),
         RUX_HEAP_REALLOC => nt_heap_realloc_svc(ctx),
         RUX_HEAP_FREE => nt_heap_free_svc(ctx),
