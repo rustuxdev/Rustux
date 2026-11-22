@@ -83,6 +83,8 @@ const RUX_DLL_DETACH: u32 = 0xF9;
 const RUX_FREE_FIN: u32 = 0xFA;
 const RUX_EXIT_DETACH: u32 = 0xFB;
 const RUX_THR_ENUM: u32 = 0xFC;
+const RUX_SPAWN_PROC: u32 = 0xFD;
+const RUX_PROC_QUERY: u32 = 0xFE;
 
 /// Handle table tags — a per-task `nth` slot's object kind. Real
 /// handles are small indices (1-based) like the actual handle table;
@@ -97,6 +99,9 @@ pub const NTH_THREAD: u8 = 5;
 /// A section object (CreateFileMapping) — `nth_fd` holds the
 /// NT_SECTIONS index.
 pub const NTH_SECTION: u8 = 6;
+/// A waitable process object (CreateProcess) — `nth_fd` holds the
+/// NT_PROCS index.
+pub const NTH_PROCESS: u8 = 7;
 pub const MAX_NTH: usize = 16;
 
 /// WAIT_TIMEOUT — WaitForSingleObject's deadline answer.
@@ -1097,8 +1102,8 @@ fn nt_create_thread_ex(ctx: &mut UCtx) -> u64 {
     STATUS_SUCCESS
 }
 
-/// NtWaitForSingleObject(handle, alertable, &timeout): thread
-/// objects are our only waitable kind. timeout is an NT interval
+/// NtWaitForSingleObject(handle, alertable, &timeout): thread and
+/// process objects are the waitable kinds. timeout is an NT interval
 /// (negative 100-ns units = relative, NULL = infinite). The wait
 /// polls the ledger between 1ms sleeps — the task slot may be
 /// reaped, the entry survives it.
@@ -1117,18 +1122,34 @@ fn nt_wait_single(ctx: &mut UCtx) -> u64 {
         let iv = unsafe { (tp as *const i64).read_unaligned() };
         Some(if iv < 0 { (-iv / 10_000) as u64 } else { 0 })
     };
-    let Some(idx) = user::nt_handle_thr_idx(h) else {
+    // Thread and process objects are both waitable; resolve which
+    // kind the handle names and check it is still live.
+    let (idx, proc) = if let Some(i) = user::nt_handle_thr_idx(h) {
+        let Some((_, _, _, _, alive)) = user::nt_thr_info(i) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if !alive {
+            return STATUS_SUCCESS; // WAIT_OBJECT_0
+        }
+        (i, false)
+    } else if let Some(i) = user::nt_handle_proc_idx(h) {
+        let Some((_, alive)) = user::nt_proc_status(i) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if !alive {
+            return STATUS_SUCCESS;
+        }
+        (i, true)
+    } else {
         return STATUS_INVALID_HANDLE;
     };
-    let Some((_, _, _, _, alive)) = user::nt_thr_info(idx) else {
-        return STATUS_INVALID_HANDLE;
-    };
-    if !alive {
-        return STATUS_SUCCESS; // WAIT_OBJECT_0
-    }
     let Some(ms) = ms else {
         // Infinite wait: no deadline, nt_wait_expire wakes on death.
-        user::nt_wait_block(ctx, idx, 0)
+        if proc {
+            user::nt_wait_block_proc(ctx, idx, 0)
+        } else {
+            user::nt_wait_block(ctx, idx, 0)
+        }
     };
     if ms == 0 {
         return STATUS_TIMEOUT; // zero-time poll of a live object
@@ -1136,7 +1157,11 @@ fn nt_wait_single(ctx: &mut UCtx) -> u64 {
     let ticks = crate::apic::TICKS
         .load(core::sync::atomic::Ordering::Relaxed)
         .saturating_add(ms.div_ceil(10));
-    user::nt_wait_block(ctx, idx, ticks)
+    if proc {
+        user::nt_wait_block_proc(ctx, idx, ticks)
+    } else {
+        user::nt_wait_block(ctx, idx, ticks)
+    }
 }
 
 /// NtQueryInformationThread(handle, class, buf, len, &retsz):
@@ -1297,6 +1322,16 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         // trampoline and ExitThread loop it to call DllMain with
         // DLL_THREAD_ATTACH (forward) / DLL_THREAD_DETACH (reverse).
         RUX_THR_ENUM => user::nt_thr_enum(arg(ctx, 0), arg(ctx, 1)),
+        // CreateProcessA's kernel half — spawn a PE child and fill
+        // the caller's PROCESS_INFORMATION; GetExitCodeProcess's
+        // status read.
+        RUX_SPAWN_PROC => user::nt_create_process(
+            arg(ctx, 0),
+            arg(ctx, 1),
+            arg(ctx, 2),
+            arg(ctx, 3),
+        ),
+        RUX_PROC_QUERY => user::nt_proc_query(arg(ctx, 0), arg(ctx, 1)),
         NT_TERMINATE_PROCESS => {
             // hProcess == (HANDLE)-1 means self; anything else is a
             // kill we don't model yet — the common case is self-exit.

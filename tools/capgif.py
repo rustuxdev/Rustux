@@ -5,17 +5,15 @@ Usage: capgif.py <out.gif> <qemu args...>
 Launches qemu with a unix monitor socket headless (-display none), polls
 screendump on the emulated GPU framebuffer, dedupes, writes a GIF.
 """
-import os, socket, subprocess, sys, time, glob
+import os, socket, subprocess, sys, tempfile, time
 from PIL import Image
 
-MON = f"/tmp/capgif-mon.{os.getpid()}.sock"  # pid-random: a fixed name is squattable
-FRD = "/tmp/capgif-frames"
 POLL = 0.35        # seconds between screendump requests
 MAXFRAMES = 900
 
-def hmp(cmd):
+def hmp(mon, cmd):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(MON); s.settimeout(2)
+    s.connect(mon); s.settimeout(2)
     # drain greeting
     try:
         s.recv(4096)
@@ -32,23 +30,25 @@ def hmp(cmd):
 def main():
     out = sys.argv[1]
     qargs = sys.argv[2:]
-    for f in glob.glob(FRD + "/*"): os.unlink(f)
-    os.makedirs(FRD, exist_ok=True)
-    if os.path.exists(MON): os.unlink(MON)
+    # Private scratch dir (mode 0700): a shared predictable /tmp path
+    # lets a local attacker plant symlinks that QEMU's screendump —
+    # or our own reads — would follow into the invoker's files.
+    frd = tempfile.mkdtemp(prefix="capgif-")
+    mon = os.path.join(frd, "mon.sock")
     cmd = ["qemu-system-x86_64",
-           "-monitor", f"unix:{MON},server,nowait",
+           "-monitor", f"unix:{mon},server,nowait",
            "-display", "none"] + qargs
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     # wait for monitor socket
     for _ in range(100):
-        if os.path.exists(MON): break
+        if os.path.exists(mon): break
         time.sleep(0.1)
     frames = []
     n = 0
     try:
         while proc.poll() is None and n < MAXFRAMES:
-            p = f"{FRD}/f{n:04d}.ppm"
-            hmp(f"screendump {p}")
+            p = f"{frd}/f{n:04d}.ppm"
+            hmp(mon, f"screendump {p}")
             if os.path.exists(p) and os.path.getsize(p) > 100:
                 frames.append(p); n += 1
             time.sleep(POLL)
@@ -58,7 +58,7 @@ def main():
         except Exception: pass
     # final frame — the monitor socket is gone once QEMU exits
     try:
-        p = f"{FRD}/f{n:04d}.ppm"; hmp(f"screendump {p}")
+        p = f"{frd}/f{n:04d}.ppm"; hmp(mon, f"screendump {p}")
         if os.path.exists(p) and os.path.getsize(p) > 100: frames.append(p)
     except OSError:
         pass

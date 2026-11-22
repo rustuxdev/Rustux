@@ -55,7 +55,7 @@ const SIGTRAMP_CODE: [u8; 9] = [0x48, 0xc7, 0xc0, 0x0f, 0, 0, 0, 0x0f, 0x05];
 
 /// Per-task kernel stack for SYSCALL entries — replaces the shared
 /// static stack so a task's kernel state can't bleed into the next.
-const KSTACK_SIZE: usize = 16384;
+const KSTACK_SIZE: usize = 49152;
 
 /// Maximum distinct user VA ranges recorded for syscall validation —
 /// the vm_max_map_count analog: mmap/mprotect splits consume slots,
@@ -219,6 +219,10 @@ enum WaitOn {
     /// (0 = infinite). nt_wait_expire re-checks the object each
     /// tick: dead -> STATUS_SUCCESS, expired -> STATUS_TIMEOUT.
     NtWait(usize),
+    /// Same wait on an NT process object — payload is the
+    /// NT_PROCS ledger index plus the tgid recorded at arm time, so
+    /// a freed-and-reallocated slot can't satisfy the wait.
+    NtWaitProc(usize, u64),
 }
 
 /// Max fds per task — a hard bound so a hostile process cannot
@@ -834,7 +838,17 @@ fn deliver_for(n: usize) -> bool {
     if st == TaskState::Exited {
         // A fatal signal landed at pick — task_exit_inner's whole
         // zombie/wake side still has to run or a wait4-blocked
-        // parent sleeps forever.
+        // parent sleeps forever. NT tasks bypass task_exit/die_signal
+        // on this path, so record the ledger death here too or object
+        // waiters sleep forever and the NT_PROCS slot leaks.
+        {
+            let t = unsafe { (*core::ptr::addr_of_mut!(TASKS))[n].as_mut().unwrap() };
+            if t.pers == PERS_NT {
+                let code = nt_sig_ntstatus(t.exit_status & 0x7f);
+                nt_thread_dead(t.pid, code);
+                nt_proc_dead(t.tgid, t.pid, code);
+            }
+        }
         exit_bookkeeping(n);
         return false;
     }
@@ -2237,9 +2251,12 @@ fn load_inner(t: &mut Task, e: &elf::Elf, img: &[u8]) -> bool {
     t.brk_cur = 0;
     // Copy the kernel PML4 — its entries are supervisor-only, so user
     // code can't reach kernel memory through them even though the
-    // mappings are shared.
+    // mappings are shared. User-window slots (128..256) are skipped:
+    // under a syscall caller's cr3 (CreateProcess) they'd alias the
+    // caller's tables by reference, and teardown of either mm would
+    // free frames the other still walks.
     let kpml4 = cpu::read_cr3() & !0xfff;
-    for i in 0..512u64 {
+    for i in (0..128u64).chain(256..512) {
         let ent = rd64(kpml4 + 8 * i);
         if ent & PRESENT != 0 {
             wr64(t.pml4 + 8 * i, ent);
@@ -2275,7 +2292,7 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
     t.brk_base = 0;
     t.brk_cur = 0;
     let kpml4 = cpu::read_cr3() & !0xfff;
-    for i in 0..512u64 {
+    for i in (0..128u64).chain(256..512) {
         let ent = rd64(kpml4 + 8 * i);
         if ent & PRESENT != 0 {
             wr64(t.pml4 + 8 * i, ent);
@@ -4005,6 +4022,37 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0xc3, //                 ret
             ]);
         }
+        // CreateProcessA(app,cmd,sa,tsa,inh,flags,env,cwd,si,pi):
+        // args 5..10 ride the caller's stack — flags@+0x30, pi@+0x50.
+        // Marshal (app, cmd, pi, flags) -> RUX_SPAWN_PROC and map
+        // NTSTATUS to BOOL (0 -> TRUE like every thunk that returns
+        // success rather than a value).
+        b"CreateProcessA" => {
+            e.raw(&[
+                0x4c, 0x8b, 0xd1, //             mov r10,rcx   (app)
+                0x4c, 0x8b, 0x44, 0x24, 0x50, // mov r8,[rsp+0x50] (pi)
+                0x4c, 0x8b, 0x4c, 0x24, 0x30, // mov r9,[rsp+0x30] (flags)
+                0xb8, 0xfd, 0, 0, 0, //         mov eax,0xFD
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3, //                         ret
+            ]);
+        }
+        // GetExitCodeProcess(h,&code) -> RUX_PROC_QUERY (h, &code);
+        // the service writes STILL_ACTIVE while the group lives.
+        b"GetExitCodeProcess" => {
+            e.raw(&[
+                0x4c, 0x8b, 0xd1, //             mov r10,rcx
+                0xb8, 0xfe, 0, 0, 0, //         mov eax,0xFE
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3, //                         ret
+            ]);
+        }
         // IsDebuggerPresent -> PEB.BeingDebugged.
         b"IsDebuggerPresent" => {
             e.raw(&[
@@ -4012,9 +4060,10 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0x0f, 0xb6, 0x40, 0x02, 0xc3,
             ]);
         }
-        // GetCommandLineA -> ANSI argv0 in the data page.
+        // GetCommandLineA -> ANSI full command line in the data
+        // page (0xa00; argv0 itself stays at 0x40).
         b"GetCommandLineA" => {
-            e.rax_imm(d + 0x40);
+            e.rax_imm(d + 0xa00);
             e.raw(&[0xc3]);
         }
         // GetCommandLineW -> the real UNICODE_STRING buffer in
@@ -5577,13 +5626,17 @@ fn k32_data_init(t: &mut Task) {
     a0[..el].copy_from_slice(&t.exe[..el]);
     a0[el..el + 4].copy_from_slice(b".exe");
     let _ = write_task_bytes(t.pml4, d + 0x40, &a0[..el + 5]);
+    // The full command line lives in its own cell at 0xa00 —
+    // CreateProcess overwrites it with lpCommandLine post-spawn;
+    // GetCommandLineA and _acmdln resolve here.
+    let _ = write_task_bytes(t.pml4, d + 0xa00, &a0[..el + 5]);
     // Data-export cells (see k32_data_sym): environ ptr, argc=1,
     // argv ptr, pgmptr, acmdln, errno/doserrno ints.
     for (off, v) in [
         (0x118, 1u64),
         (0x120, d),
         (0x128, d + 0x40),
-        (0x130, d + 0x40),
+        (0x130, d + 0xa00),
         (0x138, 0),
         (0x13c, 0),
     ] {
@@ -6111,7 +6164,6 @@ fn teb_peb_init(t: &mut Task, p: &crate::pe::Pe) -> bool {
 /// UNICODE_STRING at params+0x80 → UTF-16 text at peb+0x600, built
 /// from t.exe (+ ".exe", the same spelling argv0 uses).
 fn pe_late_init(t: &Task) -> bool {
-    let peb = crate::pe::PEB_VA;
     let teb = crate::pe::TEB_VA;
     // TEB.ClientId {UniqueProcess, UniqueThread} — read by the
     // GetCurrentProcessId/ThreadId thunks via gs:[0x40]/[0x48]. A
@@ -6121,27 +6173,13 @@ fn pe_late_init(t: &Task) -> bool {
     {
         return false;
     }
-    let params = peb + 0x400;
-    let mut u16b = [0u8; 256];
-    let wl = (t.exe_len as usize).min(123);
-    for (i, &c) in t.exe[..wl].iter().enumerate() {
-        u16b[i * 2..i * 2 + 2].copy_from_slice(&(c as u16).to_le_bytes());
-    }
-    for (i, &c) in b".exe".iter().enumerate() {
-        u16b[(wl + i) * 2..(wl + i) * 2 + 2].copy_from_slice(&(c as u16).to_le_bytes());
-    }
-    let wl = wl + 4;
-    if !write_task_bytes(t.pml4, peb + 0x600, &u16b[..wl * 2]) {
-        return false;
-    }
-    let cmdlen = (wl * 2) as u16;
-    let cmdptr = peb + 0x600;
-    // UNICODE_STRING is {u16 len, u16 maxlen, pad, *ptr} — pack it.
-    let mut usb = [0u8; 16];
-    usb[0..2].copy_from_slice(&cmdlen.to_le_bytes());
-    usb[2..4].copy_from_slice(&(cmdlen + 2).to_le_bytes());
-    usb[8..16].copy_from_slice(&cmdptr.to_le_bytes());
-    write_task_bytes(t.pml4, params + 0x80, &usb)
+    // Default CommandLine is just the image name — CreateProcess
+    // overwrites it with the caller's lpCommandLine after spawn.
+    let mut s = [0u8; 132];
+    let el = (t.exe_len as usize).min(127);
+    s[..el].copy_from_slice(&t.exe[..el]);
+    s[el..el + 4].copy_from_slice(b".exe");
+    peb_cmdline_write(t.pml4, &s[..el + 4])
 }
 
 /// PT_INTERP: when `e` names an interpreter, load that ELF too —
@@ -6681,6 +6719,7 @@ pub fn sys_brk(addr: u64) -> u64 {
                     unmap_page(t, u);
                     u += PAGE;
                 }
+                flush_tlb();
                 return t.brk_cur;
             }
             v += PAGE;
@@ -6817,6 +6856,7 @@ pub fn sys_mmap(
                 unmap_page(t, u);
                 u += PAGE;
             }
+            flush_tlb();
             return ENOMEM;
         }
         v += PAGE;
@@ -9076,6 +9116,9 @@ pub fn nt_handle_close(h: u64) -> bool {
     if t.nth[i] == crate::nt::NTH_SECTION {
         nt_sec_refdown(t.nth_fd[i] as usize);
     }
+    if t.nth[i] == crate::nt::NTH_PROCESS {
+        nt_proc_refdown(t.nth_fd[i] as usize);
+    }
     t.nth[i] = 0;
     t.nth_fd[i] = 0xff;
     true
@@ -9180,17 +9223,36 @@ pub fn nt_wait_expire() {
         if t.state != TaskState::Blocked {
             continue;
         }
-        let WaitOn::NtWait(idx) = t.wait_on else { continue };
-        let rax = match tab.get(idx) {
-            Some(e) if e.4 == 2 => crate::nt::STATUS_SUCCESS,
-            Some(e) if e.4 == 1 => {
-                if t.wait_deadline != 0 && now >= t.wait_deadline {
-                    crate::nt::STATUS_TIMEOUT
-                } else {
-                    continue;
+        let rax = match t.wait_on {
+            WaitOn::NtWait(idx) => match tab.get(idx) {
+                Some(e) if e.4 == 2 => crate::nt::STATUS_SUCCESS,
+                Some(e) if e.4 == 1 => {
+                    if t.wait_deadline != 0 && now >= t.wait_deadline {
+                        crate::nt::STATUS_TIMEOUT
+                    } else {
+                        continue;
+                    }
+                }
+                _ => crate::nt::STATUS_INVALID_HANDLE,
+            },
+            WaitOn::NtWaitProc(idx, tgid) => {
+                let ptab = unsafe { &*core::ptr::addr_of!(NT_PROCS) };
+                match ptab.get(idx) {
+                    // A freed or reallocated slot no longer names the
+                    // waited process — wake as an invalid handle.
+                    Some(e) if e.0 != tgid => crate::nt::STATUS_INVALID_HANDLE,
+                    Some(e) if e.2 == 2 => crate::nt::STATUS_SUCCESS,
+                    Some(e) if e.2 == 1 => {
+                        if t.wait_deadline != 0 && now >= t.wait_deadline {
+                            crate::nt::STATUS_TIMEOUT
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => crate::nt::STATUS_INVALID_HANDLE,
                 }
             }
-            _ => crate::nt::STATUS_INVALID_HANDLE,
+            _ => continue,
         };
         t.ctx.rax = rax;
         t.wait_on = WaitOn::None;
@@ -9258,6 +9320,308 @@ pub fn nt_handle_thr_idx(h: u64) -> Option<usize> {
     }
     let i = h as usize - 1;
     (t.nth[i] == crate::nt::NTH_THREAD).then_some(t.nth_fd[i] as usize)
+}
+
+// ---- NT process objects -------------------------------------------
+// A process handle must outlive the child's task slot the same way a
+// thread handle does, so process waitable state lives in a small
+// global ledger keyed by tgid. Only CreateProcess'd children get an
+// entry — boot-spawned PE tasks don't need handles. A process object
+// is signaled when the LAST thread of the group dies (Windows' rule);
+// the exit code it reports is the leader's.
+const NT_MAX_PROCS: usize = 8;
+/// (tgid, exit_status, state, handle_refs) — state 0=free 1=alive 2=dead.
+static mut NT_PROCS: [(u64, u64, u8, u8); NT_MAX_PROCS] = [(0, 0, 0, 0); NT_MAX_PROCS];
+
+fn nt_proc_alloc(tgid: u64) -> Option<usize> {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_PROCS) };
+    let i = tab.iter().position(|e| e.2 == 0)?;
+    tab[i] = (tgid, 0, 1, 0);
+    Some(i)
+}
+
+/// Free entries remain in the process ledger — CreateProcess
+/// prechecks this before spawning so post-spawn steps can't fail.
+fn nt_proc_slot_free() -> bool {
+    let tab = unsafe { &*core::ptr::addr_of!(NT_PROCS) };
+    tab.iter().any(|e| e.2 == 0)
+}
+
+/// (exit_status, alive) for a ledger index.
+pub fn nt_proc_status(idx: usize) -> Option<(u64, bool)> {
+    let tab = unsafe { &*core::ptr::addr_of!(NT_PROCS) };
+    let e = *tab.get(idx)?;
+    (e.2 != 0).then_some((e.1, e.2 == 1))
+}
+
+fn nt_proc_refdown(idx: usize) {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_PROCS) };
+    if let Some(e) = tab.get_mut(idx) {
+        if e.2 != 0 {
+            e.3 = e.3.saturating_sub(1);
+            if e.2 == 2 && e.3 == 0 {
+                *e = (0, 0, 0, 0);
+            }
+        }
+    }
+}
+
+/// Bind a process-object handle in the caller's table; nth_fd
+/// carries the NT_PROCS index and the entry gains one handle ref.
+pub fn nt_handle_alloc_proc(idx: usize) -> Option<u64> {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_PROCS) };
+    let t = mm_owner_mut()?;
+    for i in 0..crate::nt::MAX_NTH {
+        if t.nth[i] == 0 {
+            t.nth[i] = crate::nt::NTH_PROCESS;
+            t.nth_fd[i] = idx as u8;
+            tab[idx].3 = tab[idx].3.saturating_add(1);
+            return Some(i as u64 + 1);
+        }
+    }
+    None
+}
+
+/// The NT_PROCS index an NTH_PROCESS handle names.
+pub fn nt_handle_proc_idx(h: u64) -> Option<usize> {
+    let t = mm_owner_mut()?;
+    if h == 0 || h > crate::nt::MAX_NTH as u64 {
+        return None;
+    }
+    let i = h as usize - 1;
+    (t.nth[i] == crate::nt::NTH_PROCESS).then_some(t.nth_fd[i] as usize)
+}
+
+/// A dying NT task may end its process: when the dying pid is the
+/// leader (pid == tgid) its status becomes the process exit code —
+/// recorded at leader death even while workers still run — and the
+/// object signals once no other task of the group stays alive.
+/// Called for EVERY NT task death: the last survivor ends it. The
+/// dying task isn't Exited yet at the call site; excluding it by
+/// pid handles that.
+pub fn nt_proc_dead(tgid: u64, pid: u64, status: u64) {
+    let tab = unsafe { &mut *core::ptr::addr_of_mut!(NT_PROCS) };
+    let Some(e) = tab.iter_mut().find(|e| e.0 == tgid && e.2 == 1) else {
+        return;
+    };
+    if pid == tgid {
+        e.1 = status;
+    }
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    let alive = tasks.iter().flatten().any(|o| {
+        o.tgid == tgid && o.pid != pid && o.state != TaskState::Exited
+    });
+    if !alive {
+        e.2 = 2;
+        if e.3 == 0 {
+            *e = (0, 0, 0, 0);
+        }
+    }
+}
+
+/// CreateProcess's kernel half: resolve the image name in the
+/// caller's space (narrow ANSI), fetch the image through the same
+/// VFS/initrd source nt_mod_resolve uses, spawn it as a peer NT
+/// task, and return process + thread handles plus the ids in the
+/// caller's PROCESS_INFORMATION. flags honors CREATE_SUSPENDED (4);
+/// every other flag bit is ignored like a minimal kernel32 would.
+pub fn nt_create_process(app_va: u64, cmd_va: u64, pi_va: u64, flags: u64) -> u64 {
+    use crate::nt::*;
+    let Some(ct) = mm_owner_mut() else { return STATUS_INVALID_HANDLE };
+    let pml4 = ct.pml4;
+    // Command line first — a NULL lpApplicationName resolves to its
+    // first whitespace-delimited token, like real CreateProcess.
+    let mut cmd = [0u8; 200];
+    let cmdl = if cmd_va != 0 && range_ok(cmd_va, 1) {
+        read_task_str(pml4, cmd_va, &mut cmd).min(cmd.len() - 1)
+    } else {
+        0
+    };
+    let (nb, nl) = if app_va != 0 {
+        let Some(x) = nt_mod_name(pml4, app_va, false) else {
+            return STATUS_OBJECT_NAME_INVALID;
+        };
+        x
+    } else {
+        if cmdl == 0 {
+            return STATUS_OBJECT_NAME_INVALID;
+        }
+        let tl = cmd[..cmdl]
+            .iter()
+            .position(|&c| c == b' ' || c == b'\t')
+            .unwrap_or(cmdl);
+        let st = cmd[..tl]
+            .iter()
+            .rposition(|&c| c == b'\\' || c == b'/')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let n2 = (tl - st).min(63);
+        let mut b2 = [0u8; 64];
+        b2[..n2].copy_from_slice(&cmd[st..st + n2]);
+        if n2 == 0 {
+            return STATUS_OBJECT_NAME_INVALID;
+        }
+        (b2, n2)
+    };
+    let name = &nb[..nl];
+    if !range_ok_w(pi_va, 24) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let mut full = [0u8; 40];
+    if name.is_empty() || name.len() > full.len() - 1 {
+        return STATUS_OBJECT_NAME_INVALID;
+    }
+    full[0] = b'/';
+    full[1..1 + name.len()].copy_from_slice(name);
+    let img: Option<&[u8]> =
+        if let Some(v) = vfile_find(&full[..1 + name.len()]).and_then(vfile) {
+            (!v.data.is_null() && v.len != 0)
+                .then(|| unsafe { core::slice::from_raw_parts(v.data, v.len) })
+        } else {
+            unsafe { *core::ptr::addr_of!(INITRD) }
+                .and_then(|arc| crate::cpio::find(arc, name))
+        };
+    let Some(img) = img else { return STATUS_OBJECT_NAME_NOT_FOUND };
+    if !img.starts_with(b"MZ") {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Prechecks make every post-spawn step infallible: two handle
+    // slots (process + thread) and one entry in each waitable ledger.
+    if ct.nth.iter().filter(|&&s| s == 0).count() < 2
+        || !nt_thr_slot_free()
+        || !nt_proc_slot_free()
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    let Some(si) = spawn_idx(img, core::str::from_utf8(name).unwrap_or("winproc"), true) else {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let Some(c) = tasks.get_mut(si).and_then(|s| s.as_mut()) else {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+    let cpid = c.pid;
+    if cmdl != 0 {
+        nt_set_cmdline(c.pml4, &cmd[..cmdl]);
+    }
+    // Infallible after the prechecks: the child's leader gets a
+    // thread-ledger entry (no stack window — the task owns it) so
+    // hThread is a real waitable object, and the group gets the
+    // process object the parent waits on. A failure past this point
+    // leaves a suspended child — degraded, never panicked.
+    let (Some(tidx), Some(pidx)) = (
+        nt_thr_alloc(cpid, cpid, crate::pe::TEB_VA, 0, 0, cpid),
+        nt_proc_alloc(cpid),
+    ) else {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+    if flags & 4 == 0 {
+        // The spawn inserted the child suspended so it couldn't run
+        // and be reaped mid-wiring; a non-CREATE_SUSPENDED launch
+        // releases it now that the ledgers exist.
+        c.state = TaskState::Runnable;
+        c.wait_on = WaitOn::None;
+    }
+    let (Some(ht), Some(hp)) =
+        (nt_handle_alloc_thread(tidx), nt_handle_alloc_proc(pidx))
+    else {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+    let mut pi = [0u8; 24];
+    pi[0..8].copy_from_slice(&hp.to_le_bytes());
+    pi[8..16].copy_from_slice(&ht.to_le_bytes());
+    pi[16..20].copy_from_slice(&(cpid as u32).to_le_bytes());
+    pi[20..24].copy_from_slice(&(cpid as u32).to_le_bytes());
+    if !write_task_bytes(pml4, pi_va, &pi) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    STATUS_SUCCESS
+}
+
+/// Write a process object's status into the caller's buffer —
+/// STILL_ACTIVE (259) while the group lives, the leader's exit code
+/// after. GetExitCodeProcess's backing service.
+pub fn nt_proc_query(h: u64, out_va: u64) -> u64 {
+    use crate::nt::*;
+    if !range_ok_w(out_va, 4) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let Some(idx) = nt_handle_proc_idx(h) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some((status, alive)) = nt_proc_status(idx) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let code = if alive { STATUS_STILL_ACTIVE as u32 } else { status as u32 };
+    let Some(ct) = mm_owner_mut() else {
+        return STATUS_INVALID_HANDLE;
+    };
+    if !write_task_bytes(ct.pml4, out_va, &code.to_le_bytes()) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    STATUS_SUCCESS
+}
+
+/// CreateProcess's cmdline override: ANSI text at STUB_DATA_VA+0xa00
+/// (the cell GetCommandLineA/_acmdln resolve to) and the UTF-16
+/// UNICODE_STRING PEB ProcessParameters.CommandLine points at.
+/// Without a cmdline the default ("<name>.exe") stays.
+fn nt_set_cmdline(pml4: u64, s: &[u8]) {
+    let d = crate::pe::STUB_DATA_VA;
+    let cl = s.len().min(230);
+    let mut b = [0u8; 232];
+    b[..cl].copy_from_slice(&s[..cl]);
+    let _ = write_task_bytes(pml4, d + 0xa00, &b[..cl + 1]);
+    peb_cmdline_write(pml4, &s[..cl]);
+}
+
+/// Write PEB ProcessParameters.CommandLine — the UTF-16 buffer at
+/// PEB+0x600 and its UNICODE_STRING at params+0x80. Shared by
+/// pe_late_init (default "<name>.exe") and nt_set_cmdline.
+fn peb_cmdline_write(pml4: u64, s: &[u8]) -> bool {
+    let peb = crate::pe::PEB_VA;
+    let params = peb + 0x400;
+    let mut u16b = [0u8; 256];
+    let wl = s.len().min(123);
+    for (i, &c) in s[..wl].iter().enumerate() {
+        u16b[i * 2..i * 2 + 2].copy_from_slice(&(c as u16).to_le_bytes());
+    }
+    if !write_task_bytes(pml4, peb + 0x600, &u16b[..wl * 2 + 2]) {
+        return false;
+    }
+    let cmdlen = (wl * 2) as u16;
+    let cmdptr = peb + 0x600;
+    // UNICODE_STRING is {u16 len, u16 maxlen, pad, *ptr} — pack it.
+    let mut usb = [0u8; 16];
+    usb[0..2].copy_from_slice(&cmdlen.to_le_bytes());
+    usb[2..4].copy_from_slice(&(cmdlen + 2).to_le_bytes());
+    usb[8..16].copy_from_slice(&cmdptr.to_le_bytes());
+    write_task_bytes(pml4, params + 0x80, &usb)
+}
+
+/// Block the current task on an NT process object (ledger idx):
+/// same abandoned-kernel-frame wake model as nt_wait_block. The
+/// entry's tgid is recorded so a freed-and-reallocated slot can't
+/// satisfy the wait (a sibling closing the last handle mid-wait).
+pub fn nt_wait_block_proc(ctx: &mut UCtx, idx: usize, deadline_ticks: u64) -> ! {
+    let tgid = unsafe { &*core::ptr::addr_of!(NT_PROCS) }
+        .get(idx)
+        .map(|e| e.0)
+        .unwrap_or(0);
+    if let Some(t) = cur_mut() {
+        t.wait_on = WaitOn::NtWaitProc(idx, tgid);
+        t.wait_deadline = deadline_ticks;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+    }
+    block_switch()
+}
+
+/// Free entries remain in the thread ledger — CreateProcess
+/// prechecks it alongside the process table.
+fn nt_thr_slot_free() -> bool {
+    let tab = unsafe { &*core::ptr::addr_of!(NT_THREADS) };
+    tab.iter().any(|e| e.4 == 0)
 }
 
 // ---- NT section objects + mapped views ---------------------------
@@ -10051,6 +10415,7 @@ pub fn nt_alloc_pages(hint: u64, size: u64, commit: bool, rfl: u8, pfl: u64) -> 
             unmap_page(t, cur);
             cur += PAGE;
         }
+        flush_tlb();
     }
     None
 }
@@ -10134,6 +10499,7 @@ pub fn nt_commit_window(t: &mut Task, base: u64, size: u64, rfl: u8, pfl: u64) -
                             unmap_page(t, u);
                             u += PAGE;
                         }
+                        flush_tlb();
                         return false;
                     }
                     va += PAGE;
@@ -10158,6 +10524,7 @@ pub fn nt_commit_window(t: &mut Task, base: u64, size: u64, rfl: u8, pfl: u64) -
                         unmap_page(t, u);
                         u += PAGE;
                     }
+                    flush_tlb();
                     return false;
                 }
                 va += PAGE;
@@ -10205,6 +10572,9 @@ pub fn nt_decommit_window(t: &mut Task, base: u64, size: u64) -> bool {
         unmap_page(t, va);
         va += PAGE;
     }
+    // unmap_page doesn't invlpg — the mm stays live across sibling
+    // threads and the caller's own VA window, so one flush here.
+    flush_tlb();
     for i in 0..t.nranges {
         let (lo, hi, fl) = t.ranges[i];
         if lo >= end || hi <= base || fl & RNG_RES != 0 {
@@ -10318,6 +10688,10 @@ fn nt_free_pages_t(t: &mut Task, base: u64, size: u64) {
             t.nranges -= 1;
         }
     }
+    // unmap_page doesn't invlpg — the freed window's old translations
+    // must die before any sibling (or a later same-mm touch) can write
+    // through them into recycled frames. One flush for the whole op.
+    flush_tlb();
 }
 
 /// PAGE_* constant for a range's RNG flags — what NtQueryVirtualMemory
@@ -17763,13 +18137,23 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
 /// (argv0 = `name`, no env) and take the first free table slot.
 /// False on bad image or full table.
 pub fn spawn(img: &[u8], name: &str) -> bool {
+    spawn_idx(img, name, false).is_some()
+}
+
+/// spawn's task-index form: CreateProcess needs the child's slot to
+/// read its pid and apply the suspended flag before it can run.
+/// `hold` inserts the child suspended — a CreateProcess caller wires
+/// handles/ledgers/cmdline after this returns, and a Runnable child
+/// could run, exit and be reaped (slot + pml4 frames recycled)
+/// before that wiring lands.
+fn spawn_idx(img: &[u8], name: &str, hold: bool) -> Option<usize> {
     let is_pe = img.starts_with(b"MZ");
     let e = elf::parse(img);
     if e.is_none() && !is_pe {
-        return false;
+        return None;
     }
     let Some(mut t) = load(img) else {
-        return false;
+        return None;
     };
     let mut args = ExecArgs::empty();
     let n = name.len().min(EXEC_STR_CAP - 1);
@@ -17794,12 +18178,12 @@ pub fn spawn(img: &[u8], name: &str) -> bool {
         let e = e.unwrap();
         let Some((entry, at_base)) = interp_load(&mut t, &e, img) else {
             t.reap();
-            return false;
+            return None;
         };
         t.entry = entry;
         let Some(rsp) = setup_stack(&mut t, &e, img, &args, at_base) else {
             t.reap();
-            return false;
+            return None;
         };
         t.ctx = UCtx::launch(t.entry, rsp);
     }
@@ -17808,16 +18192,20 @@ pub fn spawn(img: &[u8], name: &str) -> bool {
     if t.pers == PERS_NT {
         let _ = pe_late_init(&t);
     }
+    if hold {
+        t.state = TaskState::Blocked;
+        t.wait_on = WaitOn::NtSuspend;
+    }
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
-    for s in tasks.iter_mut() {
+    for (i, s) in tasks.iter_mut().enumerate() {
         if s.is_none() {
             *s = Some(t);
             PROCS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            return true;
+            return Some(i);
         }
     }
     t.reap(); // table full — drop the task cleanly
-    false
+    None
 }
 
 /// Reap reapable zombies — Exited tasks whose parent can't collect
@@ -17911,10 +18299,14 @@ fn switch_to(n: usize) -> ! {
 pub fn task_exit(code: u64) -> ! {
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     if let Some(t) = unsafe { (*core::ptr::addr_of_mut!(TASKS))[cur].as_mut() } {
-        if t.pers == PERS_NT && t.tgid != t.pid {
-            // A secondary NT thread: record the RAW status for
-            // GetExitCodeThread before it gets waitstatus-encoded.
+        if t.pers == PERS_NT {
+            // Record the RAW status before waitstatus-encoding.
+            // nt_thread_dead covers secondary threads and any
+            // CreateProcess'd leader (it has a ledger entry too);
+            // nt_proc_dead signals the process object when the
+            // group's last thread is gone.
             nt_thread_dead(t.pid, code & 0xffff_ffff);
+            nt_proc_dead(t.tgid, t.pid, code & 0xffff_ffff);
         }
         t.exit_status = (code & 0xff) << 8;
     }
@@ -17923,6 +18315,18 @@ pub fn task_exit(code: u64) -> ! {
 
 /// The running task died to a signal: same teardown as exit, but the
 /// wait status is the bare signo in the low byte — real wstatus.
+/// Map a fatal signal number to the nearest NTSTATUS exception
+/// code, like a Windows crash exit status.
+fn nt_sig_ntstatus(signo: u64) -> u64 {
+    match signo {
+        11 => 0xC000_0005, // SIGSEGV -> ACCESS_VIOLATION
+        4 => 0xC000_001D,  // SIGILL  -> ILLEGAL_INSTRUCTION
+        8 => 0xC000_0094,  // SIGFPE  -> INTEGER_DIVIDE_BY_ZERO
+        5 => 0x8000_0003,  // SIGTRAP -> BREAKPOINT
+        _ => 0xC000_0000 | signo,
+    }
+}
+
 fn die_signal(signo: u64) -> ! {
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     crate::log::printk(format_args!(
@@ -17931,6 +18335,13 @@ fn die_signal(signo: u64) -> ! {
         cur_exe()
     ));
     if let Some(t) = unsafe { (*core::ptr::addr_of_mut!(TASKS))[cur].as_mut() } {
+        if t.pers == PERS_NT {
+            // Crashed NT task: waiters on its thread/process objects
+            // must still wake.
+            let code = nt_sig_ntstatus(signo);
+            nt_thread_dead(t.pid, code);
+            nt_proc_dead(t.tgid, t.pid, code);
+        }
         t.exit_status = signo;
     }
     task_exit_inner()
