@@ -1483,6 +1483,11 @@ pub struct Task {
     /// (Linux forks fresh accounting).
     utime: u64,
     stime: u64,
+    /// setitimer/alarm state: [deadline, interval] per which — REAL
+    /// counts TICKS (wall), VIRTUAL counts utime, PROF utime+stime.
+    /// deadline==0 means disarmed. Fork doesn't inherit (fresh
+    /// zeroed Task); exec preserves it like Linux.
+    itimers: [[u64; 2]; 3],
     /// NUL-joined argv captured at exec() — /proc/<pid>/cmdline's
     /// real content. Bounded: extra args are truncated at the cap,
     /// so a malformed execve can't grow kernel memory. Empty until
@@ -6708,6 +6713,7 @@ fn load(img: &[u8]) -> Option<Task> {
             .load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
         stime: 0,
+        itimers: [[0; 2]; 3],
         cmdline: [0; 256],
         cmdline_len: 0,
     };
@@ -7354,8 +7360,14 @@ pub const EXEC_STR_CAP: usize = 256;
 static mut EXEC_BUF: ExecArgs = ExecArgs::empty();
 
 /// Borrow the shared exec-argument staging buffer.
+/// Borrow the shared exec-argument staging buffer — freshly cleared
+/// each call so callers see the same all-zero state the old
+/// stack-local `ExecArgs::empty()` gave them. Without this a spawn
+/// could inherit stale argv bytes/env count from the previous exec.
 pub fn exec_args_scratch() -> &'static mut ExecArgs {
-    unsafe { &mut *core::ptr::addr_of_mut!(EXEC_BUF) }
+    let b = unsafe { &mut *core::ptr::addr_of_mut!(EXEC_BUF) };
+    *b = ExecArgs::empty();
+    b
 }
 
 pub struct ExecArgs {
@@ -11027,6 +11039,7 @@ pub fn nt_thread_create(
         start_ticks: crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
         stime: 0,
+        itimers: [[0; 2]; 3],
         cmdline: p.cmdline,
         cmdline_len: p.cmdline_len,
     };
@@ -17750,6 +17763,170 @@ fn timerfd_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
 /// disarm; periodics fold missed cycles into the count (Linux's
 /// overruns) and re-arm forward. Then wake blocked readers.
 /// Runs from the timer tick and lazily at timerfd syscall entry.
+// --- alarm + setitimer --------------------------------------------------
+
+/// Interval-timer signals: REAL counts apic::TICKS (wall clock),
+/// VIRTUAL counts billed utime, PROF utime+stime — all three clocks
+/// already exist, so every which is honest rather than a wall alias.
+const SIGALRM_: u64 = 14;
+const SIGVTALRM: u64 = 26;
+const SIGPROF: u64 = 27;
+
+/// The clock itimer `which` counts against for task t.
+fn itimer_now(t: &Task, which: usize) -> u64 {
+    match which {
+        1 => t.utime,
+        2 => t.utime + t.stime,
+        _ => crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// itimer_expire: service armed task itimers — pend the timer signal
+/// (waking/EINTR through the normal pend path), rearm on interval or
+/// disarm. tick() runs this every interrupt before billing.
+pub fn itimer_expire() {
+    const SIGS: [u64; 3] = [SIGALRM_, SIGVTALRM, SIGPROF];
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state == TaskState::Exited {
+            continue;
+        }
+        for (which, &sig) in SIGS.iter().enumerate() {
+            let [deadline, interval] = t.itimers[which];
+            if deadline == 0 || itimer_now(t, which) < deadline {
+                continue;
+            }
+            match (itimer_now(t, which) - deadline).checked_div(interval) {
+                // interval==0: one-shot — disarm.
+                None => t.itimers[which][0] = 0,
+                // Like timerfd: don't stack missed expirations, just
+                // roll the deadline forward past now.
+                Some(missed) => {
+                    t.itimers[which][0] = deadline
+                        .saturating_add(interval.saturating_mul(missed + 1));
+                }
+            }
+            let _ = pend_one(t, sig, SIGSRC_NONE);
+        }
+    }
+}
+
+/// timeval pair -> itimerval ticks. `usec` is validated <1e6 by the
+/// callers; zero answers 0 (disarm), nonzero rounds up to 1 tick.
+fn tv_to_ticks(sec: u64, usec: u64) -> u64 {
+    sec.saturating_mul(100)
+        .saturating_add(usec.div_ceil(10_000))
+}
+
+/// itimerval {it_interval {sec,usec}, it_value {sec,usec}} — 4 i64s.
+fn read_itimerval(va: u64) -> Result<[i64; 4], u64> {
+    if va == 0 || !range_ok(va, 32) {
+        return Err(EFAULT);
+    }
+    // SAFETY: validated itimerval under cur cr3.
+    Ok(unsafe {
+        [
+            (va as *const i64).read_unaligned(),
+            ((va + 8) as *const i64).read_unaligned(),
+            ((va + 16) as *const i64).read_unaligned(),
+            ((va + 24) as *const i64).read_unaligned(),
+        ]
+    })
+}
+
+/// Write the task's `which` itimer as itimerval: interval ticks and
+/// the remaining time to its deadline (0 when disarmed or expired).
+fn write_itimerval(va: u64, which: usize) -> u64 {
+    let Some(t) = cur_mut() else { return EINVAL };
+    let now = itimer_now(t, which);
+    let [deadline, interval] = t.itimers[which];
+    let rem = if deadline == 0 {
+        0
+    } else {
+        deadline.saturating_sub(now)
+    };
+    // SAFETY: va validated writable for 32 bytes under cur cr3.
+    unsafe {
+        (va as *mut i64).write_unaligned((interval / 100) as i64);
+        ((va + 8) as *mut i64).write_unaligned(((interval % 100) * 10_000) as i64);
+        ((va + 16) as *mut i64).write_unaligned((rem / 100) as i64);
+        ((va + 24) as *mut i64).write_unaligned(((rem % 100) * 10_000) as i64);
+    }
+    0
+}
+
+/// getitimer(which, cur): report the task's interval timer.
+pub fn sys_getitimer(which: u64, cur: u64) -> u64 {
+    if which > 2 {
+        return EINVAL;
+    }
+    if cur == 0 || !range_ok_w(cur, 32) {
+        return EFAULT;
+    }
+    itimer_expire(); // the report must be as-of-now
+    write_itimerval(cur, which as usize)
+}
+
+/// setitimer(which, new, old): arm/disarm an interval timer, report
+/// the prior state. which: 0=REAL(SIGALRM) 1=VIRTUAL(SIGVTALRM)
+/// 2=PROF(SIGPROF). it_value {0,0} disarms; nonzero rounds up to a
+/// tick like timerfd.
+pub fn sys_setitimer(which: u64, new: u64, old: u64) -> u64 {
+    if which > 2 {
+        return EINVAL;
+    }
+    let nv = match read_itimerval(new) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if old != 0 && !range_ok_w(old, 32) {
+        return EFAULT;
+    }
+    for &f in &nv {
+        if f < 0 {
+            return EINVAL;
+        }
+    }
+    if !(0..1_000_000).contains(&nv[1]) || !(0..1_000_000).contains(&nv[3]) {
+        return EINVAL;
+    }
+    itimer_expire(); // fire overdue timers before re-reading state
+    if old != 0 {
+        write_itimerval(old, which as usize);
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let now = itimer_now(t, which as usize);
+    let interval = tv_to_ticks(nv[0] as u64, nv[1] as u64);
+    let value = tv_to_ticks(nv[2] as u64, nv[3] as u64);
+    t.itimers[which as usize] = if value == 0 {
+        [0, 0] // {0,0} it_value disarms
+    } else {
+        [now.saturating_add(value.max(1)), interval]
+    };
+    0
+}
+
+/// alarm(sec): arm ITIMER_REAL as a one-shot — Linux implements it
+/// exactly as setitimer with no interval. Returns the remaining
+/// whole seconds of the previous alarm (0 if none armed).
+pub fn sys_alarm(sec: u64) -> u64 {
+    itimer_expire();
+    let Some(t) = cur_mut() else { return EINVAL };
+    let now = itimer_now(t, 0);
+    let prev = if t.itimers[0][0] == 0 {
+        0
+    } else {
+        t.itimers[0][0].saturating_sub(now) / 100
+    };
+    t.itimers[0] = if sec == 0 {
+        [0, 0]
+    } else {
+        [now.saturating_add(sec.saturating_mul(100).max(1)), 0]
+    };
+    prev
+}
+
 pub fn timerfd_expire() {
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     {
@@ -20599,6 +20776,7 @@ pub fn tick(img: &mut UCtx) -> *const UCtx {
     // would freeze every Blocked task's deadline and input feed.
     poll_expire(); // timed poll waits age one tick
     timerfd_expire(); // armed timerfds fire + wake their readers
+    itimer_expire(); // alarm/setitimer deadlines -> SIGALRM family
     nt_wait_expire(); // NT thread-object waits: dead/timeout wakes
     crate::e1000::rx_drain(); // feed socket queues from the live ring
     tcp_retx(); // SYN retransmit on the initial-RTO schedule
@@ -20897,6 +21075,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
             .load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
         stime: 0,
+        itimers: [[0; 2]; 3],
         cmdline: p.cmdline,
         cmdline_len: p.cmdline_len,
     };
@@ -21073,6 +21252,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
             .load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
         stime: 0,
+        itimers: [[0; 2]; 3],
         cmdline: p.cmdline,
         cmdline_len: p.cmdline_len,
     };

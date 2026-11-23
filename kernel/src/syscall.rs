@@ -361,6 +361,9 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_RT_SIGPROCMASK => user::sys_rt_sigprocmask(a1, a2, a3, a4),
         NR_POLL => user::fd_poll(ctx, a1, a2, a3 as i64),
         34 => user::sys_pause(ctx),
+        36 => user::sys_getitimer(a1, a2),
+        37 => user::sys_alarm(a1),
+        38 => user::sys_setitimer(a1, a2, a3),
         127 => user::sys_sigpending(a1, a2),
         130 => user::sys_sigsuspend(ctx, a1, a2),
         // rt_sigtimedwait(set,info,ts,sigsize): glibc sigwaitinfo
