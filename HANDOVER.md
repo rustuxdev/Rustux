@@ -2789,3 +2789,73 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   ~/.devin/rules/security-audit.md, git push creds, cve.now MCP.
 - Next: wget-style fetch through slirp, then dpkg/apt prerequisites
   (writable /var, tar/gz/SHA surface, fcntl locks), then mini-ISO.
+
+## run-131 — real busybox wget over slirp: glibc-resolver socket ABI + TCP SYN retransmit
+
+- kernel/user/wgettest.c (new, static-PIE): forks+execs /busybox
+  `wget -T 15 -q -O /wget_out http://deb.debian.org/debian/` — real
+  glibc stub resolver (reads /etc/resolv.conf -> 10.0.2.3), real TCP
+  :80, O_CREAT output through the flat VFS. NIC-less skip like
+  nettest; /wget_out unlinked after. kernel/user/resolv.conf staged
+  as etc/resolv.conf; lstest floor 45 -> 47 (wgettest + etc dir).
+- Root cause chain for `bad address 'deb.debian.org'`: busybox is
+  STATIC GLIBC, and glibc's resolver (res_send.c reopen()) treats
+  setsockopt(fd, SOL_IP, IP_RECVERR) failure as FATAL — aborts
+  before connect(). It also needs SOCK_NONBLOCK accepted, UDP
+  connect() peer-pinning, nonblocking recvfrom EAGAIN, and
+  sendmmsg for the A+AAAA pair. Implemented:
+  - OpenFile.nonblock (OFD-level like Linux file status flags —
+    dup/fork share it); socket() accepts SOCK_NONBLOCK into it;
+    fcntl F_GETFL reports accmode|O_APPEND|O_NONBLOCK, F_SETFL
+    toggles APPEND+NONBLOCK (accmode bits ignored like Linux,
+    stray status bits honest EINVAL).
+  - UdpSock.peer + fd_connect UDP arm: instant peer pin, ephemeral
+    bind like first-send, re-connect re-pins (no AF_UNSPEC
+    disconnect — EAFNOSUPPORT on the unparsable family).
+    udp_rx drops non-peer datagrams (covers queue + blocked-waiter).
+    sendto(fd,buf,len,0,0,0)/write() on a connected socket targets
+    the peer; sendto(addr) on connected -> EISCONN; send with no
+    peer -> EDESTADDRREQ. getpeername reports the pin.
+  - THE BUG: fd_socket compared RAW ty to 2 — SOCK_DGRAM|NONBLOCK
+    (0o4002) minted a TCP socket, so every glibc resolver socket
+    was TCP: sendto->EISCONN, connect->SYN to :53 ->ETIMEDOUT.
+    Now `base = ty & 0x7` drives kind selection.
+  - NR 46 sendmsg (iovec gather -> one datagram, bounded 1400;
+    TCP arm streams segments; ancillary validated readable +
+    dropped), NR 307 sendmmsg (per-entry sendmsg, msg_len written
+    back at mmsghdr+56, stop-at-first-error), NR 54 setsockopt
+    (ENOTSOCK non-socket, EFAULT unreadable optval, accept-and-drop
+    otherwise — deliberate for IP_RECVERR & friends).
+- TCP SYN retransmit: tcp_retx() rides the 100Hz tick — SynSent
+  sockets re-fire SYN at Linux's initial-RTO 1s schedule doubling
+  (RTO0 << syn_tries), cap 5. slirp DOES drop SYN/SYN-ACK under
+  TCG load — single-shot connect() flaked wgettest to ETIMEDOUT
+  twice in-suite; retransmission fixed it. TCP_CONN_TICKS (10s)
+  still bounds the open.
+- Frame-leak hunt (worth remembering): suite showed a hard 2-frame
+  leak. Provenance instrumentation (per-frame caller table over the
+  buddy, generation-tagged at the `before` snapshot) pinned it to
+  vfile kmalloc — NOT a code bug: F_SETFL now working let htop
+  actually WRITE ~/.config/htop/htoprc (previously "Invalid
+  argument" at save), a persistent VFile holding 2 frames at reap.
+  Fixed suite-side: htoptest unlinks the file post-wait like every
+  other test cleans its scratch. Instrumentation removed; the
+  kalloc FRAME_SRC pattern is documented here if needed again.
+- audit run-104 (manual scoped — rubric + cve.now MCP still absent
+  on this host): new user-pointer surfaces all funnel range_check
+  (checked_add overflow-safe, VMA-bounded) — msghdr/iovec/mmsghdr/
+  optval reads, gather bounded 1400, UIO_MAXIOV caps, msg_len
+  writeback bounded. No confirmed findings. needs_validation:
+  none new; re-verify with cve.now once configured.
+- 66 tasks, frames 99886 -> 99886 zero leak, qemu exit 33 on BOTH
+  `make run` and `make run-net`; wgettest 4/4 ok (wget exit 0,
+  file, body, "Index of /debian" marker); nettest all ok;
+  per-task exits diff-identical to run-130 baseline.
+- Env note: firewall is OFF on this VM (ufw disabled, iptables/
+  nftables empty ACCEPT) — was never blocking; git push still
+  needs creds (credential.helper or SSH remote).
+- Next: netlink route/addr surface (res_get_sort_addr path — glibc
+  probes it post-resolve; currently ENOSYS nr 122/123 but non-fatal
+  here), TCP data/FIN retransmission (SynSent covered; Estab
+  retransmit still absent — matters for real WAN loss), then
+  dpkg/apt prerequisites.
