@@ -76,6 +76,11 @@ int main(void) {
         }
     }
 
+    /* htop persists ~/.config/htop/htoprc on clean exit (HOME=/). The
+       flat VFS is kernel-lifetime — drop the file so its data frames
+       don't read as a leak in the suite's frame accounting. */
+    unlink("/.config/htop/htoprc");
+
     char buf[64];
     int m = snprintf(buf, sizeof(buf),
                      "htoptest: %d failures, done\n", fails);

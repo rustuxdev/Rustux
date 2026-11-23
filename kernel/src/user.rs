@@ -1305,6 +1305,10 @@ struct OpenFile {
     refs: usize,
     /// O_APPEND: every write lands at end-of-file regardless of pos.
     append: bool,
+    /// O_NONBLOCK: empty reads EAGAIN instead of sleeping. Lives on
+    /// the OFD like Linux — dup'd fds share it; set via
+    /// socket(SOCK_NONBLOCK) or fcntl(F_SETFL).
+    nonblock: bool,
     /// O_ACCMODE at open (0 rdonly/1 wronly/2 rdwr) — f_mode analogue.
     accmode: u8,
 }
@@ -6666,6 +6670,7 @@ fn load(img: &[u8]) -> Option<Task> {
                 pos: 0,
                 refs: 1,
                 append: false,
+                nonblock: false,
                 accmode: if i == 0 { 0 } else { 1 },
             });
             fdt(&t).fds[i] = Some(oi as u8);
@@ -12037,7 +12042,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Timerfd(i) => timerfd_read(ctx, *i, buf, len),
         FdKind::Signalfd(i) => signalfd_read(ctx, *i, buf, len),
         FdKind::Inotify(i) => inotify_read(ctx, *i, buf, len),
-        FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, 0),
+        FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, 0, o.nonblock),
         FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, 0),
         FdKind::File(data) => {
             if o.accmode == 1 {
@@ -12180,6 +12185,11 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     let Some(o) = ofd(t, fd) else { return EBADF };
     if let FdKind::Tcp(i) = &o.kind {
         return tcp_send(*i, buf, len);
+    }
+    if let FdKind::Udp(_) = &o.kind {
+        // write() on a datagram socket = send() — needs a
+        // connect()ed peer, same path as sendto with no addr.
+        return fd_sendto(fd, buf, len, 0, 0, 0);
     }
     if let FdKind::Eventfd(i) = &o.kind {
         return eventfd_write(ctx, *i, buf, len);
@@ -12470,6 +12480,7 @@ pub fn fd_pipe(fdptr: u64, flags: u64) -> u64 {
         pos: 0,
         refs: 1,
         append: false,
+        nonblock: false,
         accmode: 0,
     });
     ofds[wo] = Some(OpenFile {
@@ -12477,6 +12488,7 @@ pub fn fd_pipe(fdptr: u64, flags: u64) -> u64 {
         pos: 0,
         refs: 1,
         append: false,
+        nonblock: false,
         accmode: 1,
     });
     fdt(t).fds[rf] = Some(ro as u8);
@@ -14174,6 +14186,7 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         pos: 0,
         refs: 1,
         append: flags & O_APPEND != 0,
+        nonblock: flags & O_NONBLOCK != 0,
         accmode: acc as u8,
     });
     fdt(t).fds[fi] = Some(oi as u8);
@@ -14762,11 +14775,12 @@ pub fn fd_pread(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
 
 /// fcntl(fd, cmd, arg): the fd-metadata surface. F_GETFD/F_SETFD own
 /// the per-fd O_CLOEXEC bit (the only fd flag Linux has); F_GETFL
-/// reports O_RDONLY — the honest status of an archive fd; F_SETFL
-/// accepts 0 as a no-op (no O_APPEND/O_NONBLOCK toggles exist) and
-/// EINVALs anything else rather than silently succeeding; F_DUPFD
-/// rides fd_dup_at's min-slot scan, F_DUPFD_CLOEXEC the same plus the
-/// bit. Unknown cmds EINVAL — never a fake success.
+/// reports the OFD's accmode + O_APPEND + O_NONBLOCK status flags;
+/// F_SETFL toggles those two status flags (access mode is ignored
+/// like Linux) and EINVALs other status bits rather than silently
+/// succeeding; F_DUPFD rides fd_dup_at's min-slot scan,
+/// F_DUPFD_CLOEXEC the same plus the bit. Unknown cmds EINVAL —
+/// never a fake success.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     const F_DUPFD: u64 = 0;
     const F_GETFD: u64 = 1;
@@ -14793,13 +14807,26 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             if fd as usize >= MAX_FDS || fdt(t).fds[fd as usize].is_none() {
                 return EBADF;
             }
-            0 // O_RDONLY — the only access mode an archive fd has
+            let Some(o) = ofd(t, fd) else { return EBADF };
+            o.accmode as u64
+                | if o.append { O_APPEND } else { 0 }
+                | if o.nonblock { O_NONBLOCK } else { 0 }
         }
         F_SETFL => {
             if fd as usize >= MAX_FDS || fdt(t).fds[fd as usize].is_none() {
                 return EBADF;
             }
-            if arg == 0 { 0 } else { EINVAL }
+            // Linux ignores the access-mode bits on F_SETFL; the
+            // status flags we honor are O_APPEND + O_NONBLOCK —
+            // anything else (O_ASYNC, O_DIRECT, O_DSYNC...) stays
+            // an honest EINVAL rather than a silent drop.
+            if arg & !(0o3 | O_APPEND | O_NONBLOCK) != 0 {
+                return EINVAL;
+            }
+            let Some(o) = ofd(t, fd) else { return EBADF };
+            o.append = arg & O_APPEND != 0;
+            o.nonblock = arg & O_NONBLOCK != 0;
+            0
         }
         F_DUPFD => fd_dup_at(fd, arg),
         F_DUPFD_CLOEXEC => {
@@ -16355,6 +16382,7 @@ pub fn fd_epoll_create(flags: u64, legacy_size: bool) -> u64 {
         pos: 0,
         refs: 1,
         append: false,
+        nonblock: false,
         accmode: 2,
     });
     fdt(t).fds[fi] = Some(oi as u8);
@@ -16559,6 +16587,7 @@ fn anon_fd(kind: FdKind, cloexec: bool) -> u64 {
         pos: 0,
         refs: 1,
         append: false,
+        nonblock: false,
         accmode: 2,
     });
     fdt(t).fds[fi] = Some(oi as u8);
@@ -17217,9 +17246,14 @@ struct Dgram {
 }
 
 /// A UDP endpoint: the bound local port (0 = unbound, assigned on
-/// first send/bind) plus a one-deep receive queue.
+/// first send/bind), the connect()ed peer when set, and a one-deep
+/// receive queue.
 struct UdpSock {
     port: u16,
+    /// connect() pins the peer (dport, ip): send/write target it
+    /// implicitly and recv drops datagrams from anyone else — the
+    /// datagram-connect semantics glibc's resolver depends on.
+    peer: Option<(u16, [u8; 4])>,
     q: Option<Dgram>,
 }
 
@@ -17265,6 +17299,14 @@ pub fn udp_rx(src_ip: [u8; 4], sport: u16, dport: u16, p: &[u8]) {
     }) else {
         return; // nobody bound to this port — drop
     };
+    // A connect()ed socket only accepts its peer's datagrams —
+    // a stray sender drops like Linux, waking nothing.
+    if socks[si]
+        .as_ref()
+        .is_some_and(|k| k.peer.is_some_and(|(pp, pip)| sport != pp || src_ip != pip))
+    {
+        return;
+    }
     // A blocked receiver first: payload + sockaddr straight through
     // the sleeper's tables, count into its rax — same wake shape as
     // the pipe paths.
@@ -17315,10 +17357,14 @@ fn udp_recv_or_block(
     buf: u64,
     len: u64,
     sa: u64,
+    dontwait: bool,
 ) -> u64 {
     const EINTR_: u64 = (-4i64) as u64;
+    const EAGAIN_: u64 = (-11i64) as u64;
     let Some(t) = cur_mut() else { return EBADF };
     // A datagram already in the ring? Drain once before looking.
+    // The demux already peer-filters for connect()ed sockets, so
+    // anything queued always matches.
     crate::e1000::rx_drain();
     let take = {
         let socks = unsafe { &mut *core::ptr::addr_of_mut!(UDPSOCKS) };
@@ -17360,6 +17406,9 @@ fn udp_recv_or_block(
     if sa != 0 && !range_ok_w(sa, 16) {
         return EFAULT;
     }
+    if dontwait {
+        return EAGAIN_; // O_NONBLOCK/MSG_DONTWAIT: no sleep, no data
+    }
     if deliverable(t) {
         return EINTR_; // a signal landed before we slept
     }
@@ -17376,8 +17425,8 @@ fn udp_recv_or_block(
 /// dups/fork-shares like every other fd. SOCK_DGRAM -> UDPSOCKS,
 /// SOCK_STREAM -> TCPSOCKS in the Init state.
 /// socket() type carries SOCK_NONBLOCK(0o4000)|SOCK_CLOEXEC(0o2000000)
-/// flags — same values as the O_ bits. CLOEXEC we honor; NONBLOCK we
-/// refuse honestly (no nonblocking socket io exists).
+/// flags — same values as the O_ bits. Both ride the OFD: CLOEXEC
+/// the fd slot, NONBLOCK the shared file-status flag.
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 
@@ -17385,9 +17434,6 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
     const EAFNOSUPPORT: u64 = (-97i64) as u64;
     const ENFILE_: u64 = (-23i64) as u64;
     if ty & !(0x7 | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
-        return EINVAL;
-    }
-    if ty & SOCK_NONBLOCK != 0 {
         return EINVAL;
     }
     let base = ty & 0x7;
@@ -17402,12 +17448,12 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
     ) else {
         return EMFILE;
     };
-    let kind = if ty == 2 {
+    let kind = if base == 2 {
         let socks = unsafe { &mut *core::ptr::addr_of_mut!(UDPSOCKS) };
         let Some(si) = socks.iter().position(Option::is_none) else {
             return ENFILE_;
         };
-        socks[si] = Some(UdpSock { port: 0, q: None });
+        socks[si] = Some(UdpSock { port: 0, peer: None, q: None });
         FdKind::Udp(si)
     } else {
         let socks = tcp_socks();
@@ -17428,13 +17474,22 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
             blen: 0,
             parent: usize::MAX,
             orphan: false,
+            syn_at: 0,
+            syn_tries: 0,
             dead: false,
             rxb: [0; TCP_RX_CAP],
             rxl: 0,
         });
         FdKind::Tcp(si)
     };
-    ofds[oi] = Some(OpenFile { kind, pos: 0, refs: 1, append: false, accmode: 2 });
+    ofds[oi] = Some(OpenFile {
+        kind,
+        pos: 0,
+        refs: 1,
+        append: false,
+        nonblock: ty & SOCK_NONBLOCK != 0,
+        accmode: 2,
+    });
     fdt(t).fds[fi] = Some(oi as u8);
     cloexec_set(t, fi, ty & SOCK_CLOEXEC != 0);
     fi as u64
@@ -17559,9 +17614,13 @@ fn sock_name(fd: u64, sa: u64, alen: u64, peer: bool) -> u64 {
             let socks = unsafe { &*core::ptr::addr_of!(UDPSOCKS) };
             let Some(k) = socks[*i].as_ref() else { return EBADF };
             if peer {
-                return ENOTCONN; // our datagram socks never connect()
+                match k.peer {
+                    Some((pp, pip)) => Some((pp, pip)),
+                    None => return ENOTCONN,
+                }
+            } else {
+                Some((k.port, [0; 4]))
             }
-            Some((k.port, [0; 4]))
         }
         _ => return ENOTSOCK,
     };
@@ -17601,47 +17660,83 @@ pub fn fd_sendto(
     sa: u64,
     alen: u64,
 ) -> u64 {
-    const EAFNOSUPPORT: u64 = (-97i64) as u64;
-    const EHOSTUNREACH: u64 = (-113i64) as u64;
-    const EADDRNOTAVAIL: u64 = (-99i64) as u64;
     const EMSGSIZE: u64 = (-90i64) as u64;
     let Some(t) = cur_mut() else { return EBADF };
     // sendto on a stream socket is a plain send; a non-null
     // destination on a connected socket is EISCONN like Linux.
-    match ofd(t, fd).map(|o| &o.kind) {
+    let Some(si) = (match ofd(t, fd).map(|o| &o.kind) {
         Some(FdKind::Tcp(i)) => {
             const EISCONN: u64 = (-106i64) as u64;
             return if sa == 0 { tcp_send(*i, buf, len) } else { EISCONN };
         }
-        Some(FdKind::Udp(_)) => {}
-        _ => return EBADF,
-    }
-    let Some(si) = (match ofd(t, fd).map(|o| &o.kind) {
         Some(FdKind::Udp(i)) => Some(*i),
         _ => None,
     }) else {
         return EBADF;
     };
-    if sa == 0 || alen < 8 {
-        return EINVAL;
-    }
-    if !range_ok(sa, 8) {
-        return EFAULT;
-    }
-    if len == 0 {
-        return EINVAL;
-    }
-    // One ethernet frame: 14 + 20 + 8 + payload must fit a 1600B
-    // staging buffer in udp_tx.
     if len > 1400 {
         return EMSGSIZE;
     }
     if !range_ok(buf, len) {
         return EFAULT;
     }
-    let Some((dport, dip)) = parse_sockaddr(t.pml4, sa) else {
-        return EAFNOSUPPORT;
+    // Stage the payload kernel-side — the user buffer is read once.
+    let mut pay = [0u8; 1400];
+    // SAFETY: buf validated readable for len bytes under the
+    // current page table.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            buf as *const u8,
+            pay.as_mut_ptr(),
+            len as usize,
+        );
+    }
+    udp_send_core(t, si, &pay[..len as usize], sa, alen)
+}
+
+/// Shared UDP send: sockaddr-or-peer destination resolution,
+/// ephemeral bind, ARP route, wire transmit. `pay` is the
+/// already-staged datagram; callers hold the pointer gates.
+fn udp_send_core(t: &mut Task, si: usize, pay: &[u8], sa: u64, alen: u64) -> u64 {
+    const EAFNOSUPPORT: u64 = (-97i64) as u64;
+    const EHOSTUNREACH: u64 = (-113i64) as u64;
+    const EADDRNOTAVAIL: u64 = (-99i64) as u64;
+    const EMSGSIZE: u64 = (-90i64) as u64;
+    // Destination: the sockaddr argument, or the connect()ed peer
+    // for plain send/write. sendto(addr) on a connected socket is
+    // EISCONN like Linux; send() with no peer is EDESTADDRREQ.
+    const EISCONN_: u64 = (-106i64) as u64;
+    const EDESTADDRREQ: u64 = (-89i64) as u64;
+    let peer = {
+        let socks = unsafe { &*core::ptr::addr_of!(UDPSOCKS) };
+        socks.get(si).and_then(|s| s.as_ref()).and_then(|k| k.peer)
     };
+    let (dport, dip) = if sa == 0 {
+        let Some(p) = peer else { return EDESTADDRREQ };
+        p
+    } else {
+        if peer.is_some() {
+            return EISCONN_;
+        }
+        if alen < 8 {
+            return EINVAL;
+        }
+        if !range_ok(sa, 8) {
+            return EFAULT;
+        }
+        let Some(pa) = parse_sockaddr(t.pml4, sa) else {
+            return EAFNOSUPPORT;
+        };
+        pa
+    };
+    if pay.is_empty() {
+        return EINVAL;
+    }
+    // One ethernet frame: 14 + 20 + 8 + payload must fit a 1600B
+    // staging buffer in udp_tx.
+    if pay.len() > 1400 {
+        return EMSGSIZE;
+    }
     if !crate::e1000::net_up() {
         return EHOSTUNREACH;
     }
@@ -17657,17 +17752,6 @@ pub fn fd_sendto(
         }
         k.port
     };
-    // Stage the payload kernel-side — the user buffer is read once.
-    let mut pay = [0u8; 1400];
-    // SAFETY: buf validated readable for len bytes under the
-    // current page table.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            buf as *const u8,
-            pay.as_mut_ptr(),
-            len as usize,
-        );
-    }
     // Resolve the link-layer target: broadcast -> ff:ff; on-subnet
     // -> ARP the host; off-subnet or unresolved -> the gateway.
     let our = crate::e1000::our_ip();
@@ -17684,10 +17768,145 @@ pub fn fd_sendto(
         r.or_else(crate::e1000::gw_mac)
     };
     let Some(mac) = mac else { return EHOSTUNREACH };
-    if !crate::e1000::udp_tx(mac, dip, sport, dport, &pay[..len as usize]) {
+    if !crate::e1000::udp_tx(mac, dip, sport, dport, pay) {
         return (-5i64) as u64; // EIO — tx ring rejected
     }
-    len
+    pay.len() as u64
+}
+
+/// sendmsg(fd, msg, flags): gather the iovec into one datagram (or
+/// stream the segments for TCP) — msg_name doubles as sendto's
+/// sockaddr; ancillary control data is validated readable and
+/// dropped, matching Linux's ignore-unknown-CMSG tolerance enough
+/// for the resolver's plain use.
+pub fn fd_sendmsg(fd: u64, msg: u64, flags: u64) -> u64 {
+    let Some(t) = cur_mut() else { return EBADF };
+    if !range_ok(msg, 48) {
+        return EFAULT;
+    }
+    let name = read_task_u(t.pml4, msg, 8).unwrap_or(0);
+    let namelen = read_task_u(t.pml4, msg + 8, 4).unwrap_or(0);
+    let iov = read_task_u(t.pml4, msg + 16, 8).unwrap_or(0);
+    let iovlen = read_task_u(t.pml4, msg + 24, 8).unwrap_or(0);
+    let control = read_task_u(t.pml4, msg + 32, 8).unwrap_or(0);
+    let controllen = read_task_u(t.pml4, msg + 40, 8).unwrap_or(0);
+    if iovlen == 0 || iovlen > 1024 {
+        return EINVAL; // UIO_MAXIOV
+    }
+    if controllen > 0 && !range_ok(control, controllen) {
+        return EFAULT;
+    }
+    match ofd(t, fd).map(|o| &o.kind) {
+        Some(FdKind::Tcp(_)) => {
+            // Byte stream: feed each segment, stop on the first
+            // error like Linux's per-iter sendmsg loop.
+            let mut sent = 0u64;
+            for e in 0..iovlen {
+                let Some(base) = read_task_u(t.pml4, iov + e * 16, 8)
+                else {
+                    return EFAULT;
+                };
+                let Some(l) = read_task_u(t.pml4, iov + e * 16 + 8, 8)
+                else {
+                    return EFAULT;
+                };
+                if l == 0 {
+                    continue;
+                }
+                let r = fd_sendto(fd, base, l, flags, 0, 0);
+                if (r as i64) < 0 {
+                    return if sent > 0 { sent } else { r };
+                }
+                sent += r;
+            }
+            sent
+        }
+        Some(FdKind::Udp(i)) => {
+            let mut pay = [0u8; 1400];
+            let mut n = 0usize;
+            for e in 0..iovlen {
+                let Some(base) = read_task_u(t.pml4, iov + e * 16, 8)
+                else {
+                    return EFAULT;
+                };
+                let Some(l) = read_task_u(t.pml4, iov + e * 16 + 8, 8)
+                else {
+                    return EFAULT;
+                };
+                if !range_ok(base, l) {
+                    return EFAULT;
+                }
+                if n + l as usize > pay.len() {
+                    return (-90i64) as u64; // EMSGSIZE
+                }
+                // SAFETY: base validated readable for l bytes under
+                // the current page table; n+l fits the staging buf.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        base as *const u8,
+                        pay.as_mut_ptr().add(n),
+                        l as usize,
+                    );
+                }
+                n += l as usize;
+            }
+            udp_send_core(t, *i, &pay[..n], name, namelen)
+        }
+        _ => EBADF,
+    }
+}
+
+/// sendmmsg(fd, msgvec, vlen, flags): the batched form glibc's
+/// resolver uses for its A+AAAA pair — per-entry sendmsg with the
+/// byte count written back into each mmsghdr.msg_len, stopping at
+/// the first error once at least one datagram went out.
+pub fn fd_sendmmsg(fd: u64, msgvec: u64, vlen: u64, flags: u64) -> u64 {
+    if vlen == 0 {
+        return 0;
+    }
+    if vlen > 1024 {
+        return EINVAL; // UIO_MAXIOV
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    if !range_ok(msgvec, vlen * 64) {
+        return EFAULT;
+    }
+    let mut sent = 0u64;
+    for i in 0..vlen {
+        let r = fd_sendmsg(fd, msgvec + i * 64, flags);
+        if (r as i64) < 0 {
+            return if sent > 0 { sent } else { r };
+        }
+        write_task_u64(t.pml4, msgvec + i * 64 + 56, r);
+        sent += 1;
+    }
+    sent
+}
+
+/// setsockopt(fd, level, optname, optval, optlen): option surface
+/// the resolver and busybox probe (IP_RECVERR, SO_* flags) — the
+/// socket layer honors none of them yet, so accept-and-drop like a
+/// kernel that took the set but has no feature wired to it.
+/// ENOTSOCK on non-sockets, EFAULT on an unreadable optval, the
+/// Linux shapes kept.
+pub fn fd_setsockopt(
+    fd: u64,
+    _level: u64,
+    _optname: u64,
+    optval: u64,
+    optlen: u64,
+) -> u64 {
+    const ENOTSOCK: u64 = (-88i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF };
+    match ofd(t, fd).map(|o| &o.kind) {
+        Some(FdKind::Udp(_)) | Some(FdKind::Tcp(_)) => {}
+        Some(_) => return ENOTSOCK,
+        None => return EBADF,
+    }
+    if optlen > 0 && !range_ok(optval, optlen) {
+        return EFAULT;
+    }
+    0
 }
 
 /// recvfrom(fd, buf, len, flags, sockaddr_out, alen): the next queued
@@ -17699,14 +17918,17 @@ pub fn fd_recvfrom(
     fd: u64,
     buf: u64,
     len: u64,
-    _flags: u64,
+    flags: u64,
     sa: u64,
     _alen: u64,
 ) -> u64 {
+    const MSG_DONTWAIT: u64 = 0x40;
     let Some(t) = cur_mut() else { return EBADF };
-    match ofd(t, fd).map(|o| &o.kind) {
-        Some(FdKind::Udp(i)) => udp_recv_or_block(ctx, *i, buf, len, sa),
-        Some(FdKind::Tcp(i)) => tcp_recv_or_block(ctx, *i, buf, len, sa),
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let dw = o.nonblock || flags & MSG_DONTWAIT != 0;
+    match &o.kind {
+        FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, sa, dw),
+        FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, sa),
         _ => EBADF,
     }
 }
@@ -17768,6 +17990,10 @@ struct TcpSock {
     parent: usize,
     /// All fds gone — teardown completes asynchronously.
     orphan: bool,
+    /// Tick of the last SYN transmit — retransmit backoff clock.
+    syn_at: u64,
+    /// SYN retries sent so far (Linux initial-RTO doubling).
+    syn_tries: u8,
     /// RST seen — reads fail ECONNRESET, writes EPIPE.
     dead: bool,
     rxb: [u8; TCP_RX_CAP],
@@ -17873,6 +18099,7 @@ fn tcp_mint_fd(t: &mut Task, ci: usize, ce: bool) -> Result<u64, u64> {
         pos: 0,
         refs: 1,
         append: false,
+        nonblock: false,
         accmode: 2,
     });
     fdt(t).fds[fi] = Some(oi as u8);
@@ -18179,6 +18406,8 @@ pub fn tcp_rx(
             blen: 0,
             parent: li,
             orphan: false,
+            syn_at: 0,
+            syn_tries: 0,
             dead: false,
             rxb: [0; TCP_RX_CAP],
             rxl: 0,
@@ -18207,9 +18436,38 @@ pub fn fd_connect(ctx: &mut UCtx, fd: u64, sa: u64, len: u64) -> u64 {
     const EHOSTUNREACH: u64 = (-113i64) as u64;
     const EISCONN: u64 = (-106i64) as u64;
     const EINTR_: u64 = (-4i64) as u64;
+    const EDESTADDRREQ: u64 = (-89i64) as u64;
     let Some(t) = cur_mut() else { return EBADF };
     if len < 8 || !range_ok(sa, 8) {
         return EFAULT;
+    }
+    // UDP connect is peer-pinning, not a handshake — it completes
+    // instantly, binds a local port like first-send does, and a
+    // re-connect just re-pins (Linux semantics; AF_UNSPEC
+    // disconnect won't parse_sockaddr, giving EAFNOSUPPORT).
+    if let Some(FdKind::Udp(ui)) = ofd(t, fd).map(|o| &o.kind) {
+        let Some((dport, dip)) = parse_sockaddr(t.pml4, sa) else {
+            return EAFNOSUPPORT;
+        };
+        if dport == 0 || dip == [0; 4] {
+            return EDESTADDRREQ;
+        }
+        if !crate::e1000::net_up() {
+            return EHOSTUNREACH;
+        }
+        let socks = unsafe { &mut *core::ptr::addr_of_mut!(UDPSOCKS) };
+        let Some(k) = socks[*ui].as_mut() else { return EBADF };
+        if k.port == 0 {
+            let Some(e) = ephemeral_port() else {
+                return EADDRNOTAVAIL;
+            };
+            k.port = e;
+        }
+        // Loopback peers canonicalize to our own address — same
+        // convention as the TCP path's injected replies.
+        let ip = if dip[0] == 127 { crate::e1000::our_ip() } else { dip };
+        k.peer = Some((dport, ip));
+        return 0;
     }
     let Some(si) = (match ofd(t, fd).map(|o| &o.kind) {
         Some(FdKind::Tcp(i)) => Some(*i),
@@ -18247,6 +18505,9 @@ pub fn fd_connect(ctx: &mut UCtx, fd: u64, sa: u64, len: u64) -> u64 {
         k.peer_mac = mac;
         k.snd_nxt = tcp_isn(peer, k.port, dport).wrapping_add(1);
         k.state = TcpState::SynSent;
+        k.syn_at = crate::apic::TICKS
+            .load(core::sync::atomic::Ordering::Relaxed);
+        k.syn_tries = 0;
         let isn = k.snd_nxt.wrapping_sub(1);
         let _ = crate::e1000::tcp_tx(
             mac, dip, k.port, dport, isn, 0, crate::net::TCP_SYN, &[],
@@ -18269,6 +18530,44 @@ pub fn fd_connect(ctx: &mut UCtx, fd: u64, sa: u64, len: u64) -> u64 {
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
+}
+
+/// Per-tick SYN retransmit: a SynSent socket re-fires on Linux's
+/// initial-RTO schedule — 1 s, then doubling (syn_tries shifts the
+/// base), capped at 5 retries. slirp and real networks do drop SYNs
+/// and SYN-ACKs; a single lost frame must not sink connect(). The
+/// task's own TCP_CONN_TICKS deadline still bounds the whole open.
+fn tcp_retx() {
+    const RTO0: u64 = 100; // 1 s at 100 Hz
+    const MAX_TRIES: u8 = 5;
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    for s in tcp_socks().iter_mut() {
+        let Some(k) = s.as_ref() else { continue };
+        if k.state != TcpState::SynSent
+            || k.dead
+            || k.syn_tries >= MAX_TRIES
+            || now.wrapping_sub(k.syn_at) < RTO0 << k.syn_tries
+        {
+            continue;
+        }
+        let (pm, pi, sp, dp, isn) = (
+            k.peer_mac,
+            k.peer_ip,
+            k.port,
+            k.peer_port,
+            k.snd_nxt.wrapping_sub(1),
+        );
+        // tcp_tx may complete (or RST) the handshake on loopback —
+        // re-borrow rather than hold `k` across the call.
+        let _ = crate::e1000::tcp_tx(pm, pi, sp, dp, isn, 0,
+            crate::net::TCP_SYN, &[]);
+        if let Some(k) = s.as_mut() {
+            if k.state == TcpState::SynSent {
+                k.syn_at = now;
+                k.syn_tries += 1;
+            }
+        }
+    }
 }
 
 /// listen(fd, backlog): a bound Init socket becomes passive.
@@ -19487,6 +19786,7 @@ pub fn tick(img: &mut UCtx) -> *const UCtx {
     timerfd_expire(); // armed timerfds fire + wake their readers
     nt_wait_expire(); // NT thread-object waits: dead/timeout wakes
     crate::e1000::rx_drain(); // feed socket queues from the live ring
+    tcp_retx(); // SYN retransmit on the initial-RTO schedule
     stdin_pump(); // feed the tty input queue from the scancode ring
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     // Bill the tick: a kernel-CS frame means the task was inside a
