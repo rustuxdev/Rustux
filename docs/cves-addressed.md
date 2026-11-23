@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**137 unique CVEs recorded.**
+**140 unique CVEs recorded.**
 
 ## klib ports
 
@@ -173,6 +173,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-72020 | tcp/ipv4 (mini) | exact seq+ack required on every transition (no blind RST/state jumps — 63913 class out); option walk bounded, wscale never shifted (31495); seq state fully initialized (72020); do… |
 | CVE-2026-72110 | process lifecycle: clone(56) fork-subset + SETTID writes, rt_sigprocmask(14) real sigmask… | RUN-TIME BUG CAUGHT BY REVIEW: translate/translate_r walked ANY va through the task pml4 -- which shares kernel upper-half slots by reference -- so a user-controlled VA reached ke… |
 | CVE-2026-72183 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
+| CVE-2026-74673 | /dev/input/event0 evdev + DOOM keyboard input: PS/2 decoder now emits Linux keycode press… | audit run-118 quick scoped + cve.now MCP live (entities.search on evdev/input classes — analogs above): verified ev_push bounded to EVR_SIZE with drop-on-full; ev_pop memmove stay… |
+| CVE-2026-74683 | /dev/input/event0 evdev + DOOM keyboard input: PS/2 decoder now emits Linux keycode press… | audit run-118 quick scoped + cve.now MCP live (entities.search on evdev/input classes — analogs above): verified ev_push bounded to EVR_SIZE with drop-on-full; ev_pop memmove stay… |
 | CVE-2026-80560 | busybox real-binary rootfs rung: signal-restorer sigframe (SIGTRAMP user-RX page + [resto… | RUN-TIME BUG CAUGHT BY REAL BINARY: the old [signo][UCtx] frame made a normal-returning C handler ret into signo=17 (SIGCHLD) -> rip=0x11 crash in every busybox pipeline child — g… |
 | CVE-2026-80560 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
 | CVE-2026-80590 | `net` (IPv4/ICMP) | **design-bound** — no reassembly queue at all; `parse_ipv4` drops MF/offset fragments. Reassembly = its own future audit. Only consumer-side ICMP hits (Smack DOI) — n/a |
@@ -186,6 +188,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-90138 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
 | CVE-2026-98059 | real Debian dynamic userspace: dash 0.5.12 under bin/dash (dynamic PT_INTERP consumer) dr… | REAL-BINARY-CAUGHT ABI BUG: glibc wait wrappers zero-extend mov edi,-1 to 0xffffffff in rdi; dispatching it raw made wait4(-1) search pid 4294967295 -> ECHILD -> dash exited 255 o… |
 | CVE-2026-98163 | CLONE_SIGHAND+CLONE_THREAD: SIGTABS shared-disposition ledger (users refcount, sighand_st… | cgroup dying-task iteration UAF class — structurally absent: no cgroups, no resurrect-able task refs, slot free is synchronous under the IF-masked sweep; DEAD_THREADS flag + cur-g… |
+| CVE-2026-98205 | /dev/input/event0 evdev + DOOM keyboard input: PS/2 decoder now emits Linux keycode press… | audit run-118 quick scoped + cve.now MCP live (entities.search on evdev/input classes — analogs above): verified ev_push bounded to EVR_SIZE with drop-on-full; ev_pop memmove stay… |
 | CVE-2026-98788 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
 | CVE-2026-98839 | tty stdin: IRQ1->scancode ring->line discipline->read(0)/poll(0)/FIONREAD, WaitOn::Stdin,… | bounded queues throughout: 256B canonical edit buffer + 4KiB ready queue, drop-on-full = Linux input discard; feed runs from the timer tick (printk is irq_save-safe, kill marks pe… |
 | CVE-2026-98866 | CLONE_VM threads: shared address space via MM_REFS (pml4,users) ledger, exec_mmap-style d… | SELF-REVIEW CAUGHT two refcount-safety bugs pre-commit: mm_share silently dropped the ref when the (provably-unreachable) table was full — a shared pml4 would have freed under a l… |

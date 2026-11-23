@@ -3370,3 +3370,36 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
 - cve.now MCP + security-audit skill unavailable this session;
   scoped review done manually and recorded in the matrix row.
 - Committed locally; push held pending user test.
+
+## run-146 — /dev/input/event0 evdev + playable DOOM
+- kbd.rs: parallel evdev tap — poll() pushes (Linux keycode, press/release)
+  into a bounded 64-entry ring for every decoded scancode: plain makes,
+  plain breaks (releases preserved — the tty path ignores them, evdev
+  needs them), and E0 extended codes via ev_e0() (arrows, nav, right
+  ctrl/alt, meta, KP enter/slash). Set-1 scancode == Linux keycode for
+  unextended keys.
+- /dev/input + /dev/input/event0 (major 13, rdev 0xd40) in dev_init;
+  open whitelist arm `13 => i`; read: len<24 -> EINVAL like Linux,
+  O_NONBLOCK -> EAGAIN, else WaitOn::Evdev + evdev_wake() marshals
+  24-byte struct input_event {sec,usec,type=EV_KEY,code,value}
+  records through the sleeper's own tables (stdin_wake discipline,
+  EFAULT on vanished pages); direct path caps validation to the actual
+  write span (queued*24 min len) — partial-buffer tail never probed.
+- stdin_pump calls evdev_wake() every tick and counts pending events
+  as input-change for wake_pollers; poll() reports POLLIN on queued
+  records; EVIOCGNAME returns "Rustux PS/2 keyboard"; lseek = noop.
+- doom_rustux.c: event0 O_RDONLY|O_NONBLOCK, full LKEY_* table ->
+  doomkeys (ctrl->KEY_FIRE since doomgeneric binds key_fire to the
+  abstract 0xa3, space->KEY_USE, alt->strafe, shift->run, arrows,
+  F1-F10, keypad/nav, printable ascii) into a 64-entry pending ring —
+  DG_GetKey returns one (pressed,doomKey) per call.
+- Verified under OVMF on rustux-doom.iso: ESC opens the menu, Enter
+  navigates New Game -> episode -> skill into real E1M1, arrows move/
+  turn, ctrl fires (ammo 50->46 across held presses), ESC reopens the
+  menu in-game. Tap-length caveat: a sub-tic press+release coalesces
+  like real DOOM — use hold_ms with sendkey.
+- cve.now MCP now configured: evdev classes checked (CVE-2026-74673
+  infoleak — records fully initialized; CVE-2026-74683/98205 — ioctls
+  absent/ENOTTY). security-audit skill still not installed; manual
+  scoped review recorded. One audit fix landed this rung (write-span
+  validation). Committed locally; push held pending user test.
