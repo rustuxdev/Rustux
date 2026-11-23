@@ -2724,3 +2724,29 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   diff — no futex/sched changes; watch it).
 - Next: showcase ladder — htop needs full /proc/<pid>/stat fields +
   TIOCGWINSZ + termios output; then slirp net -> wget -> apt.
+
+
+## run-129 — htop milestone: fbcon terminal emulator + extended kbd + 1MiB ustack
+
+- fbcon.rs rewritten as VT100/xterm-subset emulator: cell grid + dirty
+  repaint, CSI cursor/positioning/ED/EL/ICH/DCH, SGR colors, DEC
+  line-draw -> CP437 glyphs, alt screen (saved_alt), DSR/DA replies
+  injected via stdin_inject; scroll region clamped above boot splash.
+- kbd.rs: E0-prefixed arrows/nav + F1-F10 -> ANSI sequences queued to
+  the tty input path; Escape handled.
+- log::user_out: raw console path for user writes — no printk record
+  prefix; curses screens render clean while kernel log keeps [ts].
+- USTACK_PAGES 16 -> 256 (1MiB) after htop overflowed the 64KiB stack
+  into the signal-trampoline page (#PF, cr2 just under stack top).
+- /proc/stat btime now RTC-derived boot epoch (was 0).
+- initrd: real htop + libncursesw/libtinfo/libm/libnl + xterm
+  terminfo; htoptest forks htop, pipe-feeds q, asserts exit 0.
+- audit run-102: 6 confirmed findings fixed (alt-screen saved cursor,
+  DECSTBM clamp order, UTF-8 abort byte-drop, cursor ghost, inject
+  poller wake, ICANON semantics documented).
+- 64 tasks, frames 108410 -> 108410 zero leak, qemu exit 33.
+- Known polish: htop prints 'Can not save configuration to
+  //.config/htop/htoprc: Invalid argument' — writable HOME/mkdir
+  surface for a later rung.
+- Next: QEMU slirp end-to-end (DHCP/DNS/TCP/wget http), then dpkg/apt
+  prerequisites, then downloadable mini-ISO.
