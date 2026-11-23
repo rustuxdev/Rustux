@@ -3403,3 +3403,10 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   absent/ENOTTY). security-audit skill still not installed; manual
   scoped review recorded. One audit fix landed this rung (write-span
   validation). Committed locally; push held pending user test.
+
+## run-147 — scheduler diagnostics for the VMware stall
+- `rustux: sched: launch <exe> (pid N) rip=` at first task entry + `no runnable task` fallback; per-slot `first syscall nr=X` bitmap; `rustux: beat t= cur= pit= kbd= net=` every 500 ticks — all screen-visible
+- VMware repro attempt with `-cpu max` showed no stall (menu reached); diagnostics deployed so a VMware boot photo now names the dead stage instead of `livemenu: queued` + silence
+- audit: safe-anything CLI scoped (security-audit skill still absent); cve.now no mapped class; no findings; run-138 pty flake still open
+- `make run` PASS exit 33, 72 tasks, frames 214361 -> 214361 zero leak; rustux-demo.iso rebuilt with the instrumented kernel for the next VMware boot test
+- next: VMware boot with the diagnostic ISO -> whichever stage the markers stop at is the fix target; then BIOS loader (16-bit + E820 + VBE + bios_entry); DOS personality (v86 + DPMI + int 21h + VGA 13h) for the real DOOM.EXE; pty ofd_release EIO flake
