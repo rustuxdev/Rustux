@@ -3320,3 +3320,30 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   fails auth then #GP-crashes on retry (kernel ABI gap, tracked).
 - Suite: 72 tasks, exit 33, zero leak; ISO boot -> menu ->
   login -> bash verified; installed disk -> login -> bash.
+
+## run-143/144 — boot-media compatibility + console fault visibility
+- initrd task scan no longer prints "skipped (data file)" per
+  archive entry — hundreds of printk lines flooded the console and
+  serial for several minutes of real time on the 81MiB live payload.
+- load_initrd tries four name variants (initrd.cpio/INITRD.CPIO/
+  initrd.cpi/INITRD.CPI): a FAT ESP keeps the long name, a bare
+  ISO9660 view truncates to 8.3. Whichever filesystem firmware
+  mounts, the archive resolves.
+- ISO is now distro-structure via xorriso: El Torito BIOS default
+  entry (512B boot stub, info-table) + UEFI alt entry (esp.img),
+  isohybrid MBR (gptmbr.bin) + GPT marking /esp.img, plus
+  /EFI/BOOT/BOOTX64.EFI and /initrd.cpio as plain ISO9660 files —
+  covers El Torito-only, partition-scanning, and file-scanning
+  firmware. 175MiB (initrd carried twice, once in esp.img once as
+  ISO9660 data — required for both paths).
+- cpu.rs: user faults AND kernel EXCEPTION reports now mirror to the
+  framebuffer console (printk+drain_task), not serial-only — a
+  faulting task or kernel oops is visible on serial-less machines
+  (VMware, bare metal). IDT gates are 0x8e (IF cleared), same
+  masking discipline drain_task already documents.
+- VMware finding recorded: kernel boots fine under Workstation UEFI;
+  userspace previously stalled after `task livemenu: queued` with
+  zero console evidence (the fault line was serial-only). Console
+  mirroring is the diagnostic that splits scheduling-stall vs
+  fault-on-entry; awaiting field data.
+- Committed locally; source push held pending user ISO test.
