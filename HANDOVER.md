@@ -2688,3 +2688,20 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
 - Next: another ABI gap from the roadmap — the NT surface still lacks
   registry/env/console-input services; Linux side lacks fchmodat2/
   statx-class syscalls and settimeofday.
+
+
+## run-127 — NT filesystem/path services (RUX_PATH 0x100)
+
+- nt_pathop subs 0-10 over the shared VFS: Get/SetCurrentDirectory,
+  GetFullPathName, Create/RemoveDirectory, GetFileAttributes,
+  GetFileType, SetEndOfFile, FlushFileBuffers, GlobalMemoryStatusEx,
+  GetComputerName — 20 thunk arms (A+W), fstab cwd shared with Linux.
+- ANSI/UTF-16 path reader, DOS-path writer with Windows size
+  semantics (returns needed-size-incl-NUL when short).
+- Audit run-100: fixed UTF-16 page-straddle read (per-byte
+  translate_r) + range_ok_w on GetComputerName *size; clamps on the
+  DOS-path stack buffers.
+- winfs2.exe exit(46): cwd round-trip, mkdir EEXIST, ".."
+  canonicalisation, attrs/type/eof/flush, gms, name — 63 tasks,
+  frames 108421 -> 108421 zero leak, qemu exit 33.
+- Next: registry/env/console-input or Linux statx-class syscalls.

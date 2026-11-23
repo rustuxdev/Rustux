@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**121 unique CVEs recorded.**
+**122 unique CVEs recorded.**
 
 ## klib ports
 
@@ -86,6 +86,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-49264 | real-binary ABI: fs_base+arch_prctl, exec initial stack (argc/argv/envp/auxv), writev/rea… | argv==NULL discipline applied (49264): argc==0 gets the binary name as argv0 (stronger than upstream's empty string -- same "never argc<1" contract glibc relies on); exec argv/env… |
 | CVE-2022-49349 | writable file layer: VFile/Ram OFDs (O_CREAT/O_EXCL/O_TRUNC/O_APPEND), write/read/pread/l… | self-review catches FIXED pre-commit: write(fd,buf,0) at pos>len allocated+extended the file (now early-0 like Linux); fd_pread on an empty VFile took null.add(0) (now n==0 early… |
 | CVE-2022-50466 | PT_INTERP dynamic ELF: Elf::interp() (first-PT_INTERP-only, absolute NUL path bounded 4Ki… | RUN-TIME BUG CAUGHT BY REAL ld.so: glibc ld.so dedupes shared objects by (st_dev,st_ino) â€” sys_fstat reported ino=0 for every cpio member, so libc.so.6 aliased ld.so's own objec… |
+| CVE-2022-50531 | NT filesystem/path services round 2: RUX_PATH 0x100 multiplexed service (subs 0-10: GetCu… | audit run-100 quick scoped: 2 confirmed findings fixed in-diff â€” UTF-16 path reader loaded a u16 whose second byte could straddle a page end into the next physical frame (per-by… |
 | CVE-2022-50531 | newfstatat: 144-byte Linux struct stat over the cpio fs | the stat buffer is [0u64;18] zeroed before any field is set -- the uninit-kernel-struct copy_to_user info-leak class (50531/KMSAN family) is structurally absent; copy_user_path ge… |
 | CVE-2022-50531 | real statfs/fstatfs: frame-allocator capacity + vfile inode counts, procfs superblock dis… | struct zeroed then fixed-offset fills only; fsid/spare stay zero; ENOENT-before-write ordering matches Linux; no new class rows. audit run-76: 0 confirmed; iotest +7 green, zero l… |
 | CVE-2022-50531 | real-busybox verification: sysinfo struct fill (totalram/freeram/procs/mem_unit) + lstat/… | struct zeroed then fully written at fixed offsets â€” no kernel bytes escape; unrelated-driver entries recorded for the class, n/a by construction (sysinfo writes only known value… |
@@ -116,6 +117,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2025-38595 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger â€” files_struct analogue… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access â€” structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-retu… |
 | CVE-2025-38722 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger â€” files_struct analogue… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access â€” structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-retu… |
 | CVE-2025-38722 | exit-time fd release (exit_files ordering) + shell-pipeline proof | CONFIRMED-BY-TEST kernel bug: task fds were only released in reap(), so a dying pipe writer OFD stayed alive and blocked readers starved for EOF forever -- the shell-shaped test (… |
+| CVE-2025-39684 | NT filesystem/path services round 2: RUX_PATH 0x100 multiplexed service (subs 0-10: GetCu… | audit run-100 quick scoped: 2 confirmed findings fixed in-diff â€” UTF-16 path reader loaded a u16 whose second byte could straddle a page end into the next physical frame (per-by… |
 | CVE-2025-39756 | open-file descriptions (lseek/dup/dup2) | fds index a shared OFD table (kind/pos/refs) â€” Linux files_struct split; dup shares offset (proven M/O/T byte reads across fd3/fd4/fd9); fixed 16-slot bound kills the 39756 clas… |
 | CVE-2025-39813 | real shell + oversized-read clamp: rsh static-pie binary (prompt/parse/fork/execve/waitpi… | CONFIRMED-BY-TEST userspace-visible divergence, not a ref bug: rshtest read(out[0], buf, 8191) crossed the 4096 MAX_COPY gate and got EINVAL -> break -> close(out[0]) -> the out-p… |
 | CVE-2025-39881 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) â€” interest pins OFD index… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
