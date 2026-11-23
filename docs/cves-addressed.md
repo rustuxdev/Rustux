@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**132 unique CVEs recorded.**
+**133 unique CVEs recorded.**
 
 ## klib ports
 
@@ -77,6 +77,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2018-3665 | per-task FPU/SSE (eager fxsave/fxrstor in the context switch) | eager save+restore at every switch -- LazyFP's lazy-restore speculation class n/a by design; INIT_FX is a post-fninit capture so every task starts from a clean FPU image, exec res… |
 | CVE-2018-3665 | real-binary ABI: fs_base+arch_prctl, exec initial stack (argc/argv/envp/auxv), writev/rea… | argv==NULL discipline applied (49264): argc==0 gets the binary name as argv0 (stronger than upstream's empty string -- same "never argc<1" contract glibc relies on); exec argv/env… |
 | CVE-2018-8897 | per-task fault isolation (user exceptions kill the task) | a CPL3 exception on the task's own kstack (interrupt gate -> IF clear, no nested timer) kills the task with the bare-signo wstatus instead of halting the kernel — maps #BP/#DB->TR… |
+| CVE-2020-25284 | ATA PIO block driver + /dev/sda + live/install ISO: ata.rs polled LBA28 on the PIIX3 prim… | audit run-112 manual scoped + cve.now over HTTP JSON-RPC (entities.search — block-device-driver class checked: CVE-2020-25284-style perms not applicable to a single-user demo kern… |
 | CVE-2020-29369 | brk/mmap/munmap/mprotect: per-task VMA table + eager zeroed pages | VMA == ranges[] entry: gate, first-fit, and teardown share one truth, so a mapped page can never escape the syscall pointer gate; first-fit scans holes between entries (freed VA i… |
 | CVE-2020-29661 | unconditional SIGTTOU gate on background TIOCSPGRP: run-91 gate core factored into shared… | 29661 n/a by construction: the Linux bug is a missing lock around a refcounted tty freed mid-jobctl-op; Rustux's console is a static singleton and pgrp/sid/FG_PGID are plain integ… |
 | CVE-2021-43267 | real Debian apt-get update over slirp: aptprobe solo-initrd stages /etc/apt+/var layout +… | audit run-109 manual scoped + cve.now reached over HTTP JSON-RPC (entities.get confirmed the analogs above): verified pow2(need+16)-16 >= need for every need (exact-pow2 needs spi… |

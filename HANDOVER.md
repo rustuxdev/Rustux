@@ -3112,3 +3112,75 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   masked by stdin redirect for now), gpgv+keyring for real sig
   checks, https method, maintainer-script .debs (postinst/prerm
   via bin/sh), and a fuller coreutils/dpkg surface.
+
+## run-138 — Unix98 PTY layer (`/dev/ptmx` + `dev/pts/N`) + apt's real pty path
+
+- `/dev/ptmx` (rdev 5,2) mints a pair per open: a private master
+  node `dev/ptm/N` (rdev 128,N — the Unix98 ptm major) and a
+  `dev/pts/N` slave node (rdev 136,N); the index rides the rdev
+  minor exactly like Linux. Pairs are two pipe rings + lock flag +
+  open counts (MAX_PTYS 4).
+- Slave opens EIO while locked; unlockpt flips the flag. Ioctl
+  surface: TIOCGPTN, TIOCSPTLCK, TIOCGPTPEER (mints a second slave
+  fd — 0x5441 plain _IO, not the direction-encoded variant),
+  TIOCSCTTY, TIOCGWINSZ, termios round-trip; FIONREAD reports ring
+  depth. Reads/writes ride the pipe arms with tty-hangup EIO when
+  the peer count hits zero; the last close retires the pair — rings
+  freed, node names unlinked, index reusable.
+- `fd_is_console` narrowed so ptmx fds stop routing through the
+  system console. `ptytest` 23 checks: allocation, tty identity,
+  ptsname match, locked-slave EIO, TIOCGPTPEER, bidirectional
+  transfer, poll readiness, termios, hangup EIO both directions,
+  index reuse.
+- apt's real pty path now runs: `Dpkg::Use-Pty "true"` +
+  posix_openpt succeeds, dpkg's output pty feeds term.log, install
+  completes with zero soft errors (the TIOCSCTTY message from the
+  first run is implemented, not suppressed). The /dev/null stdin
+  redirect stays — it feeds apt's PtyFeed child EOF, orthogonal to
+  the dpkg-side pty.
+- Known open item: an intermittent suite flake (~1-in-4 runs) —
+  slave-side write returns EIO before the explicit master close,
+  i.e. the pair's mopen counted to zero early. Reproduced with the
+  checke errno instrumentation; mechanism narrowed to open-count
+  or OFD-lifecycle accounting, not the ring path. Clean runs pass
+  all 24 checks with zero leak; the affected run leaked 2 frames
+  (the two rings). Under investigation for the next rung.
+
+## run-139 — ATA PIO block driver + `/dev/sda` + bootable live/install ISO
+
+- `kernel/src/ata.rs`: polled ATA PIO on the primary channel
+  (0x1F0/0x3F6) — IDENTIFY probe, LBA28 READ/WRITE SECTORS, one
+  FLUSH CACHE per multi-sector command (the first cut flushed per
+  sector — ~7ms each, install took minutes), capacity clamped to
+  the 28-bit LBA space so a large disk can't alias. Up to 256
+  sectors per command.
+- `/dev/sda` is a real S_IFBLK node (rdev 8<<8) minted only when
+  the probe found a disk; a crafted node on major 8 without
+  hardware opens ENXIO. fd_read/fd_write do byte-range I/O at the
+  OFD position — aligned runs write straight from the user buffer
+  (one command per 256 sectors), unaligned edges read-modify-write
+  through a kernel bounce; reads clip at capacity, writes short
+  or ENOSPC. lseek works on the node (SEEK_END = capacity).
+- `demomenu` is the demo pid1: banner + `[1] live session`
+  (fork/exec /bin/sh, back to menu on exit) + `[2] install` —
+  streams `/hd.img` to /dev/sda, verifies the first sector back,
+  `reboot(RB_AUTOBOOT)` resets through 0xCF9. On the installed
+  boot /hd.img is absent so the option hides itself.
+- Build chain: initrd-live.cpio (demomenu + busybox sh/reboot/
+  poweroff + bash + libc/ld + motd) -> hd.img 24MiB FAT16
+  (kernel + live initrd; mformat auto-FAT16 — OVMF's hard-disk
+  path rejects the undersized FAT32 a `-F` forces at 24MiB) ->
+  initrd-iso.cpio (live + hd.img) -> esp-iso.img 48MiB ->
+  rustux-demo.iso via genisoimage `-efi-boot -no-emul-boot`.
+  `make run-iso` proves it headlessly: phase 1 boots the ISO,
+  monitor-sendkey presses 2 (piped stdio never reaches the guest
+  UART — the PS/2 path is the honest one anyway), installer
+  writes + verifies + reboots; phase 2 boots target.img, sendkey
+  1 lands in busybox ash — both greps PASS.
+- The ATA driver wants the i440fx IDE channel, so the ISO targets
+  `-machine pc`; q35 puts IDE drives behind AHCI.
+- Validation: make run-iso both phases PASS; written image
+  byte-identical to hd.img (first 24MiB), mtools lists
+  EFI/+initrd on target.img; make run exit 33 — but see run-138's
+  flake note (this run hit it: ptytest EIO + 2-frame leak; the
+  ata path was inert — 'ata: no disk' on q35).
