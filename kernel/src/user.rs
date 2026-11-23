@@ -8380,6 +8380,62 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             if crate::ata::eject() { 0 } else { (-5i64) as u64 } // EIO
         }
+        0x4600 | 0x4602 => {
+            // FBIOGET_VSCREENINFO / FBIOGET_FSCREENINFO — the fbdev
+            // pair every Linux framebuffer client probes first. The
+            // fd must be an fb0 node (major 29); anything else is
+            // ENOTTY like an ioctl on the wrong device class.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            if !vfile(*i).is_some_and(|v| v.rdev == 0x1d00) {
+                return ENOTTY_;
+            }
+            let Some((w, h, stride, bgr)) = crate::log::fb_geometry() else {
+                return (-6i64) as u64; // ENXIO — node outlived its fb
+            };
+            let len = if req == 0x4600 { 160 } else { 80 };
+            if !range_ok_w(arg, len) {
+                return EFAULT;
+            }
+            // SAFETY: validated user window; layouts match linux/fb.h.
+            unsafe {
+                core::ptr::write_bytes(arg as *mut u8, 0, len as usize);
+                let put = |off: u64, v: u32| {
+                    ((arg + off) as *mut u32).write_unaligned(v)
+                };
+                if req == 0x4600 {
+                    // fb_var_screeninfo — all-u32, 160 bytes.
+                    put(0, w); put(4, h); put(8, w); put(12, h);
+                    put(24, 32); // bits_per_pixel
+                    // GOP is either BGRX (memory B,G,R,X -> u32
+                    // XRGB8888) or RGBX (u32 XBGR). Report honest
+                    // channel offsets so clients pack correctly.
+                    if bgr {
+                        put(32, 16); put(36, 8);  // red @16 len 8
+                        put(44, 8);  put(48, 8);  // green @8
+                        put(56, 0);  put(60, 8);  // blue @0
+                    } else {
+                        put(32, 0);  put(36, 8);
+                        put(44, 8);  put(48, 8);
+                        put(56, 16); put(60, 8);
+                    }
+                    put(68, 24); put(72, 8);      // transp @24 len 8
+                } else {
+                    // fb_fix_screeninfo — id[16], u64@16, u32s, u16s
+                    // with natural padding: line_length @48,
+                    // mmio_start @56.
+                    let id = b"rustux-gop\0\0\0\0\0\0";
+                    core::ptr::copy_nonoverlapping(
+                        id.as_ptr(), arg as *mut u8, 16);
+                    put(24, crate::log::fb_byte_len() as u32); // smem_len
+                    // type = FB_TYPE_PACKED_PIXELS(0), visual =
+                    // FB_VISUAL_TRUECOLOR(2) — both already zero/…
+                    put(36, 2);
+                    put(48, stride * 4); // line_length
+                    ((arg + 72) as *mut u16).write_unaligned(0);
+                }
+            }
+            0
+        }
         TIOCGWINSZ => {
             if !tty {
                 return ENOTTY_;
@@ -12639,6 +12695,19 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                 0x500 | 0x501 => tty_input_read(t, ctx, buf, len),
                 // /dev/sr0 does no sector I/O — ioctls only.
                 0xb00 => (-6i64) as u64, // ENXIO
+                // /dev/fb0 — read the framebuffer back at the OFD
+                // position (Linux fbdev read semantics).
+                0x1d00 => {
+                    let n = (len as usize).min(crate::log::fb_byte_len().saturating_sub(o.pos));
+                    if n > 0 && !range_ok_w(buf, n as u64) {
+                        return EFAULT;
+                    }
+                    // SAFETY: validated user window under cur cr3.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, n) };
+                    let w = crate::log::fb_read(o.pos, dst);
+                    o.pos += w;
+                    w as u64
+                }
                 // Unreachable while open() whitelists rdevs — belt
                 // and braces against a future arm forgetting this.
                 _ => EINVAL,
@@ -12864,6 +12933,14 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             0x107 => ENOSPC_,
             // /dev/sr0 does no sector I/O — ioctls only.
             0xb00 => (-6i64) as u64, // ENXIO
+            // /dev/fb0 — pixel blit at the OFD position, clamped to
+            // the mapped framebuffer like Linux fbdev's mem window.
+            0x1d00 => {
+                let src = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+                let w = crate::log::fb_write(o.pos, src);
+                o.pos += w;
+                w as u64
+            }
             // Everything else sinks the bytes: null/zero discard,
             // random/urandom fold them into the pool (Linux's
             // write-to-urandom is accepted and never fails),
@@ -13833,6 +13910,7 @@ pub fn dev_init() {
         (b"dev/tty", 0x500, 0o666),
         (b"dev/console", 0x501, 0o600),
         (b"dev/ptmx", 0x502, 0o666),
+        (b"dev/fb0", 0x1d00, 0o660),
     ] {
         let r = vfile_create(name);
         if (r as i64) < 0 {
@@ -14921,6 +14999,11 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                             }
                             i
                         }
+                        // /dev/fb0 — the GOP linear framebuffer, Linux
+                        // fb major 29. ENXIO on serial-only boots,
+                        // same as a driverless node.
+                        29 if crate::log::fb_geometry().is_some() => i,
+                        29 => return ENXIO,
                         _ => return ENODEV,
                     }
                 }
@@ -15806,8 +15889,12 @@ pub fn fd_lseek(fd: u64, off: i64, whence: u64) -> u64 {
     // device capacity.
     if let FdKind::Dev(i) = &o.kind {
         match vfile(*i) {
-            Some(v) if v.rdev >> 8 == 8 => {
-                let cap = crate::ata::capacity() as i64;
+            Some(v) if v.rdev >> 8 == 8 || v.rdev >> 8 == 29 => {
+                let cap = if v.rdev >> 8 == 29 {
+                    crate::log::fb_byte_len() as i64
+                } else {
+                    crate::ata::capacity() as i64
+                };
                 let base = match whence {
                     0 => 0i64,
                     1 => o.pos as i64,

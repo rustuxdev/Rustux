@@ -15,3 +15,6 @@ ports/lib-hash/libhash.so
 kernel/user/*.o
 kernel/user/*.elf
 initrd.cpio
+kernel/user/doom.wad
+initrd-doom.cpio
+esp-doom.img

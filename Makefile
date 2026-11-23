@@ -572,6 +572,42 @@ run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 		|| { echo "installed boot: FAIL"; tail -20 isoph.log; kill $$qpid; exit 1; }; \
 	echo quit | socat - UNIX-CONNECT:isomon.sock > /dev/null 2>&1 || kill $$qpid
 
+# DOOM proof-of-concept: doomgeneric (the GPL'd original id source)
+# built static-pie against the new /dev/fb0 fbdev device, running the
+# game data from a user-supplied DOOM.WAD (not committed — drop it at
+# kernel/user/doom.wad). Solo-task initrd: doom spawns, the attract
+# demo plays on the GOP framebuffer. Input is stubbed — attract mode
+# needs none.
+DOOM_SRC  := $(wildcard third_party/doomgeneric/*.c)
+DOOM_INITRD := initrd-doom.cpio
+ESP_DOOM  := esp-doom.img
+
+kernel/user/doom.elf: kernel/user/doom_rustux.c $(DOOM_SRC)
+	gcc -static-pie -O2 -DNORMALUNIX -DLINUX \
+		-Ithird_party/doomgeneric -o $@ $^ -lm
+
+$(DOOM_INITRD): kernel/user/doom.elf kernel/user/doom.wad tools/mkinitrd.py
+	python3 tools/mkinitrd.py kernel/user/doom.elf doom \
+		kernel/user/doom.wad doom.wad > $@
+
+$(ESP_DOOM): $(KERNEL) $(DOOM_INITRD)
+	dd if=/dev/zero of=$@ bs=1M count=64
+	mformat -i $@ ::
+	mmd -i $@ ::/EFI
+	mmd -i $@ ::/EFI/BOOT
+	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(DOOM_INITRD) ::/initrd.cpio
+
+run-doom: $(ESP_DOOM)
+	$(QEMU) \
+		-machine q35 \
+		-m 1G \
+		-cpu qemu64,+rdrand \
+		-bios $(OVMF) \
+		-drive file=$(ESP_DOOM),format=raw,if=ide \
+		-snapshot \
+		-serial stdio
+
 clean:
 	cargo clean
 	rm -rf $(ESP) $(ESP_IMG)

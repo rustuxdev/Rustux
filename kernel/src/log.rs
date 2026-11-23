@@ -183,6 +183,45 @@ pub fn user_out(s: &str) {
     }
 }
 
+/// /dev/fb0 backend — (width, height, stride_px, bgr) or None when the
+/// console is serial-only.
+pub fn fb_geometry() -> Option<(u32, u32, u32, bool)> {
+    let con = unsafe { *core::ptr::addr_of!(PANIC_CON) };
+    if con.is_null() {
+        return None;
+    }
+    unsafe { (*con).fb.as_ref().map(|f| f.fb_info()) }
+}
+
+/// Mapped framebuffer byte length — /dev/fb0's capacity for lseek/write.
+pub fn fb_byte_len() -> usize {
+    let con = unsafe { *core::ptr::addr_of!(PANIC_CON) };
+    if con.is_null() {
+        return 0;
+    }
+    unsafe { (*con).fb.as_ref().map_or(0, |f| f.fb_byte_len()) }
+}
+
+/// Copy user bytes into the framebuffer at `off`; bytes written.
+/// Same sole-drainer argument as user_out: syscall entry masks IF, so
+/// the LAPIC tick can't interleave a text render with a pixel blit.
+pub fn fb_write(off: usize, data: &[u8]) -> usize {
+    let con = unsafe { *core::ptr::addr_of!(PANIC_CON) };
+    if con.is_null() {
+        return 0;
+    }
+    unsafe { (*con).fb.as_mut().map_or(0, |f| f.fb_write_at(off, data)) }
+}
+
+/// Read framebuffer bytes back — Linux fbdev permits reads.
+pub fn fb_read(off: usize, dst: &mut [u8]) -> usize {
+    let con = unsafe { *core::ptr::addr_of!(PANIC_CON) };
+    if con.is_null() {
+        return 0;
+    }
+    unsafe { (*con).fb.as_ref().map_or(0, |f| f.fb_read_at(off, dst)) }
+}
+
 /// Drain pending records from task/syscall context — needed now that
 /// the scheduler keeps main parked inside sched_launch for the whole
 /// task phase. Safe there: syscall entry masks IF (the LAPIC tick

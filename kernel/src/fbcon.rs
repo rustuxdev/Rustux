@@ -180,6 +180,35 @@ impl FbConsole {
         Some(con)
     }
 
+    /// fbdev geometry: (width, height, stride in pixels, bgr lane order).
+    pub fn fb_info(&self) -> (u32, u32, u32, bool) {
+        (self.width as u32, self.height as u32, self.stride as u32, self.bgr)
+    }
+    /// Mapped framebuffer size in bytes — the /dev/fb0 capacity.
+    pub fn fb_byte_len(&self) -> usize {
+        self.size.min(self.stride * 4 * self.height)
+    }
+    /// /dev/fb0 write: copy into framebuffer memory at byte offset.
+    pub fn fb_write_at(&mut self, off: usize, data: &[u8]) -> usize {
+        let n = data.len().min(self.fb_byte_len().saturating_sub(off));
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: off..off+n is inside `size` mapped bytes per fb_byte_len.
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(off), n) };
+        n
+    }
+    /// /dev/fb0 read: copy framebuffer bytes out at byte offset.
+    pub fn fb_read_at(&self, off: usize, dst: &mut [u8]) -> usize {
+        let n = dst.len().min(self.fb_byte_len().saturating_sub(off));
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: same bounds as fb_write_at.
+        unsafe { core::ptr::copy_nonoverlapping(self.base.add(off), dst.as_mut_ptr(), n) };
+        n
+    }
+
     #[inline]
     fn px(&mut self, x: usize, y: usize, px: u32) {
         let off = y * self.stride * 4 + x * 4;

@@ -39,8 +39,8 @@ mod user;
 /// printk-style console fan-out: every write goes to COM1 and, when the GOP
 /// framebuffer is available, to the emulated display as text.
 struct Console {
-    uart: uart::Uart16550,
-    fb: Option<fbcon::FbConsole>,
+    pub(crate) uart: uart::Uart16550,
+    pub(crate) fb: Option<fbcon::FbConsole>,
 }
 
 impl core::fmt::Write for Console {
