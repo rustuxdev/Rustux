@@ -3070,3 +3070,45 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   task). Env note: push still needs creds on this VM.
 - Next: apt-get install/download path (gpgv proper + keyring for
   real signature checks, https method, more coreutils surface).
+
+## run-137 — real Debian `apt-get install hello-traditional` end-to-end
+
+- The same solo `aptprobe` initrd now continues past `update`:
+  `apt-get install -y hello-traditional` downloads the real
+  56.8 kB .deb, real `dpkg` unpacks + configures it ("Unpacking
+  hello-traditional (2.10-6) ...", "Setting up ..."), and the
+  freshly installed `/usr/bin/hello` execs and prints
+  "Hello, world!". aptprobe: 0 failures, qemu exit 33.
+- Three gaps surfaced and closed, in order:
+  - apt's input-feeder child (forked apt-get, never execs) parked
+    on `WaitOn::Stdin` forever — `Dpkg::Use-Pty "false"` alone does
+    not suppress it. Fix is real-world headless-install semantics:
+    the probe dup2s `/dev/null` onto stdin for spawned commands, so
+    the feeder and any conffile read see immediate EOF. No kernel
+    change needed — a scripted apt with tty stdin would block on
+    Linux too.
+  - dpkg's startup PATH check wants rm, tar, diff, dpkg-deb,
+    ldconfig, start-stop-daemon, dpkg-split (and dpkg-query for
+    later stages). Probe children now execve with
+    PATH=/sbin:/usr/sbin:/bin:/usr/bin and the apt initrd mirrors
+    the main initrd's proven toolchain: real dpkg-deb/dpkg-split/
+    dpkg-query/tar/ldconfig, busybox as rm/diff/ssd, plus libacl
+    and libz for tar/dpkg-deb.
+  - wait4 lost-wakeup: same check-then-arm window as the run-136
+    batch — a child exiting between the relevance scan and the
+    Blocked arming ran the wake loop with nobody home. The scan is
+    now `wait4_collect`, called on entry and again after arming;
+    the recheck either collects (disarm + return) or observes the
+    delivered wake (Runnable, pid in rax).
+- Frame retention on the solo probe (~8.4k frames at shutdown) is
+  the ramfs-resident apt state (lists + .deb + installed files) —
+  live fs objects, not a task leak; `make run`/`run-net` stay
+  zero-leak.
+- Validation: make run exit 33 99747->99747; make run-net exit 33
+  99750->99750 real DNS/TCP/HTTP/wget; make run-apt exit 33,
+  aptprobe 0 failures; clippy 57 warnings before and after the
+  diff (none on touched lines).
+- Next: PTY layer (apt's PtyFeed/term.log still wants /dev/ptmx —
+  masked by stdin redirect for now), gpgv+keyring for real sig
+  checks, https method, maintainer-script .debs (postinst/prerm
+  via bin/sh), and a fuller coreutils/dpkg surface.

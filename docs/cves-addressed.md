@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**131 unique CVEs recorded.**
+**132 unique CVEs recorded.**
 
 ## klib ports
 
@@ -63,6 +63,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2016-10229 | udp/dhcp (ipv4) | csum field zeroed before csum4 (CVE-2025-38432 fix shape); no MSG_PEEK/socket layer — 2016-10229 n/a; malformed csums dropped-and-reposted not error-looped (2015-5364/66 class abs… |
 | CVE-2016-5195 | fork/wait4/getpid + full-ctx syscall stub | eager deep copy of user space — no COW, so the 5195 COW-breakage race class is structurally absent; child ctx = parent syscall UCtx with rax=0, parent gets pid (user-only regs, no… |
 | CVE-2016-6753 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
+| CVE-2016-8655 | real Debian apt-get install end-to-end: aptprobe run() children now execve with PATH envp… | audit run-110 manual scoped + cve.now over HTTP JSON-RPC (entities.search confirmed the lost-wakeup class analogs): verified wait4_collect preserves Linux ordering (EINVAL on bad… |
 | CVE-2016-8655 | real Debian apt-get update over slirp: aptprobe solo-initrd stages /etc/apt+/var layout +… | audit run-109 manual scoped + cve.now reached over HTTP JSON-RPC (entities.get confirmed the analogs above): verified pow2(need+16)-16 >= need for every need (exact-pow2 needs spi… |
 | CVE-2017-1000255 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
 | CVE-2017-1000364 | NT process objects + CreateProcessA: NT_PROCS ledger (tgid/refs/state/exit), NTH_PROCESS… | audit run-98 quick scoped: 2 confirmed findings fixed in-diff — sys_brk grow-rollback missing flush_tlb (the 10th live-mm unmap site, now flushes at user.rs:6722) and NtWaitProc r… |
@@ -168,6 +169,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-80560 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
 | CVE-2026-80590 | `net` (IPv4/ICMP) | **design-bound** — no reassembly queue at all; `parse_ipv4` drops MF/offset fragments. Reassembly = its own future audit. Only consumer-side ICMP hits (Smack DOI) — n/a |
 | CVE-2026-80758 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
+| CVE-2026-80776 | real Debian apt-get install end-to-end: aptprobe run() children now execve with PATH envp… | audit run-110 manual scoped + cve.now over HTTP JSON-RPC (entities.search confirmed the lost-wakeup class analogs): verified wait4_collect preserves Linux ordering (EINVAL on bad… |
 | CVE-2026-89560 | char devices + real /dev: VFile.fmt/rdev + FdKind::Dev + mknod/mknodat + dev_init boot no… | 89560 n/a (no overlayfs/LSM; no-CAP_MKNOD = standing no-cred-model divergence). audit caught+fixed: open() admitted all major-1/5 minors and fd_read's catch-all routed unhandled r… |
 | CVE-2026-89595 | inotify: init/init1/add_watch/rm_watch + path-keyed watch table, dir vs self event routin… | 1479 n/a (Rust, single commit point); 46040 defensive pattern followed (slot rollback on anon_fd failure, single-assignment watch commit); 54119/89595 n/a by construction (single-… |
 | CVE-2026-89596 | `pci` | **n/a to mechanism** — our CF8/CFC access has no save/restore arrays; reminder: all config ops must stay IRQ-safe (they are — port I/O only) |
