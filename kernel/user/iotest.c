@@ -35,6 +35,14 @@ static void say(const char *s) {
     if (write(1, s, strlen(s)) < 0) { /* ignore */ }
 }
 
+#ifndef SYS_statx
+#define SYS_statx 332
+#endif
+static int xstatx(int dfd, const char *p, int f, unsigned m,
+                  struct statx *s) {
+    return syscall(SYS_statx, dfd, p, f, m, s);
+}
+
 static void check(int ok, const char *what) {
     char buf[80];
     int n = snprintf(buf, sizeof(buf), "iotest: %-28s %s\n",
@@ -1045,6 +1053,76 @@ int main(void) {
         unlink("sl_dir/rel"); unlink("sl_dirlink"); unlink("sl_at");
         unlink("sl_loop"); unlink("sl_loop1"); unlink("sl_loop2");
         unlink("sl_empty"); rmdir("sl_dir");
+    }
+
+    /* run-128: statx(332) — the modern extended stat ABI sharing
+       newfstatat/fstat's metadata pipeline. */
+    {
+        struct statx sx;
+        struct stat st;
+        int dfd, lf;
+
+        memset(&sx, 0, sizeof sx);
+        check(xstatx(AT_FDCWD, "motd.txt", 0, STATX_ALL, &sx) == 0 &&
+              (sx.stx_mask & STATX_BASIC_STATS) == STATX_BASIC_STATS,
+              "statx motd basic mask");
+        check(S_ISREG(sx.stx_mode) && (sx.stx_mode & 0777) == 0644,
+              "statx mode reg 0644");
+        check(stat("motd.txt", &st) == 0 &&
+              sx.stx_ino == st.st_ino && sx.stx_size == st.st_size &&
+              sx.stx_blksize == st.st_blksize,
+              "statx agrees with stat");
+
+        /* nofollow/follow split on a real link. */
+        lf = open("sx_target", O_CREAT | O_WRONLY, 0644);
+        check(lf >= 0, "statx: create target");
+        if (lf >= 0) close(lf);
+        check(symlink("sx_target", "sx_link") == 0,
+              "statx: symlink creates");
+        memset(&sx, 0, sizeof sx);
+        check(xstatx(AT_FDCWD, "sx_link", AT_SYMLINK_NOFOLLOW,
+                     STATX_ALL, &sx) == 0 &&
+              S_ISLNK(sx.stx_mode) && sx.stx_size == 9,
+              "statx NOFOLLOW -> LNK");
+        check(xstatx(AT_FDCWD, "sx_link", 0, STATX_ALL, &sx) == 0 &&
+              S_ISREG(sx.stx_mode), "statx follows -> reg");
+        check(xstatx(AT_FDCWD, "sx_link", AT_SYMLINK_FOLLOW,
+                     STATX_ALL, &sx) == 0 && S_ISREG(sx.stx_mode),
+              "statx FOLLOW -> reg");
+
+        /* AT_EMPTY_PATH on a dirfd, FDCWD, and a file fd. */
+        dfd = open("/", O_RDONLY | O_DIRECTORY);
+        check(dfd >= 0, "statx: open / dirfd");
+        check(dfd >= 0 &&
+              xstatx(dfd, "", AT_EMPTY_PATH, STATX_ALL, &sx) == 0 &&
+              S_ISDIR(sx.stx_mode), "statx EMPTY_PATH dirfd");
+        if (dfd >= 0) close(dfd);
+        check(xstatx(AT_FDCWD, "", AT_EMPTY_PATH, STATX_ALL, &sx) == 0 &&
+              S_ISDIR(sx.stx_mode), "statx EMPTY_PATH FDCWD");
+        lf = open("motd.txt", O_RDONLY);
+        check(lf >= 0 &&
+              xstatx(lf, "", AT_EMPTY_PATH, STATX_ALL, &sx) == 0 &&
+              S_ISREG(sx.stx_mode) && sx.stx_size > 0,
+              "statx EMPTY_PATH file fd");
+        if (lf >= 0) close(lf);
+
+        /* error edges: empty-without-flag, unknown flag, missing
+           path, bad buffer. */
+        errno = 0;
+        check(xstatx(AT_FDCWD, "", 0, STATX_ALL, &sx) == -1 &&
+              errno == ENOENT, "statx empty -> ENOENT");
+        errno = 0;
+        check(xstatx(AT_FDCWD, "motd.txt", 0x40, STATX_ALL, &sx) == -1 &&
+              errno == EINVAL, "statx bad flag -> EINVAL");
+        errno = 0;
+        check(xstatx(AT_FDCWD, "no_such_sx", 0, STATX_ALL, &sx) == -1 &&
+              errno == ENOENT, "statx missing -> ENOENT");
+        errno = 0;
+        check(xstatx(AT_FDCWD, "motd.txt", 0, STATX_ALL,
+                     (struct statx *)1) == -1 && errno == EFAULT,
+              "statx bad buf -> EFAULT");
+
+        unlink("sx_link"); unlink("sx_target");
     }
 
 

@@ -201,6 +201,7 @@ const NR_GETPPID: u64 = 110;
 const NR_PIPE2: u64 = 293;
 const NR_GETDENTS: u64 = 217;
 const NR_NEWFSTATAT: u64 = 262;
+const NR_STATX: u64 = 332;
 const NR_POLL: u64 = 7;
 const NR_SOCKET: u64 = 41;
 const NR_CONNECT: u64 = 42;
@@ -422,6 +423,7 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         // newfstatat(dirfd, path, buf, flags): dirfd is ABI-shape
         // only; flags carry AT_SYMLINK_NOFOLLOW (0x100).
         NR_NEWFSTATAT => sys_newfstatat(a1, a2, a3, a4),
+        NR_STATX => sys_statx(a1, a2, a3, a4, a5),
         NR_EXECVE => sys_execve(ctx, a1, a2, a3),
         NR_READV => user::fd_readv(ctx, a1, a2, a3),
         NR_WRITEV => sys_writev(ctx, a1, a2, a3),
@@ -559,6 +561,55 @@ fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
         Err(e) => return e,
     };
     user::newfstatat(&cb[..cn], statbuf, flags & 0x100 != 0)
+}
+
+/// statx(dirfd, path, flags, mask, statxbuf): the modern stat ABI —
+/// 256-byte struct statx. Shares newfstatat's getname+canon
+/// discipline and its metadata pipeline (fill_stat); AT_EMPTY_PATH
+/// resolves through statx_dirfd_stat (FDCWD -> cwd, fd -> fstat).
+/// Unknown AT_* flag bits are EINVAL like Linux; the STATX sync and
+/// automount/removedir bits are accepted but inert on a flat VFS.
+fn sys_statx(dirfd: u64, path: u64, flags: u64, mask: u64, statxbuf: u64) -> u64 {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_REMOVEDIR: u64 = 0x200;
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    const AT_NO_AUTOMOUNT: u64 = 0x800;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_STATX_SYNC: u64 = 0x6000;
+    const KNOWN: u64 = AT_SYMLINK_NOFOLLOW
+        | AT_REMOVEDIR
+        | AT_SYMLINK_FOLLOW
+        | AT_NO_AUTOMOUNT
+        | AT_EMPTY_PATH
+        | AT_STATX_SYNC;
+    if flags & !KNOWN != 0 {
+        return EINVAL;
+    }
+    let nofollow = flags & AT_SYMLINK_NOFOLLOW != 0;
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let st = if n == 0 {
+        if flags & AT_EMPTY_PATH == 0 {
+            return ENOENT;
+        }
+        match user::statx_dirfd_stat(dirfd, nofollow) {
+            Ok(s) => s,
+            Err(e) => return e,
+        }
+    } else {
+        let (cb, cn) = match user::canon_path(dirfd, &name[..n]) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        match user::fill_stat(&cb[..cn], nofollow) {
+            Ok(s) => s,
+            Err(e) => return e,
+        }
+    };
+    user::statx_emit(&st, mask, statxbuf)
 }
 
 /// inotify_add_watch(fd, path, mask): canon like open's getname.

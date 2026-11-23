@@ -8587,16 +8587,12 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
     }
 }
 
-/// fstat(fd, statbuf): same 144B stat as newfstatat, mode by OFD
-/// kind — chr for console, fifo for pipes, sock for sockets,
-/// reg/dir for archive entries.
-pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
-    const STAT_LEN: u64 = 144;
-    if !range_ok_w(statbuf, STAT_LEN) {
-        return EFAULT;
-    }
-    let Some(t) = cur_mut() else { return EBADF };
-    let Some(o) = ofd(t, fd) else { return EBADF };
+/// The fill half of fstat — shared with statx's AT_EMPTY_PATH fd
+/// arm. mode by OFD kind — chr for console, fifo for pipes, sock
+/// for sockets, reg/dir for archive entries.
+pub fn fill_fstat(fd: u64) -> Result<[u64; 18], u64> {
+    let Some(t) = cur_mut() else { return Err(EBADF) };
+    let Some(o) = ofd(t, fd) else { return Err(EBADF) };
     // ld.so dedupes opened shared objects by (st_dev, st_ino) — a
     // zero ino makes libc look "already mapped" (aliased to ld.so or
     // the main object) and version checks fail. Same idx+1 scheme
@@ -8654,13 +8650,87 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         }
         _ => {}
     }
-    // SAFETY: statbuf validated writable for 144 bytes.
+    Ok(st)
+}
+
+/// fstat(fd, statbuf): same 144B stat as newfstatat via fill_fstat.
+pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
+    const STAT_LEN: u64 = 144;
+    if !range_ok_w(statbuf, STAT_LEN) {
+        return EFAULT;
+    }
+    match fill_fstat(fd) {
+        Err(e) => e,
+        Ok(st) => {
+            // SAFETY: statbuf validated writable for 144 bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    st.as_ptr() as *const u8,
+                    statbuf as *mut u8,
+                    STAT_LEN as usize,
+                )
+            };
+            0
+        }
+    }
+}
+
+/// statx's AT_EMPTY_PATH dirfd resolution: AT_FDCWD stats the cwd
+/// itself (its canonical flat path), any other dirfd stats the fd
+/// like fstat.
+pub fn statx_dirfd_stat(dirfd: u64, nofollow: bool) -> Result<[u64; 18], u64> {
+    if dirfd as u32 as i32 == -100 {
+        let Some(t) = cur_mut() else { return Err(EBADF) };
+        let f = fst(t);
+        let mut pb = [0u8; 256];
+        let pn = f.cwdlen as usize;
+        pb[..pn].copy_from_slice(&f.cwd[..pn]);
+        fill_stat(&pb[..pn], nofollow)
+    } else {
+        fill_fstat(dirfd)
+    }
+}
+
+/// Write a Linux x86_64 `struct statx` (256 bytes) from a filled
+/// 144-byte stat array. We provide STATX_BASIC_STATS fields only;
+/// btime/mnt_id/dio fields stay zero and out of the reported mask.
+/// stx_mask reports request ∩ supported, per the statx contract.
+pub fn statx_emit(st: &[u64; 18], mask: u64, statxbuf: u64) -> u64 {
+    const STATX_BASIC_STATS: u64 = 0x7ff;
+    if !range_ok_w(statxbuf, 256) {
+        return EFAULT;
+    }
+    let mut b = [0u8; 256];
+    b[0..4].copy_from_slice(&((mask & STATX_BASIC_STATS) as u32).to_le_bytes());
+    b[4..8].copy_from_slice(&(st[7] as u32).to_le_bytes()); // blksize
+    b[16..20].copy_from_slice(&(st[2] as u32).to_le_bytes()); // nlink
+    b[20..24].copy_from_slice(&((st[3] >> 32) as u32).to_le_bytes()); // uid
+    b[24..28].copy_from_slice(&(st[4] as u32).to_le_bytes()); // gid
+    b[28..30].copy_from_slice(&((st[3] & 0xffff) as u16).to_le_bytes()); // mode
+    b[32..40].copy_from_slice(&st[1].to_le_bytes()); // ino
+    b[40..48].copy_from_slice(&st[6].to_le_bytes()); // size
+    b[48..56].copy_from_slice(&st[8].to_le_bytes()); // blocks
+    let ts = |sec: u64, nsec: u64, dst: &mut [u8]| {
+        dst[0..8].copy_from_slice(&sec.to_le_bytes());
+        dst[8..12].copy_from_slice(&(nsec as u32).to_le_bytes());
+    };
+    ts(st[9], st[10], &mut b[64..80]); // atime
+    ts(st[13], st[14], &mut b[96..112]); // ctime
+    ts(st[11], st[12], &mut b[112..128]); // mtime
+    // makedev decode: major ((d>>8)&0xfff)|((d>>32)&~0xfff),
+    // minor (d&0xff)|((d>>12)&~0xff) — matches glibc gnu_dev_*.
+    let (rdev, dev) = (st[5], st[0]);
+    let rmaj = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & 0xfffff000);
+    let rmin = (rdev & 0xff) | ((rdev >> 12) & 0xffffff00);
+    let dmaj = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xfffff000);
+    let dmin = (dev & 0xff) | ((dev >> 12) & 0xffffff00);
+    b[128..132].copy_from_slice(&(rmaj as u32).to_le_bytes());
+    b[132..136].copy_from_slice(&(rmin as u32).to_le_bytes());
+    b[136..140].copy_from_slice(&(dmaj as u32).to_le_bytes());
+    b[140..144].copy_from_slice(&(dmin as u32).to_le_bytes());
+    // SAFETY: statxbuf validated writable for 256 bytes.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            st.as_ptr() as *const u8,
-            statbuf as *mut u8,
-            STAT_LEN as usize,
-        )
+        core::ptr::copy_nonoverlapping(b.as_ptr(), statxbuf as *mut u8, 256)
     };
     0
 }
@@ -12412,11 +12482,7 @@ fn stat_meta(
 /// synthesized (S_IFREG|0644, S_IFDIR|0755 for "."), sizes come
 /// from the member header. dirfd/flags are accepted for ABI shape —
 /// a flat archive has no symlinks or per-dirfd namespaces to honor.
-pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
-    const STAT_LEN: u64 = 144;
-    if !range_ok_w(statbuf, STAT_LEN) {
-        return EFAULT;
-    }
+pub fn fill_stat(path: &[u8], nofollow: bool) -> Result<[u64; 18], u64> {
     let mut st = [0u64; 18];
     // Link resolution: intermediates always; the final component
     // follows only when statting (nofollow == lstat). A real VFile
@@ -12425,17 +12491,14 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
     let rbuf;
     let rn;
     if nofollow {
-        let (b, n, link) = match resolve_links(path, false) {
-            Ok(x) => x,
-            Err(e) => return e,
-        };
+        let (b, n, link) = resolve_links(path, false)?;
         rbuf = b;
         rn = n;
         if link {
             let Some(i) = vfile_find(&rbuf[..rn]) else {
-                return ENOENT;
+                return Err(ENOENT);
             };
-            let Some(v) = vfile(i) else { return ENOENT };
+            let Some(v) = vfile(i) else { return Err(ENOENT) };
             let arc_n = (unsafe { *core::ptr::addr_of!(INITRD) })
                 .map_or(0, |a| crate::cpio::entries(a).count());
             let vidx = unsafe { &*core::ptr::addr_of!(VFILES) }[..i]
@@ -12455,15 +12518,7 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
                 (v.mtime, v.mtime_ns),
                 (v.ctime, v.ctime_ns),
             );
-            // SAFETY: range_ok_w proved statbuf writable.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    st.as_ptr() as *const u8,
-                    statbuf as *mut u8,
-                    STAT_LEN as usize,
-                )
-            };
-            return 0;
+            return Ok(st);
         }
     } else {
         match resolve_links(path, true) {
@@ -12471,7 +12526,7 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
                 rbuf = b;
                 rn = n;
             }
-            Err(e) => return e,
+            Err(e) => return Err(e),
         }
     }
     let path = &rbuf[..rn];
@@ -12494,15 +12549,7 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
             st[3] = 0o120777; // S_IFLNK | 0777 — magic proc links
             st[6] = n as u64; // st_size = target length
             st[7] = 4096;
-            // SAFETY: range_ok_w proved statbuf writable.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    st.as_ptr() as *const u8,
-                    statbuf as *mut u8,
-                    STAT_LEN as usize,
-                )
-            };
-            return 0;
+            return Ok(st);
         }
     }
     if !is_file(path) && dir_exists(path) {
@@ -12511,7 +12558,7 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
         if let Some(i) = vdir_find(path) {
             // An explicit mkdir'd dir reports its stored metadata.
             let ds = unsafe { &*core::ptr::addr_of!(VDIRS) };
-            let Some(d) = ds[i].as_ref() else { return ENOENT };
+            let Some(d) = ds[i].as_ref() else { return Err(ENOENT) };
             st[3] = 0o40000 | d.mode as u64; // S_IFDIR | stored mode
             stat_meta(
                 &mut st,
@@ -12526,7 +12573,7 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
         }
     } else if let Some(i) = vfile_find(path) {
         // RAM files shadow the archive — same lookup order as open.
-        let Some(v) = vfile(i) else { return ENOENT };
+        let Some(v) = vfile(i) else { return Err(ENOENT) };
         let arc_n = (unsafe { *core::ptr::addr_of!(INITRD) })
             .map_or(0, |a| crate::cpio::entries(a).count());
         let vidx = unsafe { &*core::ptr::addr_of!(VFILES) }[..i]
@@ -12558,17 +12605,17 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
             let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
             let Some(t) = tasks.get(slot).and_then(|s| s.as_ref())
             else {
-                return ENOENT;
+                return Err(ENOENT);
             };
             let Some(arc) = (unsafe { *core::ptr::addr_of!(INITRD) })
             else {
-                return ENOENT;
+                return Err(ENOENT);
             };
             let Some((idx, (_, data))) = crate::cpio::entries(arc)
                 .enumerate()
                 .find(|(_, (n, _))| *n == &t.exe[..t.exe_len as usize])
             else {
-                return ENOENT;
+                return Err(ENOENT);
             };
             st[1] = idx as u64 + 1;
             st[2] = 1;
@@ -12589,18 +12636,18 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
             let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
             let Some(t) = tasks.get(slot).and_then(|s| s.as_ref())
             else {
-                return ENOENT;
+                return Err(ENOENT);
             };
             if t.fdi == FDI_NONE || n >= MAX_FDS {
-                return ENOENT;
+                return Err(ENOENT);
             }
             let tab =
                 unsafe { &(*core::ptr::addr_of!(FDTABS))[t.fdi as usize] };
-            let Some(oi) = tab.fds[n] else { return ENOENT };
+            let Some(oi) = tab.fds[n] else { return Err(ENOENT) };
             let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
             let Some(o) = ofds.get(oi as usize).and_then(|s| s.as_ref())
             else {
-                return ENOENT;
+                return Err(ENOENT);
             };
             let (mode, size, ino) = ofd_stat_shape(&o.kind);
             st[1] = ino;
@@ -12614,13 +12661,13 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
         }
     } else {
         let Some(arc) = (unsafe { *core::ptr::addr_of!(INITRD) }) else {
-            return ENOENT;
+            return Err(ENOENT);
         };
         let Some((idx, (_, data))) = crate::cpio::entries(arc)
             .enumerate()
             .find(|(_, (n, _))| *n == path)
         else {
-            return ENOENT;
+            return Err(ENOENT);
         };
         st[1] = idx as u64 + 1; // st_ino
         st[2] = 1; // st_nlink
@@ -12629,16 +12676,30 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
         st[8] = (data.len() as u64).div_ceil(512); // st_blocks
     }
     st[7] = 4096; // st_blksize
-    // SAFETY: range_ok_w proved statbuf is a writable user range;
-    // st is the 144-byte Linux x86_64 stat layout verbatim.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            st.as_ptr() as *const u8,
-            statbuf as *mut u8,
-            STAT_LEN as usize,
-        )
-    };
-    0
+    Ok(st)
+}
+/// newfstatat's user-facing half: validate statbuf, fill via
+/// fill_stat, copy the 144-byte Linux x86_64 stat out verbatim.
+pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
+    const STAT_LEN: u64 = 144;
+    if !range_ok_w(statbuf, STAT_LEN) {
+        return EFAULT;
+    }
+    match fill_stat(path, nofollow) {
+        Err(e) => e,
+        Ok(st) => {
+            // SAFETY: range_ok_w proved statbuf is a writable user
+            // range; st is the stat layout verbatim.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    st.as_ptr() as *const u8,
+                    statbuf as *mut u8,
+                    STAT_LEN as usize,
+                )
+            };
+            0
+        }
+    }
 }
 
 /// Explicitly-created directories — the ram layer's mkdir.
