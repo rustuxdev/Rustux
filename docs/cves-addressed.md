@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**133 unique CVEs recorded.**
+**136 unique CVEs recorded.**
 
 ## klib ports
 
@@ -47,6 +47,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2008-3534 | writable file layer: VFile/Ram OFDs (O_CREAT/O_EXCL/O_TRUNC/O_APPEND), write/read/pread/l… | self-review catches FIXED pre-commit: write(fd,buf,0) at pos>len allocated+extended the file (now early-0 like Linux); fd_pread on an empty VFile took null.add(0) (now n==0 early… |
 | CVE-2009-1385 | UDP sockets: socket/bind/sendto/recvfrom + live RX path | sockaddr_in is fully zeroed before fields (47597 uninit-struct class structurally absent); synchronous endpoint teardown at last-fd-close — no deferred-cleanup UAF (56642 n/a); rx… |
 | CVE-2009-1385 | `e1000` RX | **mitigated** — device-written `sta`/`len` now validated (EOP required, `14 <= len <= RX_BUF`) before any buffer read; repost-and-drop on violation |
+| CVE-2009-2649 | install prompt/eject + read-cap split + ATA recovery: demomenu verifies, ATAPI-ejects /de… | audit run-113 manual scoped + cve.now over HTTP JSON-RPC (entities.search — analogs above; no mapped sr/cdrom-ioctl CVE): verified every fd_read arm bounds n by source availabilit… |
 | CVE-2009-2848 | process lifecycle: clone(56) fork-subset + SETTID writes, rt_sigprocmask(14) real sigmask… | RUN-TIME BUG CAUGHT BY REVIEW: translate/translate_r walked ANY va through the task pml4 -- which shares kernel upper-half slots by reference -- so a user-controlled VA reached ke… |
 | CVE-2010-5328 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
 | CVE-2011-1020 | procfs breadth 2: fd/fdinfo dirs + fd-link share-open, exe/cwd/root links, statm/environ/… | 1020 n/a by construction: Rustux has no uids/setuid/credentials — no privilege boundary exists for the missing check to cross; single-tenant, all tasks already see all files. Shar… |
@@ -91,6 +92,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-0847 | real Debian package install: busybox dpkg-deb -x extracts hello-traditional_2.10-6 (ar +… | audit run-105 manual scoped (rubric + cve.now MCP still absent on this host): verified range_ok precedes every ring copy (wlen<=free<=PIPE_SIZE), waker len capped to avail with tr… |
 | CVE-2022-0847 | rseq(334) registration + sendfile(40): per-task rseq_va (not fork-inherited, exec-cleared… | 0847 architecturally absent: Dirty Pipe was uninit flags in pipe_buffer letting partial writes merge into shared page-cache pages; Rustux pipes are private kernel rings and sendfi… |
 | CVE-2022-4378 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
+| CVE-2022-49073 | install prompt/eject + read-cap split + ATA recovery: demomenu verifies, ATAPI-ejects /de… | audit run-113 manual scoped + cve.now over HTTP JSON-RPC (entities.search — analogs above; no mapped sr/cdrom-ioctl CVE): verified every fd_read arm bounds n by source availabilit… |
 | CVE-2022-49264 | execve image replacement | user rip round-trips SAVED_UIP so sysret can be redirected; canonicality holds — only stub (CPU-saved rip) and exec_return (elf-bounded entry) write it; ZERO_CTX gives exec'd imag… |
 | CVE-2022-49264 | real-binary ABI: fs_base+arch_prctl, exec initial stack (argc/argv/envp/auxv), writev/rea… | argv==NULL discipline applied (49264): argc==0 gets the binary name as argv0 (stronger than upstream's empty string -- same "never argc<1" contract glibc relies on); exec argv/env… |
 | CVE-2022-49349 | writable file layer: VFile/Ram OFDs (O_CREAT/O_EXCL/O_TRUNC/O_APPEND), write/read/pread/l… | self-review catches FIXED pre-commit: write(fd,buf,0) at pos>len allocated+extended the file (now early-0 like Linux); fd_pread on an empty VFile took null.add(0) (now n==0 early… |
@@ -102,6 +104,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-50661 | fork/wait4/getpid + full-ctx syscall stub | eager deep copy of user space — no COW, so the 5195 COW-breakage race class is structurally absent; child ctx = parent syscall UCtx with rax=0, parent gets pid (user-only regs, no… |
 | CVE-2022-50661 | task abstraction + frame reclaim | per-task page tables + kmalloc'd syscall stack, initrd iterates as process table; teardown freeing designed-in: reap walks user PML4 slots 128-255 only, PHYS_MASK strips NX/flags… |
 | CVE-2023-3161 | fbcon VT100/xterm-subset terminal emulator (cell grid, CSI cursor/ED/EL/ICH/DCH, SGR pale… | audit run-102 quick scoped: 6 confirmed findings fixed in-diff — alt-screen restore clobbered saved cursor (saved_alt slot); DECSTBM post-check clamp could set scr_top>scr_bot and… |
+| CVE-2023-52705 | install prompt/eject + read-cap split + ATA recovery: demomenu verifies, ATAPI-ejects /de… | audit run-113 manual scoped + cve.now over HTTP JSON-RPC (entities.search — analogs above; no mapped sr/cdrom-ioctl CVE): verified every fd_read arm bounds n by source availabilit… |
 | CVE-2023-52791 | preemptive round-robin scheduler | every switch is a UCtx resume (15 GPRs + iret frame) — launch/preemption/exit share one path; dedicated 0xf0 stub saves the FULL register file; cs&3==0 ticks never switch (58090 c… |
 | CVE-2023-53798 | real statfs/fstatfs: frame-allocator capacity + vfile inode counts, procfs superblock dis… | struct zeroed then fixed-offset fills only; fsid/spare stay zero; ENOENT-before-write ordering matches Linux; no new class rows. audit run-76: 0 confirmed; iotest +7 green, zero l… |
 | CVE-2023-53798 | real-busybox verification: sysinfo struct fill (totalram/freeram/procs/mem_unit) + lstat/… | struct zeroed then fully written at fixed offsets — no kernel bytes escape; unrelated-driver entries recorded for the class, n/a by construction (sysinfo writes only known values)… |

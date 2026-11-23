@@ -3184,3 +3184,46 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   EFI/+initrd on target.img; make run exit 33 — but see run-138's
   flake note (this run hit it: ptytest EIO + 2-frame leak; the
   ata path was inert — 'ata: no disk' on q35).
+
+## run-140 — install prompt/eject flow + MAX_READ + ATA recovery
+
+- `demomenu` no longer reboots instantly: install verifies the
+  first sector, issues CDROMEJECT on `/dev/sr0` (ATAPI START STOP
+  UNIT, LoEj — the real installer's "remove the media" step on
+  QEMU's secondary-channel -cdrom), prints the success banner and
+  blocks on ENTER before `reboot(RB_AUTOBOOT)`. The window can't
+  vanish mid-flow anymore.
+- `/dev/sr0` (S_IFBLK rdev 11<<8) is minted unconditionally —
+  a node without hardware is normal; open() whitelists major 11,
+  read/write answer ENXIO, ioctl CDROMEJECT (0x5309) is gated to
+  the exact rdev (ENOTTY elsewhere) and returns EIO with no drive.
+- The apparent "install stall" was never a wedge — it was TCG time
+  dilation (~20x) plus a 4KiB-per-syscall read cap: `MAX_COPY`
+  clamped NR_READ so each 64KiB chunk took 16 read+write cycles
+  with a FLUSH each (~6k flushes per install). `MAX_READ` = 1MiB
+  now bounds NR_READ separately (every fd_read arm already min()s
+  against available data; MAX_COPY stays for path/copy buffers),
+  and copy_image loops short reads to fill 64KiB before writing —
+  ~190 flushes total, install finishes in seconds of guest time.
+- `ata.rs` hardening from the stall hunt (kept — all real spec
+  work): post-command 400ns settle (4x ALT reads) since status is
+  undefined before it; bounded polls bail with a printk diagnostic;
+  SRST device-reset recovery plus one retry in ata::write so a
+  transient desync can't fail a write; eject() does ATAPI PACKET
+  with a fixed START STOP UNIT CDB and bounded DRQ wait.
+- run-iso is now one QEMU session: `once=d,order=c`, wait for the
+  prompt, monitor `eject -f ide1-cd0`, sendkey ret, then verify the
+  installed boot shows the live-only menu + busybox `/ #`. The
+  monitor eject is required in-session — QEMU reattaches the ISO
+  medium on device reset and OVMF's boot selection persists, so
+  the guest-side ATAPI eject alone can't survive the reboot
+  (correct on real hardware). Sendkey windows widened to match
+  TCG dilation (16x15s install / 12x15s installed-boot phases).
+- Temporary tick-heartbeat RIP diagnostics removed (the hunt that
+  found the capped-read root cause); clippy 57 = baseline.
+- Validation: make run-iso both phases PASS — log shows one
+  DVD-ROM boot (initial ISO), install writes 24MiB + verify ok +
+  medium ejected + ENTER prompt, then the installed disk boots
+  to `[1] live session` only and a busybox `/ #` shell. make run
+  exit 33, 72 tasks, frames 99744 -> 99744 zero leak, ptytest
+  all 24 checks (the run-138 flake did not reproduce this run).
