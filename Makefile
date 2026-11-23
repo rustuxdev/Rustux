@@ -608,6 +608,24 @@ run-doom: $(ESP_DOOM)
 		-snapshot \
 		-serial stdio
 
+# Bootable DOOM ISO — same distro-structure catalog as the demo ISO,
+# but the media spawns doom straight into the attract demo.
+ISO_DOOM  := rustux-doom.iso
+ISOROOT_DOOM := isoroot-doom
+
+$(ISO_DOOM): $(ESP_DOOM) $(KERNEL) $(DOOM_INITRD)
+	rm -rf $(ISOROOT_DOOM) && mkdir -p $(ISOROOT_DOOM)/EFI/BOOT
+	cp $(ESP_DOOM) $(ISOROOT_DOOM)/esp.img
+	cp $(KERNEL) $(ISOROOT_DOOM)/EFI/BOOT/BOOTX64.EFI
+	cp $(DOOM_INITRD) $(ISOROOT_DOOM)/initrd.cpio
+	printf '\372\374\364%.0s' $$(seq 170) > $(ISOROOT_DOOM)/biosboot.img
+	printf '\125\252' >> $(ISOROOT_DOOM)/biosboot.img
+	xorriso -as mkisofs -o $@ -V RUSTUX_DOOM -J -r \
+		-b biosboot.img -no-emul-boot -boot-load-size 4 -boot-info-table \
+		-eltorito-alt-boot -e esp.img -no-emul-boot \
+		-isohybrid-mbr /usr/lib/syslinux/mbr/gptmbr.bin \
+		-isohybrid-gpt-basdat $(ISOROOT_DOOM)
+
 clean:
 	cargo clean
 	rm -rf $(ESP) $(ESP_IMG)
