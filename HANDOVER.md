@@ -2947,3 +2947,40 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
 - Next: apt-get prerequisites (method URIs, /var layout, more coreutils
   surface — apt wants stty/dirname/head etc.) or alarm/setitimer to
   quiet busybox's enosys nr37; pipe O_NONBLOCK remains a small rung.
+
+## run-134 — alarm/setitimer + the EXEC_BUF stale-argv0 regression fix
+
+- `alarmtest` covers alarm(2)/setitimer/getitimer — 22/22 checks in
+  suite: one-shot+pause EINTR, leftover reporting, disarm, periodic
+  rearm, old/new itimerval round-trip, EINVAL/EFAULT matrix, VIRTUAL
+  fires on user burn, fork non-inheritance. busybox's nr-37 enosys
+  spam (wget progress watchdog) is gone.
+- Per-task `itimers [[deadline,interval];3]` on three honest clocks:
+  REAL=TICKS, VIRTUAL=utime, PROF=utime+stime (all already billed).
+  `itimer_expire` in tick() pends the right signal through pend_one —
+  wake/EINTR/sigwait semantics come free. Fork drops timers (fresh
+  zeroed Task), exec preserves them, one-shot disarms, periodic rolls
+  the deadline past-now without stacking expirations.
+- REGRESSION FIX — run-133's shared `EXEC_BUF` broke every spawned
+  glibc binary: `spawn_idx` copies argv[0] into argv[0][..n] but left
+  byte n stale from the PREVIOUS spawn's longer name (faulttest ->
+  fputest pushes "fputests" unterminated); glibc startup strrchr walks
+  off stack_top -> #PF at 0x555600100000 for ~30 tasks. `exec_args_
+  scratch()` now returns a cleared buffer — same semantics as the old
+  stack-local empty(). Found by two-variable bisect (HEAD kernel +
+  alarmtest initrd reproduced the storm — the bug predates run-134
+  and had been masked by tail-only log greps + single-task probes).
+- Suite-side source modes normalized: motd/resolv/winseed/.deb/
+  terminfo -> 644, binaries -> 755 so run-133's recorded-mode stat
+  matches intent (iotest "statx mode reg 0644" green again).
+- 70 tasks, frames 100149 -> 100149 zero leak, qemu exit 33 on BOTH
+  make run and make run-net; per-task exits match baseline profile.
+- Audit run-107 manual scoped (cve.now MCP absent — re-verify once
+  configured): no confirmed findings in the itimer surface; the
+  EXEC_BUF poisoning is documented as a fixed regression (stale-state
+  -> OOB-read-into-unmapped class). needs_validation: none.
+- lstest floor 52->53 (alarmtest).
+- Env note: push still needs creds on this VM. Verification lesson:
+  grep FULL suite logs for "user fault"/"FAIL" — tails hide storms.
+- Next: apt-get prerequisites (method URIs, /var layout, more
+  coreutils surface) or pipe O_NONBLOCK (still the open small gap).
