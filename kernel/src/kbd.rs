@@ -30,6 +30,13 @@ static TAIL: AtomicUsize = AtomicUsize::new(0); // consumer index
 static SHIFT: AtomicBool = AtomicBool::new(false);
 static E0: AtomicBool = AtomicBool::new(false);
 
+/// Decoded-escape output queue: extended keys (arrows, F-keys, nav)
+/// emit multi-byte xterm sequences that poll drains one byte at a
+/// time before consuming the scancode ring. Consumer-side only.
+const OUTQ_SIZE: usize = 24;
+static mut OUTQ: [u8; OUTQ_SIZE] = [0; OUTQ_SIZE];
+static mut OUTQ_LEN: usize = 0;
+
 /// IRQ handler — called from apic::irq_dispatch on the keyboard vector.
 /// Reads OBF-guarded data so a spurious vector can't fabricate a key.
 pub fn on_irq() {
@@ -122,6 +129,17 @@ pub fn init() -> bool {
 /// (extended keys unmapped for now), plain make codes map through the
 /// set-1 tables.
 pub fn poll() -> Option<char> {
+    // Drain queued escape-sequence bytes first (arrows/F-keys/nav).
+    unsafe {
+        let l = OUTQ_LEN;
+        if l > 0 {
+            let q = core::ptr::addr_of_mut!(OUTQ) as *mut u8;
+            let b = *q;
+            core::ptr::copy(q.add(1), q, l - 1);
+            OUTQ_LEN = l - 1;
+            return Some(b as char);
+        }
+    }
     loop {
         let tail = TAIL.load(Ordering::Relaxed);
         if tail == HEAD.load(Ordering::Acquire) {
@@ -135,7 +153,27 @@ pub fn poll() -> Option<char> {
             continue;
         }
         if E0.swap(false, Ordering::Relaxed) {
-            continue; // extended scancode — unmapped
+            // Extended make code → xterm escape sequence; break codes
+            // (bit7) are ignored — press events only.
+            if code & 0x80 == 0 {
+                if let Some(seq) = e0_seq(code) {
+                    // SAFETY: consumer-side static queue, single CPU.
+                    unsafe {
+                        let l = OUTQ_LEN;
+                        let k = seq.len().min(OUTQ_SIZE - l);
+                        core::ptr::copy_nonoverlapping(
+                            seq.as_ptr(),
+                            (core::ptr::addr_of_mut!(OUTQ) as *mut u8).add(l),
+                            k,
+                        );
+                        OUTQ_LEN = l + k;
+                        if k > 0 {
+                            DECODED.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            continue;
         }
         if code & 0x80 != 0 {
             // Break code — only shift release matters for echoing.
@@ -154,18 +192,61 @@ pub fn poll() -> Option<char> {
             NORMAL_MAP.get(code as usize).copied().unwrap_or(0)
         };
         if c == 0 {
-            continue; // unmapped make code (F-keys, etc.)
+            // F1..F10 (0x3b..=0x44) → xterm \e[11~..\e[21~ sequences.
+            if (0x3b..=0x44).contains(&code) {
+                const F_SEQ: [&[u8]; 10] = [
+                    b"\x1b[11~", b"\x1b[12~", b"\x1b[13~", b"\x1b[14~",
+                    b"\x1b[15~", b"\x1b[17~", b"\x1b[18~", b"\x1b[19~",
+                    b"\x1b[20~", b"\x1b[21~",
+                ];
+                let seq = F_SEQ[(code - 0x3b) as usize];
+                // SAFETY: consumer-side static queue, single CPU.
+                unsafe {
+                    let l = OUTQ_LEN;
+                    let k = seq.len().min(OUTQ_SIZE - l);
+                    core::ptr::copy_nonoverlapping(
+                        seq.as_ptr(),
+                        (core::ptr::addr_of_mut!(OUTQ) as *mut u8).add(l),
+                        k,
+                    );
+                    OUTQ_LEN = l + k;
+                    if k > 0 {
+                        DECODED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            continue;
         }
         DECODED.fetch_add(1, Ordering::Relaxed);
         return Some(c as char);
     }
 }
 
+/// Extended (E0) make code → xterm sequence. CSI forms unless the
+/// console reports application-cursor mode (DECSET ?1), which wants
+/// SS3 arrows. F-keys/nav always send their fixed sequences.
+fn e0_seq(code: u8) -> Option<&'static [u8]> {
+    let ss3 = crate::fbcon::app_cursor();
+    Some(match code {
+        0x48 => if ss3 { b"\x1bOA" } else { b"\x1b[A" },
+        0x50 => if ss3 { b"\x1bOB" } else { b"\x1b[B" },
+        0x4d => if ss3 { b"\x1bOC" } else { b"\x1b[C" },
+        0x4b => if ss3 { b"\x1bOD" } else { b"\x1b[D" },
+        0x47 => b"\x1b[H",      // Home
+        0x4f => b"\x1b[F",      // End
+        0x49 => b"\x1b[5~",     // PgUp
+        0x51 => b"\x1b[6~",     // PgDn
+        0x52 => b"\x1b[2~",     // Ins
+        0x53 => b"\x1b[3~",     // Del
+        _ => return None,
+    })
+}
+
 // Set-1 make-code tables, indexed by scancode (unmapped slots are 0).
 // Row order: numbers row, QWERTY row, home row, bottom row, space.
 #[rustfmt::skip]
 const NORMAL_MAP: [u8; 0x3a] = [
-    0,    0,    b'1', b'2', b'3', b'4', b'5', b'6', // 0x00-0x07
+    0,    0x1b, b'1', b'2', b'3', b'4', b'5', b'6', // 0x00-0x07 (0x01 esc)
     b'7', b'8', b'9', b'0', b'-', b'=', 0x08, b'\t', // 0x08-0x0f (0x0e = backspace)
     b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', // 0x10-0x17
     b'o', b'p', b'[', b']', b'\n',0,    b'a', b's', // 0x18-0x1f (0x1c enter, 0x1d lctrl)
@@ -177,7 +258,7 @@ const NORMAL_MAP: [u8; 0x3a] = [
 
 #[rustfmt::skip]
 const SHIFT_MAP: [u8; 0x3a] = [
-    0,    0,    b'!', b'@', b'#', b'$', b'%', b'^',
+    0,    0x1b, b'!', b'@', b'#', b'$', b'%', b'^',
     b'&', b'*', b'(', b')', b'_', b'+', 0x08, b'\t',
     b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I',
     b'O', b'P', b'{', b'}', b'\n',0,    b'A', b'S',

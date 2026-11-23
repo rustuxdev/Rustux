@@ -1124,7 +1124,10 @@ fn sys_write(ctx: &mut user::UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     // user range under the current (process) page table.
     let s = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
     match core::str::from_utf8(s) {
-        Ok(t) => log::printk(format_args!("{t}")),
+        // tty semantics: user bytes reach the console verbatim — no
+        // kernel-log record framing (the timestamp prefix would corrupt
+        // cursor-addressed full-screen apps).
+        Ok(t) => log::user_out(t),
         Err(_) => log::printk(format_args!("rustux: user write: {len}B non-utf8")),
     }
     // Flush now — main is parked in sched_launch for the whole task

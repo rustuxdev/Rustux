@@ -42,7 +42,13 @@ const USTACK_VA: u64 = 0x5556_0000_0000;
 /// ELF image (~0x4000…) and the stack (0x5556…).
 const MMAP_LO: u64 = 0x6000_0000_0000;
 const MMAP_HI: u64 = 0x7000_0000_0000;
-const USTACK_PAGES: u64 = 16;
+/// User stack: 1 MiB eagerly mapped. Real ncurses/glibc init paths
+/// (deep ld.so frames + terminfo parsing buffers) exceed the old
+/// 64 KiB — the write spilling past the bottom landed on the RO
+/// SIGTRAMP page as an opaque SIGSEGV. Lazy grow-down toward the
+/// RLIMIT_STACK default (8 MiB) is a deliberate later rung; 1 MiB
+/// covers every current fixture with headroom.
+const USTACK_PAGES: u64 = 256;
 
 /// Signal restorer trampoline: one user-RX page mapped just below
 /// the user stack at exec. Delivery points the handler's return
@@ -7836,6 +7842,37 @@ fn stdin_wake() {
     }
 }
 
+/// Inject bytes as if the terminal itself produced them — escape
+/// replies (DA/DSR) a full-screen app's ncurses init expects. Goes
+/// straight to the ready queue: ldisc processing would mangle the
+/// sequence in canonical mode, and these bytes aren't keystrokes.
+/// Dropped on a full queue like a real terminal's lost reply.
+/// Kernel-authored bytes pushed straight into the ready input queue,
+/// bypassing cooked line discipline — used for terminal status replies
+/// (DSR/DA) which must be readable verbatim by raw-mode apps.
+/// NOTE: in canonical mode these bytes can be returned mid-line from a
+/// blocked read (no line discipline applies), matching real-tty reply
+/// semantics loosely; the queue cap applies as with real input.
+pub fn stdin_inject(s: &[u8]) {
+    let cap = unsafe { RD_LEN };
+    let k = s.len().min(STDIN_READY.saturating_sub(cap));
+    if k > 0 {
+        // SAFETY: k fits the owned READY queue past RD_LEN.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                s.as_ptr(),
+                (core::ptr::addr_of_mut!(READY) as *mut u8).add(cap),
+                k,
+            );
+            RD_LEN = cap + k;
+        }
+        stdin_wake();
+        // Apps blocked in poll/select/epoll on stdin must also see the
+        // reply — stdin_wake only services WaitOn::Stdin readers.
+        wake_pollers();
+    }
+}
+
 /// Pump decoded keys into the ldisc — called from the timer tick
 /// (IRQ-safe: printk and kill both are) so typing echoes live, and
 /// lazily from read/poll so a stale queue never fools a syscall.
@@ -13461,15 +13498,16 @@ fn proc_fill(ent: &ProcEnt, s: &mut klib::seqbuf::SeqBuf) {
                 let cx = CTXT_SW.load(core::sync::atomic::Ordering::Relaxed);
                 let pr = PROCS_CREATED
                     .load(core::sync::atomic::Ordering::Relaxed);
+                let btime = crate::rtc::rtc_epoch();
                 s.printf(
                     b"cpu  %u 0 %u %u 0 0 0 0 0 0\n\
                       cpu0 %u 0 %u %u 0 0 0 0 0 0\n\
-                      intr %u\nctxt %u\nbtime 0\n\
+                      intr %u\nctxt %u\nbtime %u\n\
                       processes %u\nprocs_running %u\nprocs_blocked %u\n",
                     &[
                         Arg::U(u), Arg::U(sy), Arg::U(idle),
                         Arg::U(u), Arg::U(sy), Arg::U(idle),
-                        Arg::U(t), Arg::U(cx), Arg::U(pr),
+                        Arg::U(t), Arg::U(cx), Arg::U(btime), Arg::U(pr),
                         Arg::U(run), Arg::U(blk),
                     ],
                 );

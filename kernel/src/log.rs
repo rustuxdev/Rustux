@@ -166,6 +166,23 @@ pub fn drain(con: &mut Console) {
     }
 }
 
+/// User-space console output (tty writes): goes straight to uart+fb
+/// verbatim — no ring, no kernel-log timestamp prefix. A real tty never
+/// stamps user output; without this the record prefix corrupts
+/// full-screen apps' cell layout (htop's cursor-addressed draws).
+/// Same context rule as drain_task: syscall entry masks IF, and the
+/// sole drainer argument applies to direct console access here too.
+pub fn user_out(s: &str) {
+    let con = unsafe { *core::ptr::addr_of!(PANIC_CON) };
+    if con.is_null() {
+        return;
+    }
+    // SAFETY: sole writer by the argument above; con outlives tasks.
+    unsafe {
+        let _ = (*con).write_str(s);
+    }
+}
+
 /// Drain pending records from task/syscall context — needed now that
 /// the scheduler keeps main parked inside sched_launch for the whole
 /// task phase. Safe there: syscall entry masks IF (the LAPIC tick

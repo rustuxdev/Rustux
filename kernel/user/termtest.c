@@ -58,8 +58,15 @@ int main(void) {
     tcsetattr(1, TCSANOW, &tio); /* restore */
 
     /* winsize: the fbcon grid — nonzero rows/cols */
-    check(ioctl(1, TIOCGWINSZ, &ws) == 0 &&
-          ws.ws_col > 0 && ws.ws_row > 0, "TIOCGWINSZ grid");
+    n = ioctl(1, TIOCGWINSZ, &ws);
+    {
+        char wbuf[64];
+        int wn = snprintf(wbuf, sizeof(wbuf),
+                          "termtest: winsize %dx%d\n", ws.ws_col, ws.ws_row);
+        (void)wn;
+        say(wbuf);
+    }
+    check(n == 0 && ws.ws_col > 0 && ws.ws_row > 0, "TIOCGWINSZ grid");
 
     /* foreground pgrp is our own pid in the single-pgrp model */
     int pgrp = -1;
@@ -94,6 +101,55 @@ int main(void) {
     errno = 0;
     check(ioctl(0, FIONBIO, &n) < 0 && errno == EINVAL,
           "FIONBIO -> EINVAL");
+
+    /* Terminal-reply round-trip: write \e[6n to the console, the
+       fbcon CSI parser injects "\e[<r>;<c>R" into stdin like a real
+       terminal. \e[c (DA) answers "\e[?1;2c". The fbcon exists
+       whenever the GOP grid is nonzero (TIOCGWINSZ above). */
+    tcgetattr(0, &tio);
+    tio2 = tio;
+    tio2.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    tcsetattr(0, TCSANOW, &tio2);
+    /* flush any queued input */
+    for (;;) {
+        int avail = 0;
+        if (ioctl(0, FIONREAD, &avail) < 0 || avail == 0) break;
+        char j[64];
+        if (read(0, j, sizeof(j)) <= 0) break;
+    }
+    /* The input queue is shared like a real tty: another blocked
+       reader (e.g. rsh doing read(0,&c,1)) may consume bytes of the
+       reply — most visibly the leading ESC. Accept the reply with or
+       without it; retry a few exchanges for the same reason. */
+    char rep[32];
+    int rr = -1, cc = -1, ok = 0;
+    for (int attempt = 0; attempt < 4 && !ok; attempt++) {
+        say("\x1b[6n");
+        memset(rep, 0, sizeof(rep));
+        n = read(0, rep, sizeof(rep) - 1);
+        char *e = rep;
+        if (n > 0 && rep[0] == 0x1b) e++;
+        if (*e == '[') e++;
+        for (rr = 0; *e >= '0' && *e <= '9'; e++) rr = rr * 10 + *e - '0';
+        if (*e == ';') {
+            e++;
+            for (cc = 0; *e >= '0' && *e <= '9'; e++) cc = cc * 10 + *e - '0';
+        }
+        ok = *e == 'R' && rr > 0 && cc > 0 && rr <= ws.ws_row && cc <= ws.ws_col;
+    }
+    check(ok, "DSR \\e[6n -> \\e[r;cR");
+    ok = 0;
+    for (int attempt = 0; attempt < 4 && !ok; attempt++) {
+        say("\x1b[c");
+        memset(rep, 0, sizeof(rep));
+        n = read(0, rep, sizeof(rep) - 1);
+        /* expect "\e[?1;2c", tolerating a stolen leading ESC */
+        const char *want = "[?1;2c";
+        int off = (n > 0 && rep[0] == 0x1b) ? 1 : 0;
+        ok = n - off >= 6 && memcmp(rep + off, want, 6) == 0;
+    }
+    check(ok, "DA \\e[c -> \\e[?1;2c");
+    tcsetattr(0, TCSANOW, &tio); /* restore */
 
     char buf[64];
     int m = snprintf(buf, sizeof(buf),
