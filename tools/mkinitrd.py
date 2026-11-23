@@ -4,6 +4,7 @@
 # Format per entry: 110-byte ascii-hex header, NUL-terminated name,
 # 4-align, data, 4-align; a TRAILER!!! record ends the archive.
 import gzip
+import os
 import sys
 
 # A .gz source is decompressed into the archive; used for PE binaries
@@ -24,7 +25,14 @@ def entry(name, data, ino, mode=0o100644):
 out = b""
 ino = 1
 for path, arc in zip(sys.argv[1::2], sys.argv[2::2]):
-    out += entry(arc, load(path), ino)
+    data = load(path)
+    # Record the source's real perm bits — stat/access/exec on the
+    # archive member honor them. ELF payloads get the exec bit
+    # regardless (a quarantined .gz source may carry 0644).
+    mode = os.stat(path).st_mode & 0o7777
+    if data[:4] == b"\x7fELF":
+        mode |= 0o111
+    out += entry(arc, data, ino, 0o100000 | mode)
     ino += 1
 out += entry("TRAILER!!!", b"", ino)
 sys.stdout.buffer.write(out)

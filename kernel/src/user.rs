@@ -231,6 +231,10 @@ enum WaitOn {
     /// NT_PROCS ledger index plus the tgid recorded at arm time, so
     /// a freed-and-reallocated slot can't satisfy the wait.
     NtWaitProc(usize, u64),
+    /// fcntl F_SETLKW / flock(LOCK_EX) — blocked until the stored
+    /// wait_lock request no longer conflicts. flock_wake_all()
+    /// re-evaluates every unlock and close/release.
+    FLock,
 }
 
 /// Max fds per task — a hard bound so a hostile process cannot
@@ -1367,6 +1371,10 @@ pub struct Task {
     wait_ptr2: u64,
     /// Third wait pointer — pselect6's exceptfds VA (0 = none).
     wait_ptr3: u64,
+    /// The file-lock request a FLock-blocked task waits on —
+    /// captured at block time; the waker re-checks it against the
+    /// lock table instead of trusting a mutable user struct.
+    wait_lock: FLockReq,
     /// pselect6's saved sigmask — u64::MAX when no restore is owed.
     /// The syscall applies the caller's set for the sleep and the
     /// wake paths restore this one before userspace resumes.
@@ -1731,6 +1739,11 @@ struct VFile {
     cap: usize,
     unlinked: bool,
     is_link: bool,
+    /// A hardlink name: the entry is a bare dentry aliasing another
+    /// slot — `hard` names the slot holding the inode (data + meta).
+    /// Aliases never chain: linkat always resolves to the real slot.
+    is_hard: bool,
+    hard: usize,
     /// S_IFMT bits — S_IFREG for regulars and (harmlessly) links,
     /// S_IFCHR/S_IFBLK/S_IFIFO for mknod'd nodes.
     fmt: u32,
@@ -1756,6 +1769,25 @@ fn vfile_find(path: &[u8]) -> Option<usize> {
     vs.iter().position(|v| {
         v.as_ref().is_some_and(|v| !v.unlinked && &v.name[..v.nlen] == path)
     })
+}
+
+/// The inode slot behind a possibly-hard-aliased index — identity
+/// for plain entries, one hop for aliases (they never chain).
+fn vfile_real(i: usize) -> usize {
+    let vs = unsafe { &*core::ptr::addr_of!(VFILES) };
+    match vs.get(i).and_then(|v| v.as_ref()) {
+        Some(v) if v.is_hard => v.hard,
+        _ => i,
+    }
+}
+
+/// Live hard alias names pointing at inode slot `i`.
+fn vfile_aliases(i: usize) -> usize {
+    let vs = unsafe { &*core::ptr::addr_of!(VFILES) };
+    vs.iter()
+        .flatten()
+        .filter(|v| v.is_hard && v.hard == i && !v.unlinked)
+        .count()
 }
 
 /// The VFile backing OFD index `i` — FdKind::Ram names VFILES[i].
@@ -1784,6 +1816,8 @@ fn vfile_create(path: &[u8]) -> u64 {
         cap: 0,
         unlinked: false,
         is_link: false,
+        is_hard: false,
+        hard: 0,
         fmt: 0o100000, // S_IFREG
         rdev: 0,
         mode: 0,
@@ -2112,7 +2146,7 @@ pub fn fs_lookup(name: &[u8]) -> Option<&'static [u8]> {
     // buffer serves the image for execve's synchronous parse+load,
     // like the archive slice does.
     if let Some(i) = vfile_find(name) {
-        let v = vfile(i)?;
+        let v = vfile(vfile_real(i))?;
         if v.data.is_null() || v.len == 0 {
             return None;
         }
@@ -2847,7 +2881,7 @@ fn nt_mod_resolve(t: &mut Task, name: &[u8], depth: u8) -> Option<(usize, bool)>
     full[0] = b'/';
     full[1..1 + name.len()].copy_from_slice(name);
     let img: Option<&[u8]> =
-        if let Some(v) = vfile_find(&full[..1 + name.len()]).and_then(vfile) {
+        if let Some(v) = vfile_find(&full[..1 + name.len()]).and_then(|i| vfile(vfile_real(i))) {
             (!v.data.is_null() && v.len != 0)
                 .then(|| unsafe { core::slice::from_raw_parts(v.data, v.len) })
         } else {
@@ -6633,6 +6667,7 @@ fn load(img: &[u8]) -> Option<Task> {
         wait_ptr: 0,
         wait_ptr2: 0,
         wait_ptr3: 0,
+        wait_lock: FLockReq::EMPTY,
         psel_mask: u64::MAX,
         frame_mask: u64::MAX,
         wait_len: 0,
@@ -7304,9 +7339,24 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
 /// Bounded exec vectors — kernel-side copies made while the OLD
 /// address space is still mapped. Limits are honest EINVAL/E2BIG
 /// boundaries, not Linux's multi-MB ARG_MAX.
-pub const MAX_EXEC_ARGS: usize = 16;
-pub const MAX_EXEC_ENVS: usize = 8;
+/// Linux's real ARG_MAX is ~2MiB across argv+envp — these caps are
+/// the static-table approximation: 64 each is enough for glibc's
+/// LD_*/dpkg env spread without blowing the 8-16KiB kstack the
+/// collection used to run on (ExecArgs now lives in .bss).
+pub const MAX_EXEC_ARGS: usize = 64;
+pub const MAX_EXEC_ENVS: usize = 64;
 pub const EXEC_STR_CAP: usize = 256;
+
+/// Single kernel-side argv/envp staging buffer — ~34KiB in .bss
+/// instead of the caller's kernel stack. SAFETY: single-CPU,
+/// IF-masked syscall/boot context — only one exec collects args
+/// at a time, and the buffer outlives the exec that consumes it.
+static mut EXEC_BUF: ExecArgs = ExecArgs::empty();
+
+/// Borrow the shared exec-argument staging buffer.
+pub fn exec_args_scratch() -> &'static mut ExecArgs {
+    unsafe { &mut *core::ptr::addr_of_mut!(EXEC_BUF) }
+}
 
 pub struct ExecArgs {
     pub argv: [[u8; EXEC_STR_CAP]; MAX_EXEC_ARGS],
@@ -9421,6 +9471,8 @@ const EMFILE: u64 = (-24i64) as u64;
 const ESPIPE: u64 = (-29i64) as u64;
 const ENOTDIR: u64 = (-20i64) as u64;
 const EISDIR: u64 = (-21i64) as u64;
+const EAGAIN: u64 = (-11i64) as u64;
+const ENOLCK: u64 = (-37i64) as u64;
 
 /// Resolve an fd slot to its OFD in the global table.
 fn ofd(t: &mut Task, fd: u64) -> Option<&'static mut OpenFile> {
@@ -9964,7 +10016,7 @@ pub fn nt_create_process(app_va: u64, cmd_va: u64, pi_va: u64, flags: u64) -> u6
     full[0] = b'/';
     full[1..1 + name.len()].copy_from_slice(name);
     let img: Option<&[u8]> =
-        if let Some(v) = vfile_find(&full[..1 + name.len()]).and_then(vfile) {
+        if let Some(v) = vfile_find(&full[..1 + name.len()]).and_then(|i| vfile(vfile_real(i))) {
             (!v.data.is_null() && v.len != 0)
                 .then(|| unsafe { core::slice::from_raw_parts(v.data, v.len) })
         } else {
@@ -10934,6 +10986,7 @@ pub fn nt_thread_create(
         wait_ptr: 0,
         wait_ptr2: 0,
         wait_ptr3: 0,
+        wait_lock: FLockReq::EMPTY,
         psel_mask: u64::MAX,
         frame_mask: u64::MAX,
         wait_len: 0,
@@ -11208,7 +11261,7 @@ pub fn nt_dir_next(
         let isdir = i - 1 < 2 || dir_exists(full);
         let size = if isdir {
             0
-        } else if let Some(v) = vfile_find(full).and_then(vfile) {
+        } else if let Some(v) = vfile_find(full).and_then(|i| vfile(vfile_real(i))) {
             v.len as u64
         } else if let Some(arc) = unsafe { *core::ptr::addr_of!(INITRD) }
         {
@@ -12647,6 +12700,8 @@ pub fn fill_stat(path: &[u8], nofollow: bool) -> Result<[u64; 18], u64> {
         }
     } else if let Some(i) = vfile_find(path) {
         // RAM files shadow the archive — same lookup order as open.
+        // A hard alias stats the shared inode: same ino/nlink/meta.
+        let i = vfile_real(i);
         let Some(v) = vfile(i) else { return Err(ENOENT) };
         let arc_n = (unsafe { *core::ptr::addr_of!(INITRD) })
             .map_or(0, |a| crate::cpio::entries(a).count());
@@ -12655,7 +12710,9 @@ pub fn fill_stat(path: &[u8], nofollow: bool) -> Result<[u64; 18], u64> {
             .filter(|s| s.as_ref().is_some_and(|v| !v.unlinked))
             .count();
         st[1] = (arc_n + vidx) as u64 + 1; // st_ino — getdents order
-        st[2] = 1; // st_nlink
+        // st_nlink: the inode's own name counts only while live —
+        // unlinking it with an alias left drops nlink to 1.
+        st[2] = (!v.unlinked) as u64 + vfile_aliases(i) as u64;
         st[3] = if v.is_link {
             0o120000 | v.mode as u64 // S_IFLNK | stored (followed-into case)
         } else {
@@ -12737,15 +12794,21 @@ pub fn fill_stat(path: &[u8], nofollow: bool) -> Result<[u64; 18], u64> {
         let Some(arc) = (unsafe { *core::ptr::addr_of!(INITRD) }) else {
             return Err(ENOENT);
         };
-        let Some((idx, (_, data))) = crate::cpio::entries(arc)
+        let Some((idx, (_, data, cmode))) = crate::cpio::entries_m(arc)
             .enumerate()
-            .find(|(_, (n, _))| *n == path)
+            .find(|(_, (n, _, _))| *n == path)
         else {
             return Err(ENOENT);
         };
         st[1] = idx as u64 + 1; // st_ino
         st[2] = 1; // st_nlink
-        st[3] = 0o100644; // st_mode: S_IFREG | 0644
+        // Recorded c_mode — archives built before mode tracking
+        // report the historical 0644.
+        st[3] = if cmode & 0o170000 == 0 {
+            0o100644
+        } else {
+            cmode as u64
+        };
         st[6] = data.len() as u64; // st_size
         st[8] = (data.len() as u64).div_ceil(512); // st_blocks
     }
@@ -13232,6 +13295,17 @@ fn is_file(p: &[u8]) -> bool {
     // Every proc ent is openable except the synthetic subdirs —
     // fd links stat/open their target, so they count as files.
     !matches!(proc_parse(p), Some(ProcEnt::TaskDir) | None)
+}
+
+/// Is `path` an archive member — the read-only namespace? RAM
+/// names shadow the archive like open does, so a vfile or vdir at
+/// the same path wins first.
+pub fn fs_is_archive(path: &[u8]) -> bool {
+    if vfile_find(path).is_some() || vdir_find(path).is_some() {
+        return false;
+    }
+    unsafe { *core::ptr::addr_of!(INITRD) }
+        .is_some_and(|arc| crate::cpio::find(arc, path).is_some())
 }
 
 /// Does `p` (canonical) name a directory? Root always exists;
@@ -14064,6 +14138,9 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) {
             return EEXIST;
         }
+        // A hard alias opens the inode it names — the OFD pins the
+        // real slot, so every op shares data and meta.
+        let i = vfile_real(i);
         let dev_node = vfile(i).is_some_and(|v| v.fmt != 0o100000);
         if flags & O_TRUNC != 0 && writing && !dev_node {
             let Some(v) = vfile(i) else { return ENOENT };
@@ -14226,31 +14303,155 @@ pub fn fs_exists(path: &[u8]) -> bool {
     dir_exists(path) || is_file(path)
 }
 
-/// Drop a VFile's name. Storage dies immediately when no OFD still
-/// references it; otherwise ofd_release frees it at last close —
-/// Linux's open-unlink-keep-working semantics.
-fn vfile_remove(i: usize) {
-    let (data, nm, nlen) = {
-        let Some(v) = vfile(i) else { return };
-        v.unlinked = true;
-        let mut n = [0u8; 128];
-        n[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
-        (v.data, n, v.nlen)
+/// Free inode slot `i` once nothing can reach it: name removed,
+/// no OFD references, and no live hard alias still naming it. A
+/// name removed while all three hold leaves the slot as an
+/// anonymous inode until the last reference drops.
+fn vfile_free_if_dead(i: usize) {
+    let vs = unsafe { &mut *core::ptr::addr_of_mut!(VFILES) };
+    let Some(v) = vs.get(i).and_then(|s| s.as_ref()) else {
+        return;
     };
-    ino_report(&nm[..nlen], IN_DELETE, 0);
-    ino_report_self_loss(&nm[..nlen], IN_DELETE_SELF, 0);
+    if !v.unlinked || v.is_hard {
+        return;
+    }
+    let data = v.data;
     let live = unsafe { &*core::ptr::addr_of!(OFDS) }
         .iter()
         .flatten()
         .any(|o| matches!(o.kind, FdKind::Ram(j) | FdKind::Dev(j) if j == i));
-    if !live {
-        if !data.is_null() {
-            // SAFETY: data was kmalloc'd at cap; the slot is cleared
-            // right after so nothing can reach it.
-            unsafe { kalloc::kfree(data) };
-        }
-        unsafe { (*core::ptr::addr_of_mut!(VFILES))[i] = None };
+    if live || vfile_aliases(i) != 0 {
+        return;
     }
+    if !data.is_null() {
+        // SAFETY: data was kmalloc'd at cap; the slot is cleared
+        // right after so nothing can reach it.
+        unsafe { kalloc::kfree(data) };
+    }
+    vs[i] = None;
+}
+
+/// Drop a VFile's name. Storage dies immediately when no OFD still
+/// references it (and no hard alias keeps the inode reachable);
+/// otherwise ofd_release frees it at last close — Linux's
+/// open-unlink-keep-working semantics.
+fn vfile_remove(i: usize) {
+    let (nm, nlen, hard) = {
+        let Some(v) = vfile(i) else { return };
+        v.unlinked = true;
+        let mut n = [0u8; 128];
+        n[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+        (n, v.nlen, if v.is_hard { Some(v.hard) } else { None })
+    };
+    ino_report(&nm[..nlen], IN_DELETE, 0);
+    ino_report_self_loss(&nm[..nlen], IN_DELETE_SELF, 0);
+    if let Some(t) = hard {
+        // A hard alias is a bare name — nothing but the slot to
+        // free. Removing it may strand an already-unlinked inode.
+        unsafe { (*core::ptr::addr_of_mut!(VFILES))[i] = None };
+        vfile_free_if_dead(t);
+        return;
+    }
+    vfile_free_if_dead(i);
+}
+
+/// linkat-resolved pair: hardlink `new` to the inode `old` names.
+/// The flat VFS keeps inode+dentry in one slot, so the new name is
+/// a bare alias entry pointing at old's slot — the inode survives
+/// its own name dying while the alias reaches it. The archive is a
+/// read-only namespace — EXDEV like a cross-mount link; dirs and
+/// symlinks EPERM (no dir links; no link-inode for an alias to
+/// share). AT_EMPTY_PATH's fd-based old is out of scope.
+pub fn fs_linkat(old: &[u8], new: &[u8], flags: u64) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const EEXIST_: u64 = (-17i64) as u64;
+    const EXDEV_: u64 = (-18i64) as u64;
+    const ENOSPC_: u64 = (-28i64) as u64;
+    const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return EINVAL;
+    }
+    if new.len() > 128 {
+        return ENAMETOOLONG_;
+    }
+    // old's final component follows only under SYMLINK_FOLLOW —
+    // without it the link would name the link inode, which the
+    // alias model doesn't carry (EPERM below). new's intermediates
+    // resolve; its final component is the name to create.
+    let (ob, on, _) =
+        match resolve_links(old, flags & AT_SYMLINK_FOLLOW != 0) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    let old = &ob[..on];
+    let (nb, nn, _) = match resolve_links(new, false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if nn > 128 {
+        return ENAMETOOLONG_;
+    }
+    let new = &nb[..nn];
+    if new.is_empty() {
+        return ENOENT;
+    }
+    if dir_exists(old) {
+        return EPERM_; // dirs never hardlink
+    }
+    if vfile_find(new).is_some()
+        || dir_exists(new)
+        || fs_lookup(new).is_some()
+    {
+        return EEXIST_;
+    }
+    let Some(i) = vfile_find(old) else {
+        return if fs_lookup(old).is_some() { EXDEV_ } else { ENOENT };
+    };
+    let i = vfile_real(i); // a link through an alias names the inode
+    {
+        let Some(v) = vfile(i) else { return ENOENT };
+        if v.is_link {
+            return EPERM_;
+        }
+    }
+    let vs = unsafe { &mut *core::ptr::addr_of_mut!(VFILES) };
+    let Some(j) = vs.iter().position(|x| x.is_none()) else {
+        return ENOSPC_;
+    };
+    let mut a = VFile {
+        name: [0; 128],
+        nlen: new.len(),
+        data: core::ptr::null_mut(),
+        len: 0,
+        cap: 0,
+        unlinked: false,
+        is_link: false,
+        is_hard: true,
+        hard: i,
+        fmt: 0o100000,
+        rdev: 0,
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        atime: 0,
+        atime_ns: 0,
+        mtime: 0,
+        mtime_ns: 0,
+        ctime: 0,
+        ctime_ns: 0,
+    };
+    a.name[..new.len()].copy_from_slice(new);
+    vs[j] = Some(a);
+    // The inode's ctime bumps on link, like Linux.
+    let (s, ns) = now();
+    if let Some(v) = vfile(i) {
+        v.ctime = s;
+        v.ctime_ns = ns;
+    }
+    ino_report(new, IN_CREATE, 0);
+    0
 }
 
 /// unlink(path): the dir and archive are unwritable namespaces —
@@ -14306,9 +14507,18 @@ pub fn fs_rename(old: &[u8], new: &[u8]) -> u64 {
         return ENAMETOOLONG_;
     }
     let new = &nb[..nc];
+    // Directories move too — vdir_rename rewrites the subtree.
+    if vdir_find(old).is_some() {
+        return vdir_rename(old, new);
+    }
     let Some(i) = vfile_find(old) else {
         return if fs_lookup(old).is_some() { EROFS_ } else { ENOENT };
     };
+    // A file can't rename onto an existing directory (EISDIR) —
+    // implicit dirs count like explicit ones.
+    if dir_exists(new) && !is_file(new) {
+        return (-21i64) as u64; // EISDIR
+    }
     if let Some(j) = vfile_find(new) {
         if j == i {
             return 0; // rename onto self is a no-op
@@ -14327,6 +14537,131 @@ pub fn fs_rename(old: &[u8], new: &[u8]) -> u64 {
     ino_report_self_loss(old, IN_MOVE_SELF, cookie);
     ino_report(old, IN_MOVED_FROM, cookie);
     ino_report(new, IN_MOVED_TO, cookie);
+    0
+}
+
+/// fs_rename's directory arm: `old` names an explicit VDIRS slot.
+/// Linux's subtree move is a prefix rewrite in the flat store —
+/// every descendant vfile/vdir name swaps `old/` for `new/`.
+/// Rules match Linux: into own subtree EINVAL, onto a file
+/// ENOTDIR, replacing an existing dir requires it empty
+/// (ENOTEMPTY — implicit dirs always count as non-empty), and
+/// destination names must fit the fixed 128-byte slots, checked
+/// for every descendant first so the move can't fail halfway.
+fn vdir_rename(old: &[u8], new: &[u8]) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENOTDIR_: u64 = (-20i64) as u64;
+    const ENOTEMPTY_: u64 = (-39i64) as u64;
+    const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    if old == new {
+        return 0; // rename onto self is a no-op like files
+    }
+    if new.len() > old.len()
+        && new.starts_with(old)
+        && new[old.len()] == b'/'
+    {
+        return EINVAL_;
+    }
+    if is_file(new) {
+        return ENOTDIR_;
+    }
+    let mut npre = [0u8; 256];
+    npre[..new.len()].copy_from_slice(new);
+    npre[new.len()] = b'/';
+    let npre = &npre[..new.len() + 1];
+    if let Some(j) = vdir_find(new) {
+        // Replacing an existing dir: it must be empty — nothing in
+        // either store may live beneath it.
+        let occ = unsafe { &*core::ptr::addr_of!(VFILES) }
+            .iter()
+            .flatten()
+            .any(|v| !v.unlinked && v.name[..v.nlen].starts_with(npre))
+            || unsafe { &*core::ptr::addr_of!(VDIRS) }
+                .iter()
+                .flatten()
+                .any(|d| d.path[..d.nlen].starts_with(npre))
+            || unsafe { *core::ptr::addr_of!(INITRD) }.is_some_and(
+                |arc| {
+                    crate::cpio::entries(arc)
+                        .any(|(nm, _)| nm.starts_with(npre))
+                },
+            );
+        if occ {
+            return ENOTEMPTY_;
+        }
+        vdir_remove(j);
+    } else if dir_exists(new) {
+        return ENOTEMPTY_; // implicit dir — existing, non-empty
+    }
+    // Descendant names grow by (new.len - old.len) — pre-scan so an
+    // overlong result fails before anything moves.
+    let mut opre = [0u8; 256];
+    opre[..old.len()].copy_from_slice(old);
+    opre[old.len()] = b'/';
+    let opre = &opre[..old.len() + 1];
+    let over = unsafe { &*core::ptr::addr_of!(VFILES) }
+        .iter()
+        .flatten()
+        .any(|v| {
+            !v.unlinked
+                && v.name[..v.nlen].starts_with(opre)
+                && new.len() + v.nlen - old.len() > 128
+        })
+        || unsafe { &*core::ptr::addr_of!(VDIRS) }
+            .iter()
+            .flatten()
+            .any(|d| {
+                d.path[..d.nlen].starts_with(opre)
+                    && new.len() + d.nlen - old.len() > 128
+            });
+    if over {
+        return ENAMETOOLONG_;
+    }
+    let (ts, tns) = now();
+    let swap = |nm: &mut [u8; 128], nlen: &mut usize| {
+        let tail = *nlen - old.len();
+        let mut t = [0u8; 128];
+        t[..new.len()].copy_from_slice(new);
+        t[new.len()..new.len() + tail]
+            .copy_from_slice(&nm[old.len()..*nlen]);
+        *nm = t;
+        *nlen = new.len() + tail;
+    };
+    for v in unsafe { &mut *core::ptr::addr_of_mut!(VFILES) }
+        .iter_mut()
+        .flatten()
+    {
+        if !v.unlinked && v.name[..v.nlen].starts_with(opre) {
+            swap(&mut v.name, &mut v.nlen);
+            v.ctime = ts;
+            v.ctime_ns = tns;
+        }
+    }
+    let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
+    for d in ds.iter_mut().flatten() {
+        if d.path[..d.nlen].starts_with(opre) {
+            swap(&mut d.path, &mut d.nlen);
+            d.ctime = ts;
+            d.ctime_ns = tns;
+        }
+    }
+    // The subtree loop above can't touch `old` itself (no trailing
+    // slash match) — rename it last, still by name, so a descendant
+    // count surprise can't leave a half-moved tree.
+    let Some(i) = ds.iter().position(|d| {
+        d.as_ref().is_some_and(|d| &d.path[..d.nlen] == old)
+    }) else {
+        return ENOENT;
+    };
+    let d = ds[i].as_mut().unwrap();
+    swap(&mut d.path, &mut d.nlen);
+    d.ctime = ts;
+    d.ctime_ns = tns;
+    let cookie = INO_COOKIE
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u32;
+    ino_report_self_loss(old, IN_MOVE_SELF, cookie);
+    ino_report(old, IN_MOVED_FROM | IN_ISDIR, cookie);
+    ino_report(new, IN_MOVED_TO | IN_ISDIR, cookie);
     0
 }
 
@@ -14377,7 +14712,7 @@ pub fn fs_truncate(path: &[u8], len: u64) -> u64 {
     let Some(i) = vfile_find(path) else {
         return if fs_lookup(path).is_some() { EROFS_ } else { ENOENT };
     };
-    let Some(v) = vfile(i) else { return ENOENT };
+    let Some(v) = vfile(vfile_real(i)) else { return ENOENT };
     // Device nodes and fifos have no size to set — Linux EINVAL.
     if v.fmt != 0o100000 && !v.is_link {
         return EINVAL;
@@ -14417,7 +14752,7 @@ fn chmod_obj(p: &[u8], mode: u64) -> u64 {
     const EROFS_: u64 = (-30i64) as u64;
     let (s, ns) = now();
     if let Some(i) = vfile_find(p) {
-        let Some(v) = vfile(i) else { return ENOENT };
+        let Some(v) = vfile(vfile_real(i)) else { return ENOENT };
         v.mode = (mode & 0o7777) as u16;
         v.ctime = s;
         v.ctime_ns = ns;
@@ -14492,7 +14827,7 @@ fn chown_obj(p: &[u8], uid: u32, gid: u32) -> u64 {
     const EROFS_: u64 = (-30i64) as u64;
     let (s, ns) = now();
     if let Some(i) = vfile_find(p) {
-        let Some(v) = vfile(i) else { return ENOENT };
+        let Some(v) = vfile(vfile_real(i)) else { return ENOENT };
         if uid != u32::MAX {
             v.uid = uid;
         }
@@ -14625,7 +14960,7 @@ pub fn fs_utimens(
     const EROFS_: u64 = (-30i64) as u64;
     let nw = now();
     if let Some(i) = vfile_find(p) {
-        let Some(v) = vfile(i) else { return ENOENT };
+        let Some(v) = vfile(vfile_real(i)) else { return ENOENT };
         (v.atime, v.atime_ns) =
             utspec(at, (v.atime, v.atime_ns), nw);
         (v.mtime, v.mtime_ns) =
@@ -14806,12 +15141,423 @@ pub fn fd_pread(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
 /// succeeding; F_DUPFD rides fd_dup_at's min-slot scan,
 /// F_DUPFD_CLOEXEC the same plus the bit. Unknown cmds EINVAL —
 /// never a fake success.
+/// Byte-range lock bookkeeping for fcntl(F_SETLK/SETLKW/GETLK and
+/// the F_OFD_* family) plus flock(2). Two namespaces, like Linux:
+/// POSIX locks are per-process (owner = tgid, released on ANY close
+/// of the file and at process death); OFD locks — which flock()
+/// shares since modern Linux — live on the open file description
+/// (owner = the OFD index, released with its last fd).
+const MAX_FLOCKS: usize = 64;
+
+/// File identity a lock attaches to. The OFD pins its file, so a
+/// live lock's target always outlives the record: the archive slice
+/// is immortal, and a vfile slot can't free while an OFD names it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LockTag {
+    Ram(usize),
+    Arc(u64),
+}
+
+/// One held byte-range lock (or a waiter's pending request).
+#[derive(Clone, Copy)]
+struct FLockReq {
+    tag: LockTag,
+    /// [start, end) — l_len == 0 normalizes to end = u64::MAX.
+    start: u64,
+    end: u64,
+    write: bool,
+    /// POSIX namespace (per-tgid) vs OFD (per-open-file-desc).
+    posix: bool,
+    /// tgid for POSIX, OFD index for OFD/flock locks.
+    owner: u64,
+}
+
+impl FLockReq {
+    const EMPTY: FLockReq = FLockReq {
+        tag: LockTag::Arc(0),
+        start: 0,
+        end: 0,
+        write: false,
+        posix: false,
+        owner: 0,
+    };
+}
+
+static mut FLOCKS: [Option<FLockReq>; MAX_FLOCKS] =
+    [const { None }; MAX_FLOCKS];
+
+/// Map an OFD to the file identity its locks key on, or None for
+/// kinds that can't carry byte-range locks (pipes, sockets, dirs,
+/// /proc — Linux answers EBADF for lock requests there).
+fn ofd_lock_tag(o: &OpenFile) -> Option<LockTag> {
+    match &o.kind {
+        FdKind::File(d) => Some(LockTag::Arc(d.as_ptr() as u64)),
+        FdKind::Ram(i) | FdKind::Dev(i) => Some(LockTag::Ram(*i)),
+        _ => None,
+    }
+}
+
+/// The first held lock `req` conflicts with: same file, same
+/// namespace, different owner, overlapping range, and not two
+/// readers. POSIX and OFD records never interact, like Linux.
+fn lock_conflict(req: &FLockReq) -> Option<FLockReq> {
+    let ls = unsafe { &*core::ptr::addr_of!(FLOCKS) };
+    ls.iter().flatten().copied().find(|h| {
+        h.tag == req.tag
+            && h.posix == req.posix
+            && h.owner != req.owner
+            && h.start < req.end
+            && req.start < h.end
+            && (h.write || req.write)
+    })
+}
+
+/// Drop [start,end) out of every `owner` record on `tag` in this
+/// namespace — Linux's F_UNLCK split: remnants on either side stay.
+fn lock_subtract(tag: LockTag, start: u64, end: u64, posix: bool, owner: u64) {
+    let ls = unsafe { &mut *core::ptr::addr_of_mut!(FLOCKS) };
+    for i in 0..ls.len() {
+        let Some(h) = ls[i] else { continue };
+        if h.tag != tag || h.posix != posix || h.owner != owner {
+            continue;
+        }
+        if start >= h.end || end <= h.start {
+            continue;
+        }
+        let (hs, he) = (h.start, h.end);
+        if start > hs && end < he {
+            // Interior hole — needs a second record for the right
+            // remnant. With no free slot the whole record stays:
+            // an over-wide lock only blocks others, dropping the
+            // right side would under-cover bytes the owner holds.
+            if let Some(f) = ls.iter().position(|x| x.is_none()) {
+                ls[f] = Some(FLockReq { start: end, ..h });
+                ls[i] = Some(FLockReq { end: start, ..h });
+            }
+        } else if start > hs {
+            ls[i] = Some(FLockReq { end: start, ..h });
+        } else if end < he {
+            ls[i] = Some(FLockReq { start: end, ..h });
+        } else {
+            ls[i] = None;
+        }
+    }
+}
+
+/// Apply an acquire: same-owner overlaps absorb first (Linux merges
+/// adjacent equal-owner ranges — removing overlaps is equivalent
+/// since self never conflicts). ENOLCK-shaped false when full.
+fn lock_insert(req: FLockReq) -> bool {
+    lock_subtract(req.tag, req.start, req.end, req.posix, req.owner);
+    let ls = unsafe { &mut *core::ptr::addr_of_mut!(FLOCKS) };
+    let Some(i) = ls.iter().position(|x| x.is_none()) else {
+        return false;
+    };
+    ls[i] = Some(req);
+    true
+}
+
+/// Wake every FLock-blocked task whose stored request now fits —
+/// called after any unlock or close-side sweep.
+fn flock_wake_all() {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s else { continue };
+        if t.state != TaskState::Blocked || t.wait_on != WaitOn::FLock {
+            continue;
+        }
+        let req = t.wait_lock;
+        if lock_conflict(&req).is_some() {
+            continue;
+        }
+        if !lock_insert(req) {
+            t.ctx.rax = ENOLCK;
+        } else {
+            t.ctx.rax = 0;
+        }
+        t.wait_on = WaitOn::None;
+        t.wait_lock = FLockReq::EMPTY;
+        t.state = TaskState::Runnable;
+    }
+}
+
+/// Remove every lock with this owner+namespace — POSIX(tgid) at
+/// process death, Ofd(oi) at last-fd close.
+fn flock_sweep(posix: bool, owner: u64) {
+    let ls = unsafe { &mut *core::ptr::addr_of_mut!(FLOCKS) };
+    let mut any = false;
+    for s in ls.iter_mut() {
+        if s.is_some_and(|h| h.posix == posix && h.owner == owner) {
+            *s = None;
+            any = true;
+        }
+    }
+    if any {
+        flock_wake_all();
+    }
+}
+
+/// POSIX close semantics: closing ANY fd to a file drops ALL the
+/// process's locks on it (the famous Linux quirk). Call with the
+/// fd's file tag — resolved before ofd_release eats the kind.
+fn flock_close_sweep(tag: LockTag, tgid: u64) {
+    let ls = unsafe { &mut *core::ptr::addr_of_mut!(FLOCKS) };
+    let mut any = false;
+    for s in ls.iter_mut() {
+        if s.is_some_and(|h| {
+            h.posix && h.owner == tgid && h.tag == tag
+        }) {
+            *s = None;
+            any = true;
+        }
+    }
+    if any {
+        flock_wake_all();
+    }
+}
+
+/// Parse the user `struct flock` at `va`: (l_type, l_whence) share
+/// the first u64, then l_start, l_len, l_pid — 32 bytes, little
+/// endian, read through the caller's tables like every gated copy.
+fn flock_read(t: &Task, va: u64) -> Result<(i16, i16, i64, i64), u64> {
+    if !range_ok(va, 32) {
+        return Err(EFAULT);
+    }
+    let a = read_task_u(t.pml4, va, 8).ok_or(EFAULT)?;
+    let start = read_task_u(t.pml4, va + 8, 8).ok_or(EFAULT)? as i64;
+    let len = read_task_u(t.pml4, va + 16, 8).ok_or(EFAULT)? as i64;
+    Ok((a as u16 as i16, (a >> 16) as u16 as i16, start, len))
+}
+
+/// Resolve l_whence + l_start + l_len to an absolute [start, end)
+/// against the OFD's position/size. Empty (start >= end) is legal —
+/// it locks nothing and always succeeds. EINVAL on bad whence,
+/// negative len, or a range that under/overflows (Linux's
+/// EINVAL-before-EOVERFLOW behavior, both folded to EINVAL here).
+fn flock_range(
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    pos: u64,
+    fsize: u64,
+) -> Result<(u64, u64), u64> {
+    if l_len < 0 {
+        return Err(EINVAL);
+    }
+    let base: i128 = match l_whence {
+        0 => 0,                              // SEEK_SET
+        1 => pos as i128,                    // SEEK_CUR
+        2 => fsize as i128,                  // SEEK_END
+        _ => return Err(EINVAL),
+    };
+    let start = base + l_start as i128;
+    if start < 0 || start > u64::MAX as i128 {
+        return Err(EINVAL);
+    }
+    let end = if l_len == 0 {
+        u64::MAX
+    } else {
+        let e = start + l_len as i128;
+        if e > u64::MAX as i128 {
+            u64::MAX
+        } else {
+            e as u64
+        }
+    };
+    Ok((start as u64, end))
+}
+
+/// fcntl lock core for F_SETLK(W)/F_OFD_SETLK(W): validates the
+/// request's accmode (WRLCK needs a writable fd, RDLCK a readable
+/// one), then either conflicts (EAGAIN or block) or records it.
+fn fcntl_lock(
+    t: &mut Task,
+    fd: u64,
+    arg: u64,
+    posix: bool,
+    blocking: bool,
+) -> u64 {
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let Some(tag) = ofd_lock_tag(o) else {
+        return EBADF; // not a lockable file kind
+    };
+    let (l_type, l_whence, l_start, l_len) =
+        match flock_read(t, arg) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
+    let (start, end) =
+        match flock_range(l_whence, l_start, l_len, o.pos as u64, o_len(o)) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    match l_type {
+        F_RDLCK => {
+            if o.accmode == 1 {
+                return EBADF; // read lock needs a readable fd
+            }
+        }
+        F_WRLCK => {
+            if o.accmode == 0 {
+                return EBADF; // write lock needs a writable fd
+            }
+        }
+        F_UNLCK => {}
+        _ => return EINVAL,
+    }
+    let owner = if posix { t.tgid } else { fd_to_ofd_idx(t, fd) };
+    if l_type == F_UNLCK {
+        lock_subtract(tag, start, end, posix, owner);
+        flock_wake_all();
+        return 0;
+    }
+    let req = FLockReq {
+        tag, start, end,
+        write: l_type == F_WRLCK,
+        posix,
+        owner,
+    };
+    if lock_conflict(&req).is_some() {
+        if !blocking {
+            return EAGAIN;
+        }
+        t.wait_lock = req;
+        t.wait_on = WaitOn::FLock;
+        t.state = TaskState::Blocked;
+        block_switch();
+    }
+    if !lock_insert(req) {
+        return ENOLCK;
+    }
+    0
+}
+
+/// fcntl F_GETLK/F_OFD_GETLK: report the first conflicting lock
+/// through the user struct (l_pid = owner for POSIX, -1 for OFD
+/// like Linux), or l_type = F_UNLCK when nothing blocks it.
+fn fcntl_getlk(t: &mut Task, fd: u64, arg: u64, posix: bool) -> u64 {
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let Some(tag) = ofd_lock_tag(o) else { return EBADF };
+    let (l_type, l_whence, l_start, l_len) =
+        match flock_read(t, arg) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    if l_type != 0 && l_type != 1 {
+        return EINVAL;
+    }
+    let (start, end) =
+        match flock_range(l_whence, l_start, l_len, o.pos as u64, o_len(o)) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    let req = FLockReq {
+        tag, start, end,
+        write: l_type == 1,
+        posix,
+        owner: if posix { t.tgid } else { fd_to_ofd_idx(t, fd) },
+    };
+    if !range_ok_w(arg, 32) {
+        return EFAULT;
+    }
+    let (ty, st, ln, pid): (u64, u64, u64, u64) =
+        if let Some(h) = lock_conflict(&req) {
+            (
+                if h.write { 1 } else { 0 },
+                h.start,
+                if h.end == u64::MAX { 0 } else { h.end - h.start },
+                if posix { h.owner } else { u64::MAX }, // -1 for OFD
+            )
+        } else {
+            (2, l_start as u64, l_len as u64, 0) // F_UNLCK, input kept
+        };
+    let mut buf = [0u8; 32];
+    buf[0..2].copy_from_slice(&(ty as u16).to_ne_bytes());
+    buf[8..16].copy_from_slice(&st.to_ne_bytes());
+    buf[16..24].copy_from_slice(&ln.to_ne_bytes());
+    buf[24..28].copy_from_slice(&(pid as u32).to_ne_bytes());
+    if write_task_bytes(t.pml4, arg, &buf) { 0 } else { EFAULT }
+}
+
+/// OFD index for an fd — the lock owner for OFD-namespace records.
+fn fd_to_ofd_idx(t: &Task, fd: u64) -> u64 {
+    fdt(t).fds[fd as usize].map(|x| x as u64).unwrap_or(u64::MAX)
+}
+
+/// Current size of an OFD's file for SEEK_END lock resolution.
+fn o_len(o: &OpenFile) -> u64 {
+    match &o.kind {
+        FdKind::File(d) => d.len() as u64,
+        FdKind::Ram(i) | FdKind::Dev(i) => {
+            vfile(*i).map_or(0, |v| v.len as u64)
+        }
+        _ => 0,
+    }
+}
+
+/// flock(fd, op): BSD whole-file locks — OFD-namespace records over
+/// [0, MAX) keyed by the fd's open description, LOCK_NB returning
+/// EWOULDBLOCK (== EAGAIN here) like Linux.
+pub fn sys_flock(fd: u64, op: u64) -> u64 {
+    const LOCK_SH: u64 = 1;
+    const LOCK_EX: u64 = 2;
+    const LOCK_NB: u64 = 4;
+    const LOCK_UN: u64 = 8;
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let Some(tag) = ofd_lock_tag(o) else { return EBADF };
+    let owner = fd_to_ofd_idx(t, fd);
+    match op & !LOCK_NB {
+        LOCK_UN => {
+            lock_subtract(tag, 0, u64::MAX, false, owner);
+            flock_wake_all();
+            0
+        }
+        LOCK_SH | LOCK_EX => {
+            let wr = op & !LOCK_NB == LOCK_EX;
+            if wr && o.accmode == 0 {
+                return EBADF; // EX needs a writable fd
+            }
+            if !wr && o.accmode == 1 {
+                return EBADF; // SH needs a readable fd
+            }
+            let req = FLockReq {
+                tag, start: 0, end: u64::MAX,
+                write: wr, posix: false, owner,
+            };
+            if lock_conflict(&req).is_some() {
+                if op & LOCK_NB != 0 {
+                    return EAGAIN;
+                }
+                t.wait_lock = req;
+                t.wait_on = WaitOn::FLock;
+                t.state = TaskState::Blocked;
+                block_switch();
+            }
+            if !lock_insert(req) {
+                return ENOLCK;
+            }
+            0
+        }
+        _ => EINVAL,
+    }
+}
+
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     const F_DUPFD: u64 = 0;
     const F_GETFD: u64 = 1;
     const F_SETFD: u64 = 2;
     const F_GETFL: u64 = 3;
     const F_SETFL: u64 = 4;
+    const F_GETLK: u64 = 5;
+    const F_SETLK: u64 = 6;
+    const F_SETLKW: u64 = 7;
+    const F_OFD_GETLK: u64 = 36;
+    const F_OFD_SETLK: u64 = 37;
+    const F_OFD_SETLKW: u64 = 38;
     const F_DUPFD_CLOEXEC: u64 = 1030;
     let Some(t) = cur_mut() else { return EBADF };
     match cmd {
@@ -14861,6 +15607,12 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             }
             r
         }
+        F_GETLK => fcntl_getlk(t, fd, arg, true),
+        F_SETLK => fcntl_lock(t, fd, arg, true, false),
+        F_SETLKW => fcntl_lock(t, fd, arg, true, true),
+        F_OFD_GETLK => fcntl_getlk(t, fd, arg, false),
+        F_OFD_SETLK => fcntl_lock(t, fd, arg, false, false),
+        F_OFD_SETLKW => fcntl_lock(t, fd, arg, false, true),
         _ => EINVAL,
     }
 }
@@ -14910,9 +15662,15 @@ pub fn fd_dup2(old: u64, new: u64) -> u64 {
     if old == new {
         return new;
     }
-    // Release whatever `new` held, then point it at old's OFD.
+    // Release whatever `new` held, then point it at old's OFD. The
+    // displaced fd is a close for lock purposes — POSIX records on
+    // that file die with it (tag resolved before the OFD goes).
+    let prev_tag = ofd(t, new).and_then(|o| ofd_lock_tag(o));
     if let Some(prev) = fdt(t).fds[new as usize].take() {
         ofd_release(prev as usize);
+        if let Some(tag) = prev_tag {
+            flock_close_sweep(tag, t.tgid);
+        }
     }
     let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
     if let Some(o) = ofds.get_mut(oi as usize).and_then(|s| s.as_mut()) {
@@ -14949,11 +15707,18 @@ pub fn fd_dup3(old: u64, new: u64, flags: u64) -> u64 {
 /// gets EBADF, which is correct.
 pub fn fd_close(fd: u64) -> u64 {
     let Some(t) = cur_mut() else { return EBADF };
+    // Resolve the file's lock tag BEFORE the OFD dies — POSIX
+    // locks on the file drop on ANY close of it (Linux's quirk),
+    // OFD locks only when this release is the last.
+    let tag = ofd(t, fd).and_then(|o| ofd_lock_tag(o));
     let Some(slot) = fdt(t).fds.get_mut(fd as usize) else {
         return EBADF;
     };
     let Some(oi) = slot.take() else { return EBADF };
     ofd_release(oi as usize);
+    if let Some(tag) = tag {
+        flock_close_sweep(tag, t.tgid);
+    }
     0
 }
 
@@ -14973,6 +15738,9 @@ fn ofd_release(oi: usize) {
     let accmode = o.accmode;
     let kind = core::mem::replace(&mut o.kind, FdKind::Stdin);
     ofds[oi] = None;
+    // OFD-namespace locks (F_OFD_*, flock) die with the description —
+    // dup'd fds share it, so they outlive intermediate closes.
+    flock_sweep(false, oi as u64);
     // An OFD's death retires every epoll interest pinning it —
     // Linux drops the epitem on file teardown the same way.
     {
@@ -15040,17 +15808,9 @@ fn ofd_release(oi: usize) {
             ino_report(&nm[..v.nlen], m, 0);
         }
         // unlinked-while-open storage dies with its last OFD; a
-        // still-linked file is owned by the VFS slot and stays.
-        if let Some(v) = vfile(i) {
-            if v.unlinked {
-                if !v.data.is_null() {
-                    // SAFETY: v.data was kmalloc'd at v.cap; the slot
-                    // goes None right after so nothing can touch it.
-                    unsafe { kalloc::kfree(v.data) };
-                }
-                unsafe { (*core::ptr::addr_of_mut!(VFILES))[i] = None };
-            }
-        }
+        // still-linked file is owned by the VFS slot and stays —
+        // and hard aliases keep an unlinked inode alive by name.
+        vfile_free_if_dead(i);
     }
 }
 
@@ -15565,10 +16325,13 @@ pub fn sys_futex(
     const EAGAIN_: u64 = (-11i64) as u64;
     const ETIMEDOUT_: u64 = (-110i64) as u64;
     match op & 0x7f {
-        0 => {
-            // FUTEX_WAIT: sleep only while *uaddr == val — the
-            // compare-then-block is atomic because syscalls run
-            // IF-masked on the single CPU.
+        0 | 9 => {
+            // FUTEX_WAIT / FUTEX_WAIT_BITSET: sleep only while
+            // *uaddr == val — the compare-then-block is atomic
+            // because syscalls run IF-masked on the single CPU.
+            // The bitset's mask only selects which WAKE_BITSET
+            // wakes us; with one key space every wake reaches us
+            // anyway, so the collapse is exact here.
             let Some(t) = cur_mut() else { return EAGAIN_ };
             if !range_ok(uaddr, 4) {
                 return EFAULT;
@@ -15611,8 +16374,11 @@ pub fn sys_futex(
             t.state = TaskState::Blocked;
             block_switch()
         }
-        1 => {
-            // FUTEX_WAKE: wake up to `val` waiters on our mm's word.
+        1 | 10 => {
+            // FUTEX_WAKE / FUTEX_WAKE_BITSET: wake up to `val`
+            // waiters on our mm's word. The bitset mask only
+            // narrows the wake set — waking extra waiters is a
+            // legal spurious wake, so collapse to plain wake.
             let Some(t) = cur_mut() else { return 0 };
             let pml4 = t.pml4;
             futex_wake(pml4, uaddr, val)
@@ -19207,8 +19973,15 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     while ce != 0 {
         let fi = ce.trailing_zeros() as usize;
         ce &= !(1 << fi);
+        // A cloexec close is still a close: POSIX locks on that file
+        // release like any other close(2) of it (tag first — the
+        // OFD's kind dies inside ofd_release).
+        let tag = ofd(t, fi as u64).and_then(|o| ofd_lock_tag(o));
         if let Some(oi) = fdt(t).fds[fi].take() {
             ofd_release(oi as usize);
+            if let Some(tag) = tag {
+                flock_close_sweep(tag, t.tgid);
+            }
         }
     }
     fdt(t).cloexec = 0;
@@ -19370,7 +20143,7 @@ fn spawn_idx(img: &[u8], name: &str, hold: bool) -> Option<usize> {
     let Some(mut t) = load(img) else {
         return None;
     };
-    let mut args = ExecArgs::empty();
+    let args = exec_args_scratch();
     let n = name.len().min(EXEC_STR_CAP - 1);
     args.argv[0][..n].copy_from_slice(&name.as_bytes()[..n]);
     args.argv_len[0] = n + 1;
@@ -19626,6 +20399,9 @@ fn exit_bookkeeping(n: usize) {
             t.pid != cpid && t.tgid == ctgid && t.state != TaskState::Exited
         }) {
             nt_handle_sweep(tasks, ctgid);
+            // POSIX locks are process property — the last-standing
+            // tgid member's death releases every record it owned.
+            flock_sweep(true, ctgid);
         }
         return;
     }
@@ -19648,6 +20424,8 @@ fn exit_bookkeeping(n: usize) {
         // thread/process/section ledger objects refdown now or the
         // global ledgers leak a slot per dead handle.
         nt_handle_sweep(tasks, cpid);
+        // POSIX locks die with the process (tgid == leader pid).
+        flock_sweep(true, cpid);
     }
     // Wake a wait-blocked parent whose target just exited.
     let mut collected = false;
@@ -20079,6 +20857,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         wait_ptr: 0,
         wait_ptr2: 0,
         wait_ptr3: 0,
+        wait_lock: FLockReq::EMPTY,
         psel_mask: u64::MAX,
         frame_mask: u64::MAX,
         wait_len: 0,
@@ -20256,6 +21035,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         wait_ptr: 0,
         wait_ptr2: 0,
         wait_ptr3: 0,
+        wait_lock: FLockReq::EMPTY,
         psel_mask: u64::MAX,
         frame_mask: u64::MAX,
         wait_len: 0,

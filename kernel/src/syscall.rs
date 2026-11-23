@@ -282,10 +282,14 @@ const NR_READLINKAT: u64 = 267;
 const NR_FACCESSAT: u64 = 269;
 const NR_PREAD64: u64 = 17;
 const NR_FCNTL: u64 = 72;
+const NR_FLOCK: u64 = 73;
+const NR_LINK: u64 = 86;
+const NR_LINKAT: u64 = 265;
 const NR_OPENAT: u64 = 257;
 const NR_DUP3: u64 = 292;
 const NR_ACCEPT4: u64 = 288;
 const NR_FSYNC: u64 = 74;
+const NR_SYNC_FILE_RANGE: u64 = 277;
 const NR_FDATASYNC: u64 = 75;
 const NR_TRUNCATE: u64 = 76;
 const NR_FTRUNCATE: u64 = 77;
@@ -406,6 +410,9 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_OPENAT => sys_openat(a1, a2, a3, a4),
         NR_PREAD64 => user::fd_pread(a1, a2, a3, a4 as i64),
         NR_FCNTL => user::sys_fcntl(a1, a2, a3),
+        NR_FLOCK => user::sys_flock(a1, a2),
+        NR_LINK => sys_linkat(u64::MAX, a1, u64::MAX, a2, 0),
+        NR_LINKAT => sys_linkat(a1, a2, a3, a4, a5),
         NR_DUP3 => user::fd_dup3(a1, a2, a3),
         NR_CLOSE => user::fd_close(a1),
         // off arrives as u64; the fd layer interprets it as i64 —
@@ -456,13 +463,22 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_STAT => sys_stat_path(a1, a2, false),
         NR_LSTAT => sys_stat_path(a1, a2, true),
         NR_FSTAT => user::sys_fstat(a1, a2),
-        NR_ACCESS => sys_access(u64::MAX, a1),
-        NR_FACCESSAT => sys_access(a1, a2),
+        NR_ACCESS => sys_access(u64::MAX, a1, a2),
+        NR_FACCESSAT => sys_access(a1, a2, a3),
         NR_SYMLINK => sys_symlink(a1, a2),
         NR_SYMLINKAT => sys_symlinkat(a1, a2, a3),
         NR_READLINK => sys_readlink(a1, a2, a3),
         NR_READLINKAT => sys_readlinkat(a1, a2, a3, a4),
         NR_FSYNC | NR_FDATASYNC => user::fd_fsync(a1),
+        // Writeback hint — dpkg issues one per extracted file. No
+        // writeback exists to schedule; valid flags + valid fd = 0.
+        NR_SYNC_FILE_RANGE => {
+            if a4 & !7 != 0 {
+                EINVAL
+            } else {
+                user::fd_fsync(a1) // validates fd, returns 0
+            }
+        }
         NR_TRUNCATE => sys_truncate(a1, a2),
         NR_FTRUNCATE => user::fd_ftruncate(a1, a2),
         NR_RENAME => sys_renameat2(u64::MAX, a1, u64::MAX, a2, 0),
@@ -680,6 +696,13 @@ fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
         Err(e) => return e,
     };
     let name = &rb[..rn];
+    // A regular file with no exec bit is EACCES even for root —
+    // this is the check dpkg's helper probe actually reads.
+    if let Ok(st) = user::fill_stat(name, false) {
+        if st[3] & 0o170000 == 0o100000 && st[3] & 0o111 == 0 {
+            return (-13i64) as u64; // EACCES
+        }
+    }
     let Some(img) = user::fs_lookup(name) else {
         return ENOENT;
     };
@@ -690,8 +713,8 @@ fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
     }
     // Copy argv/envp out of the OLD address space before exec tears
     // it down — collect_exec_args gate-checks every slot and string.
-    let mut args = user::ExecArgs::empty();
-    let r = user::collect_exec_args(argv, envp, &mut args);
+    let args = user::exec_args_scratch();
+    let r = user::collect_exec_args(argv, envp, args);
     if r != 0 {
         return r;
     }
@@ -701,7 +724,7 @@ fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
         args.argv_len[0] = n + 1;
         args.argc = 1;
     }
-    if !user::exec(img, ctx, &args, name) {
+    if !user::exec(img, ctx, args, name) {
         // The address space is already torn down; the task cannot
         // safely resume. Kill it — the run() loop reaps as usual.
         sys_exit(127);
@@ -740,9 +763,12 @@ fn sys_statfs(path: u64, buf: u64) -> u64 {
     user::statfs_path(&cb[..cn], buf)
 }
 
-/// access/faccessat(path, mode): a flat namespace only has
-/// existence to report — root, archive members, RAM files.
-fn sys_access(dirfd: u64, path: u64) -> u64 {
+/// access/faccessat(path, mode): existence plus real mode checks.
+/// Root bypasses R/W permission bits (CAP_DAC_OVERRIDE); the one
+/// check even root can't skip is X_OK on a file with no exec bit.
+/// faccessat's flags arg is ignored — AT_SYMLINK_NOFOLLOW is the
+/// only defined bit and our resolution follows links anyway.
+fn sys_access(dirfd: u64, path: u64, mode: u64) -> u64 {
     let mut name = [0u8; 257];
     let n = match copy_user_path(path, &mut name) {
         Ok(n) => n,
@@ -757,11 +783,34 @@ fn sys_access(dirfd: u64, path: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    if user::fs_exists(&rb[..rn]) {
-        0
-    } else {
-        ENOENT
+    const X_OK: u64 = 1;
+    const W_OK: u64 = 2;
+    const EACCES_: u64 = (-13i64) as u64;
+    let st = match user::fill_stat(&rb[..rn], false) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let m = st[3];
+    if m & 0o170000 != 0o100000 {
+        return 0; // dirs/links/devs: searchable, writable by root
     }
+    if mode & X_OK != 0 && m & 0o111 == 0 {
+        return EACCES_;
+    }
+    // W_OK: the archive is a read-only namespace — MAY_WRITE on
+    // an ro mount is EROFS like Linux. RAM files answer by their
+    // write bits (root already bypassed the R/X questions above,
+    // but even root can't write a file with no write bits anywhere
+    // — the mode check stands for both).
+    if mode & W_OK != 0 {
+        if user::fs_is_archive(&rb[..rn]) {
+            return (-30i64) as u64; // EROFS
+        }
+        if m & 0o222 == 0 {
+            return EACCES_;
+        }
+    }
+    0
 }
 
 /// unlink/unlinkat(dirfd, path, flags): one flat directory, so dirfd
@@ -770,6 +819,31 @@ fn sys_access(dirfd: u64, path: u64) -> u64 {
 /// unlink/unlinkat(dirfd, path, flags): AT_REMOVEDIR routes to
 /// fs_rmdir; anything else nonzero EINVALs. canon_path does the
 /// dirfd validation and cwd join.
+/// linkat(olddirfd, old, newdirfd, new, flags): each side
+/// canonicalizes against its own dirfd like renameat2; flags pass
+/// through for AT_SYMLINK_FOLLOW validation in the fs layer.
+fn sys_linkat(odfd: u64, old: u64, ndfd: u64, new: u64, flags: u64) -> u64 {
+    let mut op = [0u8; 257];
+    let on = match copy_user_path(old, &mut op) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mut np = [0u8; 257];
+    let nn = match copy_user_path(new, &mut np) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let (ob, ocn) = match user::canon_path(odfd, &op[..on]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let (nb, ncn) = match user::canon_path(ndfd, &np[..nn]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::fs_linkat(&ob[..ocn], &nb[..ncn], flags)
+}
+
 fn sys_unlinkat(dirfd: u64, path: u64, flags: u64) -> u64 {
     const AT_REMOVEDIR: u64 = 0x200;
     if flags & !(AT_REMOVEDIR) != 0 {
@@ -1062,14 +1136,54 @@ fn sys_utimes_path(dirfd: u64, path: u64, times: u64) -> u64 {
     user::fs_utimens(&cb[..cn], ts, false)
 }
 
+/// Copy a utimensat-style timespec[2] out of user memory — raw
+/// sec/nsec pairs; fs_utimens validates the NOW/OMIT sentinels.
+/// NULL means both-NOW.
+fn utimens_read(times: u64) -> Result<Option<[[u64; 2]; 2]>, u64> {
+    if times == 0 {
+        return Ok(None);
+    }
+    if !user::range_ok(times, 32) {
+        return Err(EFAULT);
+    }
+    let mut t = [[0u64; 2]; 2];
+    for (i, e) in t.iter_mut().enumerate() {
+        // SAFETY: [times, times+32) validated readable.
+        *e = [
+            unsafe { (times as *const u64).add(i * 2).read_unaligned() },
+            unsafe {
+                (times as *const u64).add(i * 2 + 1).read_unaligned()
+            },
+        ];
+    }
+    Ok(Some(t))
+}
+
 /// utimensat(dirfd, path, timespec[2], flags): AT_SYMLINK_NOFOLLOW +
-/// AT_EMPTY_PATH; NULL times is both-NOW. The raw sec/nsec pairs go
-/// to fs_utimens which validates the NOW/OMIT sentinels.
+/// AT_EMPTY_PATH; NULL times is both-NOW. A NULL path is futimens:
+/// the dirfd itself is the target (tar stamps extracted files it
+/// still holds open) — NOFOLLOW is EINVAL there like Linux since
+/// there's no link to not follow, and NULL at AT_FDCWD is EFAULT.
 fn sys_utimensat(dirfd: u64, path: u64, times: u64, flags: u64) -> u64 {
     const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     const AT_EMPTY_PATH: u64 = 0x1000;
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return EINVAL;
+    }
+    if path == 0 {
+        if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            return EINVAL;
+        }
+        if dirfd as i32 == -100 {
+            return EFAULT;
+        }
+        return user::fd_utimens(
+            dirfd,
+            match utimens_read(times) {
+                Ok(t) => t,
+                Err(e) => return e,
+            },
+        );
     }
     let mut name = [0u8; 257];
     let n = match copy_user_path(path, &mut name) {
@@ -1078,21 +1192,9 @@ fn sys_utimensat(dirfd: u64, path: u64, times: u64, flags: u64) -> u64 {
     };
     // Path copied before the times pointer is touched — a bad path
     // outranks a bad times pointer like Linux's getname ordering.
-    let ts = if times == 0 {
-        None
-    } else {
-        if !user::range_ok(times, 32) {
-            return EFAULT;
-        }
-        let mut t = [[0u64; 2]; 2];
-        for i in 0..2 {
-            // SAFETY: [times, times+32) validated readable.
-            t[i][0] =
-                unsafe { (times as *const u64).add(i * 2).read_unaligned() };
-            t[i][1] =
-                unsafe { (times as *const u64).add(i * 2 + 1).read_unaligned() };
-        }
-        Some(t)
+    let ts = match utimens_read(times) {
+        Ok(t) => t,
+        Err(e) => return e,
     };
     if n == 0 && flags & AT_EMPTY_PATH != 0 {
         return user::fd_utimens(dirfd, ts);

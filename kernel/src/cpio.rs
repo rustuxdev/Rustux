@@ -12,6 +12,7 @@
 /// Header: 6 magic + 13 fields of 8 ASCII-hex digits each.
 const HDR_LEN: usize = 110;
 /// Field offsets inside the 110-byte header.
+const MODE_OFF: usize = 14;
 const FILESIZE_OFF: usize = 54;
 const NAMESIZE_OFF: usize = 94;
 /// Saner-than-need bounds against malformed archives.
@@ -45,6 +46,8 @@ fn hex8(b: &[u8]) -> Option<u64> {
 struct Entry<'a> {
     name: &'a [u8],
     data: &'a [u8],
+    /// c_mode from the header — the recorded file type+perm bits.
+    mode: u32,
     /// Archive offset of the next header.
     next: usize,
     /// True for the TRAILER!!! record — ends the archive.
@@ -58,6 +61,7 @@ fn entry_at<'a>(img: &'a [u8], off: usize) -> Option<Entry<'a>> {
     if hdr[0..6] != *b"070701" && hdr[0..6] != *b"070702" {
         return None;
     }
+    let mode = hex8(&hdr[MODE_OFF..MODE_OFF + 8])? as u32;
     let filesize = hex8(&hdr[FILESIZE_OFF..FILESIZE_OFF + 8])? as usize;
     let namesize = hex8(&hdr[NAMESIZE_OFF..NAMESIZE_OFF + 8])? as usize;
     if namesize == 0 || namesize > MAX_NAME {
@@ -75,6 +79,7 @@ fn entry_at<'a>(img: &'a [u8], off: usize) -> Option<Entry<'a>> {
     Some(Entry {
         name,
         data,
+        mode,
         next: data_off.checked_add(align4(filesize))?,
         trailer: name == b"TRAILER!!!",
     })
@@ -96,6 +101,27 @@ pub fn entries(img: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
             return None;
         }
         Some((e.name, e.data))
+    })
+}
+
+/// Same walk as `entries` but yields the c_mode too — stat, access,
+/// and the exec permission check all honor recorded perm bits.
+pub fn entries_m(
+    img: &[u8],
+) -> impl Iterator<Item = (&[u8], &[u8], u32)> + '_ {
+    let mut off = 0usize;
+    let mut steps = 0usize;
+    core::iter::from_fn(move || {
+        if steps == MAX_ENTRIES {
+            return None;
+        }
+        steps += 1;
+        let e = entry_at(img, off)?;
+        off = e.next;
+        if e.trailer {
+            return None;
+        }
+        Some((e.name, e.data, e.mode))
     })
 }
 
