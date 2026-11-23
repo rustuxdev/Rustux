@@ -177,6 +177,10 @@ enum WaitOn {
     /// user buffer — the waker copies through the sleeper's tables
     /// and deposits the count in ctx.rax, like PipeRead.
     Stdin,
+    /// read() on an empty evdev queue: `wait_ptr/len` is the user
+    /// input_event buffer — the waker marshals records through the
+    /// sleeper's tables like Stdin.
+    Evdev,
     /// futex(FUTEX_WAIT) on a user word at this VA — the wake also
     /// matches the sleeper's pml4 so same-VA waits in different
     /// address spaces stay distinct.
@@ -8236,6 +8240,85 @@ fn stdin_wake() {
     }
 }
 
+/// Marshal one evdev record into `dst` — struct input_event on
+/// x86_64 is {u64 tv_sec; u64 tv_usec; u16 type; u16 code; i32
+/// value}, 24 bytes. EV_KEY = 1.
+fn evdev_rec(dst: &mut [u8; 24], sec: u64, nsec: u32, code: u16, val: u8) {
+    dst[0..8].copy_from_slice(&sec.to_ne_bytes());
+    dst[8..16].copy_from_slice(&((nsec / 1000) as u64).to_ne_bytes());
+    dst[16..18].copy_from_slice(&1u16.to_ne_bytes()); // EV_KEY
+    dst[18..20].copy_from_slice(&code.to_ne_bytes());
+    dst[20..24].copy_from_slice(&(val as i32).to_ne_bytes());
+}
+
+/// evdev read — the direct (awake) path: marshal queued events into
+/// the user buffer. Returns the byte count (multiple of 24).
+fn evdev_fill(buf: u64, len: u64) -> u64 {
+    let (sec, nsec) = now();
+    let mut done = 0usize;
+    let mut rec = [0u8; 24];
+    while done + 24 <= len as usize {
+        let Some((code, val)) = crate::kbd::ev_pop() else { break };
+        evdev_rec(&mut rec, sec, nsec, code, val);
+        // SAFETY: caller validated [buf, buf+len) writable user range.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                rec.as_ptr(),
+                (buf + done as u64) as *mut u8,
+                24,
+            )
+        };
+        done += 24;
+    }
+    done as u64
+}
+
+/// The waiter side: a blocked Evdev reader gets input_event records
+/// copied through ITS page tables, count in rax — same discipline
+/// as stdin_wake.
+fn evdev_wake() {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let (sec, nsec) = now();
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked || t.wait_on != WaitOn::Evdev {
+            continue;
+        }
+        let mut done = 0usize;
+        let mut popped = false;
+        let mut fault = false;
+        let mut rec = [0u8; 24];
+        while done + 24 <= t.wait_len as usize {
+            // Peek via len: only pop what fits the buffer.
+            if crate::kbd::ev_len() == 0 {
+                break;
+            }
+            let Some((code, val)) = crate::kbd::ev_pop() else { break };
+            popped = true;
+            evdev_rec(&mut rec, sec, nsec, code, val);
+            for j in 0..24u64 {
+                match translate(t.pml4, t.wait_ptr + done as u64 + j) {
+                    // SAFETY: present user frame in t's tables.
+                    Some(pa) => unsafe { (pa as *mut u8).write(rec[j as usize]) },
+                    None => { fault = true; break }
+                }
+            }
+            if fault { break }
+            done += 24;
+        }
+        if done == 0 && !popped {
+            continue; // nothing landed — keep sleeping
+        }
+        t.ctx.rax = if done == 0 {
+            (-14i64) as u64 // EFAULT: buffer vanished mid-sleep
+        } else {
+            done as u64
+        };
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
+    }
+}
+
 /// Inject bytes as if the terminal itself produced them — escape
 /// replies (DA/DSR) a full-screen app's ncurses init expects. Goes
 /// straight to the ready queue: ldisc processing would mangle the
@@ -8292,10 +8375,14 @@ pub fn stdin_pump() {
         }
     }
     // Any input-state change may satisfy a poll(0) waiter the way a
-    // pipe change does — one re-scan per pump, not per key.
-    if fed {
+    // pipe change does — one re-scan per pump, not per key. A key
+    // that made no tty byte (release, modifier) still queued an
+    // evdev record, so a pending event also counts as a change.
+    if fed || crate::kbd::ev_len() > 0 {
         wake_pollers();
     }
+    // Service blocked evdev readers every pump — same reason.
+    evdev_wake();
 }
 
 /// ioctl(fd, req, arg): the console pair is our one tty — Stdin and
@@ -8435,6 +8522,29 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 }
             }
             0
+        }
+        // EVIOCGNAME(n) — _IOC(_IOC_READ,'E',0x06,n): bits 16..29
+        // carry the user buffer size, so match on the opcode bits.
+        r if r & 0x8000ffff == 0x80004506 => {
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            if !vfile(*i).is_some_and(|v| v.rdev == 0xd40) {
+                return ENOTTY_;
+            }
+            let cap = ((req >> 16) & 0x3fff) as u64;
+            let name = b"Rustux PS/2 keyboard\0";
+            let n = (name.len() as u64).min(cap);
+            if n == 0 {
+                return EINVAL;
+            }
+            if !range_ok_w(arg, n) {
+                return EFAULT;
+            }
+            // SAFETY: validated user window under cur cr3.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    name.as_ptr(), arg as *mut u8, n as usize)
+            };
+            (name.len() - 1) as u64 // Linux returns the strlen
         }
         TIOCGWINSZ => {
             if !tty {
@@ -12708,6 +12818,42 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                     o.pos += w;
                     w as u64
                 }
+                // /dev/input/event0 — evdev struct input_event
+                // stream. Linux EINVALs a buffer that can't hold
+                // one whole record; blocking reads sleep for a
+                // key, O_NONBLOCK is EAGAIN. Records beyond a
+                // whole multiple are ignored like a real evdev.
+                0xd40 => {
+                    if len < 24 {
+                        return EINVAL;
+                    }
+                    if !range_ok_w(buf, len.min(24)) {
+                        return EFAULT;
+                    }
+                    let evl = crate::kbd::ev_len() as u64;
+                    if evl > 0 {
+                        // Only validate what we'll actually write —
+                        // like Linux, a longer buffer doesn't fault
+                        // on its unread tail.
+                        let cap = (evl * 24).min(len);
+                        if cap > 0 && !range_ok_w(buf, cap) {
+                            return EFAULT;
+                        }
+                        return evdev_fill(buf, len);
+                    }
+                    if o.nonblock {
+                        return (-11i64) as u64; // EAGAIN
+                    }
+                    if deliverable(t) {
+                        return (-4i64) as u64; // -EINTR before sleep
+                    }
+                    t.wait_on = WaitOn::Evdev;
+                    t.wait_ptr = buf;
+                    t.wait_len = len;
+                    t.ctx = *ctx;
+                    t.state = TaskState::Blocked;
+                    block_switch()
+                }
                 // Unreachable while open() whitelists rdevs — belt
                 // and braces against a future arm forgetting this.
                 _ => EINVAL,
@@ -13900,6 +14046,25 @@ pub fn dev_init() {
         d.path[..7].copy_from_slice(b"dev/pts");
         ds[i] = Some(d);
     }
+    // /dev/input — the evdev dir (major-13 nodes live beneath it).
+    if let Some(i) = ds.iter().position(Option::is_none) {
+        let (s, ns) = now();
+        let mut d = VDir {
+            path: [0; 128],
+            nlen: 9,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: s,
+            atime_ns: ns,
+            mtime: s,
+            mtime_ns: ns,
+            ctime: s,
+            ctime_ns: ns,
+        };
+        d.path[..9].copy_from_slice(b"dev/input");
+        ds[i] = Some(d);
+    }
     // (path, rdev = major<<8|minor, perms) — the classic mem/tty set.
     for (name, rdev, mode) in [
         (b"dev/null" as &[u8], 0x103u32, 0o666u64),
@@ -13911,6 +14076,7 @@ pub fn dev_init() {
         (b"dev/console", 0x501, 0o600),
         (b"dev/ptmx", 0x502, 0o666),
         (b"dev/fb0", 0x1d00, 0o660),
+        (b"dev/input/event0", 0xd40, 0o660),
     ] {
         let r = vfile_create(name);
         if (r as i64) < 0 {
@@ -15004,6 +15170,8 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                         // same as a driverless node.
                         29 if crate::log::fb_geometry().is_some() => i,
                         29 => return ENXIO,
+                        // input core — evdev event nodes.
+                        13 => i,
                         _ => return ENODEV,
                     }
                 }
@@ -17005,6 +17173,14 @@ fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
                     r |= POLLIN;
                 }
                 r
+            } else if vfile(*i).is_some_and(|v| v.rdev == 0xd40) {
+                // evdev: readable when input_event records queue;
+                // writable always (ioctls, not a byte stream).
+                if crate::kbd::ev_len() > 0 {
+                    POLLIN | POLLOUT
+                } else {
+                    POLLOUT
+                }
             } else {
                 // null/zero/full/random never block either way.
                 POLLIN | POLLOUT

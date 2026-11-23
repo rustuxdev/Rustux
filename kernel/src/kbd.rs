@@ -37,6 +37,70 @@ const OUTQ_SIZE: usize = 24;
 static mut OUTQ: [u8; OUTQ_SIZE] = [0; OUTQ_SIZE];
 static mut OUTQ_LEN: usize = 0;
 
+/// evdev ring: (Linux keycode, press/release) pairs for
+/// /dev/input/event0. Single producer (`poll`, consumer context) and
+/// single consumer (evdev read, syscall context) — the same
+/// serialized-context discipline as OUTQ. Overflow drops, matching
+/// the IRQ ring's policy.
+const EVR_SIZE: usize = 64;
+static mut EVR: [(u16, u8); EVR_SIZE] = [(0, 0); EVR_SIZE];
+static mut EVR_LEN: usize = 0;
+
+fn ev_push(code: u16, val: u8) {
+    unsafe {
+        if EVR_LEN < EVR_SIZE {
+            EVR[EVR_LEN] = (code, val);
+            EVR_LEN += 1;
+        }
+    }
+}
+
+/// Queued evdev records — the blocking read checks this before
+/// sleeping so a key that arrives mid-check can't strand it.
+pub fn ev_len() -> usize {
+    unsafe { EVR_LEN }
+}
+
+/// /dev/input/event0 read source — one (keycode, value) or None.
+pub fn ev_pop() -> Option<(u16, u8)> {
+    unsafe {
+        if EVR_LEN == 0 {
+            return None;
+        }
+        let e = EVR[0];
+        core::ptr::copy(
+            core::ptr::addr_of!(EVR).cast::<(u16, u8)>().add(1),
+            core::ptr::addr_of_mut!(EVR).cast::<(u16, u8)>(),
+            EVR_LEN - 1,
+        );
+        EVR_LEN -= 1;
+        Some(e)
+    }
+}
+
+/// E0 extended make code -> Linux input-event keycode.
+fn ev_e0(code: u8) -> u16 {
+    match code {
+        0x1c => 96,  // KEY_KPENTER
+        0x1d => 97,  // KEY_RIGHTCTRL
+        0x35 => 98,  // KEY_KPSLASH
+        0x38 => 100, // KEY_RIGHTALT
+        0x47 => 102, // KEY_HOME
+        0x48 => 103, // KEY_UP
+        0x49 => 104, // KEY_PAGEUP
+        0x4b => 105, // KEY_LEFT
+        0x4d => 106, // KEY_RIGHT
+        0x4f => 107, // KEY_END
+        0x50 => 108, // KEY_DOWN
+        0x51 => 109, // KEY_PAGEDOWN
+        0x52 => 110, // KEY_INSERT
+        0x53 => 111, // KEY_DELETE
+        0x5b => 125, // KEY_LEFTMETA
+        0x5c => 126, // KEY_RIGHTMETA
+        _ => code as u16,
+    }
+}
+
 /// IRQ handler — called from apic::irq_dispatch on the keyboard vector.
 /// Reads OBF-guarded data so a spurious vector can't fabricate a key.
 pub fn on_irq() {
@@ -153,8 +217,9 @@ pub fn poll() -> Option<char> {
             continue;
         }
         if E0.swap(false, Ordering::Relaxed) {
-            // Extended make code → xterm escape sequence; break codes
-            // (bit7) are ignored — press events only.
+            // Extended code → evdev press/release AND, on make only,
+            // the tty's xterm escape sequence (tty stays press-only).
+            ev_push(ev_e0(code & 0x7f), (code & 0x80 == 0) as u8);
             if code & 0x80 == 0 {
                 if let Some(seq) = e0_seq(code) {
                     // SAFETY: consumer-side static queue, single CPU.
@@ -176,12 +241,16 @@ pub fn poll() -> Option<char> {
             continue;
         }
         if code & 0x80 != 0 {
-            // Break code — only shift release matters for echoing.
+            // Break code — evdev gets the release; only shift release
+            // matters for echoing.
+            ev_push((code & 0x7f) as u16, 0);
             if code == 0xaa || code == 0xb6 {
                 SHIFT.store(false, Ordering::Relaxed);
             }
             continue;
         }
+        // Plain make code — Linux keycodes match set-1 values.
+        ev_push(code as u16, 1);
         if code == 0x2a || code == 0x36 {
             SHIFT.store(true, Ordering::Relaxed);
             continue;
