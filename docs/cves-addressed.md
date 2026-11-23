@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**125 unique CVEs recorded.**
+**127 unique CVEs recorded.**
 
 ## klib ports
 
@@ -53,6 +53,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2011-1479 | inotify: init/init1/add_watch/rm_watch + path-keyed watch table, dir vs self event routin… | 1479 n/a (Rust, single commit point); 46040 defensive pattern followed (slot rollback on anon_fd failure, single-assignment watch commit); 54119/89595 n/a by construction (single-… |
 | CVE-2013-7446 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) — interest pins OFD index (… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
 | CVE-2014-0196 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
+| CVE-2014-3153 | real dpkg -i end-to-end: fcntl/flock POSIX+OFD byte-range locks (FLockReq table MAX_FLOCK… | audit run-106 manual scoped (rubric + cve.now MCP absent on this host — re-verify once configured): verified live locks always imply a live owner OFD or tgid so LockTag::Ram slots… |
 | CVE-2014-9322 | busybox real-binary rootfs rung: signal-restorer sigframe (SIGTRAMP user-RX page + [resto… | RUN-TIME BUG CAUGHT BY REAL BINARY: the old [signo][UCtx] frame made a normal-returning C handler ret into signo=17 (SIGCHLD) -> rip=0x11 crash in every busybox pipeline child — g… |
 | CVE-2014-9322 | fault-driven signals (catchable SIGSEGV/SIGILL/SIGFPE/SIGBUS/SIGTRAP) | interrupted UCtx is CPU/stub-captured, never user-shaped; the sigframe is the same [signo][UCtx] format sigreturn already treats as hostile (cs/ss pinned, TF/NT/IOPL cleared, rip/… |
 | CVE-2014-9322 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
@@ -64,6 +65,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2016-6753 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
 | CVE-2017-1000255 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
 | CVE-2017-1000364 | NT process objects + CreateProcessA: NT_PROCS ledger (tgid/refs/state/exit), NTH_PROCESS… | audit run-98 quick scoped: 2 confirmed findings fixed in-diff — sys_brk grow-rollback missing flush_tlb (the 10th live-mm unmap site, now flushes at user.rs:6722) and NtWaitProc r… |
+| CVE-2017-1000365 | real dpkg -i end-to-end: fcntl/flock POSIX+OFD byte-range locks (FLockReq table MAX_FLOCK… | audit run-106 manual scoped (rubric + cve.now MCP absent on this host — re-verify once configured): verified live locks always imply a live owner OFD or tgid so LockTag::Ram slots… |
 | CVE-2017-1000410 | statx(2) syscall NR 332: sys_statx (flags EINVAL on unknown AT_* bits incl AT_SYMLINK_FOL… | audit run-101 quick scoped: 1 confirmed LOW finding fixed in-diff — AT_SYMLINK_FOLLOW (0x400) EINVAL'd though Linux accepts it (== default follow semantics); added to KNOWN mask +… |
 | CVE-2017-14489 | real CRT-linked MinGW .exe: STUB_DATA_VA writable thunk-state page (argv/envp/fake FILE[]… | audit run-83 quick scoped: 1 confirmed fixed pre-commit - nt_free_pages walked [base,base+size) per page with user-controlled size bounded only by USER_VA_HI: NtFreeVirtualMemory(… |
 | CVE-2017-7558 | real GNU bash 5.2 (dynamic, +libtinfo second DT_NEEDED — ld.so's first multi-library reso… | sockaddr-leak class structurally absent: sock_name copies min(*addrlen,16) bytes of a sockaddr_in built by sockaddr_in() which zero-fills all 16 before writing fields — every copi… |

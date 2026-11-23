@@ -2892,3 +2892,58 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   payload path; `dpkg -i` adds maintainer scripts + /var/lib/dpkg status
   db — needs flock/fcntl locks, then `apt-get` needs method URIs + a
   real /var).
+
+## run-133 — real `dpkg -i`: file locks + hardlinks + archive modes + futex bitsets
+
+- `dpkgtest` forks real Debian `dpkg -i /hello-traditional_2.10-6_amd64.deb
+  --force-depends` — genuine binary + libs staged in the initrd — then
+  execs the installed `/usr/bin/hello`, checks `dpkg -l`/`status`, and
+  removes tree + db. 0 failures; `linktest` adds 39 checks for the new
+  ABI surface. Both green; 69 tasks, frames 100151 -> 100151 zero leak,
+  qemu exit 33 on `make run` and `make run-net`.
+- What real dpkg needed, in discovery order:
+  1. **fcntl/flock file locks** — "unable to lock dpkg frontend lock":
+     new bounded FLockReq table (64 slots, ENOLCK); POSIX vs OFD
+     namespaces (owner = tgid vs ofd-index); byte ranges normalized
+     (SEEK_SET/CUR/END, len==0 -> EOF); unlock splits ranges;
+     F_SETLKW/F_OFD_SETLKW block via WaitOn::FLock, signal wake -> EINTR;
+     locks swept on ANY fd close, CLOEXEC close, and task exit.
+  2. **hardlinks** — dpkg links status -> status-old: VFile gained
+     is_hard/hard alias slots sharing inode data+meta; link/linkat
+     (NR86/265); nlink counts live names; EXDEV for archive members,
+     EPERM dirs, EEXIST dest; unlinked-open inode survives to last
+     close via alias+OFD pins in vfile_free_if_dead.
+  3. **archive mode fidelity** — dpkg's file_is_exec rejected 0644:
+     cpio c_mode parsed (entries_m), mkinitrd records source perms and
+     forces 0111 on ELF payloads (incl .gz sources), stat reports real
+     modes, access(W_OK) on archive members -> EROFS, execve enforces
+     +x -> EACCES.
+  4. **exec env cap** — dpkg exports >8 vars to children: ExecArgs moved
+     to a 34KiB static .bss scratch (off the 8-16KiB kstack),
+     MAX_EXEC_ENVS 8->64, E2BIG preserved.
+  5. **futex bitsets** — libzstd's thread pool died on
+     FUTEX_WAIT_BITSET ("futex facility returned an unexpected error
+     code") truncating the data.tar stream: WAIT/WAKE_BITSET handled via
+     op&0x7f, bitset collapsed to full-mask (wake-superset is
+     Linux-legal).
+  6. **utimensat NULL path** — GNU tar does utimensat(fd, NULL, ts, 0)
+     = futimens; NULL at AT_FDCWD -> EFAULT, NOFOLLOW -> EINVAL.
+  7. **vdir_rename** — dpkg's usr/share.dpkg-new -> usr/share move
+     ENOENT'd; directory rename now rewrites the descendant prefix
+     (ENOTEMPTY/ENOTDIR/EINVAL-into-self/self-noop like files).
+  8. **sync_file_range** stub (flags masked, fd validated, returns 0 —
+     pure writeback hint on a VFS with no writeback).
+- Fixture pitfalls hit during probes: probe ESP must refresh BOTH kernel
+  and initrd (stale kernel masked the lock path); solo cpios must stage
+  /busybox at root or bb() helpers no-op; stale test binaries report
+  test-side failures that vanish on rebuild.
+- Audit run-106 manual scoped (cve.now MCP absent — re-verify once
+  configured): lock identity/lifetime sound (live lock => live owner
+  pin), alias pin prevents hard-index dangling, all new user buffers
+  range-validated, mode checks fail-closed. needs_validation: none.
+  Inherited gap still open: pipe OFDs ignore O_NONBLOCK.
+- lstest floor 49->52 (linktest + dpkgtest + implicit sbin record).
+- Env note: push still needs creds on this VM.
+- Next: apt-get prerequisites (method URIs, /var layout, more coreutils
+  surface — apt wants stty/dirname/head etc.) or alarm/setitimer to
+  quiet busybox's enosys nr37; pipe O_NONBLOCK remains a small rung.
