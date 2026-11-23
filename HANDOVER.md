@@ -2705,3 +2705,22 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   canonicalisation, attrs/type/eof/flush, gms, name — 63 tasks,
   frames 108421 -> 108421 zero leak, qemu exit 33.
 - Next: registry/env/console-input or Linux statx-class syscalls.
+
+
+## run-128 — statx(2), NR 332
+
+- sys_statx over the existing stat pipeline: newfstatat/sys_fstat
+  refactored into fill_stat/fill_fstat returning Result<[u64;18]>;
+  statx_emit builds the 256-byte struct (mask = request ∩
+  STATX_BASIC_STATS, makedev decode); statx_dirfd_stat handles
+  AT_EMPTY_PATH (FDCWD -> cwd, fd -> fstat shape).
+- Unknown AT_* flag bits -> EINVAL; audit fix added
+  AT_SYMLINK_FOLLOW (0x400) to the accepted mask.
+- iotest: 15 statx checks — basic mask/mode/ino agreement, NOFOLLOW
+  vs FOLLOW link split, EMPTY_PATH on dirfd/FDCWD/file-fd, and all
+  four error edges. 63 tasks, frames equal, qemu exit 33.
+- One flake observed mid-rung: fxtest spun in R past suite end on a
+  single boot (reproduced 0/2 subsequent runs; unrelated to this
+  diff — no futex/sched changes; watch it).
+- Next: showcase ladder — htop needs full /proc/<pid>/stat fields +
+  TIOCGWINSZ + termios output; then slirp net -> wget -> apt.

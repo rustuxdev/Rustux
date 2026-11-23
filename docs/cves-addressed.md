@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**122 unique CVEs recorded.**
+**124 unique CVEs recorded.**
 
 ## klib ports
 
@@ -64,6 +64,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2016-6753 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed â€” (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drai… |
 | CVE-2017-1000255 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
 | CVE-2017-1000364 | NT process objects + CreateProcessA: NT_PROCS ledger (tgid/refs/state/exit), NTH_PROCESS… | audit run-98 quick scoped: 2 confirmed findings fixed in-diff â€” sys_brk grow-rollback missing flush_tlb (the 10th live-mm unmap site, now flushes at user.rs:6722) and NtWaitProc… |
+| CVE-2017-1000410 | statx(2) syscall NR 332: sys_statx (flags EINVAL on unknown AT_* bits incl AT_SYMLINK_FOL… | audit run-101 quick scoped: 1 confirmed LOW finding fixed in-diff â€” AT_SYMLINK_FOLLOW (0x400) EINVAL'd though Linux accepts it (== default follow semantics); added to KNOWN mask… |
 | CVE-2017-14489 | real CRT-linked MinGW .exe: STUB_DATA_VA writable thunk-state page (argv/envp/fake FILE[]… | audit run-83 quick scoped: 1 confirmed fixed pre-commit - nt_free_pages walked [base,base+size) per page with user-controlled size bounded only by USER_VA_HI: NtFreeVirtualMemory(… |
 | CVE-2017-7558 | real GNU bash 5.2 (dynamic, +libtinfo second DT_NEEDED â€” ld.so's first multi-library re… | sockaddr-leak class structurally absent: sock_name copies min(*addrlen,16) bytes of a sockaddr_in built by sockaddr_in() which zero-fills all 16 before writing fields â€” every co… |
 | CVE-2018-14634 | brk/mmap/munmap/mprotect: per-task VMA table + eager zeroed pages | VMA == ranges[] entry: gate, first-fit, and teardown share one truth, so a mapped page can never escape the syscall pointer gate; first-fit scans holes between entries (freed VA i… |
@@ -162,6 +163,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-89560 | char devices + real /dev: VFile.fmt/rdev + FdKind::Dev + mknod/mknodat + dev_init boot no… | 89560 n/a (no overlayfs/LSM; no-CAP_MKNOD = standing no-cred-model divergence). audit caught+fixed: open() admitted all major-1/5 minors and fd_read's catch-all routed unhandled r… |
 | CVE-2026-89595 | inotify: init/init1/add_watch/rm_watch + path-keyed watch table, dir vs self event routin… | 1479 n/a (Rust, single commit point); 46040 defensive pattern followed (slot rollback on anon_fd failure, single-assignment watch commit); 54119/89595 n/a by construction (single-… |
 | CVE-2026-89596 | `pci` | **n/a to mechanism** â€” our CF8/CFC access has no save/restore arrays; reminder: all config ops must stay IRQ-safe (they are â€” port I/O only) |
+| CVE-2026-89852 | statx(2) syscall NR 332: sys_statx (flags EINVAL on unknown AT_* bits incl AT_SYMLINK_FOL… | audit run-101 quick scoped: 1 confirmed LOW finding fixed in-diff â€” AT_SYMLINK_FOLLOW (0x400) EINVAL'd though Linux accepts it (== default follow semantics); added to KNOWN mask… |
 | CVE-2026-90003 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races â€” structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchron… |
 | CVE-2026-90138 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
 | CVE-2026-98059 | real Debian dynamic userspace: dash 0.5.12 under bin/dash (dynamic PT_INTERP consumer) dr… | REAL-BINARY-CAUGHT ABI BUG: glibc wait wrappers zero-extend mov edi,-1 to 0xffffffff in rdi; dispatching it raw made wait4(-1) search pid 4294967295 -> ECHILD -> dash exited 255 o… |
