@@ -36,6 +36,18 @@ interactive input over the 16550 UART is `make run-bash` (headless
 QEMU cannot feed serial input while a capture channel is attached,
 so the session is scripted guest-side).*
 
+<p align="center">
+  <img src="docs/assets/rustux-doom.gif" alt="DOOM running on Rustux — the original id engine driving the GOP framebuffer through /dev/fb0">
+</p>
+
+*Yes, it runs DOOM.* The original id Software engine (the GPL'd
+doomgeneric tree) built static-pie against the new `/dev/fb0` fbdev
+device — Linux fb major 29 with real `FBIOGET_VSCREENINFO`/
+`FBIOGET_FSCREENINFO` ioctls and positional `write()` frames — plus
+the original `DOOM.WAD` game data. The attract demo plays E1M1
+full-screen on the GOP framebuffer (`make run-doom`; drop your own
+WAD at `kernel/user/doom.wad`).
+
 ## A world's first
 
 Rustux carries the first known working implementation of
@@ -185,7 +197,8 @@ GNU bash and native `.exe` tasks in five days:
 | **Nov 21** | **A real Linux userspace.** pthread-class `clone` flags + futex + `CHILD_CLEARTID` + `CLONE_VM`, hierarchical VFS, file-backed `mmap`, real `vfork` — then real **BusyBox**, `PT_INTERP` dynamic `ld.so`, Debian **dash** and **GNU bash 5.2** (interactive `-bash` on the serial console); process groups/sessions, tty line discipline + full job control (`SIGTTOU`/`TOSTOP`); epoll, eventfd, timerfd, signalfd, inotify; a generated `/proc`. |
 | **Nov 22** | **Last POSIX gaps → the second personality.** Queued signals, real `statfs`, VFS symlinks, file metadata, char devices + a real `/dev` — then the NT personality lands whole: PE32+ `.exe` loader, NT syscall table with NTSTATUS returns, TEB/PEB, handle tables, the Win32/CRT thunk layer (real MinGW exes end-to-end), NT file/dir/heap/VM services, threads with suspend/resume, section objects, `LoadLibrary` + the full `DllMain` attach/detach lifecycle, TLS callbacks, `CreateProcessA`. The suite stands at 61 tasks, all passing. |
 | **Nov 23** | **A real Debian system, installable.** Real `apt-get update` + `apt install` over slirp — DNS, TCP, the full dpkg toolchain (dpkg/dpkg-deb/dpkg-query/dpkg-split + GNU tar + ldconfig) running a package's unpack/configure under a real kernel pty. Unix98 PTYs (`/dev/ptmx`, `/dev/pts/N`, `TIOCGPTN`/`TIOCGPTPEER`, `unlockpt`, termios, hangup). A polled ATA PIO driver → `/dev/sda` block device + `/dev/sr0` with the `CDROMEJECT` ioctl. A GOP framebuffer terminal (xterm subset: SGR colors + persistent bold, DEC line drawing, scroll regions, alt screen, `REP`) that runs color-coded ncurses `htop` over `/proc/<pid>/task` with correct idle-vs-busy CPU accounting. And a **bootable live/install ISO** — OVMF El Torito media with a demo menu: live bash session or stream-to-disk install, eject, reboot onto the installed system. The installed disk skips the menu and boots straight to `login:` — real `/etc/passwd` + `/etc/shadow` + `crypt()` authentication (SHA-512-crypt, termios echo-off), then bash as pid 1. The suite stands at 72 tasks, all passing. |
-| **Every rung** | A scoped security audit plus a cve.now sweep of that subsystem's published kernel CVEs — 136 unique CVEs recorded in [docs/cves-addressed.md](docs/cves-addressed.md) so far. |
+| **Nov 23 (cont.)** | **It runs DOOM.** The GOP framebuffer becomes a real `/dev/fb0` fbdev device (major 29: `FBIOGET_VSCREENINFO`/`FSCREENINFO`, positional write, seekable), and the original id DOOM engine — doomgeneric, built static-pie — plays the E1M1 attract demo full-screen from the original `DOOM.WAD`. Plus the platform-compat rung: distro-structure xorriso ISO (BIOS+UEFI El Torito, hybrid MBR/GPT) and console-mirrored fault reports for serial-less machines. |
+| **Every rung** | A scoped security audit plus a cve.now sweep of that subsystem's published kernel CVEs — 137 unique CVEs recorded in [docs/cves-addressed.md](docs/cves-addressed.md) so far. |
 
 ## Acknowledgements
 
