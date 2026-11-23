@@ -100,8 +100,8 @@ pub fn load_cr3(pml4_phys: u64) {
 }
 
 /// Highest block order, as in Linux mm: orders 0..=MAX_ORDER-1 give blocks
-/// of up to 2^10 pages = 4 MiB.
-pub const MAX_ORDER: usize = 11;
+/// of up to 2^13 pages = 32 MiB — VFILE_MAX-sized contiguous requests fit.
+pub const MAX_ORDER: usize = 14;
 
 /// Buddy physical page allocator (mm/page_alloc.c shape): `free_area[o]`
 /// is the intrusive list of free 2^o-page blocks — each block's first u64

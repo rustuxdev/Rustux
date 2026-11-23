@@ -1727,7 +1727,7 @@ const MAX_OFDS: usize = 256;
 const MAX_VFILES: usize = 128;
 const MAX_VDIRS: usize = 128;
 /// Per-file ceiling — an honest ENOSPC, not an unbounded grow.
-const VFILE_MAX: usize = 1 << 20;
+const VFILE_MAX: usize = 32 << 20;
 
 /// A scratch file: kmalloc'd contents + a fixed name slot. `unlinked`
 /// survives removal while fds still name it — Linux's open-unlink
@@ -1863,6 +1863,64 @@ fn vfile_stamp(v: &mut VFile, mode: u64, umask: u16) {
     v.ctime_ns = ns;
 }
 
+/// getsockopt(fd, level, optname, optval, optlen): the read half of
+/// the socket-option surface — nonblocking connects poll SO_ERROR,
+/// callers sanity-check SO_TYPE. Honest values where the socket
+/// layer tracks them (type, dead state as SO_ERROR), benign zeroes
+/// elsewhere; ENOPROTOOPT is Linux's honest answer for options we
+/// never stored. *optlen round-trips like Linux (input cap, output
+/// actual size, min 4 for int options).
+pub fn fd_getsockopt(
+    fd: u64,
+    _level: u64,
+    optname: u64,
+    optval: u64,
+    optlen: u64,
+) -> u64 {
+    const ENOTSOCK: u64 = (-88i64) as u64;
+    const ENOPROTOOPT: u64 = (-92i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF };
+    // optlen points at the length word; read it before touching
+    // optval so an unreadable len wins EFAULT like Linux.
+    if !range_ok(optlen, 4) || !range_ok_w(optlen, 4) {
+        return EFAULT;
+    }
+    // SAFETY: validated user word under cur cr3.
+    let cap = unsafe { (optlen as *const u32).read_unaligned() } as u64;
+    if optval != 0 && !range_ok_w(optval, cap.clamp(1, 4)) {
+        return EFAULT;
+    }
+    let (v, is_tcp) = match ofd(t, fd).map(|o| &o.kind) {
+        Some(FdKind::Udp(_)) => (2i64, false), // SOCK_DGRAM
+        Some(FdKind::Tcp(i)) => {
+            let dead = unsafe { &*core::ptr::addr_of!(TCPSOCKS) }
+                .get(*i)
+                .and_then(|k| k.as_ref())
+                .is_some_and(|k| k.dead || k.state == TcpState::Closed);
+            (if dead { 111 } else { 0 }, true)
+        }
+        Some(_) => return ENOTSOCK,
+        None => return EBADF,
+    };
+    // SO_TYPE overrides the pending-error answer for UDP.
+    let val = match optname {
+        3 => {
+            if is_tcp { 1 } else { v } // SOCK_STREAM : SOCK_DGRAM
+        }
+        4 => v, // SO_ERROR — pending async error or 0
+        _ => return ENOPROTOOPT,
+    };
+    if optval != 0 && cap >= 4 {
+        // SAFETY: optval validated writable for >=4 bytes.
+        unsafe {
+            (optval as *mut u32).write_unaligned(val as u32)
+        };
+    }
+    // SAFETY: optlen validated writable above.
+    unsafe { (optlen as *mut u32).write_unaligned(4) };
+    0
+}
+
 /// Grow a VFile's buffer to at least `need` bytes — zeroed fresh
 /// region, old bytes copied, old buffer kfree'd. ENOSPC past the cap.
 fn vfile_grow(v: &mut VFile, need: usize) -> u64 {
@@ -1871,11 +1929,32 @@ fn vfile_grow(v: &mut VFile, need: usize) -> u64 {
         return 0;
     }
     if need > VFILE_MAX {
+        let nm = core::str::from_utf8(&v.name[..v.nlen.min(96)])
+            .unwrap_or("?");
+        crate::log::printk(format_args!(
+            "rustux: vfile ENOSPC: {nm} need {need} > max (len {})",
+            v.len
+        ));
         return ENOSPC_;
     }
-    let ncap = need.next_power_of_two().clamp(4096, VFILE_MAX);
+    // kmalloc's 16-byte header lives inside the block, so size the
+    // request for header+payload: pow2(need+16) minus the header gives
+    // the largest payload that fits its own order — a 16MiB-16 file
+    // stays at order 12 where a bare pow2(need) request would spill
+    // to order 13. cap must stay >= need or the copy runs 16 bytes
+    // into the neighbour chunk; needs under the slab cut-off keep the
+    // plain 4KiB request since a sub-4096 allocation lands on a
+    // permanently cache-held slab page rather than a reusable block.
+    let ncap = if need + 16 <= 4096 {
+        4096
+    } else {
+        (need + 16).next_power_of_two() - 16
+    };
     let p = kalloc::kmalloc(ncap);
     if p.is_null() {
+        crate::log::printk(format_args!(
+            "rustux: vfile ENOSPC: kmalloc {ncap} failed (need {need})"
+        ));
         return ENOSPC_;
     }
     // SAFETY: fresh buffer owns ncap bytes; copy stays inside both.
@@ -12129,7 +12208,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Signalfd(i) => signalfd_read(ctx, *i, buf, len),
         FdKind::Inotify(i) => inotify_read(ctx, *i, buf, len),
         FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, 0, o.nonblock),
-        FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, 0),
+        FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, 0, o.nonblock),
         FdKind::File(data) => {
             if o.accmode == 1 {
                 return EBADF; // O_WRONLY
@@ -12219,7 +12298,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             let Some(p) = pipes.get_mut(id).and_then(|s| s.as_mut()) else {
                 return EBADF;
             };
-            let avail = p.tail - p.head;
+            let mut avail = p.tail - p.head;
             if avail == 0 {
                 if p.writers == 0 {
                     return 0; // EOF — every writer is gone
@@ -12244,7 +12323,20 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                 t.wait_len = len;
                 t.ctx = *ctx;
                 t.state = TaskState::Blocked;
-                block_switch()
+                if t.state == TaskState::Runnable {
+                    return t.ctx.rax; // waker already delivered
+                }
+                // Armed recheck — a write between the empty test
+                // and the arming ran pipe_wake with nobody home.
+                avail = p.tail - p.head;
+                if avail == 0 && p.writers != 0 {
+                    block_switch();
+                }
+                t.wait_on = WaitOn::None;
+                t.state = TaskState::Runnable;
+                if avail == 0 {
+                    return 0; // last writer closed meanwhile — EOF
+                }
             }
             let n = core::cmp::min(len as usize, avail);
             if !range_ok_w(buf, n as u64) {
@@ -12378,7 +12470,7 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     if p.readers == 0 {
         return EPIPE; // SIGPIPE would fire here once signals exist
     }
-    let free = PIPE_SIZE - (p.tail - p.head);
+    let mut free = PIPE_SIZE - (p.tail - p.head);
     let want = len as usize;
     if want > free && (want <= PIPE_SIZE || free == 0) {
         // No progress possible this call: <=PIPE_BUF writes stay
@@ -12400,7 +12492,23 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         t.wait_len = len;
         t.ctx = *ctx;
         t.state = TaskState::Blocked;
-        block_switch()
+        if t.state == TaskState::Runnable {
+            return t.ctx.rax; // waker already consumed some
+        }
+        // Armed recheck — a reader draining between the free test
+        // and the arming ran pipe_wake with nobody home. Last
+        // reader gone meanwhile is EPIPE like the first test.
+        free = PIPE_SIZE - (p.tail - p.head);
+        if p.readers == 0 {
+            t.wait_on = WaitOn::None;
+            t.state = TaskState::Runnable;
+            return EPIPE;
+        }
+        if want > free && (want <= PIPE_SIZE || free == 0) {
+            block_switch();
+        }
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
     }
     // Writes bigger than the ring take what fits and answer short —
     // the caller loops on the remainder, same shape Linux's
@@ -16286,7 +16394,20 @@ fn wake_pollers() {
         let n = match t.wait_on {
             WaitOn::Poll => poll_scan(t, t.wait_ptr, t.wait_len),
             WaitOn::Pselect => {
-                pselect_scan(t, t.wait_ptr, t.wait_ptr2, t.wait_ptr3, t.wait_len)
+                let mut rout = [0u64; 16];
+                let mut wout = [0u64; 16];
+                let n = pselect_eval(
+                    t, t.wait_ptr, t.wait_ptr2, t.wait_len, &mut rout, &mut wout,
+                );
+                if n > 0 {
+                    // Final answer — write the result masks back to
+                    // the (still-intact) input sets before waking.
+                    pselect_write(
+                        t, t.wait_ptr, t.wait_ptr2, t.wait_ptr3,
+                        t.wait_len, &rout, &wout,
+                    );
+                }
+                n
             }
             WaitOn::Epoll(ei) => epoll_scan(t, ei, t.wait_ptr, t.wait_len),
             _ => continue,
@@ -16503,6 +16624,19 @@ pub fn fd_poll(ctx: &mut UCtx, fds: u64, nfds: u64, timeout_ms: i64) -> u64 {
     };
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
+    // Armed recheck — see fd_pselect: a state change between the
+    // first scan and the arming ran wake_pollers with nobody home.
+    if t.state == TaskState::Blocked {
+        let n = if nfds == 0 { 0 } else { poll_scan(t, fds, nfds) };
+        if n > 0 {
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            t.state = TaskState::Runnable;
+            return n;
+        }
+    } else {
+        return t.ctx.rax;
+    }
     block_switch()
 }
 
@@ -17386,6 +17520,19 @@ pub fn fd_epoll_wait(
     t.wait_deadline = deadline;
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
+    // Armed recheck — same lost-wake window as poll/pselect.
+    if t.state == TaskState::Blocked {
+        let n = epoll_scan(t, ei, events, maxevents);
+        if n > 0 {
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            t.sigmask = saved_mask;
+            t.state = TaskState::Runnable;
+            return n;
+        }
+    } else {
+        return t.ctx.rax;
+    }
     block_switch()
 }
 
@@ -17983,11 +18130,21 @@ pub fn timerfd_expire() {
 /// writing back only the ready bits (Linux overwrites the input
 /// sets). Returns the count of ready fds — works on the current
 /// task and on a blocked one via translate walks.
-fn pselect_scan(t: &Task, rfd: u64, wfd: u64, efd: u64, nwords: u64) -> u64 {
+/// Evaluate a pselect interest set without touching user memory —
+/// the result masks land in rout/wout (indexed by fd_set word).
+/// Read-only on purpose: the input sets must survive intact across
+/// every wake-time re-scan; only the path that actually returns to
+/// userspace may overwrite them (Linux's in-place result contract).
+fn pselect_eval(
+    t: &Task,
+    rfd: u64,
+    wfd: u64,
+    nwords: u64,
+    rout: &mut [u64; 16],
+    wout: &mut [u64; 16],
+) -> u64 {
     let mut ready = 0u64;
-    for w in 0..nwords {
-        let mut rout = 0u64;
-        let mut wout = 0u64;
+    for w in 0..nwords.min(16) {
         let rin = if rfd != 0 {
             read_task_u(t.pml4, rfd + w * 8, 8).unwrap_or(0)
         } else {
@@ -17998,6 +18155,8 @@ fn pselect_scan(t: &Task, rfd: u64, wfd: u64, efd: u64, nwords: u64) -> u64 {
         } else {
             0
         };
+        let mut r = 0u64;
+        let mut wo = 0u64;
         for b in 0..64u64 {
             let fd = (w * 64 + b) as i32;
             let rv = poll_revents(t, fd, POLLIN | POLLOUT);
@@ -18005,26 +18164,43 @@ fn pselect_scan(t: &Task, rfd: u64, wfd: u64, efd: u64, nwords: u64) -> u64 {
                 continue;
             }
             if rin & (1 << b) != 0 && rv & (POLLIN | POLLERR | POLLHUP) != 0 {
-                rout |= 1 << b;
+                r |= 1 << b;
                 ready += 1;
             }
             if win & (1 << b) != 0 && rv & (POLLOUT | POLLERR) != 0 {
-                wout |= 1 << b;
+                wo |= 1 << b;
                 ready += 1;
             }
         }
+        rout[w as usize] = r;
+        wout[w as usize] = wo;
+    }
+    ready
+}
+
+/// Write a completed pselect result back to the user fd_sets —
+/// called only on paths that return to userspace (initial ready,
+/// wake, timeout). exceptfds always reports an empty set.
+fn pselect_write(
+    t: &Task,
+    rfd: u64,
+    wfd: u64,
+    efd: u64,
+    nwords: u64,
+    rout: &[u64; 16],
+    wout: &[u64; 16],
+) {
+    for w in 0..nwords.min(16) {
         if rfd != 0 {
-            write_task_u64(t.pml4, rfd + w * 8, rout);
+            write_task_u64(t.pml4, rfd + w * 8, rout[w as usize]);
         }
         if wfd != 0 {
-            write_task_u64(t.pml4, wfd + w * 8, wout);
+            write_task_u64(t.pml4, wfd + w * 8, wout[w as usize]);
         }
-        // exceptfds never signals here — no OOB source exists.
         if efd != 0 {
             write_task_u64(t.pml4, efd + w * 8, 0);
         }
     }
-    ready
 }
 
 /// pselect6(nfds, rfd, wfd, efd, timespec, {sigmask,len}): select
@@ -18102,12 +18278,17 @@ pub fn fd_pselect(
             t.sigmask = unsafe { (ss as *const u64).read_unaligned() } as u32;
         }
     }
-    let ready = pselect_scan(t, rfd, wfd, efd, nwords);
+    let mut rout = [0u64; 16];
+    let mut wout = [0u64; 16];
+    let ready = pselect_eval(t, rfd, wfd, nwords, &mut rout, &mut wout);
     if ready > 0 {
+        pselect_write(t, rfd, wfd, efd, nwords, &rout, &wout);
         t.sigmask = saved_mask;
         return ready;
     }
     if ts != 0 && deadline <= crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed) {
+        // Timed return still writes the (empty) result sets back.
+        pselect_write(t, rfd, wfd, efd, nwords, &rout, &wout);
         t.sigmask = saved_mask;
         return 0;
     }
@@ -18124,6 +18305,23 @@ pub fn fd_pselect(
     t.wait_deadline = deadline;
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
+    // Re-evaluate armed: a readiness change between the first scan
+    // and this point ran wake_pollers with nobody to find. With the
+    // wait armed the waker now sees us; a race that already ran
+    // leaves state Runnable with the result in rax.
+    if t.state == TaskState::Blocked {
+        let n = pselect_eval(t, rfd, wfd, nwords, &mut rout, &mut wout);
+        if n > 0 {
+            pselect_write(t, rfd, wfd, efd, nwords, &rout, &wout);
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            t.sigmask = saved_mask;
+            t.state = TaskState::Runnable;
+            return n;
+        }
+    } else {
+        return t.ctx.rax;
+    }
     block_switch()
 }
 
@@ -18464,9 +18662,9 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
             syn_at: 0,
             syn_tries: 0,
             dead: false,
-            rxb: [0; TCP_RX_CAP],
             rxl: 0,
         });
+        tcp_rxb(si).fill(0);
         FdKind::Tcp(si)
     };
     ofds[oi] = Some(OpenFile {
@@ -18915,7 +19113,7 @@ pub fn fd_recvfrom(
     let dw = o.nonblock || flags & MSG_DONTWAIT != 0;
     match &o.kind {
         FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, sa, dw),
-        FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, sa),
+        FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, sa, dw),
         _ => EBADF,
     }
 }
@@ -18934,7 +19132,7 @@ pub fn fd_recvfrom(
 
 /// Bounds: endpoints, per-conn stream buffer, accept backlog.
 const MAX_TCPS: usize = 8;
-const TCP_RX_CAP: usize = 2048;
+const TCP_RX_CAP: usize = 65536;
 const TCP_BACKLOG: usize = 4;
 /// connect() timeout, ~10s at 100Hz ticks.
 const TCP_CONN_TICKS: u64 = 1000;
@@ -18983,8 +19181,17 @@ struct TcpSock {
     syn_tries: u8,
     /// RST seen — reads fail ECONNRESET, writes EPIPE.
     dead: bool,
-    rxb: [u8; TCP_RX_CAP],
     rxl: usize,
+}
+
+/// Per-connection stream buffers, separate from the socket struct so
+/// the `TcpSock` literals at connect/accept time don't materialize
+/// TCP_RX_CAP bytes on the kstack — a large-cap literal overflows
+/// KSTACK_SIZE outright. Slot reuse re-zeros via fill(0) on alloc.
+static mut RXBUF: [[u8; TCP_RX_CAP]; MAX_TCPS] = [[0; TCP_RX_CAP]; MAX_TCPS];
+
+fn tcp_rxb(i: usize) -> &'static mut [u8; TCP_RX_CAP] {
+    unsafe { &mut (*core::ptr::addr_of_mut!(RXBUF))[i] }
 }
 
 static mut TCPSOCKS: [Option<TcpSock>; MAX_TCPS] = [const { None }; MAX_TCPS];
@@ -19023,6 +19230,7 @@ fn tcp_seg(
     crate::e1000::tcp_tx(
         k.peer_mac, k.peer_ip, k.port, k.peer_port, k.snd_nxt,
         k.rcv_nxt, flags, payload,
+        (TCP_RX_CAP - k.rxl).min(0xffff) as u16,
     )
 }
 
@@ -19050,7 +19258,7 @@ fn tcp_rst(
         (0, seq.wrapping_add(used), crate::net::TCP_RST | crate::net::TCP_ACK)
     };
     let _ = crate::e1000::tcp_tx(
-        src_mac, src_ip, dport, sport, s, a, fl, &[],
+        src_mac, src_ip, dport, sport, s, a, fl, &[], 1460,
     );
 }
 
@@ -19153,11 +19361,15 @@ fn wake_tcp_recv(ci: usize) {
                 t.ctx.rax = ECONNRESET;
             } else if k.rxl > 0 {
                 let n = core::cmp::min(k.rxl, t.wait_len as usize);
-                if !write_task_bytes(t.pml4, t.wait_ptr, &k.rxb[..n]) {
+                if !write_task_bytes(t.pml4, t.wait_ptr, &tcp_rxb(ci)[..n]) {
                     return; // sleeper's pages vanished — leave it
                 }
-                k.rxb.copy_within(n..k.rxl, 0);
+                tcp_rxb(ci).copy_within(n..k.rxl, 0);
                 k.rxl -= n;
+                // Consumed bytes reopen the receive window — the
+                // peer may be holding on a persist probe waiting to
+                // learn it, like Linux's window-update ACK.
+                let _ = tcp_seg(k, crate::net::TCP_ACK, &[]);
                 t.ctx.rax = n as u64;
             } else if k.fin_rx {
                 t.ctx.rax = 0;
@@ -19269,6 +19481,7 @@ fn tcp_rx_conn(
                     };
                     let _ = crate::e1000::tcp_tx(
                         pm, pi, sp, dp, sn, 0, crate::net::TCP_RST, &[],
+                        1460,
                     );
                     tcp_free(ci);
                 }
@@ -19280,15 +19493,30 @@ fn tcp_rx_conn(
                 k.fin_acked = true;
             }
             let mut close_me = false;
+            if seq != k.rcv_nxt {
+                // Out-of-order, duplicate, or retransmitted segment:
+                // answer with the cumulative ack like a real stack —
+                // silent drops force a full RTO per lost packet.
+                if !payload.is_empty()
+                    || flags & crate::net::TCP_FIN != 0
+                {
+                    let _ = tcp_seg(k, crate::net::TCP_ACK, &[]);
+                }
+            }
             if seq == k.rcv_nxt {
                 let mut adv = 0u32;
                 if !payload.is_empty()
                     && k.rxl + payload.len() <= TCP_RX_CAP
                 {
-                    k.rxb[k.rxl..k.rxl + payload.len()]
+                    tcp_rxb(ci)[k.rxl..k.rxl + payload.len()]
                         .copy_from_slice(payload);
                     k.rxl += payload.len();
                     adv += payload.len() as u32;
+                } else if !payload.is_empty() {
+                    // In-order but our receive queue is full — the
+                    // dup-ack tells the sender this copy was lost so
+                    // it retransmits once the app drains the queue.
+                    let _ = tcp_seg(k, crate::net::TCP_ACK, &[]);
                 }
                 if flags & crate::net::TCP_FIN != 0 {
                     // FIN only counts once preceding bytes are ours.
@@ -19396,14 +19624,14 @@ pub fn tcp_rx(
             syn_at: 0,
             syn_tries: 0,
             dead: false,
-            rxb: [0; TCP_RX_CAP],
             rxl: 0,
         });
+        tcp_rxb(ci).fill(0);
         // SYN-ACK from the child: seq=isn, ack=their seq+1.
         let _ = crate::e1000::tcp_tx(
             src_mac, src_ip, dport, sport, isn,
             seq.wrapping_add(1),
-            crate::net::TCP_SYN | crate::net::TCP_ACK, &[],
+            crate::net::TCP_SYN | crate::net::TCP_ACK, &[], 1460,
         );
         // If the peer vanishes the child reaps when the listener
         // closes; the ACK completing it moves it to the backlog.
@@ -19498,6 +19726,7 @@ pub fn fd_connect(ctx: &mut UCtx, fd: u64, sa: u64, len: u64) -> u64 {
         let isn = k.snd_nxt.wrapping_sub(1);
         let _ = crate::e1000::tcp_tx(
             mac, dip, k.port, dport, isn, 0, crate::net::TCP_SYN, &[],
+            1460,
         );
         // Loopback may have completed the handshake inside the tx.
         match k.state {
@@ -19547,7 +19776,7 @@ fn tcp_retx() {
         // tcp_tx may complete (or RST) the handshake on loopback —
         // re-borrow rather than hold `k` across the call.
         let _ = crate::e1000::tcp_tx(pm, pi, sp, dp, isn, 0,
-            crate::net::TCP_SYN, &[]);
+            crate::net::TCP_SYN, &[], 1460);
         if let Some(k) = s.as_mut() {
             if k.state == TcpState::SynSent {
                 k.syn_at = now;
@@ -19670,6 +19899,7 @@ fn tcp_recv_or_block(
     buf: u64,
     len: u64,
     sa: u64,
+    dw: bool,
 ) -> u64 {
     const ENOTCONN: u64 = (-107i64) as u64;
     const ECONNRESET: u64 = (-104i64) as u64;
@@ -19701,18 +19931,23 @@ fn tcp_recv_or_block(
             // page table; rxb holds received bytes only.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    k.rxb.as_ptr(),
+                    tcp_rxb(si).as_ptr(),
                     buf as *mut u8,
                     n,
                 );
             }
-            k.rxb.copy_within(n..k.rxl, 0);
+            tcp_rxb(si).copy_within(n..k.rxl, 0);
             k.rxl -= n;
+            // Window update: the peer's last-seen window may be 0.
+            let _ = tcp_seg(k, crate::net::TCP_ACK, &[]);
             return n as u64;
         }
         if k.fin_rx || k.state == TcpState::Closed {
             return 0; // EOF
         }
+    }
+    if dw {
+        return (-11i64) as u64; // EAGAIN — O_NONBLOCK/MSG_DONTWAIT
     }
     if !range_ok_w(buf, len.min(TCP_RX_CAP as u64).max(1)) {
         return EFAULT;
@@ -19727,6 +19962,46 @@ fn tcp_recv_or_block(
     t.wait_ptr2 = sa;
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
+    // Re-check under the armed wait: a timer IRQ draining the ring
+    // between the first rxl test and the arming buffers bytes with
+    // nobody to wake — with wait_on already set the waker now finds
+    // this task, and a race that already ran just shows Runnable.
+    if t.state == TaskState::Blocked {
+        let done = {
+            let socks = tcp_socks();
+            match socks[si].as_mut() {
+                Some(k) if k.dead => Some((-104i64) as u64),
+                Some(k) if k.rxl > 0 => {
+                    let n = core::cmp::min(k.rxl, t.wait_len as usize);
+                    // SAFETY: buf was validated writable above; the
+                    // bytes come from this task's own socket queue.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            tcp_rxb(si).as_ptr(),
+                            buf as *mut u8,
+                            n,
+                        );
+                    }
+                    tcp_rxb(si).copy_within(n..k.rxl, 0);
+                    k.rxl -= n;
+                    // Window update for the armed-recheck copy-out.
+                    let _ = tcp_seg(k, crate::net::TCP_ACK, &[]);
+                    Some(n as u64)
+                }
+                Some(k) if k.fin_rx || k.state == TcpState::Closed => Some(0),
+                _ => None,
+            }
+        };
+        if let Some(v) = done {
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            t.state = TaskState::Runnable;
+            return v;
+        }
+    } else {
+        // Already woken by the race — rax holds the result.
+        return t.ctx.rax;
+    }
     block_switch()
 }
 
@@ -19768,16 +20043,16 @@ fn tcp_send(si: usize, buf: u64, len: u64) -> u64 {
     };
     // Snapshot what the segment needs — the tx path can re-enter
     // the table (loopback drain) so no borrow crosses it.
-    let (pm, pi, sp, dp, sn, rn) = {
+    let (pm, pi, sp, dp, sn, rn, wnd) = {
         let socks = unsafe { &*core::ptr::addr_of!(TCPSOCKS) };
         let k = socks[si].as_ref().unwrap();
         (k.peer_mac, k.peer_ip, k.port, k.peer_port, k.snd_nxt,
-         k.rcv_nxt)
+         k.rcv_nxt, (TCP_RX_CAP - k.rxl).min(0xffff) as u16)
     };
     if !crate::e1000::tcp_tx(
         pm, pi, sp, dp, sn, rn,
         crate::net::TCP_PSH | crate::net::TCP_ACK,
-        pay,
+        pay, wnd,
     ) {
         return (-5i64) as u64; // EIO — tx ring rejected
     }

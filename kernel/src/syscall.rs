@@ -408,6 +408,7 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_RECVFROM => user::fd_recvfrom(ctx, a1, a2, a3, a4, a5, a6),
         NR_SENDMSG => user::fd_sendmsg(a1, a2, a3),
         NR_SETSOCKOPT => user::fd_setsockopt(a1, a2, a3, a4, a5),
+        55 => user::fd_getsockopt(a1, a2, a3, a4, a5),
         NR_SENDMMSG => user::fd_sendmmsg(a1, a2, a3, a4),
         NR_OPEN => sys_open(a1, a2, a3),
         NR_OPENAT => sys_openat(a1, a2, a3, a4),

@@ -52,7 +52,7 @@ const TXD_IFCS: u8 = 0x02;
 const TXD_RS: u8 = 0x08;
 const TXD_STA_DD: u8 = 0x01;
 
-const N_RX: usize = 8;
+const N_RX: usize = 64; // deep enough to hold a full TCP window burst between tick drains
 const RX_BUF: usize = 2048; // per-descriptor packet buffer
 const RCTL_EN: u32 = 1 << 1;
 const RCTL_UPE: u32 = 1 << 3; // unicast promiscuous
@@ -284,13 +284,17 @@ pub fn tx_once(base: usize, frame: &[u8]) -> bool {
             break false;
         }
     };
-    // SAFETY: reads on our ring + registers.
-    let (tdh, tdt) = unsafe { (rd(base, TDH), rd(base, TDT)) };
-    printk(format_args!(
-        "rustux: e1000: tx {}-byte frame {} (TDH {tdh}/TDT {tdt})",
-        frame.len(),
-        if done { "DONE" } else { "TIMEOUT" }
-    ));
+    // Per-frame success logging is deliberately absent: a serial+fbcon
+    // line per TX costs ~100ms of console scroll and would throttle
+    // the whole stack to ~15kB/s. Failures are rare enough to log.
+    if !done {
+        // SAFETY: reads on our ring + registers.
+        let (tdh, tdt) = unsafe { (rd(base, TDH), rd(base, TDT)) };
+        printk(format_args!(
+            "rustux: e1000: tx {}-byte frame TIMEOUT (TDH {tdh}/TDT {tdt})",
+            frame.len()
+        ));
+    }
     done
 }
 
@@ -2088,6 +2092,7 @@ pub fn tcp_tx(
     ack: u32,
     flags: u8,
     payload: &[u8],
+    wnd: u16,
 ) -> bool {
     let base = LIVE_BASE.load(Ordering::Relaxed);
     if base == 0 {
@@ -2107,6 +2112,18 @@ pub fn tcp_tx(
     );
     if n == 0 {
         return false;
+    }
+    if wnd != 1460 {
+        // build_tcp4 fixes the advertised window at 1460 — callers
+        // with a real receive-buffer answer patch the field here and
+        // re-seal the checksum it is covered by.
+        let t = 14 + 20; // eth + ip
+        f[t + 14..t + 16].copy_from_slice(&wnd.to_be_bytes());
+        f[t + 16..t + 18].copy_from_slice(&[0, 0]);
+        let ck = crate::net::csum4(
+            our_ip(), dst_ip, crate::net::NH_TCP, &f[t..n],
+        );
+        f[t + 16..t + 18].copy_from_slice(&ck.to_be_bytes());
     }
     let our = our_ip();
     if dst_ip == our || dst_ip[0] == 127 {

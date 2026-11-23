@@ -214,6 +214,96 @@ run-demo: $(ESP_DEMO)
 	if [ $$status -eq 33 ]; then echo "demo: PASS (qemu exit 33)"; \
 	else echo "demo: FAIL (qemu exit $$status)"; exit 1; fi
 
+INITRD_APT := initrd-apt.cpio
+ESP_APT    := esp-apt.img
+APTROOT    := kernel/user/aptroot
+
+# Real Debian apt end-to-end: aptprobe stages a minimal apt config
+# ([trusted=yes], GzipIndexes, no persistent binary caches — the
+# in-RAM VFile ceiling cannot hold the uncompressed index or the
+# ~36 MiB srcpkgcache), then execs the real dynamically linked
+# apt-get update over slirp. Methods and helper libs are the actual
+# Debian binaries. gpgv exits nonzero (no keyring is shipped) and
+# apt's http helper can exit 100 after a completed transfer —
+# trusted=yes carries apt-get itself through to exit 0.
+$(INITRD_APT): kernel/user/aptprobe.elf kernel/user/dpkg kernel/user/busybox kernel/user/resolv.conf tools/mkinitrd.py /lib64/ld-linux-x86-64.so.2 $(APTROOT)/apt-get $(APTROOT)/apt-helper $(APTROOT)/gpgv $(wildcard $(APTROOT)/methods/*) $(wildcard $(APTROOT)/dpkgtables/*) $(wildcard $(APTROOT)/lib*.so*)
+	python3 tools/mkinitrd.py \
+		kernel/user/aptprobe.elf aptprobe \
+		$(APTROOT)/apt-get usr/bin/apt-get \
+		$(APTROOT)/apt-helper usr/lib/apt/apt-helper \
+		kernel/user/dpkg usr/bin/dpkg \
+		kernel/user/busybox busybox \
+		kernel/user/busybox bin/sh \
+		kernel/user/resolv.conf etc/resolv.conf \
+		$(APTROOT)/methods/gpgv usr/lib/apt/methods/gpgv \
+		$(APTROOT)/methods/http usr/lib/apt/methods/http \
+		$(APTROOT)/methods/store usr/lib/apt/methods/store \
+		$(APTROOT)/methods/copy usr/lib/apt/methods/copy \
+		$(APTROOT)/methods/file usr/lib/apt/methods/file \
+		$(APTROOT)/dpkgtables/cputable usr/share/dpkg/cputable \
+		$(APTROOT)/dpkgtables/ostable usr/share/dpkg/ostable \
+		$(APTROOT)/dpkgtables/tupletable usr/share/dpkg/tupletable \
+		$(APTROOT)/dpkgtables/abitable usr/share/dpkg/abitable \
+		$(APTROOT)/libapt-pkg.so.6.0 lib/x86_64-linux-gnu/libapt-pkg.so.6.0 \
+		$(APTROOT)/libapt-private.so.0.0 lib/x86_64-linux-gnu/libapt-private.so.0.0 \
+		$(APTROOT)/libassuan.so.0 lib/x86_64-linux-gnu/libassuan.so.0 \
+		$(APTROOT)/libbz2.so.1.0 lib/x86_64-linux-gnu/libbz2.so.1.0 \
+		$(APTROOT)/libcap.so.2 lib/x86_64-linux-gnu/libcap.so.2 \
+		$(APTROOT)/libffi.so.8 lib/x86_64-linux-gnu/libffi.so.8 \
+		$(APTROOT)/libgcc_s.so.1 lib/x86_64-linux-gnu/libgcc_s.so.1 \
+		$(APTROOT)/libgcrypt.so.20 lib/x86_64-linux-gnu/libgcrypt.so.20 \
+		$(APTROOT)/libgmp.so.10 lib/x86_64-linux-gnu/libgmp.so.10 \
+		$(APTROOT)/libgnutls.so.30 lib/x86_64-linux-gnu/libgnutls.so.30 \
+		$(APTROOT)/libgpg-error.so.0 lib/x86_64-linux-gnu/libgpg-error.so.0 \
+		$(APTROOT)/libhogweed.so.6 lib/x86_64-linux-gnu/libhogweed.so.6 \
+		$(APTROOT)/libidn2.so.0 lib/x86_64-linux-gnu/libidn2.so.0 \
+		$(APTROOT)/liblz4.so.1 lib/x86_64-linux-gnu/liblz4.so.1 \
+		$(APTROOT)/liblzma.so.5 lib/x86_64-linux-gnu/liblzma.so.5 \
+		$(APTROOT)/libmd.so.0 lib/x86_64-linux-gnu/libmd.so.0 \
+		$(APTROOT)/libm.so.6 lib/x86_64-linux-gnu/libm.so.6 \
+		$(APTROOT)/libnettle.so.8 lib/x86_64-linux-gnu/libnettle.so.8 \
+		$(APTROOT)/libnpth.so.0 lib/x86_64-linux-gnu/libnpth.so.0 \
+		$(APTROOT)/libp11-kit.so.0 lib/x86_64-linux-gnu/libp11-kit.so.0 \
+		$(APTROOT)/libpcre2-8.so.0 lib/x86_64-linux-gnu/libpcre2-8.so.0 \
+		$(APTROOT)/libseccomp.so.2 lib/x86_64-linux-gnu/libseccomp.so.2 \
+		$(APTROOT)/libselinux.so.1 lib/x86_64-linux-gnu/libselinux.so.1 \
+		$(APTROOT)/libstdc++.so.6 lib/x86_64-linux-gnu/libstdc++.so.6 \
+		$(APTROOT)/libsystemd.so.0 lib/x86_64-linux-gnu/libsystemd.so.0 \
+		$(APTROOT)/libtasn1.so.6 lib/x86_64-linux-gnu/libtasn1.so.6 \
+		$(APTROOT)/libudev.so.1 lib/x86_64-linux-gnu/libudev.so.1 \
+		$(APTROOT)/libunistring.so.5 lib/x86_64-linux-gnu/libunistring.so.5 \
+		$(APTROOT)/libxxhash.so.0 lib/x86_64-linux-gnu/libxxhash.so.0 \
+		$(APTROOT)/libz.so.1 lib/x86_64-linux-gnu/libz.so.1 \
+		$(APTROOT)/libzstd.so.1 lib/x86_64-linux-gnu/libzstd.so.1 \
+		$(APTROOT)/gpgv usr/bin/gpgv \
+		/lib64/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2 \
+		$(APTROOT)/libc.so.6 lib/x86_64-linux-gnu/libc.so.6 > $@
+
+$(ESP_APT): $(KERNEL) $(INITRD_APT)
+	dd if=/dev/zero of=$@ bs=1M count=64
+	mformat -i $@ ::
+	mmd -i $@ ::/EFI
+	mmd -i $@ ::/EFI/BOOT
+	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(INITRD_APT) ::/initrd.cpio
+
+run-apt: $(ESP_APT)
+	$(QEMU) \
+		-machine q35 \
+		-m 512M \
+		-cpu qemu64,+rdrand \
+		-bios $(OVMF) \
+		-drive file=$(ESP_APT),format=raw,if=ide \
+		-snapshot \
+		-netdev user,id=n0 \
+		-device e1000e,netdev=n0 \
+		-serial stdio -display none \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		-no-reboot; \
+	status=$$?; \
+	if [ $$status -eq 33 ]; then echo "apt probe: PASS (qemu exit 33)"; \
+	else echo "apt probe: FAIL (qemu exit $$status)"; exit 1; fi
+
 clean:
 	cargo clean
 	rm -rf $(ESP) $(ESP_IMG)
