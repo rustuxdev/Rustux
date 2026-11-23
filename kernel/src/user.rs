@@ -2473,6 +2473,11 @@ pub fn fs_lookup(name: &[u8]) -> Option<&'static [u8]> {
     crate::cpio::find(arc, name)
 }
 
+/// Current task slot index — diagnostics/marker tables key on it.
+pub fn cur_index() -> usize {
+    unsafe { *core::ptr::addr_of!(CUR_I) }
+}
+
 /// Borrow the running task immutably — fault/log-path accessor.
 pub(crate) fn cur_exe() -> &'static str {
     let i = unsafe { *core::ptr::addr_of!(CUR_I) };
@@ -21739,6 +21744,10 @@ fn pick_next() -> Option<usize> {
 /// unwinds to the kernel context sched_launch saved.
 pub fn launch() {
     let Some(n) = pick_ready() else {
+        crate::log::printk(format_args!(
+            "rustux: sched: launch found no runnable task"
+        ));
+        crate::log::drain_task();
         return;
     };
     unsafe { *core::ptr::addr_of_mut!(CUR_I) = n };
@@ -21749,6 +21758,17 @@ pub fn launch() {
         // SAFETY: MSR write of a task-owned user FS base.
         unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
         unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
+        let pid = t.pid;
+        let rip = t.ctx.rip;
+        let ex = core::str::from_utf8(
+            &t.exe[..(t.exe_len as usize).min(t.exe.len())],
+        )
+        .unwrap_or("?");
+        crate::log::printk(format_args!(
+            "rustux: sched: launch {} (pid {}) rip={:#x}",
+            ex, pid, rip
+        ));
+        crate::log::drain_task();
         (&t.ctx as *const UCtx, t.pml4, t.kstack_top)
     };
     syscall::set_kstack(kst);
@@ -22093,6 +22113,21 @@ fn resume_ctx(n: usize) -> *const UCtx {
 /// pending signals (a default-fatal one kills it here), round-robin
 /// with delivery at the pick, and return the ctx to resume.
 pub fn tick(img: &mut UCtx) -> *const UCtx {
+    // Heartbeat every 5s: a frozen boot screen still tells us which
+    // IRQs fire and which task was current — distinguishes "CPU dead"
+    // from "IRQ storm starves userspace" without a serial port.
+    let tks = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    if tks % 500 == 499 {
+        crate::log::printk(format_args!(
+            "rustux: beat t={} cur={} pit={} kbd={} net={}",
+            tks + 1,
+            cur_exe(),
+            crate::apic::PIT_TICKS.load(core::sync::atomic::Ordering::Relaxed),
+            crate::kbd::IRQS.load(core::sync::atomic::Ordering::Relaxed),
+            crate::e1000::IRQS.load(core::sync::atomic::Ordering::Relaxed),
+        ));
+        crate::log::drain_task();
+    }
     // Service deferred wake sources on EVERY tick — including the
     // kernel-CS frames the hlt-idle loops take, where skipping them
     // would freeze every Blocked task's deadline and input feed.

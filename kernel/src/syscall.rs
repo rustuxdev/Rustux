@@ -347,6 +347,23 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         return;
     }
     let (nr, a1, a2, a3) = (ctx.rax, ctx.rdi, ctx.rsi, ctx.rdx);
+    // First-syscall marker per task slot: on firmware where a task
+    // goes silent after spawn (the VMware stall) this separates
+    // "never reached ring-3" from "runs but produces nothing".
+    static mut SYS_SEEN: [u64; 2] = [0; 2];
+    let ci = user::cur_index();
+    if ci < 128 {
+        // SAFETY: syscall entry masks IF — single accessor.
+        let (w, b) = (ci / 64, ci % 64);
+        if unsafe { SYS_SEEN[w] } & (1 << b) == 0 {
+            unsafe { SYS_SEEN[w] |= 1 << b };
+            crate::log::printk(format_args!(
+                "rustux: sched: first syscall nr={} from slot {}",
+                nr, ci
+            ));
+            crate::log::drain_task();
+        }
+    }
     // Args 4-6 ride r10/r8/r9 per the syscall ABI (arg4 is r10,
     // never rcx — that's the CPU-clobbered return address).
     let (a4, a5, a6) = (ctx.r10, ctx.r8, ctx.r9);
