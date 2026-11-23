@@ -3009,3 +3009,64 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
 - Env note: push still needs creds on this VM.
 - Next: apt-get prerequisites (method URIs, /var layout, more
   coreutils surface — apt wants stty/dirname/head etc.).
+## run-136 — real Debian `apt-get update` end-to-end over slirp
+
+- `aptprobe` (solo initrd via `make run-apt`) stages /etc/apt +
+  /var/lib/apt, writes `[trusted=yes]` sources.list + resolv.conf,
+  then execs the real dynamically linked `apt-get update`. Result:
+  bookworm InRelease + 8.9MB compressed Packages index fetched over
+  real DNS/TCP/HTTP, "Reading package lists... Done", exit(0).
+- Kernel enablement, in the order apt exposed it:
+  - e1000 per-frame TX printk removed (each line cost ~100ms of
+    fbcon scroll — the whole stack ran at ~15kB/s); N_RX 8->64.
+  - Window-update ACKs after the app drains rxb — without them the
+    peer only relearned window space via its ~5s persist probe
+    (~10kB/s); dup-ACKs now answer out-of-order and full-queue
+    segments instead of silently dropping to RTO.
+  - `TCP_RX_CAP` 2048->65536 with the buffer moved out of `TcpSock`
+    into a `.bss` `RXBUF` — the 64KiB literal overflowed KSTACK.
+  - `O_NONBLOCK`/`MSG_DONTWAIT` dropped for TCP recv (passed to UDP
+    only): apt's method parked in recv forever on a completed
+    stream. `dw` now threads into `tcp_recv_or_block` -> EAGAIN.
+  - Armed-recheck lost-wakeup fixes: pipe read/write, TCP recv,
+    poll, pselect, epoll all re-test after `wait_on`+`Blocked` are
+    visible — a state change in the check-then-arm gap ran the
+    waker with nobody home. pselect split into read-only
+    `pselect_eval` + `pselect_write` so rescans can't corrupt the
+    caller's input fd_sets.
+  - getsockopt NR55 (SO_TYPE/SO_ERROR, optlen round-trip).
+  - `VFILE_MAX` 1MiB->32MiB, buddy `MAX_ORDER` 11->14 for the index
+    files; vfile_grow's ncap is kmalloc-header-aware
+    (pow2(need+16)-16) only above the 4KiB slab cutoff.
+- REGRESSION FIXED IN-RUNG — the first header-aware formula
+  `pow2(need)-16` under-allocated `cap` below `need` on exact-pow2
+  sizes: a 16B overwrite wrote Release-file text into a freed
+  block's freelist link -> kmalloc dereferenced "/binary-" -> #GP.
+  Corrected formula keeps cap>=need; over-cap requests degrade to
+  honest ENOSPC via the order>=MAX_ORDER guard.
+- apt config carries `Acquire::GzipIndexes` (index stays ~8.9MB
+  compressed, uncompressed ~60MB exceeds VFILE_MAX),
+  `APT::Cache-Start 100MB` (mmap pool), and empty
+  pkgcache/srcpkgcache (36MB persistent cache would not fit).
+- Expected non-zero exits: gpgv 111 (no apt-key/keyring staged —
+  trusted=yes carries through), http method 100 after completed
+  transfers (apt-tolerated).
+- `kernel/user/aptroot/` stages the real Debian apt binaries +
+  methods + lib closure + dpkg tables (copied from host
+  /usr/share/dpkg for reproducibility).
+- 71 tasks, frames 99745 -> 99745 zero leak, qemu exit 33 on make
+  run, make run-net AND make run-apt; per-task exits match baseline.
+- Audit run-109 manual scoped + cve.now reached over HTTP JSON-RPC
+  this rung (MCP unconfigured locally): the size-miscalculation
+  heap-overflow class (CVE-2022-0185, CVE-2021-43267 analogs) is
+  exactly what the ncap fix closed; UAF/freelist-corruption class
+  CVE-2024-39510; race-window class CVE-2016-8655 (lost-wakeups are
+  availability-only here, no UAF). Verified: cap>=need invariant,
+  getsockopt bounded <=4B write after optlen read+write checks,
+  every recheck disarm clears wait_on/deadline and restores sigmask,
+  RXBUF slots zeroed on reuse, wnd patch stays inside the TCP hdr
+  with re-sealed checksum. needs_validation: none.
+- lstest floor unchanged (aptprobe is a solo initrd, not a suite
+  task). Env note: push still needs creds on this VM.
+- Next: apt-get install/download path (gpgv proper + keyring for
+  real signature checks, https method, more coreutils surface).
