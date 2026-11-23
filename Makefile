@@ -503,9 +503,11 @@ $(ESP_ISO): $(KERNEL) $(INITRD_ISO)
 	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@ $(INITRD_ISO) ::/initrd.cpio
 
-$(ISO): $(ESP_ISO)
-	rm -rf $(ISOROOT) && mkdir $(ISOROOT)
+$(ISO): $(ESP_ISO) $(KERNEL) $(INITRD_ISO)
+	rm -rf $(ISOROOT) && mkdir -p $(ISOROOT)/EFI/BOOT
 	cp $(ESP_ISO) $(ISOROOT)/esp.img
+	cp $(KERNEL) $(ISOROOT)/EFI/BOOT/BOOTX64.EFI
+	cp $(INITRD_ISO) $(ISOROOT)/initrd.cpio
 	genisoimage -o $@ -V RUSTUX_DEMO -e esp.img -no-emul-boot -J -r $(ISOROOT)
 
 $(INSTALLDISK):

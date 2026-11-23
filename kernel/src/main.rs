@@ -1055,7 +1055,6 @@ fn main() -> Status {
                 || name.contains(&b'/')
                 || name.ends_with(b".dll")
             {
-                kprintln!(con, "rustux: task {nm}: skipped (data file)");
                 continue;
             }
             if user::spawn(img, nm) {
@@ -1116,17 +1115,24 @@ fn load_initrd() -> Option<(u64, usize)> {
     let mut sfs =
         uefi::boot::get_image_file_system(uefi::boot::image_handle()).ok()?;
     let mut root = sfs.open_volume().ok()?;
-    let mut f = unsafe {
-        // SAFETY: we just opened it as a plain file.
-        RegularFile::new(
-            root.open(
-                uefi::cstr16!("initrd.cpio"),
-                FileMode::Read,
-                FileAttribute::empty(),
-            )
-            .ok()?,
-        )
-    };
+    // The initrd sits next to the loaded image on whatever filesystem
+    // firmware mounted: a FAT ESP keeps `initrd.cpio` verbatim, but a
+    // bare ISO9660 view truncates to the 8.3 `INITRD.CPI`.
+    let names = [
+        uefi::cstr16!("initrd.cpio"),
+        uefi::cstr16!("INITRD.CPIO"),
+        uefi::cstr16!("initrd.cpi"),
+        uefi::cstr16!("INITRD.CPI"),
+    ];
+    let mut f = None;
+    for n in &names {
+        if let Ok(h) = root.open(n, FileMode::Read, FileAttribute::empty()) {
+            // SAFETY: we just opened it as a plain file.
+            f = Some(unsafe { RegularFile::new(h) });
+            break;
+        }
+    }
+    let mut f = f?;
     let pages = MAX_INITRD / 4096;
     let base = uefi::boot::allocate_pages(
         uefi::boot::AllocateType::AnyPages,
