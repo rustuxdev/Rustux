@@ -3347,3 +3347,26 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   mirroring is the diagnostic that splits scheduling-stall vs
   fault-on-entry; awaiting field data.
 - Committed locally; source push held pending user ISO test.
+
+## run-145 — /dev/fb0 fbdev + DOOM proof-of-concept
+- GOP framebuffer exposed as /dev/fb0 (Linux fb major 29): char node
+  minted in dev_init, open ENXIO when no fb, positional read/write
+  clamped to min(GOP map size, stride*height) — the upstream fbdev
+  smem_len hardening class; SEEK_END = fb byte length; ioctls
+  FBIOGET_VSCREENINFO (160B var, honest BGR-vs-RGB channel offsets)
+  and FBIOGET_FSCREENINFO (smem_len, line_length, TRUECOLOR visual),
+  rdev-exact ENOTTY gate.
+- Accessors: FbConsole.fb_{info,byte_len,write_at,read_at} +
+  log::fb_* through PANIC_CON (same sole-drainer argument as
+  user_out — syscall context has IF masked).
+- doom_rustux.c shim for doomgeneric (GPL'd original id source,
+  vendored under third_party/): FBIOGET probes, integer scale
+  (640x400 -> 1280x800 @2x), one lseek+write per composed frame;
+  keys stubbed (attract mode needs none); -iwad /doom.wad.
+- DOOM.WAD is copyrighted — NOT committed; .gitignore covers
+  doom.wad/initrd-doom.cpio/esp-doom.img; `make run-doom` builds and
+  boots a solo-task ESP. Verified on-screen under OVMF: registered
+  DOOM banner, WAD load, E1M1 attract demo rendering at full speed.
+- cve.now MCP + security-audit skill unavailable this session;
+  scoped review done manually and recorded in the matrix row.
+- Committed locally; push held pending user test.

@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**136 unique CVEs recorded.**
+**137 unique CVEs recorded.**
 
 ## klib ports
 
@@ -132,6 +132,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2025-38432 | udp/dhcp (ipv4) | csum field zeroed before csum4 (CVE-2025-38432 fix shape); no MSG_PEEK/socket layer — 2016-10229 n/a; malformed csums dropped-and-reposted not error-looped (2015-5364/66 class abs… |
 | CVE-2025-38432 | udp/dhcp (ipv4) | csum field zeroed before csum4 (CVE-2025-38432 fix shape); no MSG_PEEK/socket layer — 2016-10229 n/a; malformed csums dropped-and-reposted not error-looped (2015-5364/66 class abs… |
 | CVE-2025-38595 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
+| CVE-2025-38685 | /dev/fb0 fbdev + DOOM proof: GOP framebuffer exposed as Linux fb major 29 — char node, EN… | audit run-117 manual scoped (security-audit skill + cve.now MCP absent in this session — limitation recorded; CVE class checked via upstream fbdev hardening patches): verified eve… |
 | CVE-2025-38722 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
 | CVE-2025-38722 | exit-time fd release (exit_files ordering) + shell-pipeline proof | CONFIRMED-BY-TEST kernel bug: task fds were only released in reap(), so a dying pipe writer OFD stayed alive and blocked readers starved for EOF forever -- the shell-shaped test (… |
 | CVE-2025-39684 | NT filesystem/path services round 2: RUX_PATH 0x100 multiplexed service (subs 0-10: GetCu… | audit run-100 quick scoped: 2 confirmed findings fixed in-diff — UTF-16 path reader loaded a u16 whose second byte could straddle a page end into the next physical frame (per-byte… |
