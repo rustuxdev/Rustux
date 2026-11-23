@@ -8365,6 +8365,17 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             0
         }
+        0x5309 => {
+            // CDROMEJECT — the ATAPI START STOP UNIT packet on the
+            // secondary-channel CD drive. The fd must be an sr
+            // node; everything else is ENOTTY like a mistyped
+            // ioctl on the wrong device class.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            if !vfile(*i).is_some_and(|v| v.rdev == 0xb00) {
+                return ENOTTY_;
+            }
+            if crate::ata::eject() { 0 } else { (-5i64) as u64 } // EIO
+        }
         TIOCGWINSZ => {
             if !tty {
                 return ENOTTY_;
@@ -12622,6 +12633,8 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                 // /dev/tty and /dev/console read the ldisc queue —
                 // the same path fd 0 takes, job-control gate and all.
                 0x500 | 0x501 => tty_input_read(t, ctx, buf, len),
+                // /dev/sr0 does no sector I/O — ioctls only.
+                0xb00 => (-6i64) as u64, // ENXIO
                 // Unreachable while open() whitelists rdevs — belt
                 // and braces against a future arm forgetting this.
                 _ => EINVAL,
@@ -12845,6 +12858,8 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             // /dev/full is the one dev that answers a write —
             // ENOSPC on every byte, like a full disk.
             0x107 => ENOSPC_,
+            // /dev/sr0 does no sector I/O — ioctls only.
+            0xb00 => (-6i64) as u64, // ENXIO
             // Everything else sinks the bytes: null/zero discard,
             // random/urandom fold them into the pool (Linux's
             // write-to-urandom is accepted and never fails),
@@ -13802,7 +13817,10 @@ pub fn dev_init() {
         }
     }
     // /dev/sda — the node only exists when the ATA probe found a
-    // disk, matching udev behavior (no hardware, no node).
+    // disk, matching udev behavior (no hardware, no node). /dev/sr0
+    // is always minted: the CDROM* ioctls probe the secondary
+    // channel themselves and answer EIO when no ATAPI drive is
+    // there (a node without hardware is normal on real systems).
     if crate::ata::sectors() > 0 {
         let r = vfile_create(b"dev/sda");
         if (r as i64) >= 0 {
@@ -13811,6 +13829,14 @@ pub fn dev_init() {
                 v.fmt = 0o60000; // S_IFBLK
                 v.rdev = 8 << 8;
             }
+        }
+    }
+    let r = vfile_create(b"dev/sr0");
+    if (r as i64) >= 0 {
+        if let Some(v) = vfile(r as usize) {
+            vfile_stamp(v, 0o660, 0);
+            v.fmt = 0o60000; // S_IFBLK
+            v.rdev = 11 << 8;
         }
     }
     // The /dev convenience links real Linux images carry.
@@ -14773,6 +14799,10 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                 0o60000 => match v.rdev >> 8 {
                     8 if crate::ata::sectors() > 0 => i,
                     8 => return ENXIO,
+                    // /dev/sr0 — the ATAPI CD drive. No sector I/O
+                    // (read/write are ENXIO below); it exists for
+                    // the CDROM* ioctl family like eject.
+                    11 => i,
                     _ => return ENODEV,
                 },
                 // A fifo node exists but no fifo semantics live

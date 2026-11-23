@@ -323,6 +323,13 @@ const ENOSYS: u64 = (-38i64) as u64;
 /// the kernel or exhaust memory.
 const MAX_COPY: u64 = 4096;
 
+/// Longest single read result — separate from MAX_COPY because big
+/// reads are just a bounded memcpy in every fd_read arm (each arm
+/// already min()s against what the source holds). Linux caps at
+/// MAX_RW_COUNT and returns short; 1 MiB keeps the same honest
+/// shape without forcing 4 KiB-per-syscall file copies.
+const MAX_READ: u64 = 1 << 20;
+
 /// ctx=rcx — the asm stub pushed a full UCtx and hands us &mut to it
 /// (Windows x64 call convention). Args live in ctx.{rdi,rsi,rdx}; the
 /// return value goes back through ctx.rax. Handlers may also copy the
@@ -350,7 +357,7 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         // never EINVAL on a big buffer (a 128KiB stdio read must not
         // fail). Our cap is the same copy budget sys_write uses; every
         // fd_read arm already min()s against available data.
-        NR_READ => user::fd_read(ctx, a1, a2, a3.min(MAX_COPY)),
+        NR_READ => user::fd_read(ctx, a1, a2, a3.min(MAX_READ)),
         NR_WRITE => sys_write(ctx, a1, a2, a3),
         NR_PIPE => user::fd_pipe(a1, 0),
         NR_PIPE2 => user::fd_pipe(a1, a2),

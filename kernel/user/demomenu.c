@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -52,26 +53,38 @@ static void live_shell(void)
 }
 
 // Copy `n` bytes img->sd in 64 KiB chunks with a progress line.
+// Reads are looped to fill the buffer — a short read is legal —
+// so each write() carries the full 64 KiB: one multi-sector ATA
+// command and one cache flush per chunk instead of per-page.
 static int copy_image(int img, int sd, off_t n)
 {
     static char buf[64 * 1024];
     off_t done = 0;
     while (done < n) {
-        ssize_t r = read(img, buf, sizeof buf);
-        if (r <= 0) {
-            printf("install: read %s: %s\n", IMG_PATH,
-                   r < 0 ? strerror(errno) : "short file");
+        size_t got = 0;
+        while (got < sizeof buf) {
+            ssize_t r = read(img, buf + got, sizeof buf - got);
+            if (r < 0) {
+                printf("install: read %s: %s\n", IMG_PATH, strerror(errno));
+                return -1;
+            }
+            if (r == 0)
+                break;
+            got += (size_t)r;
+        }
+        if (got == 0) {
+            printf("install: read %s: short file\n", IMG_PATH);
             return -1;
         }
-        for (ssize_t w = 0; w < r;) {
-            ssize_t k = write(sd, buf + w, r - w);
+        for (size_t w = 0; w < got;) {
+            ssize_t k = write(sd, buf + w, got - w);
             if (k <= 0) {
                 printf("install: write %s: %s\n", SD_PATH, strerror(errno));
                 return -1;
             }
-            w += k;
+            w += (size_t)k;
         }
-        done += r;
+        done += got;
         if ((done & (4 * 1024 * 1024 - 1)) == 0 || done == n)
             printf("install: %lld / %lld MiB\n",
                    (long long)(done >> 20), (long long)(n >> 20));
@@ -113,11 +126,32 @@ static void install(void)
     printf("install: verify first sector: %s\n", ok ? "ok" : "MISMATCH");
     close(img);
     close(sd);
-    if (!ok)
+    if (!ok) {
+        printf("install: FAILED — disk image did not verify\n");
         return;
+    }
     sync();
-    printf("install: complete — rebooting into the installed system\n");
-    sleep(1);
+    // Eject the installation medium like a real installer — after
+    // this the reboot lands on the installed disk, not the ISO.
+    {
+        int cd = open("/dev/sr0", O_RDONLY);
+        if (cd >= 0) {
+            if (ioctl(cd, 0x5309 /* CDROMEJECT */, 0) == 0)
+                printf("install: installation medium ejected\n");
+            close(cd);
+        }
+    }
+    printf("\n");
+    printf("Rustux has been installed to the disk successfully.\n");
+    printf("Remove the installation medium if present, then press\n");
+    printf("ENTER to reboot into the installed system.\n");
+    fflush(stdout);
+    {
+        char buf[8];
+        if (!fgets(buf, sizeof buf, stdin))
+            sleep(1);
+    }
+    printf("install: rebooting into the installed system\n");
     reboot(RB_AUTOBOOT);
     printf("install: reboot: %s\n", strerror(errno));
 }

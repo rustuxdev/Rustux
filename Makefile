@@ -376,14 +376,17 @@ $(ISO): $(ESP_ISO)
 $(INSTALLDISK):
 	dd if=/dev/zero of=$@ bs=1M count=32
 
-# End-to-end install proof: phase 1 boots the ISO and monitor-
-# sendkey presses "2" at the menu (the PS/2 path — QEMU does not
-# deliver piped stdio to the guest UART), the installer streams
-# hd.img to /dev/sda and reboots (QEMU exits under -no-reboot);
-# phase 2 boots the installed disk and sendkeys "1" into a shell.
-# The ATA driver binds the i440fx IDE controller — hence -machine pc.
+# End-to-end install proof in one guest session: `-boot once=d,
+# order=c` boots the CD first and the installed disk after the
+# reset — the real installer flow. monitor-sendkey presses "2" at
+# the menu (the PS/2 path — QEMU does not deliver piped stdio to
+# the guest UART), the installer streams hd.img to /dev/sda,
+# reports status, and waits for ENTER; sendkey answers it, the
+# guest resets into the installed system, and "1" lands in the
+# live shell. The ATA driver binds the i440fx IDE controller —
+# hence -machine pc.
 run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
-	rm -f isomon.sock
+	rm -f isomon.sock isoph.log
 	$(QEMU) \
 		-machine pc \
 		-m 512M \
@@ -391,42 +394,32 @@ run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 		-bios $(OVMF) \
 		-cdrom $(ISO) \
 		-drive file=$(INSTALLDISK),format=raw,if=ide \
-		-serial file:isoph1.log -display none \
+		-boot once=d,order=c \
+		-serial file:isoph.log -display none \
 		-monitor unix:isomon.sock,server,nowait \
-		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-		-no-reboot & \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 & \
 	qpid=$$!; \
-	for i in 1 2 3 4 5; do \
+	ok=0; \
+	for i in $$(seq 1 16); do \
 		sleep 15; \
-		grep -q "install:" isoph1.log && break; \
+		grep -q "ENTER to reboot" isoph.log && { ok=1; break; }; \
 		python3 tools/sendkey.py isomon.sock 2 ret; \
 	done; \
-	wait $$qpid || true; \
-	grep -q "install: complete" isoph1.log \
+	[ $$ok -eq 1 ] \
 		&& echo "iso install: PASS" \
-		|| { echo "iso install: FAIL"; tail -20 isoph1.log; exit 1; }
-	rm -f isomon2.sock
-	$(QEMU) \
-		-machine pc \
-		-m 512M \
-		-cpu qemu64,+rdrand \
-		-bios $(OVMF) \
-		-drive file=$(INSTALLDISK),format=raw,if=ide \
-		-serial file:isoph2.log -display none \
-		-monitor unix:isomon2.sock,server,nowait \
-		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-		-no-reboot & \
-	qpid=$$!; \
-	for i in 1 2 3 4 5; do \
+		|| { echo "iso install: FAIL"; tail -20 isoph.log; kill $$qpid; exit 1; }; \
+	echo "eject -f ide1-cd0" | socat - UNIX-CONNECT:isomon.sock > /dev/null; \
+	python3 tools/sendkey.py isomon.sock ret; \
+	ok=0; \
+	for i in $$(seq 1 12); do \
 		sleep 15; \
-		python3 tools/sendkey.py isomon2.sock 1 ret; \
-		sleep 4; \
-		grep -q "/ #" isoph2.log && break; \
+		grep -q "/ #" isoph.log && { ok=1; break; }; \
+		python3 tools/sendkey.py isomon.sock 1 ret; \
 	done; \
-	grep -q "/ #" isoph2.log \
+	grep -q "/ #" isoph.log \
 		&& echo "installed boot + live shell: PASS" \
-		|| { echo "installed boot: FAIL"; tail -20 isoph2.log; kill $$qpid; exit 1; }; \
-	echo quit | socat - UNIX-CONNECT:isomon2.sock > /dev/null 2>&1 || kill $$qpid
+		|| { echo "installed boot: FAIL"; tail -20 isoph.log; kill $$qpid; exit 1; }; \
+	echo quit | socat - UNIX-CONNECT:isomon.sock > /dev/null 2>&1 || kill $$qpid
 
 clean:
 	cargo clean
