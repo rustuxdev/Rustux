@@ -84,16 +84,18 @@ int main(void) {
     struct itimerval old;
     memset(&old, 0, sizeof(old));
     it.it_interval.tv_sec = 0; it.it_interval.tv_usec = 100000;
-    it.it_value.tv_sec = 1; it.it_value.tv_usec = 0;
+    it.it_value.tv_sec = 5; it.it_value.tv_usec = 0;
     check(setitimer(ITIMER_REAL, &it, &old) == 0, "setitimer old=");
     check(old.it_interval.tv_usec == 50000, "old reports interval");
 
-    /* getitimer sees the armed one-shot value (~1s minus elapsed). */
+    /* getitimer sees the armed one-shot value — 5s leaves slack for
+     * a descheduled timeslice under suite round-robin. */
     struct itimerval cur;
     memset(&cur, 0, sizeof(cur));
     check(getitimer(ITIMER_REAL, &cur) == 0, "getitimer armed");
-    check(cur.it_value.tv_sec == 0 && cur.it_value.tv_usec > 0,
-          "getitimer remaining <1s");
+    check((cur.it_value.tv_sec > 0 || cur.it_value.tv_usec > 0) &&
+          cur.it_value.tv_sec <= 5,
+          "getitimer remaining 0<r<=5s");
     check(cur.it_interval.tv_usec == 100000, "getitimer interval");
     alarm(0); /* leave REAL disarmed for the rest */
 

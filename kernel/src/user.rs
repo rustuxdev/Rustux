@@ -12227,6 +12227,9 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                 if len == 0 {
                     return 0;
                 }
+                if o.nonblock {
+                    return EAGAIN; // O_NONBLOCK empty read
+                }
                 // Block until a writer delivers. The waker copies
                 // through OUR tables and deposits the count in
                 // ctx.rax; wait_ptr's validity was verified now.
@@ -12380,8 +12383,11 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     if want > free && (want <= PIPE_SIZE || free == 0) {
         // No progress possible this call: <=PIPE_BUF writes stay
         // atomic (they need the whole request to fit), and a larger
-        // write can only start when the ring has SOME room. The
-        // waker pulls our buffer through OUR tables and deposits
+        // write can only start when the ring has SOME room.
+        if o.nonblock {
+            return EAGAIN;
+        }
+        // The waker pulls our buffer through OUR tables and deposits
         // the count in ctx.rax — possibly short for big writes.
         if len > 0 && !range_ok(buf, 1) {
             return EFAULT;
@@ -12513,13 +12519,13 @@ pub fn sys_sendfile(out_fd: u64, in_fd: u64, off_va: u64, count: u64) -> u64 {
 
 /// pipe2(fds, flags): a kernel ring with a read end and a write end,
 /// each an OFD so the pair can be dup'd and fork-shared. O_CLOEXEC
-/// marks both ends for exec-close; O_NONBLOCK remains unsupported
-/// (no nonblocking pipe io — EINVAL, flagged NV). ENFILE at the
+/// marks both ends for exec-close; O_NONBLOCK sets the OFD flag so
+/// empty reads and atomic-fail writes answer EAGAIN. ENFILE at the
 /// pool bound, EMFILE at the fd/OFD bounds.
 pub fn fd_pipe(fdptr: u64, flags: u64) -> u64 {
     const ENFILE_: u64 = (-23i64) as u64;
     const O_NONBLOCK: u64 = 0o4000;
-    if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 || flags & O_NONBLOCK != 0 {
+    if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
         return EINVAL;
     }
     if !range_ok_w(fdptr, 8) {
@@ -12566,12 +12572,13 @@ pub fn fd_pipe(fdptr: u64, flags: u64) -> u64 {
             writers: 1,
         });
     }
+    let nb = flags & O_NONBLOCK != 0;
     ofds[ro] = Some(OpenFile {
         kind: FdKind::Pipe { id: pi, write: false },
         pos: 0,
         refs: 1,
         append: false,
-        nonblock: false,
+        nonblock: nb,
         accmode: 0,
     });
     ofds[wo] = Some(OpenFile {
@@ -12579,7 +12586,7 @@ pub fn fd_pipe(fdptr: u64, flags: u64) -> u64 {
         pos: 0,
         refs: 1,
         append: false,
-        nonblock: false,
+        nonblock: nb,
         accmode: 1,
     });
     fdt(t).fds[rf] = Some(ro as u8);
