@@ -94,10 +94,22 @@ SIGTTIN, SIGTTOU with TOSTOP — the whole job-control model), `clone`
 flags up to full pthread-style thread groups (`CLONE_VM|FS|FILES|
 SIGHAND|THREAD`, `SETTLS`, futex wait/wake, `CHILD_CLEARTID`), and real
 `vfork` semantics — a shared-mm child running on the parent's stack
-while the parent sleeps. The suite boots a real static **BusyBox**,
-real Debian **dash**, and dynamically linked **GNU bash 5.2** — 61
+while the parent sleeps, Unix98 PTYs
+(`posix_openpt`/`TIOCGPTN`/`TIOCGPTPEER`/`unlockpt`, pts indexes,
+hangup semantics), a polled ATA PIO driver behind real `/dev/sda`
+and `/dev/sr0` block nodes (`CDROMEJECT` included), and a GOP
+framebuffer xterm-subset console that ncurses targets.
+The suite boots a real static **BusyBox**,
+real Debian **dash**, and dynamically linked **GNU bash 5.2** — 72
 tasks, all passing; `make run-bash` boots an
 interactive `-bash` login shell on the serial console.
+Beyond the suite, `make run-apt` proves real Debian package
+management end to end — `apt-get update`/`apt install` fetch from
+deb.debian.org over slirp and dpkg unpacks/configures the package
+under a kernel pty — and `make run-iso` builds a bootable
+**live/install ISO**: El Torito media that offers a live bash
+session or an ATA install to disk, ejects itself, and reboots into
+the installed system.
 
 And the kernel is **dual-personality**: next to the Linux ABI sits a
 native NT personality — real PE32+ `.exe` binaries running on a
@@ -108,7 +120,7 @@ Every rung is also security-reviewed: a scoped audit of the diff plus a
 check of that subsystem's published kernel CVEs — each gets a written
 verdict in [docs/cve-matrix.md](docs/cve-matrix.md) (structurally
 absent, explicitly mitigated, or a documented divergence), gathered
-into a flat ledger of 120+ unique CVEs so far.
+into a flat ledger of 136 unique CVEs so far.
 
 ## A second personality: native Windows `.exe`, no Wine
 
@@ -172,7 +184,8 @@ GNU bash and native `.exe` tasks in five days:
 | **Nov 20** | **Hardware → wire → ring 3, in one day.** fbcon + boot logo, ExitBootServices, own page tables, buddy + slab/kmalloc, GDT/IDT, LAPIC timer, IST guard stack, the Rustux rename; ACPI + I/O APIC, PS/2 keyboard, PCI, e1000e TX/RX DMA + MSI-X; ARP, IPv4/ICMP ping, **world-first IPv8 on the wire**, IPv6/NDP, UDP + a real DHCP lease, TCP handshake, ChaCha20 CSPRNG — then ring 3: ELF loader, syscall boundary, initrd rootfs, preemptive scheduler, `fork`/`wait4`, pipes, signals, per-task fault isolation, FPU context, poll, UDP+TCP sockets, `brk`/`mmap`, and the glibc-startup ABI. |
 | **Nov 21** | **A real Linux userspace.** pthread-class `clone` flags + futex + `CHILD_CLEARTID` + `CLONE_VM`, hierarchical VFS, file-backed `mmap`, real `vfork` — then real **BusyBox**, `PT_INTERP` dynamic `ld.so`, Debian **dash** and **GNU bash 5.2** (interactive `-bash` on the serial console); process groups/sessions, tty line discipline + full job control (`SIGTTOU`/`TOSTOP`); epoll, eventfd, timerfd, signalfd, inotify; a generated `/proc`. |
 | **Nov 22** | **Last POSIX gaps → the second personality.** Queued signals, real `statfs`, VFS symlinks, file metadata, char devices + a real `/dev` — then the NT personality lands whole: PE32+ `.exe` loader, NT syscall table with NTSTATUS returns, TEB/PEB, handle tables, the Win32/CRT thunk layer (real MinGW exes end-to-end), NT file/dir/heap/VM services, threads with suspend/resume, section objects, `LoadLibrary` + the full `DllMain` attach/detach lifecycle, TLS callbacks, `CreateProcessA`. The suite stands at 61 tasks, all passing. |
-| **Every rung** | A scoped security audit plus a cve.now sweep of that subsystem's published kernel CVEs — 120 unique CVEs recorded in [docs/cves-addressed.md](docs/cves-addressed.md) so far. |
+| **Nov 23** | **A real Debian system, installable.** Real `apt-get update` + `apt install` over slirp — DNS, TCP, the full dpkg toolchain (dpkg/dpkg-deb/dpkg-query/dpkg-split + GNU tar + ldconfig) running a package's unpack/configure under a real kernel pty. Unix98 PTYs (`/dev/ptmx`, `/dev/pts/N`, `TIOCGPTN`/`TIOCGPTPEER`, `unlockpt`, termios, hangup). A polled ATA PIO driver → `/dev/sda` block device + `/dev/sr0` with the `CDROMEJECT` ioctl. A GOP framebuffer terminal (xterm subset: SGR colors, DEC line drawing, scroll regions, alt screen) that runs ncurses `htop` over `/proc/<pid>/task`. And a **bootable live/install ISO** — OVMF El Torito media with a demo menu: live bash session or stream-to-disk install, eject, reboot onto the installed system. The suite stands at 72 tasks, all passing. |
+| **Every rung** | A scoped security audit plus a cve.now sweep of that subsystem's published kernel CVEs — 136 unique CVEs recorded in [docs/cves-addressed.md](docs/cves-addressed.md) so far. |
 
 ## Acknowledgements
 
@@ -210,6 +223,11 @@ make run             # builds kernel.efi -> esp.img, boots under OVMF in QEMU;
                      # PASS when the kernel exits QEMU with status 33
 make run-bash        # solo image: an interactive -bash login shell on
                      # the serial console — type into the terminal
+make run-apt         # real apt-get update + install hello-traditional
+                     # over slirp; dpkg unpacks under a kernel pty
+make run-iso         # builds rustux-demo.iso, installs it to target.img
+                     # in one QEMU session, then boots the installed disk
+./boot-demo.sh iso   # same ISO demo with a visible QEMU window
 make run-ttout       # solo image: the TOSTOP/SIGTTOU write-gate test
                      # (must own the machine; see HANDOVER run-91)
 ```

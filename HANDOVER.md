@@ -3227,3 +3227,96 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   to `[1] live session` only and a busybox `/ #` shell. make run
   exit 33, 72 tasks, frames 99744 -> 99744 zero leak, ptytest
   all 24 checks (the run-138 flake did not reproduce this run).
+
+## run-141 — live payload: bash/htop/apt + cpio symlinks + /proc task + fbcon REP
+
+- The demo ISO's live session is now a real Debian-flavored system:
+  bash login shell (TERM/TERMINFO/HOME/PATH env), htop with its
+  ncursesw/tinfo/libm/libnl deps + xterm terminfo, 50+ busybox
+  applets as mkinitrd `link:` symlink records (one 2.8MB busybox
+  copy instead of N), and the full apt/dpkg toolchain (apt-get,
+  apt-helper, gpgv, http/store/copy/file methods, dpkg + dpkg-deb/
+  query/split, real GNU tar, ldconfig, dpkg arch tables, ~30 libs,
+  /etc/apt sources.list + 99rustux config, resolv.conf). ISO QEMU
+  invocations gain slirp + e1000e so the NIC exists on demo media.
+- `resolve_links` now follows initrd cpio S_IFLNK entries, not just
+  VFile links — a `link:` record's data is the raw target text,
+  resolved through the same 40-hop ELOOP/256-byte-name discipline
+  as VFS links. This is what was missing for every applet link:
+  `/bin/ls` exec'd the literal text "/bin/busybox" before (ls, df,
+  top, ps — all dead); now multicall resolves argv[0] correctly.
+  The lstat/readlink `fl` flag reports cpio links too.
+- `/proc/<pid>/task` — htop's per-pid thread-group enumeration:
+  PROC_TFILES gains task/, ProcEnt parses task/<tid>/<leaf>,
+  dir_exists + getdents enumerate the group's TIDs and the leaf
+  set per TID. htop showed an empty process list without it
+  (busybox top's simpler proc walk masked the gap).
+- fbcon gains REP (CSI Ps b — repeat last graphic char, bounded to
+  cols*rows via a tracked last_glyph) — htop's meter bars paint
+  their full width now instead of a single cell.
+- MAX_INITRD 64->128 MiB: the ISO initrd carries the 48MiB hd.img
+  install payload on top of the live rootfs (~81MiB) — the guard
+  tripped and the kernel fell back to the embedded ELF.
+- MAX_VFILES 128->1024 / MAX_VDIRS 128->512: a real `apt install`
+  dep-set extracts several hundred names; 128 slots ENOSPC'd
+  mid-libc6. Still bounded — an honest ENOSPC, ~300KB static.
+- demomenu seeds /var/lib/dpkg/status marking every staged .so as
+  installed (libc6 + dep set + ncurses/libnl for htop leaves) —
+  without it apt tries to install libc6 for real and dpkg's
+  backup-link step fails EXDEV on the cpio-backed staged file.
+  Same pattern aptprobe already proved. Known divergence noted:
+  hardlinking an initrd file is EXDEV — a real copy-up is roadmap.
+- Boot selection pinned with device bootindex (CD 0, disk 1) +
+  order=dc — OVMF's NVRAM-cached BootOrder ignores once= across
+  sessions, which made the installed disk win over the media.
+- QEMU -m 512M -> 1G everywhere: 81MiB initrd + ramfs extract
+  headroom; the 512M guest vfile-ENOSPC'd mid-libc6.
+- Verified live: `ls /` colored applet output, `df -h` real statfs,
+  `apt-get --version` (apt 2.8.4), `apt update` (bookworm InRelease
+  + 8.8MB Packages, dep tree built), `apt install hello-traditional`
+  (leaf-only fetch, dpkg unpack+configure under the pty), and
+  `/usr/bin/hello` prints "Hello, world!". htop paints Tasks/bars
+  with SGR colors on the fb console.
+- Validation: make run exit 33, 72 tasks; first run hit the known
+  run-138 pty flake (2 frames), clean rerun 214361 -> 214361 zero
+  leak. clippy 58 = baseline, none in touched regions.
+- Scoped audit (quick): resolve_links cpio-link hop reuses the
+  bounded tgt/cur buffers + ELOOP cap; cve.now entities.search —
+  CVE-2024-53142 (initramfs name overrun, re-validated: same strict
+  parser feeds entries_m) and CVE-2023-3161 (fbcon font-size OOB —
+  structurally absent, fixed 8x16 font, REP bounded). needs_validation:
+  run-138 pty flake stands.
+
+## run-142 — fbcon CSI param fix + real login chain
+
+- fbcon CSI parser: multi-digit params were split one digit per
+  slot (nparams used as the index), so \e[50;1H -> row 4,
+  \e[36m -> params [3,6] = no color, \e[1;50r -> scroll region
+  rows 0-4 = whole-screen scramble. Digits now accumulate into
+  the current param; ';' counts empty leading params. One bug,
+  every symptom (no colors, floating F-bar, mangled layout).
+- SGR bold is now persistent (self.bold) — ncurses emits
+  \e[0;1m\e[30m for bright black; the old one-shot bump was lost
+  on the following 30..37, rendering bar values/`kthr` invisible.
+- Tick accounting: kernel-CS frames billed stime to cur
+  unconditionally — the hlt-idle loop is kernel CS, so every
+  idle tick landed on the last task (htop showed 100%). Now only
+  billed when cur is Runnable (real preempted syscall frame).
+- stdin_echo printk -> log::user_out: echo was rendering one
+  timestamped log record per char; now verbatim console bytes.
+- setfsuid(122)/setfsgid(123) -> 0: bash's startup probes
+  stopped spamming enosys records.
+- demomenu -> livemenu (rename everywhere). pid1 flow split:
+  media boot (hd.img in initrd) shows the menu; an installed
+  disk has no payload -> straight to login, no menu. Menu is
+  media-only per request.
+- Authentication: run_login does real /etc/passwd + /etc/shadow
+  lookup with crypt() verification (libcrypt.a, $6$ SHA-512),
+  termios ECHO-off password read, constant-shape "Login
+  incorrect"; success sets HOME/USER/SHELL/PATH env and execs
+  the account shell. root/rustux seeded via openssl passwd -6.
+  whoami/id/logname/groups links; /etc/passwd existing gives
+  htop USER=root. busybox login applet was tried first — it
+  fails auth then #GP-crashes on retry (kernel ABI gap, tracked).
+- Suite: 72 tasks, exit 33, zero leak; ISO boot -> menu ->
+  login -> bash verified; installed disk -> login -> bash.
