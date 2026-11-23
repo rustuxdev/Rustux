@@ -1095,8 +1095,9 @@ fn load_initrd() -> Option<(u64, usize)> {
 
     /// Largest initrd we accept — a guard against a corrupt ESP
     /// handing us something absurd. Static-PIE test binaries are
-    /// ~800KB each, so this grew with the real-binary suite.
-    const MAX_INITRD: usize = 32 << 20;
+    /// ~800KB each, so this grew with the real-binary suite. The
+    /// run-130 archive crossed 30MiB; headroom again.
+    const MAX_INITRD: usize = 64 << 20;
 
     let mut sfs =
         uefi::boot::get_image_file_system(uefi::boot::image_handle()).ok()?;

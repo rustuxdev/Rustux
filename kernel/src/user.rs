@@ -74,7 +74,7 @@ const MAX_RANGES: usize = 128;
 /// Max resident tasks — a hard bound so spawn can't exhaust the
 /// kernel heap by enqueueing forever. 48 was fork-EAGAIN-tight
 /// for the 39-task suite + concurrent children (observed on VM).
-const MAX_TASKS: usize = 64;
+const MAX_TASKS: usize = 80;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -1513,7 +1513,7 @@ const FDT_EMPTY: FdTab = FdTab { users: 0, cloexec: 0, fds: [None; MAX_FDS] };
 /// Task-slot parity plus CLONE_FILES slack (threads share the
 /// leader's table) — a full table ENOMEMs, never
 /// corrupts, same discipline as MM_REFS.
-const MAX_FDTABS: usize = 64;
+const MAX_FDTABS: usize = MAX_TASKS;
 /// Task.fdi sentinel after release — makes a second release_fds a
 /// no-op instead of a double-decrement.
 const FDI_NONE: u8 = u8::MAX;
@@ -1597,7 +1597,7 @@ const SIGH_EMPTY: SigTab = SigTab {
     flags: [0; 31],
     masks: [0; 31],
 };
-const MAX_SIGTABS: usize = 64;
+const MAX_SIGTABS: usize = MAX_TASKS;
 /// Task.sigh sentinel after release — second release is a no-op.
 const SIGH_NONE: u8 = u8::MAX;
 static mut SIGTABS: [SigTab; MAX_SIGTABS] = [SIGH_EMPTY; MAX_SIGTABS];
@@ -1653,7 +1653,7 @@ struct FsTab {
     cwdlen: u8,
 }
 const FS_EMPTY: FsTab = FsTab { users: 0, umask: 0, cwd: [0; 128], cwdlen: 0 };
-const MAX_FSTABS: usize = 64;
+const MAX_FSTABS: usize = MAX_TASKS;
 /// Task.fsi sentinel after release.
 const FSI_NONE: u8 = u8::MAX;
 static mut FSTABS: [FsTab; MAX_FSTABS] = [FS_EMPTY; MAX_FSTABS];

@@ -39,7 +39,7 @@ _start:
     inc %r15d
 3:
     mov %rax, %r13              # bytes returned
-    # walk the reclen chain — the archive guarantees 44 root
+    # walk the reclen chain — the archive guarantees 45 root
     # records: ".", "..", "proc", every flat member, plus the
     # implicit lib64/lib dirs. Other tasks can only ADD records
     # (VFiles/VDIRS are global) — so a >= floor, never ==.
@@ -53,7 +53,7 @@ _start:
     add %r13, %rax              # buf end
     cmp %rax, %rbx
     jb 4b
-    cmp $44, %ebp
+    cmp $45, %ebp
     jae 5f
     inc %r15d
 5:
@@ -64,7 +64,12 @@ _start:
     je 6f
 51: inc %r15d
 6:
-    # getdents again -> 0 (EOF: pos consumed all entries)
+    # getdents again -> 0 once drained: concurrent tasks can ADD
+    # root records between calls (VFiles/VDIRS are global), so a
+    # nonzero return is just new entries past pos — drain until EOF
+    # with a bound. Only a stream that never ends is a failure.
+    mov $256, %r12d
+61:
     mov %r14, %rdi
     lea -4096(%rsp), %rsi
     mov $4096, %edx
@@ -72,6 +77,8 @@ _start:
     syscall
     test %rax, %rax
     je 7f
+    dec %r12d
+    jnz 61b
     inc %r15d
 7:
     # lseek(dirfd, 0, SEEK_SET) -> 0 (rewind); getdents -> >0 again
