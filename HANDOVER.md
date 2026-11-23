@@ -2750,3 +2750,42 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   surface for a later rung.
 - Next: QEMU slirp end-to-end (DHCP/DNS/TCP/wget http), then dpkg/apt
   prerequisites, then downloadable mini-ISO.
+
+## run-130 — slirp end-to-end: DNS + TCP connect + HTTP through QEMU user net
+
+- kernel/user/nettest.c (new, static-PIE): wire-format DNS query to
+  slirp's resolver 10.0.2.3 (label encoder, compression-aware answer
+  walk for the first A record), then a real TCP connect :80 +
+  HTTP/1.0 GET asserting the status line. EHOSTUNREACH on sendto ->
+  clean skip so a NIC-less boot stays green.
+- Makefile: nettest.elf in USER_ELFS + mkinitrd; new `run-net` target
+  attaching -netdev user + -device e1000e explicitly. Note: q35's
+  QEMU default is already `-nic user,model=e1000e`, so `make run`
+  exercises the same wire path — run-net makes it explicit, and the
+  skip path only triggers under -nic none.
+- user.rs: MAX_TASKS 64 -> 80 (65-task suite + fork slack); the
+  FDTABS/SIGTABS/FSTABS caps now follow MAX_TASKS instead of a
+  literal 64 so they can't silently under-provision again.
+- main.rs: MAX_INITRD 32 -> 64 MiB — adding nettest pushed the
+  archive to 30.9/32 MiB (96%); crossing the cap makes load_initrd
+  return None -> the whole suite would silently collapse to the
+  embedded hello while still exiting 33.
+- lstest.S: record floor 44 -> 45 (nettest member; real count is 81
+  incl concurrent adds). EOF check now drains bounded (256 calls)
+  instead of requiring a single second call to return 0 — concurrent
+  tasks add root records mid-suite (dashtest /sh_tmp, /proc churn is
+  separate) so the old check raced; found via pid 4 lstest exit(1).
+- audit run-103 (manual scoped — security-audit.md rubric and
+  cve.now MCP not yet on this host): no kernel input/RX path touched;
+  all caps remain compile-time bounded; nettest bounds-checks every
+  parse. No confirmed findings. Verify with cve.now once configured.
+- 65 tasks, frames 100174 -> 100174 zero leak (baseline -8192 frames
+  = the extra 32MiB LOADER_DATA pre-alloc), qemu exit 33 on both
+  `make run` and `make run-net`; nettest exit(0), HTTP/1.1 200 OK
+  from deb.debian.org via 10.0.2.3.
+- Env note (moved off Windows): repo at ~/linux-rust on this VM;
+  toolchain native (no WSL). Missing vs old box: ~/linux-ref
+  (v7.4.0-rc3 port base — needed only for NEW port extractions),
+  ~/.devin/rules/security-audit.md, git push creds, cve.now MCP.
+- Next: wget-style fetch through slirp, then dpkg/apt prerequisites
+  (writable /var, tar/gz/SHA surface, fcntl locks), then mini-ISO.
