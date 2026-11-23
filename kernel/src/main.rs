@@ -14,6 +14,7 @@ use uefi::prelude::*;
 
 mod acpi;
 mod apic;
+mod ata;
 mod cpu;
 mod cpio;
 mod e1000;
@@ -949,6 +950,18 @@ fn main() -> Status {
         }
     } else {
         kprintln!(con, "rustux: e1000: no 82574L on the bus");
+    }
+
+    // Driver binding step 2: the primary-channel ATA disk, when the
+    // machine has one (-drive if=ide). Pure PIO — the probe only
+    // costs an IDENTIFY round-trip, so run it whether or not PCI
+    // found the controller (QEMU's PIIX3 is always port-fixed).
+    let ata_secs = ata::init();
+    if ata_secs > 0 {
+        kprintln!(con, "rustux: ata: primary master {ata_secs} sectors ({} MiB)",
+            ata_secs / 2048);
+    } else {
+        kprintln!(con, "rustux: ata: no disk on the primary channel");
     }
 
     if lapic {

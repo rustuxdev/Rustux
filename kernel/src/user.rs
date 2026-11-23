@@ -341,6 +341,230 @@ struct Pipe {
 
 static mut PIPES: [Option<Pipe>; MAX_PIPES] = [const { None }; MAX_PIPES];
 
+/// Max concurrent pty pairs — same fixed-table discipline.
+const MAX_PTYS: usize = 4;
+
+/// A pty pair: two pipe rings (m2s = master writes/slave reads,
+/// s2m = slave writes/master reads) plus lock and open counts.
+/// The master fd is FdKind::Dev on a private `ptm/N` node with
+/// rdev = 128<<8|N (the Unix98 ptm major); the slave lives at
+/// dev/pts/N with rdev = 136<<8|N — the index always rides in
+/// the rdev minor, exactly like Linux.
+struct Pty {
+    m2s: usize,
+    s2m: usize,
+    locked: bool,
+    mopen: usize,
+    sopen: usize,
+}
+
+static mut PTYS: [Option<Pty>; MAX_PTYS] = [const { None }; MAX_PTYS];
+
+/// (pty index, is_master) for a Dev OFD on a pty end — masters
+/// carry the private ptm major 128, slaves the devpts major 136.
+fn ofd_pty(o: &OpenFile) -> Option<(usize, bool)> {
+    let FdKind::Dev(i) = &o.kind else { return None };
+    let v = vfile(*i)?;
+    match v.rdev >> 8 {
+        128 => Some(((v.rdev & 0xff) as usize, true)),
+        136 => Some(((v.rdev & 0xff) as usize, false)),
+        _ => None,
+    }
+}
+
+/// Mint a pty pair: PTYS slot, two pipe rings, the private master
+/// node and the dev/pts/N slave node. Returns the master vfile
+/// index for the Dev OFD; ENFILE/ENOMEM honestly on exhaustion.
+fn ptmx_open() -> Result<usize, u64> {
+    const ENFILE_: u64 = (-23i64) as u64;
+    const ENOMEM_: u64 = (-12i64) as u64;
+    let ptys = unsafe { &mut *core::ptr::addr_of_mut!(PTYS) };
+    let Some(id) = ptys.iter().position(Option::is_none) else {
+        return Err(ENFILE_);
+    };
+    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
+    let Some(m2s) = pipes.iter().position(Option::is_none) else {
+        return Err(ENFILE_);
+    };
+    let Some(s2m) = pipes[m2s + 1..]
+        .iter()
+        .position(Option::is_none)
+        .map(|p| p + m2s + 1)
+        .or_else(|| pipes[..m2s].iter().position(Option::is_none))
+    else {
+        return Err(ENFILE_);
+    };
+    let (Some(b1), Some(b2)) = (kalloc::alloc_frame(), kalloc::alloc_frame())
+    else {
+        return Err(ENOMEM_);
+    };
+    let mv = {
+        let mut nm = *b"dev/ptm/0                    ";
+        nm[8] = b'0' + id as u8;
+        vfile_create(&nm[..9])
+    };
+    let sv = {
+        let mut nm = *b"dev/pts/0                    ";
+        nm[8] = b'0' + id as u8;
+        vfile_create(&nm[..9])
+    };
+    if (mv as i64) < 0 || (sv as i64) < 0 {
+        kalloc::free_frame(b1);
+        kalloc::free_frame(b2);
+        return Err(ENFILE_);
+    }
+    pipes[m2s] = Some(Pipe { buf: b1, head: 0, tail: 0, readers: 1, writers: 1 });
+    pipes[s2m] = Some(Pipe { buf: b2, head: 0, tail: 0, readers: 1, writers: 1 });
+    if let Some(v) = vfile(mv as usize) {
+        vfile_stamp(v, 0o600, 0);
+        v.fmt = 0o20000;
+        v.rdev = (128 << 8) | id as u32;
+    }
+    if let Some(v) = vfile(sv as usize) {
+        vfile_stamp(v, 0o620, 0);
+        v.fmt = 0o20000;
+        v.rdev = (136 << 8) | id as u32;
+    }
+    ptys[id] = Some(Pty { m2s, s2m, locked: true, mopen: 1, sopen: 0 });
+    Ok(mv as usize)
+}
+
+/// read() on a pty end — pipe semantics except peer-closed is EIO
+/// (a tty hangup) rather than EOF. Blocks on PipeRead(ring), so
+/// pipe wakes and the armed recheck work unchanged.
+fn pty_read(
+    ctx: &mut UCtx,
+    t: &mut Task,
+    ring: usize,
+    peer_open: bool,
+    nonblock: bool,
+    buf: u64,
+    len: u64,
+) -> u64 {
+    const EIO_: u64 = (-5i64) as u64;
+    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
+    let Some(p) = pipes.get_mut(ring).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    let mut avail = p.tail - p.head;
+    if avail == 0 {
+        if !peer_open {
+            return EIO_;
+        }
+        if len == 0 {
+            return 0;
+        }
+        if nonblock {
+            return EAGAIN;
+        }
+        if !range_ok_w(buf, 1) {
+            return EFAULT;
+        }
+        if deliverable(t) {
+            return (-4i64) as u64; // -EINTR
+        }
+        t.wait_on = WaitOn::PipeRead(ring);
+        t.wait_ptr = buf;
+        t.wait_len = len;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+        if t.state == TaskState::Runnable {
+            return t.ctx.rax; // waker already delivered
+        }
+        avail = p.tail - p.head;
+        if avail == 0 {
+            block_switch();
+        }
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
+        if avail == 0 {
+            // Peer closed mid-sleep (rax = EIO) or data arrived
+            // then got consumed — rax is authoritative either way.
+            return t.ctx.rax;
+        }
+    }
+    let n = core::cmp::min(len as usize, avail);
+    if !range_ok_w(buf, n as u64) {
+        return EFAULT;
+    }
+    for i in 0..n {
+        // SAFETY: ring frame is pipe-owned, index wraps in bounds;
+        // buf is a validated user window under the current cr3.
+        unsafe {
+            let b = ((p.buf + ((p.head + i) % PIPE_SIZE) as u64) as *const u8).read();
+            ((buf + i as u64) as *mut u8).write(b);
+        }
+    }
+    p.head += n;
+    pipe_wake(ring);
+    n as u64
+}
+
+/// write() on a pty end — pipe write semantics; peer-closed is EIO.
+fn pty_write(
+    ctx: &mut UCtx,
+    t: &mut Task,
+    ring: usize,
+    peer_open: bool,
+    nonblock: bool,
+    buf: u64,
+    len: u64,
+) -> u64 {
+    const EIO_: u64 = (-5i64) as u64;
+    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
+    let Some(p) = pipes.get_mut(ring).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    if !peer_open {
+        return EIO_;
+    }
+    let mut free = PIPE_SIZE - (p.tail - p.head);
+    let want = len as usize;
+    if want > free && (want <= PIPE_SIZE || free == 0) {
+        if nonblock {
+            return EAGAIN;
+        }
+        if len > 0 && !range_ok(buf, 1) {
+            return EFAULT;
+        }
+        if deliverable(t) {
+            return (-4i64) as u64;
+        }
+        t.wait_on = WaitOn::PipeWrite(ring);
+        t.wait_ptr = buf;
+        t.wait_len = len;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+        if t.state == TaskState::Runnable {
+            return t.ctx.rax;
+        }
+        free = PIPE_SIZE - (p.tail - p.head);
+        if want > free && (want <= PIPE_SIZE || free == 0) {
+            block_switch();
+        }
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
+        if free == 0 {
+            return t.ctx.rax; // waker's verdict (EIO or progress)
+        }
+    }
+    let wlen = want.min(free);
+    if wlen > 0 && !range_ok(buf, wlen as u64) {
+        return EFAULT;
+    }
+    for i in 0..wlen {
+        // SAFETY: buf is validated user memory under the current cr3;
+        // the ring index wraps inside the pipe-owned frame.
+        unsafe {
+            let b = ((buf + i as u64) as *const u8).read();
+            ((p.buf + ((p.tail + i) % PIPE_SIZE) as u64) as *mut u8).write(b);
+        }
+    }
+    p.tail += wlen;
+    pipe_wake(ring);
+    wlen as u64
+}
+
 /// Max concurrent epoll instances — same fixed-table discipline as
 /// pipes/sockets; ENFILE is the honest answer past the bound.
 const MAX_EPOLLS: usize = 8;
@@ -8092,7 +8316,7 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     let Some(o) = ofd(t, fd) else { return EBADF };
     let tty = matches!(o.kind, FdKind::Stdin | FdKind::Console)
         || matches!(&o.kind, FdKind::Dev(i)
-            if vfile(*i).is_some_and(|v| v.rdev >> 8 == 5));
+            if vfile(*i).is_some_and(|v| matches!(v.rdev >> 8, 5 | 128 | 136)));
     match req {
         TCGETS => {
             if !tty {
@@ -8129,6 +8353,16 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                     36,
                 )
             };
+            0
+        }
+        0x540e => {
+            // TIOCSCTTY — adopt this tty as the controlling
+            // terminal. We have no per-pty session model yet;
+            // accepting keeps callers (apt's dpkg child) moving —
+            // TIOCGPGRP answers remain console-scoped.
+            if !tty {
+                return ENOTTY_;
+            }
             0
         }
         TIOCGWINSZ => {
@@ -8212,6 +8446,78 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             unsafe { FG_PGID = g };
             0
         }
+        // pty master ioctls — only on the ptm end (rdev 128).
+        0x80045430 => {
+            // TIOCGPTN — the pair's index.
+            let Some((id, true)) = ofd_pty(o) else {
+                return ENOTTY_;
+            };
+            if !range_ok_w(arg, 4) {
+                return EFAULT;
+            }
+            // SAFETY: arg is a validated writable user dword.
+            unsafe { (arg as *mut u32).write_unaligned(id as u32) };
+            0
+        }
+        0x40045431 => {
+            // TIOCSPTLCK — arg 0 unlocks the slave, nonzero relocks.
+            let Some((id, true)) = ofd_pty(o) else {
+                return ENOTTY_;
+            };
+            if !range_ok(arg, 4) {
+                return EFAULT;
+            }
+            // SAFETY: arg validated readable for 4 bytes.
+            let v = unsafe { (arg as *const u32).read_unaligned() };
+            if let Some(p) = unsafe { &mut *core::ptr::addr_of_mut!(PTYS) }
+                .get_mut(id)
+                .and_then(|s| s.as_mut())
+            {
+                p.locked = v != 0;
+            }
+            0
+        }
+        0x5441 | 0x80045441 => {
+            // TIOCGPTPEER — open the slave end as a new fd (arg is
+            // Linux open-style flags; we honor NONBLOCK/CLOEXEC only).
+            let Some((id, true)) = ofd_pty(o) else {
+                return ENOTTY_;
+            };
+            let ptys = unsafe { &mut *core::ptr::addr_of_mut!(PTYS) };
+            let Some(p) = ptys.get_mut(id).and_then(|s| s.as_mut()) else {
+                return (-5i64) as u64;
+            };
+            if p.locked {
+                return (-5i64) as u64; // EIO — still locked
+            }
+            // Find the slave node — its rdev minor is this index.
+            let vs = unsafe { &*core::ptr::addr_of!(VFILES) };
+            let Some(svi) = vs.iter().flatten().position(|v| {
+                v.fmt == 0o20000 && v.rdev == ((136 << 8) | id as u32)
+            }) else {
+                return (-2i64) as u64; // ENOENT — node unlinked
+            };
+            let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+            let Some(oi) = ofds.iter().position(Option::is_none) else {
+                return (-24i64) as u64; // EMFILE
+            };
+            let Some(fi) = fdt(t).fds.iter().position(Option::is_none)
+            else {
+                return (-24i64) as u64;
+            };
+            p.sopen += 1;
+            ofds[oi] = Some(OpenFile {
+                kind: FdKind::Dev(svi),
+                pos: 0,
+                refs: 1,
+                append: false,
+                nonblock: arg & 0o4000 != 0,
+                accmode: 2,
+            });
+            fdt(t).fds[fi] = Some(oi as u8);
+            cloexec_set(t, fi, arg & 0x80000 != 0); // O_CLOEXEC bit
+            fi as u64
+        }
         FIONREAD => {
             if !range_ok_w(arg, 4) {
                 return EFAULT;
@@ -8222,7 +8528,19 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 // no input side: honest 0 like a tty asked that way.
                 FdKind::Stdin => (unsafe { RD_LEN }) as u64,
                 FdKind::Dev(i) => {
-                    if vfile(*i).is_some_and(|v| v.rdev >> 8 == 5) {
+                    if let Some((id, master)) = ofd_pty(o) {
+                        (unsafe { &*core::ptr::addr_of!(PTYS) })
+                            .get(id)
+                            .and_then(|p| p.as_ref())
+                            .map(|p| {
+                                let ring = if master { p.s2m } else { p.m2s };
+                                (unsafe { &*core::ptr::addr_of!(PIPES) })
+                                    .get(ring)
+                                    .and_then(|r| r.as_ref())
+                                    .map_or(0, |r| (r.tail - r.head) as u64)
+                            })
+                            .unwrap_or(0)
+                    } else if vfile(*i).is_some_and(|v| v.rdev >> 8 == 5) {
                         (unsafe { RD_LEN }) as u64
                     } else {
                         0
@@ -9576,7 +9894,7 @@ pub fn fd_is_console(fd: u64) -> bool {
     let Some(t) = cur_mut() else { return false };
     matches!(ofd(t, fd).map(|o| &o.kind), Some(FdKind::Console))
         || matches!(ofd(t, fd).map(|o| &o.kind), Some(FdKind::Dev(i))
-            if vfile(*i).is_some_and(|v| v.rdev >> 8 == 5))
+            if vfile(*i).is_some_and(|v| v.rdev == 0x500 || v.rdev == 0x501))
 }
 
 /// PRNG state for /dev/{,u}random — a plain xorshift64* seeded at
@@ -12136,6 +12454,94 @@ pub fn sleep_ms(ctx: &mut UCtx, ms: u64) {
 /// feed wakes the task; Console and closed slots are EBADF.
 /// The kernel validates that [buf, buf+n) is user-writable before
 /// copying — checked arithmetic, no partial writes past the gate.
+/// /dev/sdN read at the OFD position: the ATA port path is
+/// 512-byte granular, so unaligned edges bounce through a kernel
+/// sector buffer. Reads clip at the device end — Linux's short
+/// read, not an error.
+fn sd_read(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
+    let cap = crate::ata::capacity();
+    if o.pos as u64 >= cap {
+        return 0;
+    }
+    let n = len.min(cap - o.pos as u64) as usize;
+    if !range_ok_w(buf, n as u64) {
+        return EFAULT;
+    }
+    let mut done = 0usize;
+    let mut bounce = [0u8; 512];
+    while done < n {
+        let off = o.pos + done;
+        if !crate::ata::read((off / 512) as u32, &mut bounce) {
+            // EIO on hardware failure — bytes already delivered
+            // still count, like Linux.
+            return if done > 0 { done as u64 } else { (-5i64) as u64 };
+        }
+        let take = (512 - off % 512).min(n - done);
+        // SAFETY: `buf..buf+n` passed range_ok_w under cur cr3.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bounce[off % 512..].as_ptr(),
+                (buf + done as u64) as *mut u8,
+                take,
+            )
+        };
+        done += take;
+    }
+    o.pos += done;
+    done as u64
+}
+
+/// /dev/sdN write at the OFD position: partial sectors read-
+/// modify-write through the bounce buffer; a write clipped at the
+/// device end is Linux's short write, a write starting past it is
+/// ENOSPC.
+fn sd_write(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
+    let cap = crate::ata::capacity();
+    if o.pos as u64 >= cap {
+        return (-28i64) as u64; // ENOSPC
+    }
+    let n = len.min(cap - o.pos as u64) as usize;
+    if !range_ok(buf, n as u64) {
+        return EFAULT;
+    }
+    let mut done = 0usize;
+    let mut bounce = [0u8; 512];
+    while done < n {
+        let off = o.pos + done;
+        // Aligned full sectors write straight from the user buffer —
+        // one command carries up to 256. Only unaligned edges pay
+        // the read-modify-write bounce.
+        if off.is_multiple_of(512) && n - done >= 512 {
+            let run = ((n - done) / 512).min(256) as u32;
+            let p = (buf + done as u64) as *const u8;
+            if !crate::ata::write((off / 512) as u32, run, p) {
+                return if done > 0 { done as u64 } else { (-5i64) as u64 };
+            }
+            done += run as usize * 512;
+            continue;
+        }
+        let take = (512 - off % 512).min(n - done);
+        // A partial sector keeps its untouched bytes — fetch first.
+        if !crate::ata::read((off / 512) as u32, &mut bounce) {
+            return if done > 0 { done as u64 } else { (-5i64) as u64 };
+        }
+        // SAFETY: `buf..buf+n` passed range_ok under cur cr3.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (buf + done as u64) as *const u8,
+                bounce[off % 512..].as_mut_ptr(),
+                take,
+            )
+        };
+        if !crate::ata::write((off / 512) as u32, 1, bounce.as_ptr()) {
+            return if done > 0 { done as u64 } else { (-5i64) as u64 };
+        }
+        done += take;
+    }
+    o.pos += done;
+    done as u64
+}
+
 pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     // Drain any decoded keys sitting in the scancode ring before the
     // ready check — the tick pump also runs, but a read should never
@@ -12150,10 +12556,32 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             if o.accmode == 1 {
                 return EBADF; // O_WRONLY
             }
+            if let Some((id, master)) = ofd_pty(o) {
+                let Some((ring, peer)) = (unsafe {
+                    &*core::ptr::addr_of!(PTYS)
+                })
+                .get(id)
+                .and_then(|p| p.as_ref())
+                .map(|p| {
+                    (
+                        if master { p.s2m } else { p.m2s },
+                        if master { p.sopen } else { p.mopen },
+                    )
+                }) else {
+                    return (-5i64) as u64; // EIO — pty retired
+                };
+                let nb = o.nonblock;
+                return pty_read(ctx, t, ring, peer > 0, nb, buf, len);
+            }
             let Some(v) = vfile(*i) else { return EBADF };
             let (ts, tns) = now();
             v.atime = ts;
             v.atime_ns = tns;
+            // Block devices read at the OFD position — sector I/O
+            // through a kernel bounce buffer.
+            if v.rdev >> 8 == 8 {
+                return sd_read(o, buf, len);
+            }
             match v.rdev {
                 // /dev/null reads EOF.
                 0x103 => 0,
@@ -12388,10 +12816,30 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         if o.accmode == 0 {
             return EBADF; // O_RDONLY
         }
+        if let Some((id, master)) = ofd_pty(o) {
+            let Some((ring, peer)) = (unsafe { &*core::ptr::addr_of!(PTYS) })
+                .get(id)
+                .and_then(|p| p.as_ref())
+                .map(|p| {
+                    (
+                        if master { p.m2s } else { p.s2m },
+                        if master { p.sopen } else { p.mopen },
+                    )
+                }) else {
+                return (-5i64) as u64; // EIO — pty retired
+            };
+            let nb = o.nonblock;
+            return pty_write(ctx, t, ring, peer > 0, nb, buf, len);
+        }
         if len > 0 && !range_ok(buf, len) {
             return EFAULT;
         }
         let Some(v) = vfile(*i) else { return EBADF };
+        // Block devices write at the OFD position; partial sectors
+        // read-modify-write through a kernel bounce buffer.
+        if v.rdev >> 8 == 8 {
+            return sd_write(o, buf, len);
+        }
         const ENOSPC_: u64 = (-28i64) as u64;
         return match v.rdev {
             // /dev/full is the one dev that answers a write —
@@ -13313,6 +13761,25 @@ pub fn dev_init() {
         d.path[..3].copy_from_slice(b"dev");
         ds[i] = Some(d);
     }
+    // dev/pts — the slave side of minted pty pairs lands under it.
+    if let Some(i) = ds.iter().position(Option::is_none) {
+        let (s, ns) = now();
+        let mut d = VDir {
+            path: [0; 128],
+            nlen: 7,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: s,
+            atime_ns: ns,
+            mtime: s,
+            mtime_ns: ns,
+            ctime: s,
+            ctime_ns: ns,
+        };
+        d.path[..7].copy_from_slice(b"dev/pts");
+        ds[i] = Some(d);
+    }
     // (path, rdev = major<<8|minor, perms) — the classic mem/tty set.
     for (name, rdev, mode) in [
         (b"dev/null" as &[u8], 0x103u32, 0o666u64),
@@ -13322,6 +13789,7 @@ pub fn dev_init() {
         (b"dev/urandom", 0x109, 0o666),
         (b"dev/tty", 0x500, 0o666),
         (b"dev/console", 0x501, 0o600),
+        (b"dev/ptmx", 0x502, 0o666),
     ] {
         let r = vfile_create(name);
         if (r as i64) < 0 {
@@ -13331,6 +13799,18 @@ pub fn dev_init() {
             vfile_stamp(v, mode, 0);
             v.fmt = 0o20000; // S_IFCHR
             v.rdev = rdev;
+        }
+    }
+    // /dev/sda — the node only exists when the ATA probe found a
+    // disk, matching udev behavior (no hardware, no node).
+    if crate::ata::sectors() > 0 {
+        let r = vfile_create(b"dev/sda");
+        if (r as i64) >= 0 {
+            if let Some(v) = vfile(r as usize) {
+                vfile_stamp(v, 0o660, 0);
+                v.fmt = 0o60000; // S_IFBLK
+                v.rdev = 8 << 8;
+            }
         }
     }
     // The /dev convenience links real Linux images carry.
@@ -14284,43 +14764,78 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
             const ENODEV: u64 = (-19i64) as u64;
             const ENXIO: u64 = (-6i64) as u64;
             let v = vfile(i).unwrap();
-            match v.fmt {
+            let dev_idx = match v.fmt {
                 // No block driver exists to claim the node —
                 // Linux's answer opening a driverless block dev.
-                0o60000 => return ENODEV,
+                // Block devices — major 8 is the sd family. The node
+                // can be crafted by mknod even without hardware, so
+                // answer ENXIO (the driver has no such device).
+                0o60000 => match v.rdev >> 8 {
+                    8 if crate::ata::sectors() > 0 => i,
+                    8 => return ENXIO,
+                    _ => return ENODEV,
+                },
                 // A fifo node exists but no fifo semantics live
                 // here yet — ENXIO is the documented divergence
                 // (Linux blocks for a peer; there is no peer).
                 0o10000 | 0o140000 => return ENXIO,
-                0o20000 => match v.rdev >> 8 {
-                    // mem family — only the minors we actually
-                    // implement; a crafted node on another minor
-                    // must not fall through to a driver it isn't.
-                    1 => match v.rdev & 0xff {
-                        3 | 5 | 7 | 8 | 9 => {}
-                        _ => return ENXIO,
-                    },
-                    // /dev/tty is the ctty — only the console's
-                    // own session has one, ENXIO otherwise.
-                    5 => match v.rdev & 0xff {
+                0o20000 => {
+                    match v.rdev >> 8 {
+                        // mem family — only the minors we actually
+                        // implement; a crafted node on another minor
+                        // must not fall through to a driver it isn't.
+                        1 => match v.rdev & 0xff {
+                            3 | 5 | 7 | 8 | 9 => i,
+                            _ => return ENXIO,
+                        },
                         // /dev/tty is the ctty — only the console's
                         // own session has one, ENXIO otherwise.
-                        0 => {
-                            if t.sid
-                                != unsafe { *core::ptr::addr_of!(CONSOLE_SID) }
-                            {
-                                return ENXIO;
+                        5 => match v.rdev & 0xff {
+                            // /dev/tty is the ctty — only the console's
+                            // own session has one, ENXIO otherwise.
+                            0 => {
+                                if t.sid
+                                    != unsafe { *core::ptr::addr_of!(CONSOLE_SID) }
+                                {
+                                    return ENXIO;
+                                }
+                                i
                             }
+                            // /dev/console — same driver.
+                            1 => i,
+                            // /dev/ptmx — mint a pair; the OFD names
+                            // the private master node, not the mux.
+                            2 => match ptmx_open() {
+                                Ok(m) => m,
+                                Err(e) => return e,
+                            },
+                            _ => return ENXIO,
+                        },
+                        // dev/pts/N — Linux's EIO on a still-locked
+                        // or never-allocated slave.
+                        136 => {
+                            let n = (v.rdev & 0xff) as usize;
+                            let ok = unsafe { &*core::ptr::addr_of!(PTYS) }
+                                .get(n)
+                                .and_then(|p| p.as_ref())
+                                .is_some_and(|p| !p.locked);
+                            if !ok {
+                                return (-5i64) as u64; // EIO
+                            }
+                            unsafe {
+                                (*core::ptr::addr_of_mut!(PTYS))[n]
+                                    .as_mut()
+                                    .unwrap()
+                                    .sopen += 1;
+                            }
+                            i
                         }
-                        // /dev/console — same driver.
-                        1 => {}
-                        _ => return ENXIO,
-                    },
-                    _ => return ENODEV,
-                },
+                        _ => return ENODEV,
+                    }
+                }
                 _ => return ENODEV,
-            }
-            FdKind::Dev(i)
+            };
+            FdKind::Dev(dev_idx)
         } else {
             FdKind::Ram(i)
         }
@@ -15195,9 +15710,30 @@ pub fn fd_lseek(fd: u64, off: i64, whence: u64) -> u64 {
         return EINVAL;
     }
     // Character devices are noop_llseek — the "position" exists but
-    // lseek answers 0 without moving anything.
-    if let FdKind::Dev(_) = &o.kind {
-        return 0;
+    // lseek answers 0 without moving anything. Block devices ARE
+    // seekable (Linux's default_file_llseek) with SEEK_END at the
+    // device capacity.
+    if let FdKind::Dev(i) = &o.kind {
+        match vfile(*i) {
+            Some(v) if v.rdev >> 8 == 8 => {
+                let cap = crate::ata::capacity() as i64;
+                let base = match whence {
+                    0 => 0i64,
+                    1 => o.pos as i64,
+                    2 => cap,
+                    _ => return EINVAL,
+                };
+                let Some(np) = base.checked_add(off) else {
+                    return EINVAL;
+                };
+                if np < 0 {
+                    return EINVAL;
+                }
+                o.pos = np as usize;
+                return np as u64;
+            }
+            _ => return 0,
+        }
     }
     let dlen = match &o.kind {
         FdKind::File(d) => d.len(),
@@ -15896,6 +16432,66 @@ fn ofd_release(oi: usize) {
     if let FdKind::Inotify(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(INOTIFY))[i] = None };
     }
+    if let FdKind::Dev(i) = kind {
+        // pty end closed: masters are rdev 128, slaves 136 — the
+        // index rides the minor. A dead master gives slave reads/
+        // writes EIO (the tty hangup); a dead last-slave does the
+        // same to the master. Both gone retires the pair: rings
+        // freed, node names removed.
+        if let Some((n, master)) = vfile(i).and_then(|v| match v.rdev >> 8 {
+            128 => Some(((v.rdev & 0xff) as usize, true)),
+            136 => Some(((v.rdev & 0xff) as usize, false)),
+            _ => None,
+        }) {
+            let ptys = unsafe { &mut *core::ptr::addr_of_mut!(PTYS) };
+            if let Some(p) = ptys.get_mut(n).and_then(|s| s.as_mut()) {
+                if master {
+                    p.mopen = p.mopen.saturating_sub(1);
+                    if p.mopen == 0 {
+                        wake_pipe_waiters(WaitOn::PipeRead(p.m2s), (-5i64) as u64);
+                        wake_pipe_waiters(WaitOn::PipeWrite(p.s2m), (-5i64) as u64);
+                    }
+                } else {
+                    p.sopen = p.sopen.saturating_sub(1);
+                    if p.sopen == 0 {
+                        wake_pipe_waiters(WaitOn::PipeRead(p.s2m), (-5i64) as u64);
+                        wake_pipe_waiters(WaitOn::PipeWrite(p.m2s), (-5i64) as u64);
+                    }
+                }
+                if p.mopen == 0 && p.sopen == 0 {
+                    let (a, b) = (p.m2s, p.s2m);
+                    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
+                    for r in [a, b] {
+                        if let Some(pi) = pipes.get_mut(r).and_then(|s| s.as_mut()) {
+                            kalloc::free_frame(pi.buf);
+                            pipes[r] = None;
+                        }
+                    }
+                    ptys[n] = None;
+                    if let Some(v) = vfile(i) {
+                        v.unlinked = true;
+                    }
+                    vfile_free_if_dead(i);
+                    // The peer node (master's ptm/N or slave's
+                    // dev/pts/N) is unreachable now too.
+                    let peer = if master { 136 } else { 128 };
+                    let pv = (unsafe { &*core::ptr::addr_of!(VFILES) })
+                        .iter()
+                        .flatten()
+                        .position(|v| {
+                            v.fmt == 0o20000
+                                && v.rdev == ((peer << 8) | n as u32)
+                        });
+                    if let Some(pi) = pv {
+                        if let Some(v) = vfile(pi) {
+                            v.unlinked = true;
+                        }
+                        vfile_free_if_dead(pi);
+                    }
+                }
+            }
+        }
+    }
     if let FdKind::Pipe { id, write } = kind {
         pipe_end_closed(id, write);
     }
@@ -16191,7 +16787,40 @@ fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
             }
         }
         FdKind::Dev(i) => {
-            if vfile(*i).is_some_and(|v| v.rdev >> 8 == 5) {
+            if let Some((id, master)) = ofd_pty(o) {
+                // pty: readable when the inbound ring has data,
+                // writable when the outbound ring has room, HUP
+                // when the far side is fully closed (Linux's
+                // slave-also-ERR nuance collapsed into HUP).
+                let Some(p) = (unsafe { &*core::ptr::addr_of!(PTYS) })
+                    .get(id)
+                    .and_then(|x| x.as_ref()) else {
+                    return POLLERR;
+                };
+                let (in_r, out_r, peer) = if master {
+                    (p.s2m, p.m2s, p.sopen)
+                } else {
+                    (p.m2s, p.s2m, p.mopen)
+                };
+                let pipes = unsafe { &*core::ptr::addr_of!(PIPES) };
+                let mut r = 0u16;
+                let Some(pi) = pipes.get(in_r).and_then(|x| x.as_ref()) else {
+                    return POLLERR;
+                };
+                if pi.tail > pi.head {
+                    r |= POLLIN;
+                }
+                let Some(po) = pipes.get(out_r).and_then(|x| x.as_ref()) else {
+                    return POLLERR;
+                };
+                if po.tail - po.head < PIPE_SIZE {
+                    r |= POLLOUT;
+                }
+                if peer == 0 {
+                    r |= POLLHUP;
+                }
+                r
+            } else if vfile(*i).is_some_and(|v| v.rdev >> 8 == 5) {
                 // tty: writable always, readable when input queues.
                 let mut r = POLLOUT;
                 if stdin_ready() > 0 {

@@ -85,10 +85,9 @@ int main(void) {
            "Acquire::GzipIndexes \"true\";\n"
            "APT::Cache-Start \"100000000\";\n"
            "APT::Sandbox::User \"root\";\n"
-           // No PTY layer yet — the term log and dpkg's pty wrap
-           // both want /dev/ptmx.
-           "Dir::Log::Terminal \"\";\n"
-           "Dpkg::Use-Pty \"false\";\n"
+           // The pty wrap is now real — dpkg runs under
+           // posix_openpt with output tee'd to term.log.
+           "Dpkg::Use-Pty \"true\";\n"
            "Dir::Cache::pkgcache \"\";\n"
            "Dir::Cache::srcpkgcache \"\";\n");
     // libc6 is the only dependency of hello-traditional; we already

@@ -71,7 +71,7 @@ kernel/user/dyntest.elf: kernel/user/dyntest.c
 # file, read from the ESP by the kernel before ExitBootServices. The
 # archive doubles as the fd layer's read-only root filesystem.
 $(INITRD): $(USER_ELFS) kernel/user/busybox kernel/user/dash kernel/user/bash kernel/user/libtinfo.so.6 kernel/user/libncursesw.so.6 kernel/user/libm.so.6 kernel/user/libnl-3.so.200 kernel/user/libnl-genl-3.so.200 kernel/user/htop kernel/user/motd.txt kernel/user/winseed.txt kernel/user/terminfo_x/xterm kernel/user/dpkg kernel/user/dpkg-deb kernel/user/dpkg-query kernel/user/dpkg-split kernel/user/tar kernel/user/ldconfig kernel/user/libdpkg/libmd.so.0 kernel/user/libdpkg/libselinux.so.1 kernel/user/libdpkg/libpcre2-8.so.0 kernel/user/libdpkg/libacl.so.1 kernel/user/libdpkg/libz.so.1 kernel/user/libdpkg/liblzma.so.5 kernel/user/libdpkg/libzstd.so.1 kernel/user/libdpkg/libbz2.so.1.0 tools/mkinitrd.py /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6
-	python3 tools/mkinitrd.py kernel/user/hello.elf init kernel/user/selftest.elf selftest kernel/user/fstest.elf fstest kernel/user/lstest.elf lstest kernel/user/exectest.elf exectest kernel/user/spinA.elf spinA kernel/user/spinB.elf spinB kernel/user/forktest.elf forktest kernel/user/pipetest.elf pipetest kernel/user/sigtest.elf sigtest kernel/user/faulttest.elf faulttest kernel/user/fputest.elf fputest kernel/user/sigfault.elf sigfault kernel/user/polltest.elf polltest kernel/user/udptest.elf udptest kernel/user/tcptest.elf tcptest kernel/user/mmtest.elf mmtest kernel/user/realbin.elf realbin kernel/user/parent.elf parent kernel/user/iotest.elf iotest kernel/user/shelltest.elf shelltest kernel/user/wiotest.elf wiotest kernel/user/termtest.elf termtest kernel/user/kbdtest.elf kbdtest kernel/user/rsh.elf rsh kernel/user/rshtest.elf rshtest kernel/user/vmtest.elf vmtest kernel/user/fxtest.elf fxtest kernel/user/ftest.elf ftest kernel/user/thrtest.elf thrtest kernel/user/aptest.elf aptest kernel/user/clftest.elf clftest kernel/user/dtest.elf dtest kernel/user/fmaptest.elf fmaptest kernel/user/bbtest.elf bbtest kernel/user/vtest.elf vtest kernel/user/dyntest.elf dyntest kernel/user/dashtest.elf dashtest kernel/user/rtest.elf rtest kernel/user/bashtest.elf bashtest kernel/user/pgtest.elf pgtest kernel/user/petest petest kernel/user/peitest peitest kernel/user/hello_win.exe hello_win kernel/user/crt_hello.exe crt_hello kernel/user/winfile.exe winfile kernel/user/windir.exe windir kernel/user/winheap.exe.gz winheap kernel/user/winmisc.exe.gz winmisc kernel/user/winmem.exe.gz winmem kernel/user/winthr.exe.gz winthr kernel/user/winmap.exe.gz winmap kernel/user/windll.dll.gz windll.dll kernel/user/windlltest.exe.gz windlltest kernel/user/wbase.dll.gz wbase.dll kernel/user/wchain.dll.gz wchain.dll kernel/user/winchain.exe.gz winchain kernel/user/winstatic.exe.gz winstatic kernel/user/windetach.exe.gz windetach kernel/user/windexit.exe.gz windexit kernel/user/winthrnt.exe.gz winthrnt kernel/user/winchild.exe.gz winchild.exe kernel/user/winspawn.exe.gz winspawn kernel/user/winsys.exe.gz winsys kernel/user/winfs2.exe.gz winfs2 kernel/user/winseed.txt winseed.txt kernel/user/busybox busybox kernel/user/dash bin/dash kernel/user/bash bin/bash kernel/user/libtinfo.so.6 lib/x86_64-linux-gnu/libtinfo.so.6 kernel/user/htoptest.elf htoptest kernel/user/nettest.elf nettest kernel/user/htop bin/htop kernel/user/wgettest.elf wgettest kernel/user/resolv.conf etc/resolv.conf kernel/user/debtest.elf debtest kernel/user/linktest.elf linktest kernel/user/dpkgtest.elf dpkgtest kernel/user/alarmtest.elf alarmtest kernel/user/nbtest.elf nbtest kernel/user/hello-traditional_2.10-6_amd64.deb hello-traditional_2.10-6_amd64.deb kernel/user/dpkg usr/bin/dpkg kernel/user/dpkg-deb usr/bin/dpkg-deb kernel/user/dpkg-query usr/bin/dpkg-query kernel/user/dpkg-split usr/bin/dpkg-split kernel/user/tar bin/tar kernel/user/dash bin/sh kernel/user/busybox bin/rm kernel/user/busybox bin/diff kernel/user/busybox bin/cat kernel/user/busybox sbin/start-stop-daemon kernel/user/ldconfig sbin/ldconfig kernel/user/ldconfig usr/sbin/ldconfig kernel/user/libdpkg/libmd.so.0 lib/x86_64-linux-gnu/libmd.so.0 kernel/user/libdpkg/libselinux.so.1 lib/x86_64-linux-gnu/libselinux.so.1 kernel/user/libdpkg/libpcre2-8.so.0 lib/x86_64-linux-gnu/libpcre2-8.so.0 kernel/user/libdpkg/libacl.so.1 lib/x86_64-linux-gnu/libacl.so.1 kernel/user/libdpkg/libz.so.1 lib/x86_64-linux-gnu/libz.so.1 kernel/user/libdpkg/liblzma.so.5 lib/x86_64-linux-gnu/liblzma.so.5 kernel/user/libdpkg/libzstd.so.1 lib/x86_64-linux-gnu/libzstd.so.1 kernel/user/libdpkg/libbz2.so.1.0 lib/x86_64-linux-gnu/libbz2.so.1.0 kernel/user/libncursesw.so.6 lib/x86_64-linux-gnu/libncursesw.so.6 kernel/user/libm.so.6 lib/x86_64-linux-gnu/libm.so.6 kernel/user/libnl-3.so.200 lib/x86_64-linux-gnu/libnl-3.so.200 kernel/user/libnl-genl-3.so.200 lib/x86_64-linux-gnu/libnl-genl-3.so.200 kernel/user/terminfo_x/xterm usr/share/terminfo/x/xterm kernel/user/motd.txt motd.txt /lib64/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6 lib/x86_64-linux-gnu/libc.so.6 > $@
+	python3 tools/mkinitrd.py kernel/user/hello.elf init kernel/user/selftest.elf selftest kernel/user/fstest.elf fstest kernel/user/lstest.elf lstest kernel/user/exectest.elf exectest kernel/user/spinA.elf spinA kernel/user/spinB.elf spinB kernel/user/forktest.elf forktest kernel/user/pipetest.elf pipetest kernel/user/sigtest.elf sigtest kernel/user/faulttest.elf faulttest kernel/user/fputest.elf fputest kernel/user/sigfault.elf sigfault kernel/user/polltest.elf polltest kernel/user/udptest.elf udptest kernel/user/tcptest.elf tcptest kernel/user/mmtest.elf mmtest kernel/user/realbin.elf realbin kernel/user/parent.elf parent kernel/user/iotest.elf iotest kernel/user/shelltest.elf shelltest kernel/user/wiotest.elf wiotest kernel/user/termtest.elf termtest kernel/user/kbdtest.elf kbdtest kernel/user/rsh.elf rsh kernel/user/rshtest.elf rshtest kernel/user/vmtest.elf vmtest kernel/user/fxtest.elf fxtest kernel/user/ftest.elf ftest kernel/user/thrtest.elf thrtest kernel/user/aptest.elf aptest kernel/user/clftest.elf clftest kernel/user/dtest.elf dtest kernel/user/fmaptest.elf fmaptest kernel/user/bbtest.elf bbtest kernel/user/vtest.elf vtest kernel/user/dyntest.elf dyntest kernel/user/dashtest.elf dashtest kernel/user/rtest.elf rtest kernel/user/bashtest.elf bashtest kernel/user/pgtest.elf pgtest kernel/user/petest petest kernel/user/peitest peitest kernel/user/hello_win.exe hello_win kernel/user/crt_hello.exe crt_hello kernel/user/winfile.exe winfile kernel/user/windir.exe windir kernel/user/winheap.exe.gz winheap kernel/user/winmisc.exe.gz winmisc kernel/user/winmem.exe.gz winmem kernel/user/winthr.exe.gz winthr kernel/user/winmap.exe.gz winmap kernel/user/windll.dll.gz windll.dll kernel/user/windlltest.exe.gz windlltest kernel/user/wbase.dll.gz wbase.dll kernel/user/wchain.dll.gz wchain.dll kernel/user/winchain.exe.gz winchain kernel/user/winstatic.exe.gz winstatic kernel/user/windetach.exe.gz windetach kernel/user/windexit.exe.gz windexit kernel/user/winthrnt.exe.gz winthrnt kernel/user/winchild.exe.gz winchild.exe kernel/user/winspawn.exe.gz winspawn kernel/user/winsys.exe.gz winsys kernel/user/winfs2.exe.gz winfs2 kernel/user/winseed.txt winseed.txt kernel/user/busybox busybox kernel/user/dash bin/dash kernel/user/bash bin/bash kernel/user/libtinfo.so.6 lib/x86_64-linux-gnu/libtinfo.so.6 kernel/user/htoptest.elf htoptest kernel/user/nettest.elf nettest kernel/user/htop bin/htop kernel/user/wgettest.elf wgettest kernel/user/resolv.conf etc/resolv.conf kernel/user/debtest.elf debtest kernel/user/linktest.elf linktest kernel/user/dpkgtest.elf dpkgtest kernel/user/alarmtest.elf alarmtest kernel/user/nbtest.elf nbtest kernel/user/ptytest.elf ptytest kernel/user/hello-traditional_2.10-6_amd64.deb hello-traditional_2.10-6_amd64.deb kernel/user/dpkg usr/bin/dpkg kernel/user/dpkg-deb usr/bin/dpkg-deb kernel/user/dpkg-query usr/bin/dpkg-query kernel/user/dpkg-split usr/bin/dpkg-split kernel/user/tar bin/tar kernel/user/dash bin/sh kernel/user/busybox bin/rm kernel/user/busybox bin/diff kernel/user/busybox bin/cat kernel/user/busybox sbin/start-stop-daemon kernel/user/ldconfig sbin/ldconfig kernel/user/ldconfig usr/sbin/ldconfig kernel/user/libdpkg/libmd.so.0 lib/x86_64-linux-gnu/libmd.so.0 kernel/user/libdpkg/libselinux.so.1 lib/x86_64-linux-gnu/libselinux.so.1 kernel/user/libdpkg/libpcre2-8.so.0 lib/x86_64-linux-gnu/libpcre2-8.so.0 kernel/user/libdpkg/libacl.so.1 lib/x86_64-linux-gnu/libacl.so.1 kernel/user/libdpkg/libz.so.1 lib/x86_64-linux-gnu/libz.so.1 kernel/user/libdpkg/liblzma.so.5 lib/x86_64-linux-gnu/liblzma.so.5 kernel/user/libdpkg/libzstd.so.1 lib/x86_64-linux-gnu/libzstd.so.1 kernel/user/libdpkg/libbz2.so.1.0 lib/x86_64-linux-gnu/libbz2.so.1.0 kernel/user/libncursesw.so.6 lib/x86_64-linux-gnu/libncursesw.so.6 kernel/user/libm.so.6 lib/x86_64-linux-gnu/libm.so.6 kernel/user/libnl-3.so.200 lib/x86_64-linux-gnu/libnl-3.so.200 kernel/user/libnl-genl-3.so.200 lib/x86_64-linux-gnu/libnl-genl-3.so.200 kernel/user/terminfo_x/xterm usr/share/terminfo/x/xterm kernel/user/motd.txt motd.txt /lib64/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6 lib/x86_64-linux-gnu/libc.so.6 > $@
 
 $(KERNEL): kernel/src/*.rs kernel/Cargo.toml klib/src/*.rs klib/Cargo.toml Cargo.toml kernel/user/hello.elf FORCE
 	cargo build --release --target $(TARGET) -p kernel
@@ -315,6 +315,118 @@ run-apt: $(ESP_APT)
 	status=$$?; \
 	if [ $$status -eq 33 ]; then echo "apt probe: PASS (qemu exit 33)"; \
 	else echo "apt probe: FAIL (qemu exit $$status)"; exit 1; fi
+
+# Bootable demo ISO — live session + self-installer. demomenu is the
+# solo task (pid1): it offers a live shell or a raw install of
+# hd.img (a ready-made FAT boot image carrying this same kernel +
+# the live initrd) onto /dev/sda via the ATA PIO driver, then
+# reboots. The installed disk boots the same live payload — the
+# installer option hides itself there because /hd.img is absent.
+INITRD_LIVE := initrd-live.cpio
+INITRD_ISO  := initrd-iso.cpio
+HD_IMG      := hd.img
+ESP_ISO     := esp-iso.img
+ISO         := rustux-demo.iso
+INSTALLDISK := target.img
+ISOROOT     := isoroot
+
+LIVE_PAIRS := \
+	kernel/user/demomenu.elf demomenu \
+	kernel/user/busybox bin/sh \
+	kernel/user/busybox bin/busybox \
+	kernel/user/busybox sbin/reboot \
+	kernel/user/busybox sbin/poweroff \
+	kernel/user/bash bin/bash \
+	/lib64/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2 \
+	/lib/x86_64-linux-gnu/libc.so.6 lib/x86_64-linux-gnu/libc.so.6 \
+	kernel/user/libtinfo.so.6 lib/x86_64-linux-gnu/libtinfo.so.6 \
+	kernel/user/motd.txt motd.txt
+
+LIVE_DEPS := kernel/user/demomenu.elf kernel/user/busybox kernel/user/bash \
+	kernel/user/libtinfo.so.6 kernel/user/motd.txt tools/mkinitrd.py \
+	/lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6
+
+$(INITRD_LIVE): $(LIVE_DEPS)
+	python3 tools/mkinitrd.py $(LIVE_PAIRS) > $@
+
+$(INITRD_ISO): $(LIVE_DEPS) $(HD_IMG)
+	python3 tools/mkinitrd.py $(LIVE_PAIRS) $(HD_IMG) hd.img > $@
+
+$(HD_IMG): $(KERNEL) $(INITRD_LIVE)
+	dd if=/dev/zero of=$@ bs=1M count=24
+	mformat -i $@ ::
+	mmd -i $@ ::/EFI
+	mmd -i $@ ::/EFI/BOOT
+	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(INITRD_LIVE) ::/initrd.cpio
+
+$(ESP_ISO): $(KERNEL) $(INITRD_ISO)
+	dd if=/dev/zero of=$@ bs=1M count=48
+	mformat -F -i $@ ::
+	mmd -i $@ ::/EFI
+	mmd -i $@ ::/EFI/BOOT
+	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(INITRD_ISO) ::/initrd.cpio
+
+$(ISO): $(ESP_ISO)
+	rm -rf $(ISOROOT) && mkdir $(ISOROOT)
+	cp $(ESP_ISO) $(ISOROOT)/esp.img
+	genisoimage -o $@ -V RUSTUX_DEMO -e esp.img -no-emul-boot -J -r $(ISOROOT)
+
+$(INSTALLDISK):
+	dd if=/dev/zero of=$@ bs=1M count=32
+
+# End-to-end install proof: phase 1 boots the ISO and monitor-
+# sendkey presses "2" at the menu (the PS/2 path — QEMU does not
+# deliver piped stdio to the guest UART), the installer streams
+# hd.img to /dev/sda and reboots (QEMU exits under -no-reboot);
+# phase 2 boots the installed disk and sendkeys "1" into a shell.
+# The ATA driver binds the i440fx IDE controller — hence -machine pc.
+run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
+	rm -f isomon.sock
+	$(QEMU) \
+		-machine pc \
+		-m 512M \
+		-cpu qemu64,+rdrand \
+		-bios $(OVMF) \
+		-cdrom $(ISO) \
+		-drive file=$(INSTALLDISK),format=raw,if=ide \
+		-serial file:isoph1.log -display none \
+		-monitor unix:isomon.sock,server,nowait \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		-no-reboot & \
+	qpid=$$!; \
+	for i in 1 2 3 4 5; do \
+		sleep 15; \
+		grep -q "install:" isoph1.log && break; \
+		python3 tools/sendkey.py isomon.sock 2 ret; \
+	done; \
+	wait $$qpid || true; \
+	grep -q "install: complete" isoph1.log \
+		&& echo "iso install: PASS" \
+		|| { echo "iso install: FAIL"; tail -20 isoph1.log; exit 1; }
+	rm -f isomon2.sock
+	$(QEMU) \
+		-machine pc \
+		-m 512M \
+		-cpu qemu64,+rdrand \
+		-bios $(OVMF) \
+		-drive file=$(INSTALLDISK),format=raw,if=ide \
+		-serial file:isoph2.log -display none \
+		-monitor unix:isomon2.sock,server,nowait \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		-no-reboot & \
+	qpid=$$!; \
+	for i in 1 2 3 4 5; do \
+		sleep 15; \
+		python3 tools/sendkey.py isomon2.sock 1 ret; \
+		sleep 4; \
+		grep -q "/ #" isoph2.log && break; \
+	done; \
+	grep -q "/ #" isoph2.log \
+		&& echo "installed boot + live shell: PASS" \
+		|| { echo "installed boot: FAIL"; tail -20 isoph2.log; kill $$qpid; exit 1; }; \
+	echo quit | socat - UNIX-CONNECT:isomon2.sock > /dev/null 2>&1 || kill $$qpid
 
 clean:
 	cargo clean
