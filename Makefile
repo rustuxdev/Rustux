@@ -508,7 +508,16 @@ $(ISO): $(ESP_ISO) $(KERNEL) $(INITRD_ISO)
 	cp $(ESP_ISO) $(ISOROOT)/esp.img
 	cp $(KERNEL) $(ISOROOT)/EFI/BOOT/BOOTX64.EFI
 	cp $(INITRD_ISO) $(ISOROOT)/initrd.cpio
-	genisoimage -o $@ -V RUSTUX_DEMO -e esp.img -no-emul-boot -J -r $(ISOROOT)
+	# 512B BIOS stub — makes the El Torito catalog match distro media
+	# (BIOS default entry + UEFI alt entry). It only ever runs on legacy
+	# BIOS, which we don't support; the signature is all firmware checks.
+	printf '\372\374\364%.0s' $$(seq 170) > $(ISOROOT)/biosboot.img
+	printf '\125\252' >> $(ISOROOT)/biosboot.img
+	xorriso -as mkisofs -o $@ -V RUSTUX_DEMO -J -r \
+		-b biosboot.img -no-emul-boot -boot-load-size 4 -boot-info-table \
+		-eltorito-alt-boot -e esp.img -no-emul-boot \
+		-isohybrid-mbr /usr/lib/syslinux/mbr/gptmbr.bin \
+		-isohybrid-gpt-basdat $(ISOROOT)
 
 $(INSTALLDISK):
 	dd if=/dev/zero of=$@ bs=1M count=64

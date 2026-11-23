@@ -245,6 +245,15 @@ extern "C" fn report_frame(f: &mut TrapFrame, regs: *mut SavedRegs) {
                         "rustux: cpu: user fault {} task={} rip={:#x} err={:#x} cr2={:#x} -> sig {}",
                         name, tn, f.rip, f.err, cr2, signo
                     );
+                    // Mirror to the framebuffer console: without this a
+                    // faulting task is invisible on systems with no
+                    // serial port (bare metal, VMware) — a real oops
+                    // belongs on the console.
+                    crate::log::printk(format_args!(
+                        "rustux: cpu: user fault {} task={} rip={:#x} err={:#x} cr2={:#x} -> sig {}",
+                        name, tn, f.rip, f.err, cr2, signo
+                    ));
+                    crate::log::drain_task();
                     // Rebuild the complete interrupted context from
                     // the stubs' saved registers — a caught
                     // disposition pushes [signo][UCtx] on the user
@@ -305,6 +314,11 @@ extern "C" fn report_frame(f: &mut TrapFrame, regs: *mut SavedRegs) {
                 "rustux: cpu: EXCEPTION {} rip={:#x} err={:#x} cs={:#x} cr2={:#x} -- halting",
                 name, f.rip, f.err, f.cs, cr2
             );
+            crate::log::printk(format_args!(
+                "rustux: cpu: EXCEPTION {} rip={:#x} err={:#x} cs={:#x} cr2={:#x} -- halting",
+                name, f.rip, f.err, f.cs, cr2
+            ));
+            crate::log::drain_task();
             loop {
                 // SAFETY: halting forever is the intended terminal state.
                 unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) }
