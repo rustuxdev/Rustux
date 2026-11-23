@@ -545,6 +545,9 @@ extern "C" fn handle_syscall(c: *mut user::UCtx) {
         NR_MKNODAT => sys_mknodat(a1, a2, a3, a4),
         NR_RMDIR => sys_rmdir(a1),
         NR_EXIT => sys_exit(a1),
+        // setfsuid/setfsgid: single-uid kernel — the fs credentials
+        // are 0 and stay 0; the ABI returns the previous value.
+        122 | 123 => 0,
         _ => {
             // Bring-up aid: real binaries probe ABI surface. Linux
             // returns ENOSYS the same way; we just name the number.

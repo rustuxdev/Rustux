@@ -1,0 +1,9 @@
+APT::Get::AllowUnauthenticated "true";
+Acquire::AllowInsecureRepositories "true";
+Acquire::Languages "none";
+Acquire::GzipIndexes "true";
+APT::Cache-Start "100000000";
+APT::Sandbox::User "root";
+Dpkg::Use-Pty "true";
+Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache "";

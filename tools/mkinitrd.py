@@ -25,6 +25,13 @@ def entry(name, data, ino, mode=0o100644):
 out = b""
 ino = 1
 for path, arc in zip(sys.argv[1::2], sys.argv[2::2]):
+    # A "link:<target>" source emits a symlink entry — multicall
+    # binaries (busybox) get their applet names without duplicating
+    # the binary per alias.
+    if path.startswith("link:"):
+        out += entry(arc, path[5:].encode(), ino, 0o120777)
+        ino += 1
+        continue
     data = load(path)
     # Record the source's real perm bits — stat/access/exec on the
     # archive member honor them. ELF payloads get the exec bit

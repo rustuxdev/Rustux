@@ -104,6 +104,8 @@ pub struct FbConsole {
     g0_gfx: bool,
     alt: bool,
     cur_vis: bool,
+    bold: bool, // SGR 1 intensity — persistent until 22/reset
+    last_glyph: u8, // last emitted char — REP (CSI Ps b) repeats it
     esc: EscState,
     params: [u16; 16],
     nparams: usize,
@@ -162,6 +164,8 @@ impl FbConsole {
             g0_gfx: false,
             alt: false,
             cur_vis: true,
+            bold: false,
+            last_glyph: b' ',
             esc: EscState::Norm,
             params: [0; 16],
             nparams: 0,
@@ -392,6 +396,7 @@ impl FbConsole {
         self.put_cell(self.cx, self.cy, cell);
         self.draw_cell(self.cx, self.cy);
         self.cx += 1;
+        self.last_glyph = c;
     }
 
     fn sgr(&mut self) {
@@ -400,9 +405,16 @@ impl FbConsole {
         while i < n {
             let p = self.params.get(i).copied().unwrap_or(0);
             match p {
-                0 => self.attr = 0x07,
+                0 => {
+                    self.attr = 0x07;
+                    self.bold = false;
+                }
                 1 => {
-                    // Bold: brighten the fg color.
+                    // Bold is a persistent intensity flag: it must
+                    // survive a later 30-37 (ncurses emits 0;1;30 for
+                    // bright black). Brighten the current fg now too,
+                    // for the color-then-bold order.
+                    self.bold = true;
                     let f = self.attr & 0x0f;
                     if f < 8 {
                         self.attr = (self.attr & !0x0f) | (f + 8);
@@ -415,6 +427,7 @@ impl FbConsole {
                     self.attr = (self.attr & 0x80) | ((fg & 0x07) << 4) | bg;
                 }
                 22 => {
+                    self.bold = false;
                     let f = self.attr & 0x0f;
                     if f >= 8 {
                         self.attr = (self.attr & !0x0f) | (f - 8);
@@ -428,9 +441,15 @@ impl FbConsole {
                     // inverted is impossible to detect; xterm apps send
                     // 0m before 27m anyway.
                 }
-                39 => self.attr = (self.attr & 0xf0) | 7,
+                39 => {
+                    self.attr = (self.attr & 0xf0)
+                        | if self.bold { 15 } else { 7 };
+                }
                 49 => self.attr &= 0x8f,
-                30..=37 => self.attr = (self.attr & !0x0f) | ((p - 30) as u8),
+                30..=37 => {
+                    let c = (p - 30) as u8 + if self.bold { 8 } else { 0 };
+                    self.attr = (self.attr & !0x0f) | c;
+                }
                 90..=97 => self.attr = (self.attr & !0x0f) | ((p - 90 + 8) as u8),
                 40..=47 => {
                     self.attr = (self.attr & !0x70) | (((p - 40) as u8) << 4)
@@ -548,6 +567,13 @@ impl FbConsole {
             b'u' => {
                 let (x, y, a) = self.saved;
                 (self.cx, self.cy, self.attr) = (x.min(self.cols - 1), y.min(self.rows - 1), a);
+            }
+            b'b' => {
+                // REP: repeat the preceding graphic char Ps times.
+                let c = self.last_glyph;
+                for _ in 0..p1(0, 1).min(self.cols * self.rows) {
+                    self.put_glyph(c);
+                }
             }
             b'm' => self.sgr(),
             b'h' | b'l' => {
@@ -696,6 +722,7 @@ impl FbConsole {
                         // RIS: full reset.
                         self.clear_screen();
                         self.attr = 0x07;
+                        self.bold = false;
                         self.scr_top = self.top;
                         self.scr_bot = self.rows - 1;
                         self.g0_gfx = false;
@@ -719,14 +746,21 @@ impl FbConsole {
             }
             EscState::Csi => match b {
                 b'0'..=b'9' => {
-                    let i = self.nparams.min(15);
-                    if self.nparams < 16 {
-                        self.nparams = i + 1;
+                    // Digits accumulate into the CURRENT param; the
+                    // count only grows at the first digit and at ';'.
+                    if self.nparams == 0 {
+                        self.nparams = 1;
                     }
+                    let i = (self.nparams - 1).min(15);
                     let v = &mut self.params[i];
                     *v = (*v).saturating_mul(10).saturating_add((b - b'0') as u16);
                 }
                 b';' => {
+                    // An empty leading param counts too: "\e[;5" is
+                    // two params [0,5], not one.
+                    if self.nparams == 0 {
+                        self.nparams = 1;
+                    }
                     if self.nparams < 16 {
                         self.nparams += 1;
                     }

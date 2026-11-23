@@ -1946,10 +1946,11 @@ const MAX_OFDS: usize = 256;
 /// truncated, renamed and unlinked. Bounded so untrusted fd churn
 /// can't exhaust frames.
 /// dpkg-deb -x on a real .deb walks ~50 files + ~95 dirs (locale
-/// trees are deep) — headroom for a couple of package extracts
-/// plus the suite's own scratch files.
-const MAX_VFILES: usize = 128;
-const MAX_VDIRS: usize = 128;
+/// trees are deep); a real `apt install libc6` extracts several
+/// hundred names across its six-package dep set — headroom for
+/// that plus the suite's own scratch files.
+const MAX_VFILES: usize = 1024;
+const MAX_VDIRS: usize = 512;
 /// Per-file ceiling — an honest ENOSPC, not an unbounded grow.
 const VFILE_MAX: usize = 32 << 20;
 
@@ -8002,7 +8003,10 @@ fn t_cc(i: usize) -> u8 {
 /// Echo one byte through the printk ring — IRQ-safe (irq_save inside)
 /// and identical to how user console writes reach the screen.
 fn stdin_echo(b: u8) {
-    crate::log::printk(format_args!("{}", b as char));
+    // tty echo is console output, not a log record — one raw byte
+    // through the user-output path, no record framing.
+    let s = [b];
+    crate::log::user_out(core::str::from_utf8(&s).unwrap_or(""));
 }
 
 /// Signal the foreground process group — Linux's ldisc sends ^C/
@@ -13588,6 +13592,23 @@ pub fn resolve_links(
                     }
                 }
             }
+            // Initrd cpio links follow too: a S_IFLNK entry's data is
+            // the raw target text (mkinitrd's link:<tgt> records).
+            if tl == 0 {
+                if let Some(arc) =
+                    unsafe { *core::ptr::addr_of!(INITRD) }
+                {
+                    if let Some((_, data, cmode)) =
+                        crate::cpio::entries_m(arc)
+                            .find(|(n, _, _)| *n == &cur[..end])
+                    {
+                        if cmode & 0o170000 == 0o120000 {
+                            tl = data.len().min(256);
+                            tgt[..tl].copy_from_slice(&data[..tl]);
+                        }
+                    }
+                }
+            }
             if tl > 0 {
                 // A relative target joins the link's own directory —
                 // canon already discards the base on '/'-led input.
@@ -13619,7 +13640,14 @@ pub fn resolve_links(
         }
         if !hit {
             let fl = vfile_find(&cur[..cn])
-                .is_some_and(|j| vfile(j).is_some_and(|v| v.is_link));
+                .is_some_and(|j| vfile(j).is_some_and(|v| v.is_link))
+                || (unsafe { *core::ptr::addr_of!(INITRD) }).is_some_and(
+                    |arc| {
+                        crate::cpio::entries_m(arc).any(|(n, _, m)| {
+                            n == &cur[..cn] && m & 0o170000 == 0o120000
+                        })
+                    },
+                );
             return Ok((cur, cn, fl));
         }
     }
@@ -13999,9 +14027,10 @@ fn dir_exists(p: &[u8]) -> bool {
 /// Leaf entries a per-task dir exports. "exe"/"cwd"/"root" aren't
 /// rendered text — they resolve like symlinks; "fd"/"fdinfo" are
 /// directories of the task's live fd table.
-const PROC_TFILES: [&[u8]; 13] = [
+const PROC_TFILES: [&[u8]; 14] = [
     b"stat", b"status", b"comm", b"cmdline", b"statm", b"environ",
     b"wchan", b"io", b"exe", b"cwd", b"root", b"fd", b"fdinfo",
+    b"task",
 ];
 /// Synthetic system files under /proc itself.
 const PROC_GFILES: [&[u8]; 8] = [
@@ -14085,13 +14114,46 @@ fn proc_parse(p: &[u8]) -> Option<ProcEnt> {
     let slot = proc_pid_slot(&rest[..i])?;
     let Some(j) = leaf.iter().position(|&c| c == b'/') else {
         return PROC_TFILES.iter().find(|f| **f == leaf).map(|f| {
-            if *f == b"fd" || *f == b"fdinfo" {
+            if *f == b"fd" || *f == b"fdinfo" || *f == b"task" {
                 ProcEnt::TaskDir
             } else {
                 ProcEnt::Task(slot, *f)
             }
         });
     };
+    let sub = &leaf[..j];
+    // /proc/<pid>/task/<tid>[/<leaf>] — the thread-group view htop,
+    // ps -L and gdb walk. A bare tid is a dir; <tid>/<leaf> is that
+    // thread's own copy of the pid leaves (no nested task dir).
+    // The tid must belong to this pid's thread group, like Linux.
+    if sub == b"task" {
+        let name = &leaf[j + 1..];
+        let k = name.iter().position(|&c| c == b'/').unwrap_or(name.len());
+        let tid = &name[..k];
+        if tid.is_empty() || !tid.iter().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let mut tnum = 0u64;
+        for &c in tid {
+            tnum = tnum * 10 + (c - b'0') as u64;
+        }
+        let tslot = task_slot_by_pid(tnum)?;
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        if tasks.get(tslot)?.as_ref()?.tgid != tasks.get(slot)?.as_ref()?.tgid {
+            return None;
+        }
+        if k == name.len() {
+            return Some(ProcEnt::TaskDir);
+        }
+        let leaf2 = &name[k + 1..];
+        if leaf2.contains(&b'/') {
+            return None;
+        }
+        return PROC_TFILES
+            .iter()
+            .find(|f| **f == leaf2 && **f != b"fd" && **f != b"fdinfo" && **f != b"task")
+            .map(|f| ProcEnt::Task(tslot, *f));
+    }
     // Third level — only fd/fdinfo hold numbered children, and only
     // for slots whose fd table still lives (a reaped one releases
     // it — its fd dir reads empty like Linux).
@@ -14116,7 +14178,6 @@ fn proc_parse(p: &[u8]) -> Option<ProcEnt> {
     if tab.fds[n].is_none() {
         return None;
     }
-    let sub = &leaf[..j];
     if sub == b"fd" {
         Some(ProcEnt::TaskFd(slot, n))
     } else if sub == b"fdinfo" {
@@ -20957,6 +21018,63 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
                         n += 1;
                     }
                 }
+            } else if &rest[j + 1..] == b"task" {
+                // /proc/<pid>/task — one numeric entry per live tid
+                // in the pid's thread group, like Linux. The tid
+                // names are rendered into spare pidbuf slots.
+                let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+                let tgid = tasks[slot].as_ref().map(|t| t.tgid);
+                for (i, pb) in pidbuf.iter_mut().enumerate() {
+                    let Some(t) = tasks[i].as_ref() else { continue };
+                    if proc_dead(t, tasks) || Some(t.tgid) != tgid {
+                        continue;
+                    }
+                    let b = &mut *pb;
+                    let mut m = 0usize;
+                    let mut v = t.pid;
+                    let mut d = [0u8; 20];
+                    let mut dl = 0usize;
+                    loop {
+                        d[dl] = b'0' + (v % 10) as u8;
+                        v /= 10;
+                        dl += 1;
+                        if v == 0 {
+                            break;
+                        }
+                    }
+                    while dl > 0 {
+                        dl -= 1;
+                        b[m] = d[dl];
+                        m += 1;
+                    }
+                    if n < names.len() {
+                        names[n] = Some(&pb[..m]);
+                        n += 1;
+                    }
+                }
+            } else if let Some(tidc) = rest[j + 1..].strip_prefix(b"task/") {
+                // /proc/<pid>/task/<tid> — the leaf set, minus the
+                // subdir names our parse doesn't nest there.
+                if !tidc.is_empty() && tidc.iter().all(|c| c.is_ascii_digit()) {
+                    let mut tnum = 0u64;
+                    for &c in tidc {
+                        tnum = tnum * 10 + (c - b'0') as u64;
+                    }
+                    if task_slot_by_pid(tnum).is_some() {
+                        for f in PROC_TFILES {
+                            if f == b"fd".as_slice()
+                                || f == b"fdinfo".as_slice()
+                                || f == b"task".as_slice()
+                            {
+                                continue;
+                            }
+                            if n < names.len() {
+                                names[n] = Some(f);
+                                n += 1;
+                            }
+                        }
+                    }
+                }
             } else if &rest[j + 1..] == b"fd" || &rest[j + 1..] == b"fdinfo" {
                 let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
                 if let Some(t) = tasks.get(slot).and_then(|s| s.as_ref()) {
@@ -21725,13 +21843,18 @@ pub fn tick(img: &mut UCtx) -> *const UCtx {
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     // Bill the tick: a kernel-CS frame means the task was inside a
     // syscall when the timer hit (stime); a CPL3 frame is user time.
+    // Exception: the hlt-idle loop also runs kernel CS — its ticks
+    // belong to nobody, so only charge a task that is still
+    // Runnable (a genuinely preempted syscall frame).
     // This is the accounting /proc/<pid>/stat and /proc/stat print.
     if img.cs & 3 != 3 {
         if cur != usize::MAX {
             if let Some(t) =
                 unsafe { (*core::ptr::addr_of_mut!(TASKS))[cur].as_mut() }
             {
-                t.stime += 1;
+                if t.state == TaskState::Runnable {
+                    t.stime += 1;
+                }
             }
         }
         return img;

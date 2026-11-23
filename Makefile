@@ -87,7 +87,7 @@ $(ESP_IMG): $(KERNEL) $(INITRD)
 run: build
 	$(QEMU) \
 		-machine q35 \
-		-m 512M \
+		-m 1G \
 		-cpu qemu64,+rdrand \
 		-bios $(OVMF) \
 		-drive file=$(ESP_IMG),format=raw,if=ide \
@@ -107,7 +107,7 @@ INITRD_BASH := initrd-bash.cpio
 run-net: build
 	$(QEMU) \
 		-machine q35 \
-		-m 512M \
+		-m 1G \
 		-cpu qemu64,+rdrand \
 		-bios $(OVMF) \
 		-drive file=$(ESP_IMG),format=raw,if=ide \
@@ -140,7 +140,7 @@ $(ESP_BASH): $(KERNEL) $(INITRD_BASH)
 run-bash: $(ESP_BASH)
 	$(QEMU) \
 		-machine q35 \
-		-m 512M \
+		-m 1G \
 		-cpu qemu64,+rdrand \
 		-bios $(OVMF) \
 		-drive file=$(ESP_BASH),format=raw,if=ide \
@@ -170,7 +170,7 @@ $(ESP_TOUT): $(KERNEL) $(INITRD_TOUT)
 run-ttout: $(ESP_TOUT)
 	$(QEMU) \
 		-machine q35 \
-		-m 512M \
+		-m 1G \
 		-cpu qemu64,+rdrand \
 		-bios $(OVMF) \
 		-drive file=$(ESP_TOUT),format=raw,if=ide \
@@ -202,7 +202,7 @@ $(ESP_DEMO): $(KERNEL) $(INITRD_DEMO)
 run-demo: $(ESP_DEMO)
 	$(QEMU) \
 		-machine q35 \
-		-m 512M \
+		-m 1G \
 		-cpu qemu64,+rdrand \
 		-bios $(OVMF) \
 		-drive file=$(ESP_DEMO),format=raw,if=ide \
@@ -302,7 +302,7 @@ $(ESP_APT): $(KERNEL) $(INITRD_APT)
 run-apt: $(ESP_APT)
 	$(QEMU) \
 		-machine q35 \
-		-m 512M \
+		-m 1G \
 		-cpu qemu64,+rdrand \
 		-bios $(OVMF) \
 		-drive file=$(ESP_APT),format=raw,if=ide \
@@ -316,7 +316,7 @@ run-apt: $(ESP_APT)
 	if [ $$status -eq 33 ]; then echo "apt probe: PASS (qemu exit 33)"; \
 	else echo "apt probe: FAIL (qemu exit $$status)"; exit 1; fi
 
-# Bootable demo ISO — live session + self-installer. demomenu is the
+# Bootable demo ISO — live session + self-installer. livemenu is the
 # solo task (pid1): it offers a live shell or a raw install of
 # hd.img (a ready-made FAT boot image carrying this same kernel +
 # the live initrd) onto /dev/sda via the ATA PIO driver, then
@@ -330,21 +330,156 @@ ISO         := rustux-demo.iso
 INSTALLDISK := target.img
 ISOROOT     := isoroot
 
+# One real busybox copy + symlink applets (link:<target> is a
+# mkinitrd symlink record — multicall resolves argv[0]). A curated
+# demo set; unimplemented syscalls just report ENOSYS honestly.
 LIVE_PAIRS := \
-	kernel/user/demomenu.elf demomenu \
-	kernel/user/busybox bin/sh \
+	kernel/user/livemenu.elf livemenu \
 	kernel/user/busybox bin/busybox \
-	kernel/user/busybox sbin/reboot \
-	kernel/user/busybox sbin/poweroff \
+	link:/bin/busybox bin/sh \
+	link:/bin/busybox bin/ash \
+	link:/bin/busybox bin/ls \
+	link:/bin/busybox bin/cat \
+	link:/bin/busybox bin/cp \
+	link:/bin/busybox bin/mv \
+	link:/bin/busybox bin/rm \
+	link:/bin/busybox bin/mkdir \
+	link:/bin/busybox bin/touch \
+	link:/bin/busybox bin/echo \
+	link:/bin/busybox bin/pwd \
+	link:/bin/busybox bin/df \
+	link:/bin/busybox bin/du \
+	link:/bin/busybox bin/free \
+	link:/bin/busybox bin/ps \
+	link:/bin/busybox bin/top \
+	link:/bin/busybox bin/uname \
+	link:/bin/busybox bin/hostname \
+	link:/bin/busybox bin/date \
+	link:/bin/busybox bin/mount \
+	link:/bin/busybox bin/umount \
+	link:/bin/busybox bin/dd \
+	link:/bin/busybox bin/sync \
+	link:/bin/busybox bin/grep \
+	link:/bin/busybox bin/sed \
+	link:/bin/busybox bin/diff \
+	link:/bin/busybox bin/find \
+	link:/bin/busybox bin/xargs \
+	link:/bin/busybox bin/sort \
+	link:/bin/busybox bin/tr \
+	link:/bin/busybox bin/md5sum \
+	link:/bin/busybox bin/chown \
+	link:/bin/busybox bin/chmod \
+	link:/bin/busybox bin/ln \
+	link:/bin/busybox bin/rmdir \
+	link:/bin/busybox bin/test \
+	link:/bin/busybox bin/install \
+	link:/bin/busybox bin/mkfifo \
+	link:/bin/busybox bin/sleep \
+	link:/bin/busybox bin/expr \
+	link:/bin/busybox bin/head \
+	link:/bin/busybox bin/tail \
+	link:/bin/busybox bin/wc \
+	link:/bin/busybox bin/more \
+	link:/bin/busybox bin/less \
+	link:/bin/busybox bin/vi \
+	link:/bin/busybox bin/clear \
+	link:/bin/busybox bin/which \
+	link:/bin/busybox bin/dmesg \
+	link:/bin/busybox bin/whoami \
+	link:/bin/busybox usr/bin/id \
+	link:/bin/busybox usr/bin/logname \
+	link:/bin/busybox usr/bin/groups \
+	link:/bin/busybox sbin/reboot \
+	link:/bin/busybox sbin/poweroff \
+	link:/bin/busybox sbin/halt \
 	kernel/user/bash bin/bash \
+	kernel/user/htop bin/htop \
+	$(APTROOT)/apt-get usr/bin/apt-get \
+	link:/usr/bin/apt-get usr/bin/apt \
+	$(APTROOT)/apt-helper usr/lib/apt/apt-helper \
+	$(APTROOT)/methods/gpgv usr/lib/apt/methods/gpgv \
+	$(APTROOT)/methods/http usr/lib/apt/methods/http \
+	$(APTROOT)/methods/store usr/lib/apt/methods/store \
+	$(APTROOT)/methods/copy usr/lib/apt/methods/copy \
+	$(APTROOT)/methods/file usr/lib/apt/methods/file \
+	$(APTROOT)/gpgv usr/bin/gpgv \
+	kernel/user/dpkg usr/bin/dpkg \
+	kernel/user/dpkg-deb usr/bin/dpkg-deb \
+	kernel/user/dpkg-split usr/bin/dpkg-split \
+	kernel/user/dpkg-query usr/bin/dpkg-query \
+	kernel/user/tar bin/tar \
+	kernel/user/ldconfig sbin/ldconfig \
+	kernel/user/ldconfig usr/sbin/ldconfig \
+	link:/bin/busybox sbin/start-stop-daemon \
+	link:/bin/busybox usr/sbin/start-stop-daemon \
+	$(APTROOT)/dpkgtables/cputable usr/share/dpkg/cputable \
+	$(APTROOT)/dpkgtables/ostable usr/share/dpkg/ostable \
+	$(APTROOT)/dpkgtables/tupletable usr/share/dpkg/tupletable \
+	$(APTROOT)/dpkgtables/abitable usr/share/dpkg/abitable \
+	$(APTROOT)/libapt-pkg.so.6.0 lib/x86_64-linux-gnu/libapt-pkg.so.6.0 \
+	$(APTROOT)/libapt-private.so.0.0 lib/x86_64-linux-gnu/libapt-private.so.0.0 \
+	$(APTROOT)/libassuan.so.0 lib/x86_64-linux-gnu/libassuan.so.0 \
+	$(APTROOT)/libcap.so.2 lib/x86_64-linux-gnu/libcap.so.2 \
+	$(APTROOT)/libffi.so.8 lib/x86_64-linux-gnu/libffi.so.8 \
+	$(APTROOT)/libgcc_s.so.1 lib/x86_64-linux-gnu/libgcc_s.so.1 \
+	$(APTROOT)/libgcrypt.so.20 lib/x86_64-linux-gnu/libgcrypt.so.20 \
+	$(APTROOT)/libgmp.so.10 lib/x86_64-linux-gnu/libgmp.so.10 \
+	$(APTROOT)/libgnutls.so.30 lib/x86_64-linux-gnu/libgnutls.so.30 \
+	$(APTROOT)/libgpg-error.so.0 lib/x86_64-linux-gnu/libgpg-error.so.0 \
+	$(APTROOT)/libhogweed.so.6 lib/x86_64-linux-gnu/libhogweed.so.6 \
+	$(APTROOT)/libidn2.so.0 lib/x86_64-linux-gnu/libidn2.so.0 \
+	$(APTROOT)/liblz4.so.1 lib/x86_64-linux-gnu/liblz4.so.1 \
+	$(APTROOT)/libnettle.so.8 lib/x86_64-linux-gnu/libnettle.so.8 \
+	$(APTROOT)/libnpth.so.0 lib/x86_64-linux-gnu/libnpth.so.0 \
+	$(APTROOT)/libp11-kit.so.0 lib/x86_64-linux-gnu/libp11-kit.so.0 \
+	$(APTROOT)/libseccomp.so.2 lib/x86_64-linux-gnu/libseccomp.so.2 \
+	$(APTROOT)/libstdc++.so.6 lib/x86_64-linux-gnu/libstdc++.so.6 \
+	$(APTROOT)/libsystemd.so.0 lib/x86_64-linux-gnu/libsystemd.so.0 \
+	$(APTROOT)/libtasn1.so.6 lib/x86_64-linux-gnu/libtasn1.so.6 \
+	$(APTROOT)/libudev.so.1 lib/x86_64-linux-gnu/libudev.so.1 \
+	$(APTROOT)/libunistring.so.5 lib/x86_64-linux-gnu/libunistring.so.5 \
+	$(APTROOT)/libxxhash.so.0 lib/x86_64-linux-gnu/libxxhash.so.0 \
+	kernel/user/libdpkg/libselinux.so.1 lib/x86_64-linux-gnu/libselinux.so.1 \
+	kernel/user/libdpkg/libpcre2-8.so.0 lib/x86_64-linux-gnu/libpcre2-8.so.0 \
+	kernel/user/libdpkg/libacl.so.1 lib/x86_64-linux-gnu/libacl.so.1 \
+	kernel/user/libdpkg/libz.so.1 lib/x86_64-linux-gnu/libz.so.1 \
+	kernel/user/libdpkg/liblzma.so.5 lib/x86_64-linux-gnu/liblzma.so.5 \
+	kernel/user/libdpkg/libzstd.so.1 lib/x86_64-linux-gnu/libzstd.so.1 \
+	kernel/user/libdpkg/libbz2.so.1.0 lib/x86_64-linux-gnu/libbz2.so.1.0 \
+	kernel/user/libdpkg/libmd.so.0 lib/x86_64-linux-gnu/libmd.so.0 \
+	kernel/user/aptetc/sources.list etc/apt/sources.list \
+	kernel/user/aptetc/99rustux etc/apt/apt.conf.d/99rustux \
+	kernel/user/resolv.conf etc/resolv.conf \
+	kernel/user/etc/passwd etc/passwd \
+	kernel/user/etc/shadow etc/shadow \
+	kernel/user/etc/group etc/group \
+	kernel/user/etc/securetty etc/securetty \
+	kernel/user/libncursesw.so.6 lib/x86_64-linux-gnu/libncursesw.so.6 \
+	kernel/user/libm.so.6 lib/x86_64-linux-gnu/libm.so.6 \
+	kernel/user/libnl-3.so.200 lib/x86_64-linux-gnu/libnl-3.so.200 \
+	kernel/user/libnl-genl-3.so.200 lib/x86_64-linux-gnu/libnl-genl-3.so.200 \
+	kernel/user/terminfo_x/xterm usr/share/terminfo/x/xterm \
 	/lib64/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2 \
 	/lib/x86_64-linux-gnu/libc.so.6 lib/x86_64-linux-gnu/libc.so.6 \
 	kernel/user/libtinfo.so.6 lib/x86_64-linux-gnu/libtinfo.so.6 \
 	kernel/user/motd.txt motd.txt
 
-LIVE_DEPS := kernel/user/demomenu.elf kernel/user/busybox kernel/user/bash \
-	kernel/user/libtinfo.so.6 kernel/user/motd.txt tools/mkinitrd.py \
-	/lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6
+# livemenu links libcrypt for the real /etc/shadow check.
+kernel/user/livemenu.elf: kernel/user/livemenu.c
+	gcc -static-pie -O2 -o $@ $< -lcrypt
+
+LIVE_DEPS := kernel/user/livemenu.elf kernel/user/busybox kernel/user/bash \
+	$(addprefix kernel/user/etc/,passwd shadow group securetty) \
+	kernel/user/htop kernel/user/libncursesw.so.6 kernel/user/libm.so.6 \
+	kernel/user/libnl-3.so.200 kernel/user/libnl-genl-3.so.200 \
+	kernel/user/terminfo_x/xterm kernel/user/libtinfo.so.6 kernel/user/motd.txt \
+	kernel/user/dpkg kernel/user/dpkg-deb kernel/user/dpkg-split kernel/user/dpkg-query \
+	kernel/user/tar kernel/user/ldconfig kernel/user/resolv.conf \
+	kernel/user/aptetc/sources.list kernel/user/aptetc/99rustux \
+	$(APTROOT)/apt-get $(APTROOT)/apt-helper $(APTROOT)/gpgv \
+	$(wildcard $(APTROOT)/methods/*) $(wildcard $(APTROOT)/dpkgtables/*) \
+	$(wildcard $(APTROOT)/lib*.so*) $(wildcard kernel/user/libdpkg/lib*.so*) \
+	tools/mkinitrd.py /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6
 
 $(INITRD_LIVE): $(LIVE_DEPS)
 	python3 tools/mkinitrd.py $(LIVE_PAIRS) > $@
@@ -353,7 +488,7 @@ $(INITRD_ISO): $(LIVE_DEPS) $(HD_IMG)
 	python3 tools/mkinitrd.py $(LIVE_PAIRS) $(HD_IMG) hd.img > $@
 
 $(HD_IMG): $(KERNEL) $(INITRD_LIVE)
-	dd if=/dev/zero of=$@ bs=1M count=24
+	dd if=/dev/zero of=$@ bs=1M count=48
 	mformat -i $@ ::
 	mmd -i $@ ::/EFI
 	mmd -i $@ ::/EFI/BOOT
@@ -361,7 +496,7 @@ $(HD_IMG): $(KERNEL) $(INITRD_LIVE)
 	mcopy -i $@ $(INITRD_LIVE) ::/initrd.cpio
 
 $(ESP_ISO): $(KERNEL) $(INITRD_ISO)
-	dd if=/dev/zero of=$@ bs=1M count=48
+	dd if=/dev/zero of=$@ bs=1M count=96
 	mformat -F -i $@ ::
 	mmd -i $@ ::/EFI
 	mmd -i $@ ::/EFI/BOOT
@@ -374,11 +509,13 @@ $(ISO): $(ESP_ISO)
 	genisoimage -o $@ -V RUSTUX_DEMO -e esp.img -no-emul-boot -J -r $(ISOROOT)
 
 $(INSTALLDISK):
-	dd if=/dev/zero of=$@ bs=1M count=32
+	dd if=/dev/zero of=$@ bs=1M count=64
 
-# End-to-end install proof in one guest session: `-boot once=d,
-# order=c` boots the CD first and the installed disk after the
-# reset — the real installer flow. monitor-sendkey presses "2" at
+# End-to-end install proof in one guest session: `-boot order=dc`
+# prefers the CD while it's inserted and falls back to the disk
+# after the monitor eject — the real installer flow (once= proved
+# unreliable: OVMF picked a stale boot entry over it). monitor-
+# sendkey presses "2" at
 # the menu (the PS/2 path — QEMU does not deliver piped stdio to
 # the guest UART), the installer streams hd.img to /dev/sda,
 # reports status, and waits for ENTER; sendkey answers it, the
@@ -389,12 +526,15 @@ run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 	rm -f isomon.sock isoph.log
 	$(QEMU) \
 		-machine pc \
-		-m 512M \
+		-m 1G \
 		-cpu qemu64,+rdrand \
 		-bios $(OVMF) \
-		-cdrom $(ISO) \
-		-drive file=$(INSTALLDISK),format=raw,if=ide \
-		-boot once=d,order=c \
+		-drive file=$(INSTALLDISK),format=raw,if=none,id=hd0 \
+		-device ide-hd,drive=hd0,bus=ide.0,unit=0,bootindex=1 \
+		-drive file=$(ISO),format=raw,if=none,id=cd0,media=cdrom \
+		-device ide-cd,drive=cd0,bus=ide.1,unit=0,bootindex=0 \
+		-netdev user,id=n0 -device e1000e,netdev=n0 \
+		-boot order=dc \
 		-serial file:isoph.log -display none \
 		-monitor unix:isomon.sock,server,nowait \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 & \
@@ -408,7 +548,7 @@ run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 	[ $$ok -eq 1 ] \
 		&& echo "iso install: PASS" \
 		|| { echo "iso install: FAIL"; tail -20 isoph.log; kill $$qpid; exit 1; }; \
-	echo "eject -f ide1-cd0" | socat - UNIX-CONNECT:isomon.sock > /dev/null; \
+	echo "eject -f cd0" | socat - UNIX-CONNECT:isomon.sock > /dev/null; \
 	python3 tools/sendkey.py isomon.sock ret; \
 	ok=0; \
 	for i in $$(seq 1 12); do \
