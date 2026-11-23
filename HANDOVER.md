@@ -3410,3 +3410,6 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
 - audit: safe-anything CLI scoped (security-audit skill still absent); cve.now no mapped class; no findings; run-138 pty flake still open
 - `make run` PASS exit 33, 72 tasks, frames 214361 -> 214361 zero leak; rustux-demo.iso rebuilt with the instrumented kernel for the next VMware boot test
 - next: VMware boot with the diagnostic ISO -> whichever stage the markers stop at is the fix target; then BIOS loader (16-bit + E820 + VBE + bios_entry); DOS personality (v86 + DPMI + int 21h + VGA 13h) for the real DOOM.EXE; pty ofd_release EIO flake
+
+## pending user tests
+- rustux-demo.iso (diagnostic build, commit a0c8b57 kernel) in VMware: boot it, photograph the screen — the sched: launch / first-syscall / beat markers name the dead stage. Pending as of run-147.
