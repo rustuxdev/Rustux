@@ -226,14 +226,26 @@ APTROOT    := kernel/user/aptroot
 # Debian binaries. gpgv exits nonzero (no keyring is shipped) and
 # apt's http helper can exit 100 after a completed transfer —
 # trusted=yes carries apt-get itself through to exit 0.
-$(INITRD_APT): kernel/user/aptprobe.elf kernel/user/dpkg kernel/user/busybox kernel/user/resolv.conf tools/mkinitrd.py /lib64/ld-linux-x86-64.so.2 $(APTROOT)/apt-get $(APTROOT)/apt-helper $(APTROOT)/gpgv $(wildcard $(APTROOT)/methods/*) $(wildcard $(APTROOT)/dpkgtables/*) $(wildcard $(APTROOT)/lib*.so*)
+$(INITRD_APT): kernel/user/aptprobe.elf kernel/user/dpkg kernel/user/dpkg-deb kernel/user/dpkg-split kernel/user/dpkg-query kernel/user/tar kernel/user/ldconfig kernel/user/busybox kernel/user/resolv.conf tools/mkinitrd.py /lib64/ld-linux-x86-64.so.2 kernel/user/libdpkg/libacl.so.1 kernel/user/libdpkg/libz.so.1 $(APTROOT)/apt-get $(APTROOT)/apt-helper $(APTROOT)/gpgv $(wildcard $(APTROOT)/methods/*) $(wildcard $(APTROOT)/dpkgtables/*) $(wildcard $(APTROOT)/lib*.so*)
 	python3 tools/mkinitrd.py \
 		kernel/user/aptprobe.elf aptprobe \
 		$(APTROOT)/apt-get usr/bin/apt-get \
 		$(APTROOT)/apt-helper usr/lib/apt/apt-helper \
 		kernel/user/dpkg usr/bin/dpkg \
+		kernel/user/dpkg-deb usr/bin/dpkg-deb \
+		kernel/user/dpkg-split usr/bin/dpkg-split \
+		kernel/user/dpkg-query usr/bin/dpkg-query \
+		kernel/user/tar bin/tar \
+		kernel/user/ldconfig sbin/ldconfig \
+		kernel/user/ldconfig usr/sbin/ldconfig \
 		kernel/user/busybox busybox \
 		kernel/user/busybox bin/sh \
+		kernel/user/busybox bin/rm \
+		kernel/user/busybox bin/diff \
+		kernel/user/busybox sbin/start-stop-daemon \
+		kernel/user/busybox usr/sbin/start-stop-daemon \
+		kernel/user/libdpkg/libacl.so.1 lib/x86_64-linux-gnu/libacl.so.1 \
+		kernel/user/libdpkg/libz.so.1 lib/x86_64-linux-gnu/libz.so.1 \
 		kernel/user/resolv.conf etc/resolv.conf \
 		$(APTROOT)/methods/gpgv usr/lib/apt/methods/gpgv \
 		$(APTROOT)/methods/http usr/lib/apt/methods/http \

@@ -21554,6 +21554,95 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
 /// reports stopped children ((stopsig << 8) | 0x7f), WCONTINUED
 /// continued ones (0xffff). Blocks when matching children are
 /// still running; ECHILD when there are none to wait for.
+/// One pass of wait4's reportable-child scan: a collectable zombie
+/// (reap + status), then per flags an unreported stop or continue.
+/// Called on entry and again under the armed wait so a child that
+/// changed state in the arm window can't strand the parent.
+fn wait4_collect(
+    tasks: &mut [Option<Task>],
+    cpid: u64,
+    mypgid: u64,
+    pid: i64,
+    status_va: u64,
+    flags: u64,
+) -> Option<u64> {
+    const EFAULT_: u64 = (-14i64) as u64;
+    let relevant = |t: &Task| {
+        t.ppid == cpid
+            && (pid == -1
+                || (pid > 0 && t.pid == pid as u64)
+                || (pid == 0 && t.pgid == mypgid)
+                || (pid < -1 && t.pgid == (-pid) as u64))
+    };
+    // A collectable zombie first — write status and free it for reap.
+    if let Some(i) = tasks.iter().position(|s| {
+        s.as_ref().is_some_and(|t| relevant(t) && t.state == TaskState::Exited)
+    }) {
+        let t = tasks[i].as_mut().unwrap();
+        if status_va != 0 {
+            if !range_ok_w(status_va, 4) {
+                return Some(EFAULT_);
+            }
+            // SAFETY: validated writable user range in cur's space.
+            unsafe {
+                (status_va as *mut u32)
+                    .write_unaligned((t.exit_status & 0xffff) as u32)
+            };
+        }
+        let r = t.pid;
+        // Collected — reap now (Linux releases the task at wait):
+        // the child's fds/map/pml4 free immediately, so shared
+        // endpoint counts (pipe writers/readers) drop before we
+        // return — a poll right after wait4 sees the child gone.
+        t.reap();
+        tasks[i] = None;
+        return Some(r);
+    }
+    // WUNTRACED: an unreported stopped child → (stopsig << 8) | 0x7f.
+    // stop_sig clears at report — one notification per stop.
+    if flags & WUNTRACED != 0 {
+        if let Some(t) = tasks
+            .iter_mut()
+            .flatten()
+            .find(|t| relevant(t) && t.state == TaskState::Stopped && t.stop_sig != 0)
+        {
+            if status_va != 0 {
+                if !range_ok_w(status_va, 4) {
+                    return Some(EFAULT_);
+                }
+                // SAFETY: validated writable user dword in cur's map.
+                unsafe {
+                    (status_va as *mut u32).write_unaligned(((t.stop_sig as u32) << 8) | 0x7f)
+                };
+            }
+            let r = t.pid;
+            t.stop_sig = 0;
+            return Some(r);
+        }
+    }
+    // WCONTINUED: a child resumed by SIGCONT → 0xffff, once per
+    // continue (cont_report clears at report).
+    if flags & WCONTINUED != 0 {
+        if let Some(t) = tasks
+            .iter_mut()
+            .flatten()
+            .find(|t| relevant(t) && t.cont_report)
+        {
+            if status_va != 0 {
+                if !range_ok_w(status_va, 4) {
+                    return Some(EFAULT_);
+                }
+                // SAFETY: validated writable user dword in cur's map.
+                unsafe { (status_va as *mut u32).write_unaligned(0xffff) };
+            }
+            let r = t.pid;
+            t.cont_report = false;
+            return Some(r);
+        }
+    }
+    None
+}
+
 pub fn wait4(ctx: &mut UCtx, pid: i64, status_va: u64, flags: u64) -> u64 {
     const ECHILD: u64 = (-10i64) as u64;
     const EFAULT_: u64 = (-14i64) as u64;
@@ -21570,6 +21659,9 @@ pub fn wait4(ctx: &mut UCtx, pid: i64, status_va: u64, flags: u64) -> u64 {
             .unwrap_or((0, 0))
     };
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    if let Some(r) = wait4_collect(tasks, cpid, mypgid, pid, status_va, flags) {
+        return r;
+    }
     let relevant = |t: &Task| {
         t.ppid == cpid
             && (pid == -1
@@ -21577,72 +21669,6 @@ pub fn wait4(ctx: &mut UCtx, pid: i64, status_va: u64, flags: u64) -> u64 {
                 || (pid == 0 && t.pgid == mypgid)
                 || (pid < -1 && t.pgid == (-pid) as u64))
     };
-    // A collectable zombie first — write status and free it for reap.
-    if let Some(i) = tasks.iter().position(|s| {
-        s.as_ref().is_some_and(|t| relevant(t) && t.state == TaskState::Exited)
-    }) {
-        let t = tasks[i].as_mut().unwrap();
-        if status_va != 0 {
-            if !range_ok_w(status_va, 4) {
-                return EFAULT_;
-            }
-            // SAFETY: validated writable user range in cur's space.
-            unsafe {
-                (status_va as *mut u32)
-                    .write_unaligned((t.exit_status & 0xffff) as u32)
-            };
-        }
-        let r = t.pid;
-        // Collected — reap now (Linux releases the task at wait):
-        // the child's fds/map/pml4 free immediately, so shared
-        // endpoint counts (pipe writers/readers) drop before we
-        // return — a poll right after wait4 sees the child gone.
-        t.reap();
-        tasks[i] = None;
-        return r;
-    }
-    // WUNTRACED: an unreported stopped child → (stopsig << 8) | 0x7f.
-    // stop_sig clears at report — one notification per stop.
-    if flags & WUNTRACED != 0 {
-        if let Some(t) = tasks
-            .iter_mut()
-            .flatten()
-            .find(|t| relevant(t) && t.state == TaskState::Stopped && t.stop_sig != 0)
-        {
-            if status_va != 0 {
-                if !range_ok_w(status_va, 4) {
-                    return EFAULT_;
-                }
-                // SAFETY: validated writable user dword in cur's map.
-                unsafe {
-                    (status_va as *mut u32).write_unaligned(((t.stop_sig as u32) << 8) | 0x7f)
-                };
-            }
-            let r = t.pid;
-            t.stop_sig = 0;
-            return r;
-        }
-    }
-    // WCONTINUED: a child resumed by SIGCONT → 0xffff, once per
-    // continue (cont_report clears at report).
-    if flags & WCONTINUED != 0 {
-        if let Some(t) = tasks
-            .iter_mut()
-            .flatten()
-            .find(|t| relevant(t) && t.cont_report)
-        {
-            if status_va != 0 {
-                if !range_ok_w(status_va, 4) {
-                    return EFAULT_;
-                }
-                // SAFETY: validated writable user dword in cur's map.
-                unsafe { (status_va as *mut u32).write_unaligned(0xffff) };
-            }
-            let r = t.pid;
-            t.cont_report = false;
-            return r;
-        }
-    }
     if !tasks.iter().flatten().any(relevant) {
         return ECHILD;
     }
@@ -21671,6 +21697,22 @@ pub fn wait4(ctx: &mut UCtx, pid: i64, status_va: u64, flags: u64) -> u64 {
         t.wait_len = flags;
         t.ctx = *ctx;
         t.state = TaskState::Blocked;
+    }
+    // Armed recheck — see tcp_recv_or_block: a child exiting between
+    // the scan and the arming ran the wake loop with nobody home.
+    // With wait_on set the exit path now sees us; a race that
+    // already ran shows Runnable with the pid in rax.
+    if tasks[cur].as_ref().unwrap().state == TaskState::Blocked {
+        if let Some(r) = wait4_collect(tasks, cpid, mypgid, pid, status_va, flags)
+        {
+            let t = tasks[cur].as_mut().unwrap();
+            t.wait_on = WaitOn::None;
+            t.wait_ptr = 0;
+            t.state = TaskState::Runnable;
+            return r;
+        }
+    } else {
+        return tasks[cur].as_ref().unwrap().ctx.rax;
     }
     block_switch()
 }
