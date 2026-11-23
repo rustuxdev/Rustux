@@ -1708,7 +1708,11 @@ const MAX_OFDS: usize = 256;
 /// cpio names are read-only, VFILES names are created, written,
 /// truncated, renamed and unlinked. Bounded so untrusted fd churn
 /// can't exhaust frames.
-const MAX_VFILES: usize = 32;
+/// dpkg-deb -x on a real .deb walks ~50 files + ~95 dirs (locale
+/// trees are deep) — headroom for a couple of package extracts
+/// plus the suite's own scratch files.
+const MAX_VFILES: usize = 128;
+const MAX_VDIRS: usize = 128;
 /// Per-file ceiling — an honest ENOSPC, not an unbounded grow.
 const VFILE_MAX: usize = 1 << 20;
 
@@ -2102,6 +2106,22 @@ pub fn fs_lookup(name: &[u8]) -> Option<&'static [u8]> {
             return Some(d);
         }
         return None;
+    }
+    // VFile-backed executables — installed binaries (dpkg -x and
+    // friends) live in the flat VFS, not the archive. The data
+    // buffer serves the image for execve's synchronous parse+load,
+    // like the archive slice does.
+    if let Some(i) = vfile_find(name) {
+        let v = vfile(i)?;
+        if v.data.is_null() || v.len == 0 {
+            return None;
+        }
+        // SAFETY: the slice is consumed inside this syscall's
+        // single-CPU context — no task can mutate or free the
+        // buffer while parse+exec reads it.
+        return Some(unsafe {
+            core::slice::from_raw_parts(v.data, v.len)
+        });
     }
     crate::cpio::find(arc, name)
 }
@@ -12282,9 +12302,6 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     if !write {
         return EBADF; // wrong end
     }
-    if len > PIPE_SIZE as u64 {
-        return EINVAL; // single-frame ring; larger writes rejected
-    }
     let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
     let Some(p) = pipes.get_mut(id).and_then(|s| s.as_mut()) else {
         return EBADF;
@@ -12292,10 +12309,14 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     if p.readers == 0 {
         return EPIPE; // SIGPIPE would fire here once signals exist
     }
-    if PIPE_SIZE - (p.tail - p.head) < len as usize {
-        // Doesn't fit — <=PIPE_BUF writes are atomic, so block until
-        // the ring drains enough. The waker pulls our buffer through
-        // OUR tables and deposits the count in ctx.rax.
+    let free = PIPE_SIZE - (p.tail - p.head);
+    let want = len as usize;
+    if want > free && (want <= PIPE_SIZE || free == 0) {
+        // No progress possible this call: <=PIPE_BUF writes stay
+        // atomic (they need the whole request to fit), and a larger
+        // write can only start when the ring has SOME room. The
+        // waker pulls our buffer through OUR tables and deposits
+        // the count in ctx.rax — possibly short for big writes.
         if len > 0 && !range_ok(buf, 1) {
             return EFAULT;
         }
@@ -12309,10 +12330,14 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         t.state = TaskState::Blocked;
         block_switch()
     }
-    if !range_ok(buf, len) {
+    // Writes bigger than the ring take what fits and answer short —
+    // the caller loops on the remainder, same shape Linux's
+    // >PIPE_BUF blocking write produces under a full pipe.
+    let wlen = want.min(free);
+    if wlen > 0 && !range_ok(buf, wlen as u64) {
         return EFAULT;
     }
-    for i in 0..len as usize {
+    for i in 0..wlen {
         // SAFETY: buf is validated user memory under the current cr3;
         // the ring index wraps inside the pipe-owned frame.
         unsafe {
@@ -12320,9 +12345,9 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             ((p.buf + ((p.tail + i) % PIPE_SIZE) as u64) as *mut u8).write(b);
         }
     }
-    p.tail += len as usize;
+    p.tail += wlen;
     pipe_wake(id); // new data may unblock readers
-    len
+    wlen as u64
 }
 
 /// sendfile(out_fd, in_fd, off_t*, count): fd-to-fd copy without a
@@ -12767,7 +12792,7 @@ struct VDir {
     ctime: u64,
     ctime_ns: u32,
 }
-static mut VDIRS: [Option<VDir>; 16] = [None; 16];
+static mut VDIRS: [Option<VDir>; MAX_VDIRS] = [None; MAX_VDIRS];
 
 fn vdir_find(path: &[u8]) -> Option<usize> {
     unsafe { &*core::ptr::addr_of!(VDIRS) }
@@ -15139,10 +15164,22 @@ fn wake_pipe_writers(id: usize) -> usize {
         let Some(p) = pipes.get_mut(id).and_then(|x| x.as_mut()) else {
             break;
         };
-        if PIPE_SIZE - (p.tail - p.head) < t.wait_len as usize {
-            continue; // still doesn't fit — stays blocked
-        }
-        let len = t.wait_len as usize;
+        let avail = PIPE_SIZE - (p.tail - p.head);
+        let want = t.wait_len as usize;
+        // <=PIPE_BUF waits stay atomic (whole len or nothing); a
+        // bigger write settles for the room that exists — avail is
+        // always < want there, so len is the chunk it gets now.
+        let len = if want <= PIPE_SIZE {
+            if avail < want {
+                continue; // still doesn't fit — stays blocked
+            }
+            want
+        } else {
+            if avail == 0 {
+                continue;
+            }
+            avail
+        };
         let mut done = 0usize;
         while done < len {
             match translate(t.pml4, t.wait_ptr + done as u64) {
