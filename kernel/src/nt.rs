@@ -34,6 +34,9 @@ pub const STATUS_OBJECT_NAME_COLLISION: u64 = 0xC000_0035;
 pub const STATUS_OBJECT_PATH_NOT_FOUND: u64 = 0xC000_003A;
 pub const STATUS_INSUFFICIENT_RESOURCES: u64 = 0xC000_009A;
 pub const STATUS_NO_MORE_FILES: u64 = 0x8000_0006;
+pub const STATUS_BUFFER_TOO_SMALL: u64 = 0xC000_0023;
+pub const STATUS_DIRECTORY_NOT_EMPTY: u64 = 0xC000_0101;
+pub const STATUS_NAME_TOO_LONG: u64 = 0xC000_0106;
 /// STATUS_MAPPED_FILE_SIZE_ZERO — file-backed section requested
 /// with no size on an empty file.
 pub const STATUS_MAPPED_FILE_SIZE_ZERO: u64 = 0xC000_011E;
@@ -86,6 +89,7 @@ const RUX_THR_ENUM: u32 = 0xFC;
 const RUX_SPAWN_PROC: u32 = 0xFD;
 const RUX_PROC_QUERY: u32 = 0xFE;
 const RUX_SYS_INFO: u32 = 0xFF;
+const RUX_PATH: u32 = 0x100;
 
 /// Handle table tags — a per-task `nth` slot's object kind. Real
 /// handles are small indices (1-based) like the actual handle table;
@@ -1335,6 +1339,13 @@ pub fn dispatch(ctx: &mut UCtx, nr: u32) -> u64 {
         RUX_PROC_QUERY => user::nt_proc_query(arg(ctx, 0), arg(ctx, 1)),
 
         RUX_SYS_INFO => user::nt_sysinfo(arg(ctx, 0), arg(ctx, 1)),
+
+        RUX_PATH => user::nt_pathop(
+            arg(ctx, 0),
+            arg(ctx, 1),
+            arg(ctx, 2),
+            arg(ctx, 3),
+        ),
         NT_TERMINATE_PROCESS => {
             // hProcess == (HANDLE)-1 means self; anything else is a
             // kill we don't model yet — the common case is self-exit.

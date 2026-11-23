@@ -4167,6 +4167,209 @@ fn k32_emit(buf: &mut [u8], name: &[u8]) -> Option<usize> {
                 0xc3,
             ]);
         }
+        // Path/directory/file services — RUX_PATH 0x100:
+        // r10 = sub, rdx/r8/r9 = a1/a2/a3 (same marshalling as
+        // RUX_SYS_INFO). GetCurrentDirectory*(len,buf) ->
+        // sub 0, DWORD chars.
+        b"GetCurrentDirectoryA" => {
+            e.raw(&[
+                0x49, 0x89, 0xc8, //             mov r8,rcx (len)
+                0x45, 0x31, 0xc9, //             xor r9d,r9d (ansi)
+                0x41, 0xba, 0, 0, 0, 0, //      mov r10d,0
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        b"GetCurrentDirectoryW" => {
+            e.raw(&[
+                0x49, 0x89, 0xc8, //             mov r8,rcx (len)
+                0x41, 0xb9, 1, 0, 0, 0, //      mov r9d,1 (wide)
+                0x41, 0xba, 0, 0, 0, 0, //      mov r10d,0
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        // SetCurrentDirectory*(path) -> sub 1, BOOL.
+        b"SetCurrentDirectoryA" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x45, 0x31, 0xc0, //             xor r8d,r8d (ansi)
+                0x41, 0xba, 1, 0, 0, 0, //      mov r10d,1
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        b"SetCurrentDirectoryW" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xb8, 1, 0, 0, 0, //      mov r8d,1 (wide)
+                0x41, 0xba, 1, 0, 0, 0, //      mov r10d,1
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        // GetFullPathName*(path,len,buf,fp) -> sub 2, DWORD chars.
+        // a3 packs (len<<1)|wide; filepart arg ignored (NULL use).
+        b"GetFullPathNameA" => {
+            e.raw(&[
+                0x4c, 0x8d, 0x0c, 0x12, //        lea r9,[rdx+rdx] (len*2)
+                0x48, 0x89, 0xca, //             mov rdx,rcx (path)
+                0x41, 0xba, 2, 0, 0, 0, //      mov r10d,2
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        b"GetFullPathNameW" => {
+            e.raw(&[
+                0x4c, 0x8d, 0x0c, 0x12, //        lea r9,[rdx+rdx] (len*2)
+                0x49, 0x83, 0xc9, 0x01, //        or r9,1 (wide)
+                0x48, 0x89, 0xca, //             mov rdx,rcx (path)
+                0x41, 0xba, 2, 0, 0, 0, //      mov r10d,2
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        // Create/RemoveDirectory*(path[,sa]) -> subs 3/4, BOOL.
+        b"CreateDirectoryA" | b"CreateDirectoryW" => {
+            let wide = name == b"CreateDirectoryW";
+            e.raw(&[0x48, 0x89, 0xca]); //         mov rdx,rcx
+            if wide {
+                e.raw(&[0x41, 0xb8, 1, 0, 0, 0]); // mov r8d,1
+            } else {
+                e.raw(&[0x45, 0x31, 0xc0]); //     xor r8d,r8d
+            }
+            e.raw(&[
+                0x41, 0xba, 3, 0, 0, 0, //      mov r10d,3
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        b"RemoveDirectoryA" | b"RemoveDirectoryW" => {
+            let wide = name == b"RemoveDirectoryW";
+            e.raw(&[0x48, 0x89, 0xca]); //         mov rdx,rcx
+            if wide {
+                e.raw(&[0x41, 0xb8, 1, 0, 0, 0]); // mov r8d,1
+            } else {
+                e.raw(&[0x45, 0x31, 0xc0]); //     xor r8d,r8d
+            }
+            e.raw(&[
+                0x41, 0xba, 4, 0, 0, 0, //      mov r10d,4
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        // GetFileAttributes*(path) -> sub 5, DWORD attrs.
+        b"GetFileAttributesA" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x45, 0x31, 0xc0, //             xor r8d,r8d (ansi)
+                0x41, 0xba, 5, 0, 0, 0, //      mov r10d,5
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        b"GetFileAttributesW" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xb8, 1, 0, 0, 0, //      mov r8d,1 (wide)
+                0x41, 0xba, 5, 0, 0, 0, //      mov r10d,5
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        // GetFileType(h) -> sub 6, DWORD type.
+        b"GetFileType" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 6, 0, 0, 0, //      mov r10d,6
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, 0xc3, //             syscall; ret
+            ]);
+        }
+        // SetEndOfFile(h) -> sub 7, BOOL.
+        b"SetEndOfFile" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 7, 0, 0, 0, //      mov r10d,7
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        // FlushFileBuffers(h) -> sub 8, BOOL.
+        b"FlushFileBuffers" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 8, 0, 0, 0, //      mov r10d,8
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        // GlobalMemoryStatusEx(buf) -> sub 9, BOOL.
+        b"GlobalMemoryStatusEx" => {
+            e.raw(&[
+                0x48, 0x89, 0xca, //             mov rdx,rcx
+                0x41, 0xba, 9, 0, 0, 0, //      mov r10d,9
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        // GetComputerName*(buf,size*) -> sub 10, BOOL.
+        b"GetComputerNameA" => {
+            e.raw(&[
+                0x49, 0x89, 0xd0, //             mov r8,rdx (size*)
+                0x48, 0x89, 0xca, //             mov rdx,rcx (buf)
+                0x45, 0x31, 0xc9, //             xor r9d,r9d (ansi)
+                0x41, 0xba, 10, 0, 0, 0, //     mov r10d,10
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
+        b"GetComputerNameW" => {
+            e.raw(&[
+                0x49, 0x89, 0xd0, //             mov r8,rdx (size*)
+                0x48, 0x89, 0xca, //             mov rdx,rcx (buf)
+                0x41, 0xb9, 1, 0, 0, 0, //      mov r9d,1 (wide)
+                0x41, 0xba, 10, 0, 0, 0, //     mov r10d,10
+                0xb8, 0x00, 0x01, 0, 0, //       mov eax,0x100
+                0x0f, 0x05, //                   syscall
+                0x85, 0xc0, //                   test eax,eax
+                0x0f, 0x94, 0xc0, //             sete al
+                0x0f, 0xb6, 0xc0, //             movzx eax,al
+                0xc3,
+            ]);
+        }
         // IsDebuggerPresent -> PEB.BeingDebugged.
         b"IsDebuggerPresent" => {
             e.raw(&[
@@ -9795,6 +9998,347 @@ pub fn nt_sysinfo(sub: u64, out: u64) -> u64 {
         STATUS_SUCCESS
     } else {
         STATUS_ACCESS_VIOLATION
+    }
+}
+
+/// Read an NT path argument — ANSI cstring or UTF-16 (wide=true) —
+/// and normalize to our unix form: '\' -> '/', a DOS drive prefix
+/// or \??\ gone. ASCII only like nt_create_file; empty/bad reads
+/// and non-ASCII wides fail None.
+fn nt_read_path(pml4: u64, va: u64, wide: bool) -> Option<([u8; 256], usize)> {
+    let mut b = [0u8; 256];
+    let n = if wide {
+        let mut n = 0usize;
+        loop {
+            if n >= 255 {
+                return None;
+            }
+            // Each byte is gated separately: a u16 straddling a
+            // page end must not read into the next physical frame.
+            let lo = translate_r(pml4, va + 2 * n as u64)?;
+            let hi = translate_r(pml4, va + 2 * n as u64 + 1)?;
+            // SAFETY: both are present user bytes in pml4.
+            let u = unsafe {
+                *(lo as *const u8) as u16 | (*(hi as *const u8) as u16) << 8
+            };
+            if u == 0 {
+                break;
+            }
+            if u > 0x7f {
+                return None;
+            }
+            b[n] = u as u8;
+            n += 1;
+        }
+        n
+    } else {
+        read_task_str(pml4, va, &mut b)
+    };
+    if n == 0 {
+        return None;
+    }
+    for c in b[..n].iter_mut() {
+        if *c == b'\\' {
+            *c = b'/';
+        }
+    }
+    let mut st = 0usize;
+    if n >= 4 && &b[..4] == b"/??/" {
+        st = 4;
+    }
+    if n - st >= 2 && b[st + 1] == b':' && b[st].is_ascii_alphabetic() {
+        st += 2;
+    }
+    if st >= n {
+        return None;
+    }
+    let mut out = [0u8; 256];
+    out[..n - st].copy_from_slice(&b[st..n]);
+    Some((out, n - st))
+}
+
+/// unix flat path ("" = root) -> DOS form "C:\a\b" in `out`.
+fn nt_dos_path(upath: &[u8], out: &mut [u8; 260]) -> usize {
+    // "C:\" + path must fit: clamp so a future long caller can't
+    // run past `out` (current callers bound upath <= 256).
+    let upath = &upath[..upath.len().min(257)];
+    out[0] = b'C';
+    out[1] = b':';
+    out[2] = b'\\';
+    let mut n = 3;
+    for &c in upath {
+        out[n] = if c == b'/' { b'\\' } else { c };
+        n += 1;
+    }
+    n
+}
+
+/// Write a DOS path to a user buffer, ANSI or UTF-16. Windows
+/// semantics for the get-dir/get-name APIs: returns the char count
+/// written EXCLUDING the NUL; when the buffer is too small returns
+/// the required size INCLUDING the NUL (caller sees > buflen).
+fn nt_dos_write(
+    pml4: u64,
+    buf: u64,
+    buflen: u64,
+    wide: bool,
+    dos: &[u8],
+) -> u64 {
+    // w[520]/b[260] bound the copy: clamp callers' input to fit.
+    let dos = &dos[..dos.len().min(259)];
+    let need = dos.len() as u64 + 1; // in TCHARs
+    if buflen < need {
+        return need;
+    }
+    let ok = if wide {
+        let mut w = [0u8; 520];
+        for (i, &c) in dos.iter().enumerate() {
+            w[i * 2] = c;
+        }
+        range_ok_w(buf, dos.len() as u64 * 2 + 2)
+            && write_task_bytes(pml4, buf, &w[..dos.len() * 2 + 2])
+    } else {
+        range_ok_w(buf, need) && {
+            let mut b = [0u8; 260];
+            b[..dos.len()].copy_from_slice(dos);
+            write_task_bytes(pml4, buf, &b[..dos.len() + 1])
+        }
+    };
+    if ok {
+        dos.len() as u64
+    } else {
+        0
+    }
+}
+
+/// RUX_PATH(sub, a1, a2, a3): the path/directory/file-attribute
+/// services the Win32 thunk layer serves. String subs return a
+/// DWORD char count, attribute subs a DWORD, the rest NTSTATUS.
+///   0 GetCurrentDirectory(buf,len,wide)     1 SetCurrentDirectory(path,wide)
+///   2 GetFullPathName(in,out,len<<1|wide)   3 CreateDirectory(path,wide)
+///   4 RemoveDirectory(path,wide)            5 GetFileAttributes(path,wide)
+///   6 GetFileType(handle)                   7 SetEndOfFile(handle)
+///   8 FlushFileBuffers(handle)              9 GlobalMemoryStatusEx(buf)
+///  10 GetComputerName(buf,lenptr,wide)
+pub fn nt_pathop(sub: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    use crate::nt::*;
+    let Some(ct) = mm_owner_mut() else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let pml4 = ct.pml4;
+    match sub {
+        0 => {
+            // GetCurrentDirectory: "C:\" + cwd with backslashes.
+            let f = fst(ct);
+            let mut dos = [0u8; 260];
+            let dn = nt_dos_path(&f.cwd[..f.cwdlen as usize], &mut dos);
+            nt_dos_write(pml4, a1, a2, a3 != 0, &dos[..dn])
+        }
+        2 => {
+            // GetFullPathName: canon vs cwd -> DOS form. a3 low bit
+            // is the wide flag, the rest is the buffer length.
+            let (wide, buflen) = (a3 & 1 != 0, a3 >> 1);
+            let Some((p, n)) = nt_read_path(pml4, a1, wide) else {
+                return 0;
+            };
+            let Ok((cp, cn)) = canon_path(u64::MAX, &p[..n]) else {
+                return 0;
+            };
+            let mut dos = [0u8; 260];
+            let dn = nt_dos_path(&cp[..cn], &mut dos);
+            nt_dos_write(pml4, a2, buflen, wide, &dos[..dn])
+        }
+        1 | 3 | 4 | 5 => {
+            let Some((p, n)) = nt_read_path(pml4, a1, a2 != 0) else {
+                return if sub == 5 { u64::MAX } else { STATUS_OBJECT_NAME_INVALID };
+            };
+            let Ok((cp, cn)) = canon_path(u64::MAX, &p[..n]) else {
+                return if sub == 5 { u64::MAX } else { STATUS_NAME_TOO_LONG };
+            };
+            match sub {
+                1 => {
+                    // SetCurrentDirectory: canonical must name a dir;
+                    // the resolved form becomes the new cwd.
+                    let Ok((rp, rn, _)) = resolve_links(&cp[..cn], true) else {
+                        return STATUS_OBJECT_NAME_NOT_FOUND;
+                    };
+                    if !dir_exists(&rp[..rn]) {
+                        return STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
+                    if rn > 128 {
+                        return STATUS_NAME_TOO_LONG;
+                    }
+                    let t = mm_owner_mut().unwrap();
+                    let f = fst(t);
+                    f.cwd[..rn].copy_from_slice(&rp[..rn]);
+                    f.cwdlen = rn as u8;
+                    STATUS_SUCCESS
+                }
+                3 => fs_mkdir_status(&cp[..cn]),
+                4 => fs_rmdir_status(&cp[..cn]),
+                5 => {
+                    // GetFileAttributes: dir -> DIRECTORY, file ->
+                    // ARCHIVE, nothing -> INVALID_FILE_ATTRIBUTES.
+                    if let Ok((rp, rn, _)) = resolve_links(&cp[..cn], true) {
+                        if dir_exists(&rp[..rn]) {
+                            return 0x10; // FILE_ATTRIBUTE_DIRECTORY
+                        }
+                        if is_file(&rp[..rn]) {
+                            return 0x20; // FILE_ATTRIBUTE_ARCHIVE
+                        }
+                    }
+                    u64::MAX // INVALID_FILE_ATTRIBUTES
+                }
+                _ => unreachable!(),
+            }
+        }
+        6..=8 => {
+            // Handle ops: nth must name a file-backed handle.
+            let kind = nt_handle_kind(a1);
+            if sub == 6
+                && (kind == NTH_STDIN || kind == NTH_STDOUT || kind == NTH_STDERR)
+            {
+                // Console/std streams report FILE_TYPE_CHAR.
+                return 2;
+            }
+            let fd = (kind == NTH_FILE)
+                .then(|| nt_handle_fd(a1))
+                .flatten();
+            let Some(fd) = fd else {
+                return if sub == 6 { 0 } else { STATUS_INVALID_HANDLE };
+            };
+            match sub {
+                6 => {
+                    // GetFileType: console/std -> CHAR, pipe -> PIPE,
+                    // regular storage -> DISK, the rest UNKNOWN.
+                    let t = mm_owner_mut().unwrap();
+                    let Some(o) = ofd(t, fd) else { return 0 };
+                    match &o.kind {
+                        FdKind::Stdin | FdKind::Console | FdKind::Dev(_) => 2,
+                        FdKind::Pipe { .. } => 3,
+                        FdKind::File(_) | FdKind::Ram(_) | FdKind::Dir(_) => 1,
+                        _ => 0,
+                    }
+                }
+                7 => {
+                    // SetEndOfFile: truncate at the shared position.
+                    let pos = fd_lseek(fd, 0, 1);
+                    if (pos as i64) < 0 {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    let r = fd_ftruncate(fd, pos);
+                    if (r as i64) < 0 {
+                        STATUS_ACCESS_DENIED
+                    } else {
+                        STATUS_SUCCESS
+                    }
+                }
+                _ => {
+                    // FlushFileBuffers: the VFS is synchronous RAM —
+                    // nothing dirty exists, so a valid handle is
+                    // always an honest success.
+                    STATUS_SUCCESS
+                }
+            }
+        }
+        9 => {
+            // GlobalMemoryStatusEx: 64B struct — real frame counters,
+            // user window for virtual, no paging file.
+            if !range_ok_w(a1, 64) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            let total = crate::kalloc::total_frames() * 4096;
+            let avail = crate::kalloc::free_frames() * 4096;
+            let load = (total - avail)
+                .checked_mul(100)
+                .and_then(|v| v.checked_div(total))
+                .unwrap_or(0);
+            let mut b = [0u8; 64];
+            b[0..4].copy_from_slice(&64u32.to_le_bytes());
+            b[4..8].copy_from_slice(&(load as u32).to_le_bytes());
+            for (off, v) in [
+                (8usize, total),
+                (16, avail),
+                // TotalPageFile/AvailPageFile stay 0 — no paging.
+                (40, crate::elf::USER_VA_HI - crate::elf::USER_VA_LO),
+                (48, crate::elf::USER_VA_HI - crate::elf::USER_VA_LO),
+            ] {
+                b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            if write_task_bytes(pml4, a1, &b) {
+                STATUS_SUCCESS
+            } else {
+                STATUS_ACCESS_VIOLATION
+            }
+        }
+        10 => {
+            // GetComputerName: "RUSTUX" — the caller's *size is the
+            // in/out buffer length (chars, no NUL on input).
+            if !range_ok_w(a2, 4) || !range_ok_w(a1, 1) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            let Some(pa) = translate_r(pml4, a2) else {
+                return STATUS_ACCESS_VIOLATION;
+            };
+            // SAFETY: pa is a present user frame in pml4.
+            let cap = unsafe { (pa as *const u32).read_unaligned() } as u64;
+            if cap < 7 {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            if nt_dos_write(pml4, a1, cap, a3 != 0, b"RUSTUX") != 6 {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            let _ = write_task_bytes(pml4, a2, &6u32.to_le_bytes());
+            STATUS_SUCCESS
+        }
+        _ => STATUS_INVALID_PARAMETER,
+    }
+}
+
+/// mkdir for the NT service: canon already applied, errno->NTSTATUS.
+fn fs_mkdir_status(cpath: &[u8]) -> u64 {
+    use crate::nt::*;
+    if cpath.len() > 255 {
+        return STATUS_NAME_TOO_LONG;
+    }
+    // fs_mkdir resolves a canonical absolute path straight through —
+    // feed it as a root-led path so no second cwd join happens.
+    let mut abs = [0u8; 256];
+    abs[0] = b'/';
+    abs[1..1 + cpath.len()].copy_from_slice(cpath);
+    let r = fs_mkdir(u64::MAX, &abs[..1 + cpath.len()], 0);
+    nt_errno(r)
+}
+
+/// rmdir twin of fs_mkdir_status.
+fn fs_rmdir_status(cpath: &[u8]) -> u64 {
+    use crate::nt::*;
+    if cpath.len() > 255 {
+        return STATUS_NAME_TOO_LONG;
+    }
+    let mut abs = [0u8; 256];
+    abs[0] = b'/';
+    abs[1..1 + cpath.len()].copy_from_slice(cpath);
+    let r = fs_rmdir(u64::MAX, &abs[..1 + cpath.len()]);
+    nt_errno(r)
+}
+
+/// A Linux -errno return to NTSTATUS for the path services.
+fn nt_errno(r: u64) -> u64 {
+    use crate::nt::*;
+    if (r as i64) >= 0 {
+        return STATUS_SUCCESS;
+    }
+    match r as i64 {
+        -2 => STATUS_OBJECT_NAME_NOT_FOUND,
+        -9 => STATUS_INVALID_HANDLE,
+        -13 | -30 => STATUS_ACCESS_DENIED,
+        -17 => STATUS_OBJECT_NAME_COLLISION,
+        -20 => STATUS_OBJECT_PATH_NOT_FOUND,
+        -24 => STATUS_INSUFFICIENT_RESOURCES,
+        -36 => STATUS_NAME_TOO_LONG,
+        -39 => STATUS_DIRECTORY_NOT_EMPTY,
+        _ => STATUS_INVALID_PARAMETER,
     }
 }
 
