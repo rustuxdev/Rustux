@@ -2859,3 +2859,36 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   here), TCP data/FIN retransmission (SynSent covered; Estab
   retransmit still absent — matters for real WAN loss), then
   dpkg/apt prerequisites.
+
+## run-132 — real .deb install: dpkg-deb extract + installed-binary exec
+
+- `debtest` forks busybox `dpkg-deb -x /hello-traditional_2.10-6_amd64.deb
+  /pkgout` — a genuine Debian package (ar container + xz data.tar) —
+  then execs the freshly installed `/pkgout/usr/bin/hello` (DYNAMIC —
+  loads through the staged /lib64 ld.so + libc), verifies the greeting
+  over a capture pipe, and `rm -rf`s the tree. 9/9 checks, exit 0.
+- Two kernel gaps stood between wget and this:
+  1. pipe `fd_write` rejected `len > PIPE_SIZE` with EINVAL — the
+     in-process unxz filter's 64KiB writes died instantly ("short read",
+     nothing extracted). Now Linux semantics: <=PIPE_BUF atomic-or-block,
+     larger writes take available room and return a short count; the
+     waker copies only what fits and deposits the count in ctx.rax.
+  2. `fs_lookup` only resolved initrd-archive names — installed
+     (VFile-backed) binaries couldn't execve. New arm serves the vfile
+     data buffer synchronously, same shadow order open() uses (vfile
+     before archive).
+- `MAX_VFILES` 32->128 and `VDIRS` literal 16->MAX_VDIRS 128 — the
+  package's ~50 files + ~95 dirs (locale trees) overran both caps.
+- 67 tasks, frames 100163 -> 100163 zero leak, qemu exit 33 on BOTH
+  `make run` and `make run-net`; debtest/lstest all ok; per-task exits
+  match the run-131 baseline profile.
+- lstest floor 47->49 (debtest ELF + .deb record).
+- Audit run-105 manual scoped (rubric + cve.now MCP absent — re-verify
+  once configured): no confirmed findings; Dirty-Pipe class stays
+  architecturally absent (private kernel ring). needs_validation: none.
+  Inherited gap noted: pipe OFDs don't honor O_NONBLOCK yet.
+- Env note: push still needs creds on this VM.
+- Next: pipe O_NONBLOCK (EAGAIN), then dpkg proper (`dpkg-deb -x` is the
+  payload path; `dpkg -i` adds maintainer scripts + /var/lib/dpkg status
+  db — needs flock/fcntl locks, then `apt-get` needs method URIs + a
+  real /var).
