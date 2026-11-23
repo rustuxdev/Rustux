@@ -2984,3 +2984,28 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   grep FULL suite logs for "user fault"/"FAIL" — tails hide storms.
 - Next: apt-get prerequisites (method URIs, /var layout, more
   coreutils surface) or pipe O_NONBLOCK (still the open small gap).
+
+## run-135 — pipe O_NONBLOCK (the inherited gap, closed)
+
+- `nbtest` covers the surface — 21/21 checks: pipe2(O_NONBLOCK),
+  empty-read EAGAIN, atomic <=PIPE_BUF write EAGAIN, >PIPE_BUF short
+  write with partial room, F_GETFL/F_SETFL flag round-trips, and a
+  fork-proven blocking wake once nonblock is cleared.
+- Implementation was small because the OFD already carries
+  `nonblock` (UDP uses it): fd_pipe accepts the flag and mints both
+  ends set; the read arm EAGAINs after the writers-EOF/len==0 checks
+  and before the EFAULT/EINTR/block path; the write arm EAGAINs in
+  the no-progress branch (atomicity rules unchanged).
+- alarmtest's `getitimer remaining` check was racy under 71-task
+  round-robin — armed 1s then slept >1s descheduled. Now arms 5s and
+  asserts 0<r<=5s.
+- 71 tasks, frames 100151 -> 100151 zero leak, qemu exit 33 on BOTH
+  make run and make run-net; per-task exits match baseline.
+- Audit run-108 manual scoped (cve.now MCP absent — re-verify once
+  configured): no confirmed findings; errno ordering verified
+  against Linux (EOF/EPIPE/EFAULT/EINTR precede the EAGAIN branch).
+  needs_validation: none.
+- lstest floor 53->54 (nbtest).
+- Env note: push still needs creds on this VM.
+- Next: apt-get prerequisites (method URIs, /var layout, more
+  coreutils surface — apt wants stty/dirname/head etc.).
