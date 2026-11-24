@@ -37,7 +37,7 @@ QEMU cannot feed serial input while a capture channel is attached,
 so the session is scripted guest-side).*
 
 <p align="center">
-  <img src="docs/assets/rustux-doom.gif" alt="DOOM running on Rustux — the original id engine driving the GOP framebuffer through /dev/fb0">
+  <img src="docs/assets/rustux-doom-attract.gif" alt="DOOM running on Rustux — the original id engine driving the GOP framebuffer through /dev/fb0">
 </p>
 
 *Yes, it runs DOOM.* The original id Software engine (the GPL'd
