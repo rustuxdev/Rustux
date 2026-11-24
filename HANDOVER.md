@@ -3413,3 +3413,42 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
 
 ## pending user tests
 - rustux-demo.iso (diagnostic build, commit a0c8b57 kernel) in VMware: boot it, photograph the screen — the sched: launch / first-syscall / beat markers name the dead stage. Pending as of run-147.
+
+## run-148 — legacy BIOS boot via GRUB Multiboot2
+- kernel/src/bios.rs + bios.ld: kernel builds for x86_64-unknown-none as
+  a static 1 MiB ELF with an MB2 header; GRUB i386-pc (grub-mkrescue)
+  handles real mode/A20/E820/VBE/disk; a .code32 trampoline switches to
+  long mode on a 6-page boot pml4 (4 GiB identity), bios_entry parses
+  MB2 tags (mmap->MapEnt, fb->FbDesc, module->initrd, RSDP 14/15 or
+  0xE0000 scan) into the same normalized inputs UEFI builds —
+  rustux_main is now front-end-agnostic (BOOT_ENTS/FbDesc/extra_reserved).
+- Root-cause fixes this rung:
+  - asm<->Rust ABI: x86_64-unknown-none is SysV while every stub passes
+    args in rcx/rdx (win64). report_frame/sched_tick_frame/handle_syscall
+    + the syscall.rs extern block are now extern "win64". Before this,
+    sched_tick_frame returned garbage -> `mov rsp,rax` into .bss statics
+    -> PRB ring destroyed + ASCII-filled fault dumps + vec 0x16.
+  - resv alignment: the MB2 module end is unaligned; add_range seeded
+    buddy blocks from that unaligned base -> corrupt free lists ->
+    garbage frame -> noncanonical memcpy in map_loads (#GP). extra_
+    reserved now rounds start-down/end-up before subtraction.
+  - page-table carve: was at the START of the largest region (0x100000 =
+    the kernel image itself under BIOS); now carved from the region END
+    and capped <4 GiB (trampoline only identity-maps 4 GiB).
+  - Cargo.toml gates uefi dep to target_os=uefi; acpi provide_rsdp;
+    fbcon from_desc splits construction from GOP discovery.
+- `make run-bios`: SeaBIOS -> GRUB -> multiboot2 -> full 72-task suite,
+  exit 33, frames 246152 -> 246152 zero leak. UEFI `make run` still PASS
+  (frames 214356 -> 214356). Note: GRUB's int13 read of the 55MB initrd
+  takes ~70-90s under QEMU TCG — real BIOS/VMware hardware loads it
+  fast; not a hang.
+- Audit: safe-anything MCP scoped scan clean; one real fix in review
+  (mmap entry_size floor 16->20 — CVE-2026-31613 pattern). cve.now
+  checked firmware-parsing classes; GRUB2's own CVEs are build-time
+  tooling, out of scope. security-audit skill still absent — recorded.
+- Serial markers: tramp prints A/B/C/D on COM1 per stage (kept — only
+  visibility into pre-console BIOS bring-up); the F/V/I/T/R dbg_mark
+  probes and buddy canaries were debug scaffolding, all removed.
+- next: VMware boot with the diagnostic ISO (still the open user test);
+  DOS personality (v86 + DPMI + int 21h + VGA 13h) for real DOOM.EXE;
+  pty ofd_release EIO flake.
