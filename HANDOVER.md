@@ -4902,3 +4902,28 @@ than the shell — if so, our vfork's shared-mm/blocking model differs
 from Linux's in a way that changes ash's process tree. Also worth
 checking exit_bookkeeping's orphan sweep for normal (non-thread)
 exits.
+
+## run-194 — pipeline: children gone before the wait (no code change)
+
+Full-neighbourhood trace at the shell's ECHILD (newest tasks, with
+pid/ppid/state):
+
+    E142 148/41/1 149/103/0 147/35/0
+
+The shell is pid 142; the tasks newer than it carry other parents
+(41, 103, 35) and one is an Exited zombie of task 41. NOT ONE task
+has ppid == 142. So by the time the shell calls wait4(-1) its
+pipeline children are gone entirely — not re-parented and visible,
+but reaped.
+
+That closes the loop on the mechanism: the children are orphaned
+(ppid -> 0) somewhere and pick_next's zombie pass then reaps them
+(`t.ppid == 0` is immediately reapable). The only code that clears
+ppid is exit_bookkeeping's orphan sweep, which currently runs for a
+dying THREAD's children — so either a non-thread exit is taking that
+path, or the children's parent is the intermediate vfork child and
+its exit orphans them.
+
+Concrete next step (cheap): instrument the orphan sweep to print
+(dead pid, child pid) via user_out, and run the pipeline. That names
+the intermediate in one boot.
