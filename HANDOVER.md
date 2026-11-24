@@ -4770,3 +4770,28 @@ Verified: 2 consecutive boots PASS exit 33, 75 tasks, frames X -> X
 zero leak, ia32test exit 0.
 Audit: scoped quick run (run-15) — the arm is one line onto the
 shared wait4.
+
+## run-189 — pipeline status: root symptom found (no code change)
+
+Traced the shell during a pipeline run (per-syscall printk on exe
+"uname" for nr 114/7/2/190). The decisive line:
+
+    tr: pid=146 nr=114 a1=0xffffffff ret=0xfffffffffffffff6
+
+i.e. the shell's wait4(-1, ...) returns -ECHILD while the pipeline's
+children exist. ash treats that as "no children" and reports an
+error, which is why the pipeline's exit status is unreliable
+(measured 4-5 of 5 runs failing, status decoding as -1 because
+wait4 never wrote it).
+
+So the open bug is in the wait4/zombie-reap interaction, not the
+shell: either (a) the children's ppid is wrong by the time the shell
+waits, or (b) pick_next's "reapable" zombie pass collected them
+first because the parent looked non-live (the pass treats Blocked as
+living — worth re-checking the vfork case, where the parent blocks in
+WaitOn::Vfork and may be seen as non-live mid-handoff), or (c) the
+children had not yet been linked when wait4 scanned.
+
+Next session: print ppid/state for the shell's children at the
+ECHILD point, and re-check pick_next's live-snapshot against a
+parent that is Blocked in WaitOn::Vfork.
