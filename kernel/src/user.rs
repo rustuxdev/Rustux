@@ -8280,11 +8280,12 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
 /// it in the task's TLS slot array and installs it in the GDT, then
 /// writes the chosen entry NUMBER back (glibc derives the %gs selector
 /// as entry*8+3 itself). Compat-only: 64-bit TLS is arch_prctl's MSR.
-pub fn sys_set_thread_area(u_info: u64) -> u64 {
-    const ESRCH: u64 = (-3i64) as u64;
-    let Some(t) = cur_mut() else { return ESRCH };
-    if !t.is_compat || !range_ok(u_info, 16) || !range_ok_w(u_info, 4) {
-        return EINVAL;
+/// Parse an i386 `struct user_desc` (16 bytes; the flags are ONE u32
+/// at offset 12) into (requested entry number, GDT descriptor, base).
+/// None when the pointer does not resolve to a readable 16 bytes.
+fn parse_user_desc(u_info: u64) -> Option<(u32, u64, u64)> {
+    if !range_ok(u_info, 16) {
+        return None;
     }
     // SAFETY: validated user range in this task's address space.
     let (entry, base, limit) = unsafe {
@@ -8294,9 +8295,6 @@ pub fn sys_set_thread_area(u_info: u64) -> u64 {
             ((u_info + 8) as *const u32).read_unaligned(),
         )
     };
-    // struct user_desc packs its flags into ONE u32 at offset 12:
-    // seg_32bit:1, contents:2, read_exec_only:1, limit_in_pages:1,
-    // seg_not_present:1, useable:1, lm:1 (Linux's layout).
     let f = unsafe { ((u_info + 12) as *const u32).read_unaligned() };
     let (seg_32bit, contents, read_exec_only) = (f & 1, (f >> 1) & 3, (f >> 3) & 1);
     let (limit_in_pages, seg_not_present, useable) = ((f >> 4) & 1, (f >> 5) & 1, (f >> 6) & 1);
@@ -8314,6 +8312,23 @@ pub fn sys_set_thread_area(u_info: u64) -> u64 {
         | ((seg_32bit as u64 & 1) << 54) // D/B
         | ((limit_in_pages as u64 & 1) << 55) // G
         | (((base as u64 >> 24) & 0xff) << 56); // base31_24
+    Some((entry, desc, base as u64))
+}
+
+/// set_thread_area(u_info): i386 TLS install — Linux's GDT TLS-entry
+/// scheme. Keeps the descriptor in the task's TLS slot array and
+/// installs it in the GDT, then writes the chosen entry NUMBER back
+/// (glibc derives the %gs selector as entry*8+3 itself). Compat-only:
+/// 64-bit TLS is arch_prctl's MSR.
+pub fn sys_set_thread_area(u_info: u64) -> u64 {
+    const ESRCH: u64 = (-3i64) as u64;
+    let Some(t) = cur_mut() else { return ESRCH };
+    if !t.is_compat || !range_ok_w(u_info, 4) {
+        return EINVAL;
+    }
+    let Some((entry, desc, base)) = parse_user_desc(u_info) else {
+        return EINVAL;
+    };
     // -1 asks the kernel to pick the first free slot (glibc's startup
     // call); an explicit entry must be one of our TLS slots.
     let slot = if entry == u32::MAX {
@@ -8337,7 +8352,7 @@ pub fn sys_set_thread_area(u_info: u64) -> u64 {
     // enough — mirror the base into gs_base (written to the MSR on
     // every switch). A compat-mode load (the task's own `mov gs`)
     // reads the descriptor, which carries the same base.
-    t.gs_base = base as u64;
+    t.gs_base = base;
     // SAFETY: validated writable user range (entry_number).
     unsafe { (u_info as *mut u32).write_unaligned(num) };
     0
@@ -10583,6 +10598,19 @@ fn ofd(t: &mut Task, fd: u64) -> Option<&'static mut OpenFile> {
 }
 
 /// May `fd` be a write() target? Only the console streams.
+/// Debug: describe the current task's fd kind.
+pub fn fd_kind_dbg(fd: u64) -> u32 {
+    let Some(t) = cur_mut() else { return 0xdead };
+    match ofd(t, fd).map(|o| &o.kind) {
+        Some(FdKind::Stdin) => 1,
+        Some(FdKind::Console) => 2,
+        Some(FdKind::Ram(_)) => 3,
+        Some(FdKind::Dev(i)) => 0x100 + (*i as u32 & 0xff),
+        Some(_) => 4,
+        None => 0xff,
+    }
+}
+
 pub fn fd_is_console(fd: u64) -> bool {
     let Some(t) = cur_mut() else { return false };
     matches!(ofd(t, fd).map(|o| &o.kind), Some(FdKind::Console))
@@ -23271,7 +23299,11 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         name: p.name,
         exe: p.exe,
         exe_len: p.exe_len,
-        fs_base: if settls { tls } else { p.fs_base },
+        // CLONE_SETTLS means different things per ABI: a raw FS base
+        // on x86_64, a struct user_desc pointer under i386. The
+        // compat descriptor is installed below (needs the child's
+        // TLS slot array, which is copied from the parent here).
+        fs_base: if settls && !p.is_compat { tls } else { p.fs_base },
         rseq_va: 0,
         clear_ctid: 0,
         pgid: p.pgid,
@@ -23306,6 +23338,28 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
     };
     if c.tgid == 0 {
         c.tgid = c.pid; // a non-THREAD clone leads its own group
+    }
+    // i386 CLONE_SETTLS: the argument is a struct user_desc pointer.
+    // Install it into the child's own TLS slots (Linux's
+    // set_tls_desc on the clone path); a bad pointer leaves the
+    // parent's TLS in place rather than failing the clone.
+    if settls && c.is_compat {
+        if let Some((entry, desc, base)) = parse_user_desc(tls) {
+            let slot = if entry == u32::MAX {
+                (0..cpu::TLS_SLOTS).find(|&i| c.tls[i] == 0)
+            } else if (cpu::TLS_SLOT_BASE..cpu::TLS_SLOT_BASE + cpu::TLS_SLOTS)
+                .contains(&(entry as usize))
+            {
+                Some(entry as usize - cpu::TLS_SLOT_BASE)
+            } else {
+                None
+            };
+            if let Some(slot) = slot {
+                c.tls[slot] = desc;
+                c.gs_sel = (((cpu::TLS_SLOT_BASE + slot) * 8 + 3) as u32) as u16;
+                c.gs_base = base;
+            }
+        }
     }
     let cpid = c.pid;
     tasks[slot] = Some(c);

@@ -11,17 +11,17 @@ static void check(int c) { if (!c) fails++; }
 
 static long sc0(long n) {
     long r;
-    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n));
+    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n) : "memory");
     return r;
 }
 static long sc1(long n, long a1) {
     long r;
-    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a1));
+    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a1) : "memory");
     return r;
 }
 static long sc3(long n, long a1, long a2, long a3) {
     long r;
-    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a1), "c"(a2), "d"(a3));
+    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a1), "c"(a2), "d"(a3) : "memory");
     return r;
 }
 static long sc6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
@@ -32,11 +32,46 @@ static long sc6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
         "int $0x80\n\t"
         "pop %%ebp"
         : "=a"(r)
-        : "a"(n), "b"(a1), "c"(a2), "d"(a3), "S"(a4), "D"(a5), "r"(a6));
+        : "a"(n), "b"(a1), "c"(a2), "d"(a3), "S"(a4), "D"(a5), "r"(a6)
+        : "memory");
     return r;
 }
 
 static const char msg[] = "ia32: compat task alive\n";
+
+// Compat clone child: a real function so the child's prologue builds
+// its own frame on the new stack (what glibc's clone stub does) —
+// resuming straight into the parent's frame would read garbage.
+static int tpipe[2];
+__attribute__((used)) int twrite_ret;
+__attribute__((used)) char tbyte = 'T';
+__attribute__((used)) void thread_body(void) {
+    char t = 'T';
+    tbyte = t; // publish via a static: the child's own stack write
+    twrite_ret = (int)sc3(4, tpipe[1], (long)&tbyte, 1);
+    sc1(1, 0); // thread-only exit
+    for (;;) {}
+}
+// glibc's clone-stub shape: issue clone, branch on the return in eax
+// (never reloaded from a stack slot — the child's stack is new), and
+// call a real function so its prologue builds a frame there.
+__attribute__((used)) long clone_stack_top;
+__attribute__((naked)) long clone_thread(void) {
+    __asm__ volatile(
+        "movl $120, %eax\n\t"      // clone
+        "movl $0x10f00, %ebx\n\t"  // VM|FS|FILES|SIGHAND|THREAD
+        "movl clone_stack_top, %ecx\n\t"
+        "xorl %edx, %edx\n\t"      // ptid
+        "xorl %esi, %esi\n\t"      // tls
+        "xorl %edi, %edi\n\t"      // ctid
+        "int $0x80\n\t"
+        "testl %eax, %eax\n\t"
+        "jz 1f\n\t"
+        "ret\n\t"
+        "1:\n\t"
+        "call thread_body\n\t"
+        "ud2\n\t");
+}
 
 // The ABI stack must be read BEFORE any C prologue runs — a naked
 // _start stashes argc/argv, then main32 does the checking in C.
@@ -130,6 +165,7 @@ void main32(void) {
     check(st.st_size > 0);
     check(st.st_ino != 0 && st.__st_ino == (unsigned int)st.st_ino);
     check(st.st_nlink == 1);
+    long motsize = (long)st.st_size; // st is reused for the console below
 
     // read(3) + close(6) through the compat fd layer.
     char fb[64];
@@ -158,7 +194,7 @@ void main32(void) {
     __builtin_memcpy(&stx_mask, stx, 4);
     __builtin_memcpy(&stx_size_lo, stx + 40, 4);
     check((stx_mask & 0x7ff) != 0);
-    check(stx_size_lo == (unsigned int)st.st_size);
+    check(stx_size_lo == (unsigned int)motsize);
 
     // clock_gettime32 — ia32 nr 265: two i32 fields.
     struct { int sec; int nsec; } ts;
@@ -190,6 +226,22 @@ void main32(void) {
     long w = sc3(7, cpid, (long)&wstatus, 0);
     check(w == cpid);
     check(wstatus == (7 << 8)); // normal exit, status 7
+
+    { static const char m[] = "M3\n"; sc3(4, 1, (long)m, 3); }
+    // ---- clone thread (ia32 nr 120): VM|FS|FILES|SIGHAND|THREAD.
+    // The child calls a real function on the new stack and writes one
+    // byte into a pipe; the parent blocks reading it — a deterministic
+    // handshake that proves the thread ran on the shared mm.
+    check(sc1(42, (long)tpipe) == 0);
+    long tstk = sc6(192, 0, 0x4000, 3, 0x22, -1, 0); // mmap2 16 KiB
+    check(tstk > 0);
+    clone_stack_top = tstk + 0x4000 - 0x100;
+    long tid = clone_thread(); // child never returns here
+    check(tid > 0);
+    char rb = 0;
+    check(sc3(3, tpipe[0], (long)&rb, 1) == 1);
+    check(twrite_ret == 1);
+    check(rb == 'T');
 
     // Unknown ia32 number -> -ENOSYS (38), not a crash.
     check(sc0(999) == -38);
