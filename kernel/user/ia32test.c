@@ -327,6 +327,7 @@ void main32(void) {
         av[2] = (unsigned int)a2;
         av[3] = 0;
         sc3(11, (long)"/uname", (long)av, 0);
+        (void)av;
         sc1(1, 9); // exec failed
         for (;;) {}
     }
@@ -334,6 +335,27 @@ void main32(void) {
     static volatile int sh_status;
     check(sc3(7, spid, (long)&sh_status, 0) == spid);
     check(sh_status == 0);
+
+    // ---- integration: CROSS-ABI exec — a compat child execs the
+    // initrd's 64-bit busybox as `cat /motd.txt`. The task switches
+    // to ELF64 (is_compat=false) inside exec; exit 0 plus the motd
+    // text on the console proves the whole path.
+    long ppid2 = sc0(2);
+    if (ppid2 == 0) {
+        static char a0[] = "cat";
+        static char a1[] = "/motd.txt";
+        unsigned int av[3];
+        av[0] = (unsigned int)a0;
+        av[1] = (unsigned int)a1;
+        av[2] = 0;
+        sc3(11, (long)"/bin/cat", (long)av, 0);
+        sc1(1, 9); // exec failed
+        for (;;) {}
+    }
+    check(ppid2 > 0);
+    static volatile int cat_status;
+    check(sc3(7, ppid2, (long)&cat_status, 0) == ppid2);
+    check(cat_status == 0);
 
     // Unknown ia32 number -> -ENOSYS (38), not a crash.
     check(sc0(999) == -38);
