@@ -9952,6 +9952,26 @@ pub fn sys_clock_gettime(clk: u64, ts: u64) -> u64 {
     0
 }
 
+/// clock_gettime for i386: struct timespec32 is two i32 fields — the
+/// 32-bit ABI's timespec, distinct from the x86_64 two-i64 layout.
+pub fn sys_clock_gettime32(clk: u64, ts: u64) -> u64 {
+    if !range_ok_w(ts, 8) {
+        return EFAULT;
+    }
+    let (s, ns) = if matches!(clk, 0 | 5 | 8) {
+        crate::rtc::wall_now()
+    } else {
+        let t = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        (t / 100, (t % 100) * 10_000_000)
+    };
+    // SAFETY: ts validated writable for 8 bytes; i386 timespec32.
+    unsafe {
+        (ts as *mut i32).write_unaligned(s as i32);
+        (ts as *mut i32).add(1).write_unaligned(ns as i32);
+    }
+    0
+}
+
 /// mkdir/mkdirat(dirfd, path, mode): create an explicit VDIRS dir —
 /// mode is accepted and ignored (no per-file modes yet). EEXIST on
 /// any existing name; the parent must already be a directory.
@@ -14124,6 +14144,64 @@ pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
             0
         }
     }
+}
+
+/// Write i386's packed 96-byte `struct stat64` from a filled
+/// 144-byte x86_64 stat array. Field map (Linux asm/stat.h):
+/// dev@0, __st_ino@12, mode@16, nlink@20, uid@24, gid@28, rdev@32,
+/// size@44, blksize@52, blocks@56, atime@64, mtime@72, ctime@80,
+/// ino@88 — 32-bit times, 64-bit size/blocks/ino.
+pub fn emit_stat64(st: &[u64; 18], statbuf: u64) -> u64 {
+    const STAT64_LEN: u64 = 96;
+    if !range_ok_w(statbuf, STAT64_LEN) {
+        return EFAULT;
+    }
+    let mut b = [0u8; 96];
+    b[0..8].copy_from_slice(&st[0].to_le_bytes()); // st_dev
+    b[12..16].copy_from_slice(&(st[1] as u32).to_le_bytes()); // __st_ino
+    b[16..20].copy_from_slice(&(st[3] as u32).to_le_bytes()); // mode
+    b[20..24].copy_from_slice(&(st[2] as u32).to_le_bytes()); // nlink
+    b[24..28].copy_from_slice(&((st[3] >> 32) as u32).to_le_bytes()); // uid
+    b[28..32].copy_from_slice(&(st[4] as u32).to_le_bytes()); // gid
+    b[32..40].copy_from_slice(&st[5].to_le_bytes()); // st_rdev
+    b[44..52].copy_from_slice(&st[6].to_le_bytes()); // st_size
+    b[52..56].copy_from_slice(&(st[7] as u32).to_le_bytes()); // blksize
+    b[56..64].copy_from_slice(&st[8].to_le_bytes()); // blocks
+    b[64..68].copy_from_slice(&(st[9] as u32).to_le_bytes()); // atime
+    b[68..72].copy_from_slice(&(st[10] as u32).to_le_bytes()); // atime_nsec
+    b[72..76].copy_from_slice(&(st[11] as u32).to_le_bytes()); // mtime
+    b[76..80].copy_from_slice(&(st[12] as u32).to_le_bytes()); // mtime_nsec
+    b[80..84].copy_from_slice(&(st[13] as u32).to_le_bytes()); // ctime
+    b[84..88].copy_from_slice(&(st[14] as u32).to_le_bytes()); // ctime_nsec
+    b[88..96].copy_from_slice(&st[1].to_le_bytes()); // st_ino
+    // SAFETY: range_ok_w proved statbuf is a writable user range.
+    unsafe {
+        core::ptr::copy_nonoverlapping(b.as_ptr(), statbuf as *mut u8, 96)
+    };
+    0
+}
+
+/// fstatat64(dirfd, path, statbuf, flags) for i386 — the path is
+/// resolved like newfstatat, the metadata reshaped to stat64.
+/// AT_EMPTY_PATH (0x1000) with an empty path stats the dirfd itself,
+/// which is how glibc's fstat() reaches here.
+pub fn newfstatat32(dirfd: u64, path: &[u8], statbuf: u64, flags: u64) -> u64 {
+    let nofollow = flags & 0x100 != 0;
+    let st = if path.is_empty() {
+        if flags & 0x1000 == 0 {
+            return ENOENT;
+        }
+        match statx_dirfd_stat(dirfd, nofollow) {
+            Ok(s) => s,
+            Err(e) => return e,
+        }
+    } else {
+        match fill_stat(path, nofollow) {
+            Ok(s) => s,
+            Err(e) => return e,
+        }
+    };
+    emit_stat64(&st, statbuf)
 }
 
 /// Explicitly-created directories — the ram layer's mkdir.

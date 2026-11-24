@@ -92,6 +92,84 @@ void main32(void) {
     char rnd[16];
     check(sc3(355, (long)rnd, 16, 0) == 16);
 
+    // ---- stat64 shims: glibc's stat family lands on fstatat64
+    // (300), fstat64 (197), openat (295), statx (383) and
+    // clock_gettime32 (265). struct stat64 is i386's packed 96-byte
+    // layout — 32-bit times, 64-bit size/blocks/ino.
+    struct stat64 {
+        unsigned long long st_dev;      // 0
+        unsigned char pad0[4];          // 8
+        unsigned int __st_ino;          // 12
+        unsigned int st_mode;           // 16
+        unsigned int st_nlink;          // 20
+        unsigned int st_uid;            // 24
+        unsigned int st_gid;            // 28
+        unsigned long long st_rdev;     // 32
+        unsigned char pad3[4];          // 40
+        long long st_size;              // 44
+        unsigned int st_blksize;        // 52
+        unsigned long long st_blocks;   // 56
+        unsigned int st_atime;          // 64
+        unsigned int st_atime_nsec;     // 68
+        unsigned int st_mtime;          // 72
+        unsigned int st_mtime_nsec;     // 76
+        unsigned int st_ctime;          // 80
+        unsigned int st_ctime_nsec;     // 84
+        unsigned long long st_ino;      // 88
+    } __attribute__((packed));
+    check(sizeof(struct stat64) == 96);
+
+    // openat(AT_FDCWD, "/motd.txt", O_RDONLY) — ia32 nr 295.
+    long fd = sc6(295, -100, (long)"/motd.txt", 0, 0, 0, 0);
+    check(fd >= 3);
+
+    // fstat64 — ia32 nr 197: regular file, sane size/ino/nlink.
+    struct stat64 st;
+    check(sc3(197, fd, (long)&st, 0) == 0);
+    check((st.st_mode & 0xf000) == 0x8000); // S_IFREG
+    check(st.st_size > 0);
+    check(st.st_ino != 0 && st.__st_ino == (unsigned int)st.st_ino);
+    check(st.st_nlink == 1);
+
+    // read(3) + close(6) through the compat fd layer.
+    char fb[64];
+    check(sc3(3, fd, (long)fb, sizeof(fb)) > 0);
+    check(sc1(6, fd) == 0);
+
+    // fstatat64 — ia32 nr 300: same file by path; size agrees.
+    struct stat64 st2;
+    check(sc6(300, -100, (long)"/motd.txt", (long)&st2, 0, 0, 0) == 0);
+    check(st2.st_size == st.st_size);
+    check((st2.st_mode & 0xf000) == 0x8000);
+
+    // lstat path: AT_SYMLINK_NOFOLLOW (0x100) on a regular file is
+    // the same answer.
+    check(sc6(300, -100, (long)"/motd.txt", (long)&st2, 0x100, 0, 0) == 0);
+    check((st2.st_mode & 0xf000) == 0x8000);
+
+    // fstat64 on the console fd — a character device.
+    check(sc3(197, 1, (long)&st, 0) == 0);
+    check((st.st_mode & 0xf000) == 0x2000); // S_IFCHR
+
+    // statx — ia32 nr 383: 256-byte struct, mask reports basic stats.
+    unsigned char stx[256];
+    check(sc6(383, -100, (long)"/motd.txt", 0, 0xfff, (long)stx, 0) == 0);
+    unsigned int stx_mask, stx_size_lo;
+    __builtin_memcpy(&stx_mask, stx, 4);
+    __builtin_memcpy(&stx_size_lo, stx + 40, 4);
+    check((stx_mask & 0x7ff) != 0);
+    check(stx_size_lo == (unsigned int)st.st_size);
+
+    // clock_gettime32 — ia32 nr 265: two i32 fields.
+    struct { int sec; int nsec; } ts;
+    check(sc3(265, 1, (long)&ts, 0) == 0); // CLOCK_MONOTONIC
+    check(ts.sec >= 0 && ts.nsec >= 0);
+
+    // clock_gettime64 — ia32 nr 403: the timespec64 layout.
+    struct { long long sec; long long nsec; } ts64;
+    check(sc3(403, 1, (long)&ts64, 0) == 0);
+    check(ts64.sec >= 0);
+
     // Unknown ia32 number -> -ENOSYS (38), not a crash.
     check(sc0(999) == -38);
 

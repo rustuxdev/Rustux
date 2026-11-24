@@ -708,6 +708,22 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         220 => user::fd_getdents(a1, a2, a3),
         172 => user::sys_prctl(a1, a2),
         191 => user::sys_ugetrlimit(a1),
+        // i386 stat64 family — glibc's stat/lstat/fstat land on 195/
+        // 196/197 (and fstatat64 300); struct stat64 is the packed
+        // 96-byte i386 layout, not the 144-byte x86_64 one.
+        195 => sys_fstatat64(u64::MAX, a1, a2, 0),
+        196 => sys_fstatat64(u64::MAX, a1, a2, 0x100),
+        197 => match user::fill_fstat(a1) {
+            Ok(st) => user::emit_stat64(&st, a2),
+            Err(e) => e,
+        },
+        265 => user::sys_clock_gettime32(a1, a2),
+        295 => sys_openat(a1, a2, a3, a4),
+        300 => sys_fstatat64(a1, a2, a3, a4),
+        // statx: same 256-byte struct on both ABIs.
+        383 => sys_statx(a1, a2, a3, a4, a5),
+        // clock_gettime64 — timespec64 is the x86_64 layout.
+        403 => user::sys_clock_gettime(a1, a2),
         224 => user::sys_gettid(),
         // i386 TLS install — glibc's startup calls this before it
         // touches %gs-based errno/TCB.
@@ -766,6 +782,31 @@ fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
         Err(e) => return e,
     };
     user::newfstatat(&cb[..cn], statbuf, flags & 0x100 != 0)
+}
+
+/// fstatat64(dirfd, path, statbuf, flags) for i386 — getname+canon
+/// then the stat64 shim. A NULL path is legal only with AT_EMPTY_PATH
+/// (glibc's fstat reaches here that way).
+fn sys_fstatat64(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
+    if path == 0 {
+        if flags & 0x1000 == 0 {
+            return EFAULT;
+        }
+        return user::newfstatat32(dirfd, &[], statbuf, flags);
+    }
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if n == 0 {
+        return user::newfstatat32(dirfd, &[], statbuf, flags);
+    }
+    let (cb, cn) = match user::canon_path(dirfd, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::newfstatat32(dirfd, &cb[..cn], statbuf, flags)
 }
 
 /// statx(dirfd, path, flags, mask, statxbuf): the modern stat ABI —
