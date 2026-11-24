@@ -4510,3 +4510,25 @@ one-liners onto already-audited implementations, fork is bounded by
 MAX_TASKS, and compat exec reuses the validated getname + elf parse
 path. Parent performed hunt/critic inline (rate limit) — no
 independent clean-coverage claim.
+
+## run-178 — pty flake root-caused and fixed (open since run-138)
+
+The intermittent `ptytest: slave write FAIL errno=5` + 2-frame leak
+is gone. Root cause: TIOCGPTPEER derived the new OFD's vfile index
+with `vs.iter().flatten().position(...)` — the position in the
+LIVE-ONLY sequence, not the VFILE slot. With holes in VFILES (freed
+pty nodes) the OFD named a different node — often the pair's MASTER
+— so closing the returned fd decremented `mopen` instead of `sopen`.
+The master count hit 0 while the test still held it, pty_write
+answered EIO (hangup), and the pair retired with its two ring frames
+still referenced (the leak). Fixed by using the slot index:
+`vs.iter().position(|v| v.as_ref().is_some_and(...))`. Only
+occurrence of the pattern in the tree (grep-verified).
+
+Verification: 8 consecutive boots, 7 observed — all ptytest exit(0)
+with `frames X -> X` zero leak.
+
+Suite: make run PASS exit 33, 75 tasks, zero leak, ia32test exit(0).
+Audit: scoped quick run (run-6). No trust-boundary finding (the bug
+is a reference-count/identity error confined to the caller's own
+pty), recorded as a lifecycle-correctness fix.
