@@ -718,6 +718,9 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         146 => sys_writev32(ctx, a1, a2, a3),
         162 => user::sys_nanosleep32(ctx, a1, a2),
         168 => user::fd_poll(ctx, a1, a2, a3 as i32 as i64),
+        // fcntl64: modern i386 (glibc/busybox) uses it for
+        // F_DUPFD_CLOEXEC, which the old 32-bit fcntl cannot express.
+        221 => user::sys_fcntl(a1, a2, a3),
         119 | 173 => user::rt_sigreturn32(ctx),
         126 | 175 => user::rt_sigprocmask32(a1, a2, a3, if nr == 175 { a4 } else { 4 }),
         // i386 process creation: fork(2), waitpid(7), execve(11).

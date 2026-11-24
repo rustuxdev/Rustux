@@ -364,6 +364,13 @@ void main32(void) {
     static const char c_plain[] = "cat /motd.txt";
     int s_plain = run_sh(c_plain);
     check(s_plain == 0); // motd text appears on the console
+    // A redirect needs fcntl64 (i386 nr 221) for F_DUPFD_CLOEXEC.
+    static const char c_redir[] = "cat /motd.txt > /dev/null";
+    int s_redir = run_sh(c_redir);
+    check(s_redir == 0);
+    // NOTE: `cat /motd.txt | cat > /dev/null` still HANGS (recorded
+    // in HANDOVER) — the pipeline path is not asserted here or the
+    // suite would never finish.
 
     // Unknown ia32 number -> -ENOSYS (38), not a crash.
     check(sc0(999) == -38);
