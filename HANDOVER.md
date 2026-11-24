@@ -4428,3 +4428,48 @@ inline (rate limit) — no independent clean-coverage claim.
 Follow-on: ia32 fork/clone/execve/wait4 + ia32 signal frames (also
 makes run-173's slot-source fix validation plan executable), then
 timeval32/iovec32 shims.
+
+## run-176 — compat identity-map hazards: slot-0 restore + 2M KRESV
+
+Investigation rung for i386 fork/execve/wait4. The arms themselves are
+NOT landed (reverted): bringing them up exposed two real hazards that
+only bite when UEFI loads the kernel image BELOW 4 GiB — and the fix
+for those is what this rung ships.
+
+* Hazard 1: exec's and exit's compat teardown zeroed PML4 slot 0
+  after freeing the private PDPT. With the image below 4 GiB the
+  kernel's own code/statics ARE slot 0, and exec/exit keep running on
+  that cr3 until the next switch — zeroing the slot unmapped the
+  kernel under itself (CPL0 #PF loop at an image VA, e.g.
+  0x3d8af6d0, IP==CR2, stack walking down to a triple fault). Fixed:
+  free_user_mappings restores rd64(kernel_pml4()) instead of 0.
+* Hazard 2: map_page32 splits a 2M identity leaf into a PT when a
+  user page lands under it, and teardown frees that PT — so a split
+  region loses its identity mapping afterwards. A page-exact KRESV
+  entry was not enough: a compat page anywhere in the image's 2M
+  region could strand the image. Fixed: kresv_2m() rejects compat VAs
+  whose 2 MiB region intersects a KRESV span.
+* Groundwork kept: collect_strs takes an ABI stride — 4-byte pointer
+  slots for i386 argv/envp, 8-byte for x86_64 (compat execve needs
+  it; not reachable until the ia32 arms land).
+* Debug notes for the next rung: with the arms in, fork+exec+wait4
+  DID work end-to-end (child exec'd /ia32child, printed, exited 7;
+  the parent collected the pid and the kernel wrote 0x700 to the
+  parent's status buffer), but runs were flaky: QEMU's MTTCG hit
+  `qemu_mutex_lock_iothread_impl` assertions / triple-fault exits on
+  some boots (image below 4 GiB), while `-accel tcg,thread=single`
+  passed. Diagnose with single-threaded TCG before trusting a
+  failure. Also: the compat parent's wait4 status check read -1 even
+  though exitwake logged st=0x700 written to the right address —
+  unresolved, suspect test-side stack aliasing (a static volatile
+  status was the next experiment).
+* Follow-on: durable fix = higher-half kernel (image never in slot 0)
+  or an image-GiB reservation; then re-land ia32 fork/clone/execve/
+  wait4 + ia32 signal frames.
+
+Suite: make run PASS exit 33 — 74 tasks incl. ia32test exit(0) and
+uname exit(0); frames 213331 -> 213331 zero leak.
+Audit: scoped quick run (run-4). No findings: both changes only
+restore supervisor-only kernel mappings or reject user mappings.
+Parent performed hunt/critic inline (rate limit) — no independent
+clean-coverage claim.
