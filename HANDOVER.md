@@ -4795,3 +4795,24 @@ children had not yet been linked when wait4 scanned.
 Next session: print ppid/state for the shell's children at the
 ECHILD point, and re-check pick_next's live-snapshot against a
 parent that is Blocked in WaitOn::Vfork.
+
+## run-190 — pipeline status: negative results (no code change)
+
+Two more experiments, both negative — recorded so the next session
+does not repeat them:
+
+* Mapping ia32 vfork (190) to a full fork() instead of
+  clone_vm/sys_vfork did NOT make the pipeline reliable (it still
+  hung in the same place). So the failure is not vfork-specific.
+* The ECHILD diagnostic in wait4 fires for several tasks (e.g. a task
+  waiting on a pid that no longer exists), which means children are
+  being reaped before their parent collects them somewhere — but the
+  printk ring drops the shell's own ECHILD lines, so it could not be
+  correlated within the run.
+
+State of the investigation: the three missing syscalls (fcntl64 221,
+pipe2 331, wait4 114) are landed and audited; plain commands and
+redirects through the i386 shell are reliable; the pipeline still
+needs a correlation-safe trace (write the diagnostic to a per-task
+buffer or to the console via user_out instead of printk) to see the
+shell's own children at its ECHILD point.
