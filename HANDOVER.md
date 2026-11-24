@@ -4679,3 +4679,31 @@ Verified: PASS exit 33, 75 tasks, frames 213333 -> 213333 zero leak,
 both ia32test tasks exit 0, motd text on the console.
 Audit: scoped quick run (run-12) — the arm is a one-liner onto the
 audited vfork path.
+
+## run-185 — investigation notes: i386 shell pipelines (no code change)
+
+Narrowed the run-184 gap without landing code. What WORKS from a
+compat task, verified directly in ia32test (each check green):
+
+* creating a fresh ABSOLUTE path with openat(O_WRONLY|O_CREAT|O_TRUNC,
+  0644), writing a byte, closing, reopening and reading it back;
+* opening /dev/null with the exact flags a `>` redirect uses
+  (O_WRONLY|O_CREAT|O_TRUNC) — so the redirect target is not the
+  problem;
+* `busybox sh -c "cat /motd.txt"` — the shell vforks and execs the
+  64-bit cat and the motd reaches the console (run-184).
+
+So the failure is ash-specific, not the fs: both
+`sh -c "cat /motd.txt > /dev/null"` and
+`sh -c "cat /motd.txt | cat > /dev/null"` exit non-zero (1 and 2)
+while the same commands without a redirect/pipeline work. Next
+session should look at what ash does around the spawn: it may use
+fcntl(F_DUPFD_CLOEXEC)/F_SETFD, setpgid/tcsetpgrp, or a
+pipe2-style call our ia32 table lacks (i386 pipe2 is nr 359,
+unwired; 42 pipe is wired). Trace with a per-syscall printk on the
+ia32 dispatch for the shell's child.
+
+Side observation: a test that creates a file and never removes it
+leaves 2 frames unreclaimed at the end of the run — created-file
+storage is not part of the task ledger. Not a regression (HEAD is
+green, zero leak); worth remembering when writing fs tests.
