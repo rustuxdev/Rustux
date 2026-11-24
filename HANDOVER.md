@@ -4847,3 +4847,31 @@ a user-space busy loop follows every mis-reap.
 Next: at the ECHILD point print the zombie's pid + tgid + ppid (not
 just counts) — if tgid != pid on the zombie, the thread path is the
 bug; if ppid is 0 with tgid == pid, the orphan sweep is.
+
+## run-192 — pipeline status: ECHILD hypothesis refuted (no code change)
+
+The caller/zombie trace refutes the run-191 hypothesis. With the
+caller's pid included the records read:
+
+    Z41:186/186/180   x92     caller 41, zombie 186 (ppid 180)
+    Z41:168/168/161   x17
+    Z41:187/187/185   x2
+
+The caller is NOT the zombie's parent in every case, so those wait4
+ECHILDs are CORRECT Linux behaviour (a process with no children of
+its own), not children losing their ppid. The zombies are normal
+processes (tgid == pid), so exit_bookkeeping's thread path is not
+involved either.
+
+So the i386 shell's pipeline failure is something else. What is
+established:
+* plain commands and redirects through the i386 shell are reliable;
+* the pipeline runs sometimes and fails sometimes (4-5 of 5 in one
+  boot), and its status reads as -1, i.e. the shell's own wait4 did
+  not write a status;
+* three missing syscalls were found and landed on the way here
+  (fcntl64 221, pipe2 331, wait4 114).
+
+Next session should capture the shell's own stderr during a failing
+pipeline (ash prints "can't ..." messages) and trace the two cat
+children's exit statuses, rather than the ECHILD path.
