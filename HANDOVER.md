@@ -4707,3 +4707,27 @@ Side observation: a test that creates a file and never removes it
 leaves 2 frames unreclaimed at the end of the run — created-file
 storage is not part of the task ledger. Not a regression (HEAD is
 green, zero leak); worth remembering when writing fs tests.
+
+## run-186 — ia32 fcntl64: the shell's redirects work
+
+Traced the run-184/185 gap to a missing syscall: the i386 shell's
+last call before failing a `>` redirect was fcntl64 (i386 nr 221)
+with F_DUPFD_CLOEXEC (1030), answered ENOSYS.
+
+* syscall.rs arm 221 -> user::sys_fcntl (the audited 64-bit path,
+  which already implements F_DUPFD/F_GETFL/F_SETFL/F_DUPFD_CLOEXEC).
+  The old 32-bit fcntl (55) cannot express 1030, so modern i386
+  glibc/busybox use fcntl64 exclusively.
+* ia32test: run_sh() now asserts `cat /motd.txt` (plain) and
+  `cat /motd.txt > /dev/null` (redirect) both exit 0.
+
+Still open: `sh -c "cat /motd.txt | cat > /dev/null"` HANGS (not
+merely fails) — the pipeline path. The test deliberately does not
+assert it (a hang would block the suite); next session should trace
+the pipeline's second fork and the pipe reads (suspects: pipe2 359
+unwired, ash's two-fork setup, or a pipe read that never wakes).
+
+Verified: 2 boots PASS exit 33, 75 tasks, frames X -> X zero leak,
+both ia32test tasks exit 0.
+Audit: scoped quick run (run-13) — the arm is a one-liner onto the
+audited fcntl.
