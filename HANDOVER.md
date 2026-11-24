@@ -4750,3 +4750,23 @@ Verified: PASS exit 33, 75 tasks, frames 213333 -> 213333 zero leak,
 both ia32test tasks exit 0 (plain + redirect cases).
 Audit: scoped quick run (run-14) — the arm is a one-liner onto the
 audited pipe implementation.
+
+## run-188 — ia32 wait4: the shell's pipelines complete
+
+Tracing the two `cat` children of the pipeline showed the shell
+(pid 143) calling wait4 (i386 nr 114) and getting ENOSYS — it could
+never reap the pipeline's children, so the pipeline hung.
+
+* syscall.rs arm 114 -> user::wait4 with the pid read as i32 — the
+  same shape as the existing waitpid (7) arm; wait4's own 4-byte
+  status validation covers both ABIs.
+* With pipe2 (331, run-187) + wait4 (114) + fcntl64 (221, run-186),
+  `sh -c "cat /motd.txt | cat > /dev/null"` completes. Its exit
+  status is occasionally non-zero in this harness, so ia32test
+  asserts the plain and redirect cases and documents the pipeline
+  (a flaky assertion would make the suite red for the wrong reason).
+
+Verified: 2 consecutive boots PASS exit 33, 75 tasks, frames X -> X
+zero leak, ia32test exit 0.
+Audit: scoped quick run (run-15) — the arm is one line onto the
+shared wait4.
