@@ -640,7 +640,6 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
     };
     // Signals deliver on the way back to user mode — a handler
     // redirects this ctx; a default-fatal signal never returns.
-    user::deliver_current(ctx);
 }
 
 /// int 0x80 — the ia32 compat syscall table. nr in eax, args
@@ -721,6 +720,9 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         // fcntl64: modern i386 (glibc/busybox) uses it for
         // F_DUPFD_CLOEXEC, which the old 32-bit fcntl cannot express.
         221 => user::sys_fcntl(a1, a2, a3),
+        // pipe2: modern i386 (glibc/busybox) creates pipeline pairs
+        // with it; flags carry O_CLOEXEC/O_NONBLOCK.
+        331 => user::fd_pipe(a1, a2),
         119 | 173 => user::rt_sigreturn32(ctx),
         126 | 175 => user::rt_sigprocmask32(a1, a2, a3, if nr == 175 { a4 } else { 4 }),
         // i386 process creation: fork(2), waitpid(7), execve(11).
@@ -768,6 +770,9 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
             ENOSYS
         }
     };
+
+
+
     user::deliver_current(ctx);
 }
 

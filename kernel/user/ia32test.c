@@ -368,9 +368,10 @@ void main32(void) {
     static const char c_redir[] = "cat /motd.txt > /dev/null";
     int s_redir = run_sh(c_redir);
     check(s_redir == 0);
-    // NOTE: `cat /motd.txt | cat > /dev/null` still HANGS (recorded
-    // in HANDOVER) — the pipeline path is not asserted here or the
-    // suite would never finish.
+    // NOTE: the pipeline case (`cat /motd.txt | cat > /dev/null`)
+    // still HANGS even with pipe2 (331) wired — it is deliberately
+    // not asserted here or the suite would never finish. See
+    // HANDOVER run-187 for the narrowed trace.
 
     // Unknown ia32 number -> -ENOSYS (38), not a crash.
     check(sc0(999) == -38);
