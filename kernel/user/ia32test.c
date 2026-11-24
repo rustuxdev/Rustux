@@ -39,6 +39,27 @@ static long sc6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
 
 static const char msg[] = "ia32: compat task alive\n";
 
+// Run `busybox sh -c <cmd>` as a compat child and return its wait
+// status (code << 8). The command string must be a static.
+static int run_sh(const char *cmd) {
+    long p = sc0(2);
+    if (p == 0) {
+        static char a0[] = "sh";
+        static char a1[] = "-c";
+        unsigned int av[4];
+        av[0] = (unsigned int)a0;
+        av[1] = (unsigned int)a1;
+        av[2] = (unsigned int)(long)cmd;
+        av[3] = 0;
+        sc3(11, (long)"/uname", (long)av, 0);
+        sc1(1, 9);
+        for (;;) {}
+    }
+    int st = -1;
+    sc3(7, p, (long)&st, 0);
+    return st;
+}
+
 // Signal proof: a caught SIGUSR1 must enter the handler with the
 // signo on the stack and return through the kernel's sigreturn
 // trampoline, restoring the interrupted context.
@@ -336,26 +357,13 @@ void main32(void) {
     check(sc3(7, spid, (long)&sh_status, 0) == spid);
     check(sh_status == 0);
 
-    // ---- integration: CROSS-ABI exec — a compat child execs the
-    // initrd's 64-bit busybox as `cat /motd.txt`. The task switches
-    // to ELF64 (is_compat=false) inside exec; exit 0 plus the motd
-    // text on the console proves the whole path.
-    long ppid2 = sc0(2);
-    if (ppid2 == 0) {
-        static char a0[] = "cat";
-        static char a1[] = "/motd.txt";
-        unsigned int av[3];
-        av[0] = (unsigned int)a0;
-        av[1] = (unsigned int)a1;
-        av[2] = 0;
-        sc3(11, (long)"/bin/cat", (long)av, 0);
-        sc1(1, 9); // exec failed
-        for (;;) {}
-    }
-    check(ppid2 > 0);
-    static volatile int cat_status;
-    check(sc3(7, ppid2, (long)&cat_status, 0) == ppid2);
-    check(cat_status == 0);
+    // ---- integration: external commands through the i386 shell.
+    // The shell spawns /bin/cat (the initrd's 64-bit busybox) with
+    // vfork (ia32 nr 190) and execs it — so this covers cross-ABI
+    // exec, the shell's spawn path and the wait status.
+    static const char c_plain[] = "cat /motd.txt";
+    int s_plain = run_sh(c_plain);
+    check(s_plain == 0); // motd text appears on the console
 
     // Unknown ia32 number -> -ENOSYS (38), not a crash.
     check(sc0(999) == -38);

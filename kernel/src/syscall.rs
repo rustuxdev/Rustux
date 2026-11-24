@@ -727,6 +727,8 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         // clone(flags, stack, ptid, tls, ctid) — i386 passes TLS in
         // esi and ctid in edi, the reverse of the x86_64 order.
         120 => user::sys_clone(ctx, a1, a2, a3, a5, a4),
+        // vfork: busybox ash and glibc's i386 spawn path use it.
+        190 => user::sys_vfork(ctx),
         172 => user::sys_prctl(a1, a2),
         191 => user::sys_ugetrlimit(a1),
         // i386 stat64 family — glibc's stat/lstat/fstat land on 195/
