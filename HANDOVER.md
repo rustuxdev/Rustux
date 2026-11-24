@@ -4614,3 +4614,24 @@ was chased to a stale-image build (make output had been suppressed)
 — rebuild with visible output before trusting a red result.
 Audit: scoped quick run (run-9). No findings — every shim validates
 the whole struct/array and delegates elements to the fd gates.
+
+## run-182 — integration proof: the real i386 busybox runs as a shell
+
+No kernel changes — this rung proves the chain end to end. ia32test
+forks, the child execs the initrd's real i386 busybox (the 2 MB
+static glibc build) with argv[0]="sh" and `-c "echo IA32-SH-OK"`,
+and the parent's wait4 collects status 0. The console shows
+IA32-SH-OK.
+
+That single path exercises: compat fork + execve of a real binary,
+glibc init (set_thread_area TLS, stat64/statx, clock_gettime,
+rt_sigaction), the multicall applet dispatch, the shell builtin, and
+the exit → wait4 status propagation.
+
+Verified: 2 boots PASS exit 33, 75 tasks, frames 213335 -> 213335
+zero leak, both ia32test tasks exit 0.
+Audit: scoped quick run (run-10) — no kernel code changed; the proof
+cannot pass silently (a failed exec exits 9 and the status check
+fails).
+Next: SA_SIGINFO i386 frame (siginfo + fpstate), then i386 pipelines
+with external commands (busybox sh -c "cat /motd.txt | wc -c").
