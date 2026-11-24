@@ -4473,3 +4473,40 @@ Audit: scoped quick run (run-4). No findings: both changes only
 restore supervisor-only kernel mappings or reject user mappings.
 Parent performed hunt/critic inline (rate limit) — no independent
 clean-coverage claim.
+
+## run-177 — ia32 fork + execve + wait4: a compat task forks and execs
+
+Re-lands the process-management arms on top of the run-176 hazard
+fixes. A compat (i386) task now forks, the child execs a second
+ELFCLASS32 image, and the parent collects the exact wait status.
+
+* syscall.rs ia32 arms: 2 fork (user::fork), 7 waitpid
+  (user::wait4 with the pid read as i32, 4-byte status), 11 execve
+  (the same sys_execve the 64-bit ABI uses). The compat argv/envp
+  collector (4-byte pointer slots) landed in run-176.
+* kernel/user/ia32child.c: a second ELFCLASS32 proof image at
+  0x08048000 — naked _start, one int-0x80 write, exit(7).
+* ia32test.c: fork → child execs /ia32child → parent wait4's into a
+  static volatile status and asserts pid + 7<<8. The earlier
+  stack-local status read -1 even though the kernel wrote 0x700 to
+  the right address (compiler stack aliasing); a static volatile
+  fixed it — worth remembering for future compat tests.
+* Verified: make run PASS exit 33, 75 tasks incl. ia32test exit(0)
+  and uname exit(0), frames 213332 -> 213332 zero leak on a clean
+  run (the pty run-138 flake still hits sometimes and leaks its two
+  ring frames on the failing run).
+* QEMU note (cost hours this session): multithreaded TCG can abort
+  with `qemu_mutex_lock_iothread_impl` assertions / triple-fault
+  exits on boots where the UEFI loader places the image below 4 GiB.
+  Diagnose with `-accel tcg,thread=single`; the guest itself was
+  fine once the run-176 hazards were fixed.
+* Still open: ia32 clone (120) and ia32 signal frames; compat
+  struct shims for timeval32/iovec32.
+
+Suite: make run PASS exit 33 — 75 tasks, ia32test exit(0) (fork +
+execve + wait4 all green), uname exit(0), zero leak on the clean run.
+Audit: scoped quick run (run-5). No findings; the arms are
+one-liners onto already-audited implementations, fork is bounded by
+MAX_TASKS, and compat exec reuses the validated getname + elf parse
+path. Parent performed hunt/critic inline (rate limit) — no
+independent clean-coverage claim.
