@@ -311,6 +311,30 @@ void main32(void) {
         check(sc3(168, (long)&pf, 1, 0) == 0);
     }
 
+    // ---- integration: exec the real i386 busybox (the initrd's
+    // "uname" entry) as a SHELL. argv[0] selects the applet, so
+    // `sh -c "echo ..."` runs the shell's builtin echo — exercising
+    // glibc init (TLS/stat/signals), the multicall dispatch and the
+    // exit path on a 2 MB real binary.
+    long spid = sc0(2);
+    if (spid == 0) {
+        static char a0[] = "sh";
+        static char a1[] = "-c";
+        static char a2[] = "echo IA32-SH-OK";
+        unsigned int av[4];
+        av[0] = (unsigned int)a0;
+        av[1] = (unsigned int)a1;
+        av[2] = (unsigned int)a2;
+        av[3] = 0;
+        sc3(11, (long)"/uname", (long)av, 0);
+        sc1(1, 9); // exec failed
+        for (;;) {}
+    }
+    check(spid > 0);
+    static volatile int sh_status;
+    check(sc3(7, spid, (long)&sh_status, 0) == spid);
+    check(sh_status == 0);
+
     // Unknown ia32 number -> -ENOSYS (38), not a crash.
     check(sc0(999) == -38);
 
