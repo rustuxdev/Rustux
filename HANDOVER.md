@@ -4596,3 +4596,21 @@ sigreturn restored the interrupted context).
 Audit: scoped quick run (run-8). No findings — sigreturn pins the
 privilege fields, sigaction32 refuses SIGKILL/SIGSTOP changes and
 never stores a user restorer.
+
+## run-181 — compat struct shims: timeval32 / timespec32 / iovec32
+
+* user.rs: sys_gettimeofday32 (two i32), sys_nanosleep32 (timespec32,
+  rejects negative/≥1e9 nsec, saturating tick math, no 64-bit
+  remainder buffer), fd_readv32 (8-byte iovec32 elements).
+* syscall.rs: sys_writev32 (beside sys_write so the console fan-out
+  is reused); ia32 arms 78 gettimeofday, 145 readv, 146 writev,
+  162 nanosleep, 168 poll (struct pollfd is ABI-identical).
+* ia32test: gettimeofday/nanosleep round-trip, a pipe writev32 →
+  readv32 of two 1-byte iovecs, and a drained-pipe poll returning 0.
+
+Suite: PASS exit 33, 75 tasks, frames 213335 -> 213335 zero leak,
+ia32test exit(0) (thread + leader). One intermittent leader failure
+was chased to a stale-image build (make output had been suppressed)
+— rebuild with visible output before trusting a red result.
+Audit: scoped quick run (run-9). No findings — every shim validates
+the whole struct/array and delegates elements to the fd gates.
