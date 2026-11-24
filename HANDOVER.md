@@ -4386,3 +4386,45 @@ Follow-on: ia32 fstatat64/stat64 + timeval32/iovec32 shims (unblocks
 `ls`, `cat`, `sh` applets), then fork/clone/execve/wait4 + ia32
 signal frames (makes the run-173 slot-source fix's validation plan
 executable).
+
+## run-175 — i386 stat64 shims: fstatat64/stat64/statx/clock_gettime32
+
+glibc's stat family on i386 lands on fstatat64 (300) and friends, and
+its struct stat64 is the PACKED 96-byte i386 layout — not the 144-byte
+x86_64 struct stat the kernel already produced. This rung adds the
+compat shims; `busybox ls` now lists the root directory (openat +
+getdents64 + fstatat64 + statx all green; it exits 1 only because a
+linktest scratch symlink vanished between getdents and stat — a real
+race, not an ABI failure).
+
+* user.rs: emit_stat64() — builds the packed layout into a zeroed
+  [u8;96] with explicit LE field writes (dev@0, __st_ino@12, mode@16,
+  nlink@20, uid@24, gid@28, rdev@32, size@44, blksize@52, blocks@56,
+  atime@64, mtime@72, ctime@80, ino@88) then one bounded copy-out.
+  newfstatat32() — empty path only under AT_EMPTY_PATH (stats the
+  dirfd), else fill_stat's canon/getname discipline.
+  sys_clock_gettime32() — timespec32 (two i32) for ia32 nr 265.
+* syscall.rs: sys_fstatat64() helper (NULL path requires
+  AT_EMPTY_PATH) + ia32 arms 195 stat64, 196 lstat64, 197 fstat64,
+  265 clock_gettime32, 295 openat, 300 fstatat64, 383 statx,
+  403 clock_gettime64.
+* ia32test.c: compiled proof — sizeof(struct stat64)==96, openat +
+  fstat64 regular-file fields, fstatat64 by path, AT_SYMLINK_NOFOLLOW,
+  fstat64 on the console fd (S_IFCHR), statx mask/size, timespec32 and
+  timespec64 clock_gettime. All pass (ia32test exit(0)).
+
+Divergences still open: i386 old-style stat/lstat/fstat (106/107/108,
+__old_kernel_stat) unwired — modern glibc never uses them; stat64
+32-bit time fields truncate past 2038 (statx carries 64-bit times).
+
+Suite: make run PASS exit 33 — 74 tasks incl. ia32test exit(0) and
+uname exit(0) printing "Rustux"; frames 213330 -> 213330 zero leak on
+the clean run. ptytest slave-write EIO flake seen again (its 2-frame
+leak rides with the failing run) — unchanged run-138 item.
+Audit: scoped quick run (run-3). No findings; every arm routes to an
+already-validated implementation or writes a fixed-size struct into a
+range_ok_w range, padding always zeroed. Parent performed hunt/critic
+inline (rate limit) — no independent clean-coverage claim.
+Follow-on: ia32 fork/clone/execve/wait4 + ia32 signal frames (also
+makes run-173's slot-source fix validation plan executable), then
+timeval32/iovec32 shims.
