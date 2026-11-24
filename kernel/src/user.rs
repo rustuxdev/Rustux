@@ -63,6 +63,39 @@ const SIGTRAMP_CODE: [u8; 9] = [0x48, 0xc7, 0xc0, 0x0f, 0, 0, 0, 0x0f, 0x05];
 /// static stack so a task's kernel state can't bleed into the next.
 const KSTACK_SIZE: usize = 49152;
 
+// --- IA-32e compat (32-bit tasks) -----------------------------------
+//
+// A compat-mode CPU emits only <4 GiB linear addresses, so an ELF32
+// image must live in the low half — under PML4[0], the slot every
+// other pml4 aliases to the kernel identity map. COMPAT_LO..HI carves
+// the dead zone between the 1 GiB RAM top and the PCI MMIO hole
+// (BARs sit at 0x80000000+ on q35): the phys frames these VAs shadow
+// in the identity map don't exist, so splicing user pages over the
+// supervisor entries costs the kernel nothing.
+const COMPAT_LO: u64 = 0x4000_0000;
+const COMPAT_HI: u64 = 0x8000_0000;
+/// Compat user stack: USTACK_PAGES high, top below COMPAT_HI.
+const CSTACK_VA: u64 = 0x7fef_0000;
+/// Compat mmap first-fit arena — inside the window, clear of the
+/// image (~0x5000…) and the stack (~0x7ff0…).
+const CMMAP_LO: u64 = 0x6000_0000;
+const CMMAP_HI: u64 = 0x7000_0000;
+/// PTE software bit (ignored by the CPU) marking a supervisor
+/// identity-fill entry inside a compat PT: phys == va, a mirror of
+/// the kernel map, never task-owned — unmap_page and teardown must
+/// never free it, and translate/mprotect must never expose it.
+const IDENT: u64 = 1 << 9;
+
+/// The task's user-VA window: the high half for 64-bit images, the
+// compat dead-zone window for ELF32.
+fn user_window(t: &Task) -> (u64, u64) {
+    if t.is_compat {
+        (COMPAT_LO, COMPAT_HI)
+    } else {
+        (elf::USER_VA_LO, elf::USER_VA_HI)
+    }
+}
+
 /// Maximum distinct user VA ranges recorded for syscall validation —
 /// the vm_max_map_count analog: mmap/mprotect splits consume slots,
 /// brk/ELF/stack hold permanent ones. Overflow fails the op (ENOMEM),
@@ -119,6 +152,20 @@ impl UCtx {
         UCtx {
             rip,
             cs: 0x33,
+            rflags: 0x202,
+            rsp,
+            ss: 0x2b,
+            ..UCtx::ZERO
+        }
+    }
+    /// The compat-task variant: cs is the GDT's 32-bit user code
+    /// segment so iretq lands in IA-32e compatibility mode. ss stays
+    /// the flat user data selector — a 32-bit task's esp still lives
+    /// in the compat window's pages.
+    fn launch_compat(rip: u64, rsp: u64) -> UCtx {
+        UCtx {
+            rip,
+            cs: cpu::UC32_SEL as u64,
             rflags: 0x202,
             rsp,
             ss: 0x2b,
@@ -941,6 +988,16 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                 return;
             }
             handler => {
+                // A caught signal needs the x86_64 frame ABI — a
+                // restorer stub, a 160-byte UCtx, siginfo. Compat
+                // tasks can't consume that shape (the ia32 frame
+                // ABI is a follow-on rung), so a caught signal takes
+                // the default-fatal path like SIG_DFL would.
+                if t.is_compat {
+                    t.state = TaskState::Exited;
+                    t.exit_status = sig as u64;
+                    return;
+                }
                 // [restorer][signo][UCtx][siginfo_t][saved sigmask]:
                 // a C handler that returns pops the restorer —
                 // SIGTRAMP_VA's `mov $15; syscall` stub — so ret IS
@@ -1023,12 +1080,16 @@ pub fn fault_signal(signo: u64, code: i32, addr: u64, ctx: &mut UCtx) -> (u64, u
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
     if let Some(t) = tasks.get_mut(cur).and_then(|s| s.as_mut()) {
-        let caught = sigt(t)
-            .handlers
-            .get(signo.saturating_sub(1) as usize)
-            .copied()
-            .unwrap_or(SIG_DFL)
-            > SIG_IGN;
+        // Compat tasks have no ia32 signal-frame ABI — a caught
+        // disposition is treated as uncaught (fatal with the fault
+        // signo, like maybe_deliver's compat gate).
+        let caught = !t.is_compat
+            && sigt(t)
+                .handlers
+                .get(signo.saturating_sub(1) as usize)
+                .copied()
+                .unwrap_or(SIG_DFL)
+                > SIG_IGN;
         if caught {
             let i = (signo - 1).min(31) as usize;
             if t.pending & (1u32 << i) == 0 {
@@ -1658,6 +1719,12 @@ pub struct Task {
     /// PERS_NT (nt::dispatch — NTSTATUS, r10-arg1, stack args at
     /// rsp+0x28). Set by the image format at exec/spawn.
     pers: u8,
+    /// ELFCLASS32 image: the task runs in IA-32e compatibility mode —
+    /// entry on the GDT's 32-bit user CS, the whole address space in
+    /// the low-4GiB compat window (private PDPT under PML4[0]), and
+    /// syscalls on int 0x80's ia32 numbering. Set by load_inner from
+    /// the ELF class, inherited by fork.
+    is_compat: bool,
     /// The task's user GS base — NT tasks point it at their TEB
     /// page (Windows threads read TEB fields via gs:[]); restored
     /// to MSR_GS_BASE on every switch like fs_base.
@@ -2221,6 +2288,43 @@ impl Task {
     /// reused (exec) or the table freed (reap). Shared kernel slots
     /// 0..127 are never touched.
     fn free_user_mappings(&mut self) {
+        // A compat task's private PDPT under slot 0: free only what
+        // map_page32 spliced in — USER-marked table pointers and
+        // USER leaves. Shared supervisor PDs and IDENT fill entries
+        // are kernel mirrors and never task-owned.
+        if self.is_compat {
+            let e0 = rd64(self.pml4);
+            if e0 & USER != 0 {
+                let pdpt = e0 & PHYS_MASK;
+                for j in 0..512u64 {
+                    let de = rd64(pdpt + 8 * j);
+                    if de & USER == 0 {
+                        continue;
+                    }
+                    let pd = de & PHYS_MASK;
+                    for k in 0..512u64 {
+                        let te = rd64(pd + 8 * k);
+                        if te & (PRESENT | USER) != (PRESENT | USER) || te & (1 << 7) != 0 {
+                            continue;
+                        }
+                        let pt = te & PHYS_MASK;
+                        for l in 0..512u64 {
+                            let le = rd64(pt + 8 * l);
+                            // Task-owned leaf: present and not an
+                            // identity fill — covers PROT_NONE pages
+                            // (present, no USER bit) too.
+                            if le & (PRESENT | IDENT) == PRESENT {
+                                kalloc::free_frame(le & PHYS_MASK);
+                            }
+                        }
+                        kalloc::free_frame(pt);
+                    }
+                    kalloc::free_frame(pd);
+                }
+                kalloc::free_frame(pdpt);
+                wr64(self.pml4, 0);
+            }
+        }
         for i in 128..256u64 {
             let e = rd64(self.pml4 + 8 * i);
             if e & PRESENT == 0 {
@@ -2541,6 +2645,9 @@ fn wr64(p: u64, v: u64) {
 /// and ORs in the new permissions — union semantics for overlapping
 /// segments.
 fn map_page(t: &mut Task, va: u64, flags: u64) -> Option<u64> {
+    if t.is_compat {
+        return map_page32(t, va, flags);
+    }
     let mut tab = t.pml4;
     for shift in [39u64, 30, 21] {
         let idx = ((va >> shift) & 0x1ff) as usize;
@@ -2568,6 +2675,90 @@ fn map_page(t: &mut Task, va: u64, flags: u64) -> Option<u64> {
     Some(f)
 }
 
+/// Compat counterpart to map_page: the VA lives under PML4[0], the
+/// slot every task pml4 aliases to the KERNEL identity map. A compat
+/// pml4 instead carries a private PDPT there (built lazily on the
+/// first map): entries start as verbatim copies of the kernel PDPT's
+/// supervisor pointers, so every untouched GiB keeps the shared
+/// identity translation. When a user page lands in a GiB, a private
+/// PD is spliced in place of the shared one; when it lands under a
+/// 2M identity leaf, that leaf is split into a PT whose neighbours
+/// keep the supervisor identity translation — IDENT-tagged so
+/// unmap/teardown/translate never treat them as task-owned. USER
+/// rides every spliced table entry (the CPU requires it on the whole
+/// chain for user access) but never a kernel leaf, so the identity
+/// map stays supervisor-only to the task.
+fn map_page32(t: &mut Task, va: u64, flags: u64) -> Option<u64> {
+    if !(COMPAT_LO..0x1_0000_0000).contains(&va) {
+        // Below COMPAT_LO the identity-map VAs shadow REAL phys
+        // frames: a user PTE there would alias kernel phys accesses
+        // made under this task's cr3 (table writes, frame fills)
+        // into user memory and back. The window keeps compat pages
+        // in the dead zone where no kernel access can collide.
+        return None;
+    }
+    let e0 = rd64(t.pml4);
+    let pdpt = if e0 & USER == 0 {
+        // Still the copied kernel slot: replace it with a private
+        // PDPT carrying the same entries.
+        if e0 & PRESENT == 0 {
+            return None;
+        }
+        let f = kalloc::alloc_frame()?;
+        for i in 0..512u64 {
+            wr64(f + 8 * i, rd64((e0 & PHYS_MASK) + 8 * i));
+        }
+        wr64(t.pml4, f | PRESENT | WRITE | USER);
+        f
+    } else {
+        e0 & PHYS_MASK
+    };
+    let ent = pdpt + 8 * ((va >> 30) & 0x1ff);
+    let e = rd64(ent);
+    let pd = if e & USER == 0 {
+        // Shared kernel PD (a supervisor pointer, possibly a 1G
+        // leaf): splice in a private clone.
+        if e & PRESENT == 0 || e & (1 << 7) != 0 {
+            return None; // no kernel mapping here / 1G leaf
+        }
+        let f = kalloc::alloc_frame()?;
+        for i in 0..512u64 {
+            wr64(f + 8 * i, rd64((e & PHYS_MASK) + 8 * i));
+        }
+        wr64(ent, f | PRESENT | WRITE | USER);
+        f
+    } else {
+        e & PHYS_MASK
+    };
+    let ent = pd + 8 * ((va >> 21) & 0x1ff);
+    let e = rd64(ent);
+    let pt = if e & (1 << 7) != 0 {
+        // A 2M supervisor identity leaf: split it into a PT of
+        // per-page supervisor entries so the user page can land
+        // beside them. IDENT marks them as kernel mirrors.
+        let f = kalloc::alloc_frame()?;
+        let base = e & PHYS_MASK;
+        for i in 0..512u64 {
+            wr64(f + 8 * i, (base + i * PAGE) | (e & (PRESENT | WRITE)) | IDENT);
+        }
+        wr64(ent, f | PRESENT | WRITE | USER);
+        f
+    } else if e & (PRESENT | USER) == (PRESENT | USER) {
+        e & PHYS_MASK // our PT from an earlier split
+    } else {
+        return None; // hole or foreign entry — nothing to map onto
+    };
+    let ent = pt + 8 * ((va >> 12) & 0x1ff);
+    let e = rd64(ent);
+    if e & PRESENT != 0 && e & IDENT == 0 {
+        wr64(ent, (e & PHYS_MASK) | flags | PRESENT);
+        return Some(e & PHYS_MASK);
+    }
+    let f = kalloc::alloc_frame()?;
+    wr64(ent, f | flags | PRESENT);
+    Some(f)
+}
+
 /// Populate `t`'s address space from the ELF image's PT_LOAD
 /// segments and record their VMAs. All header fields are hostile —
 /// every extent is checked before use. `track_brk` extends the break
@@ -2575,6 +2766,7 @@ fn map_page(t: &mut Task, va: u64, flags: u64) -> Option<u64> {
 /// whose span sits in the mmap arena and must not move the main
 /// binary's break.
 fn map_loads(t: &mut Task, e: &elf::Elf, img: &[u8], track_brk: bool) -> bool {
+    let (ulo, uhi) = user_window(t);
     for p in e.phdrs(img) {
         if p.ty != elf::PT_LOAD {
             continue;
@@ -2596,7 +2788,7 @@ fn map_loads(t: &mut Task, e: &elf::Elf, img: &[u8], track_brk: bool) -> bool {
         if p.memsz == 0 {
             continue;
         }
-        if p.va < elf::USER_VA_LO || mend > elf::USER_VA_HI {
+        if p.va < ulo || mend > uhi {
             return false;
         }
         let mut fl = USER;
@@ -2649,6 +2841,7 @@ fn map_loads(t: &mut Task, e: &elf::Elf, img: &[u8], track_brk: bool) -> bool {
 fn load_inner(t: &mut Task, e: &elf::Elf, img: &[u8]) -> bool {
     t.brk_base = 0;
     t.brk_cur = 0;
+    t.is_compat = e.is32;
     // Copy the kernel PML4 — its entries are supervisor-only, so user
     // code can't reach kernel memory through them even though the
     // mappings are shared. User-window slots (128..256) are skipped:
@@ -2665,21 +2858,32 @@ fn load_inner(t: &mut Task, e: &elf::Elf, img: &[u8]) -> bool {
     if !map_loads(t, e, img, true) {
         return false;
     }
+    let (sva, stop) = if t.is_compat {
+        (CSTACK_VA, CSTACK_VA + USTACK_PAGES * PAGE)
+    } else {
+        (USTACK_VA, USTACK_VA + USTACK_PAGES * PAGE)
+    };
     for i in 0..USTACK_PAGES {
-        if map_page(t, USTACK_VA + i * PAGE, USER | WRITE | NX).is_none() {
+        if map_page(t, sva + i * PAGE, USER | WRITE | NX).is_none() {
             return false;
         }
     }
-    let Some(tp) = map_page(t, SIGTRAMP_VA, USER) else {
-        return false;
-    };
-    // SAFETY: tp is an identity-mapped frame we just allocated.
-    unsafe { (tp as *mut u8).copy_from_nonoverlapping(SIGTRAMP_CODE.as_ptr(), SIGTRAMP_CODE.len()) };
-    t.stack_top = USTACK_VA + USTACK_PAGES * PAGE;
+    // The sigreturn trampoline is a 64-bit facility — it lives at
+    // SIGTRAMP_VA in the 64-bit window, which a compat task can't
+    // reach; maybe_deliver takes the default-fatal path for caught
+    // signals on compat tasks instead of pushing the x86_64 frame.
+    if !t.is_compat {
+        let Some(tp) = map_page(t, SIGTRAMP_VA, USER) else {
+            return false;
+        };
+        // SAFETY: tp is an identity-mapped frame we just allocated.
+        unsafe { (tp as *mut u8).copy_from_nonoverlapping(SIGTRAMP_CODE.as_ptr(), SIGTRAMP_CODE.len()) };
+    }
+    t.stack_top = stop;
     if t.nranges >= MAX_RANGES {
         return false;
     }
-    t.ranges[t.nranges] = (USTACK_VA, t.stack_top, RNG_R | RNG_W);
+    t.ranges[t.nranges] = (sva, stop, RNG_R | RNG_W);
     t.nranges += 1;
     t.brk_cur = t.brk_base;
     true
@@ -2691,6 +2895,7 @@ fn load_inner(t: &mut Task, e: &elf::Elf, img: &[u8]) -> bool {
 fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
     t.brk_base = 0;
     t.brk_cur = 0;
+    t.is_compat = false; // PE32+ images are 64-bit-only today
     let kpml4 = cpu::read_cr3() & !0xfff;
     for i in (0..128u64).chain(256..512) {
         let ent = rd64(kpml4 + 8 * i);
@@ -7007,6 +7212,7 @@ fn load(img: &[u8]) -> Option<Task> {
         sid: 1,
         did_exec: true,
         pers: PERS_LINUX,
+        is_compat: false,
         gs_base: 0,
         nth: [0; crate::nt::MAX_NTH],
         nth_fd: [0xff; crate::nt::MAX_NTH],
@@ -7145,6 +7351,12 @@ fn unmap_page(t: &mut Task, va: u64) {
     }
     let ent = tab + 8 * ((va >> 12) & 0x1ff);
     let e = rd64(ent);
+    if e & IDENT != 0 {
+        // Compat PT identity fill — a kernel-mirror entry, never
+        // task-owned: clear the PTE but don't free the phys frame.
+        wr64(ent, 0);
+        return;
+    }
     if e & PRESENT != 0 {
         kalloc::free_frame(e & PHYS_MASK);
         wr64(ent, 0);
@@ -7163,7 +7375,8 @@ fn leaf_ent(t: &Task, va: u64) -> Option<u64> {
         tab = e & PHYS_MASK;
     }
     let ent = tab + 8 * ((va >> 12) & 0x1ff);
-    (rd64(ent) & PRESENT != 0).then_some(ent)
+    let e = rd64(ent);
+    (e & PRESENT != 0 && e & IDENT == 0).then_some(ent)
 }
 
 /// Append a range entry; false when the table is full — callers
@@ -7334,10 +7547,15 @@ fn protect_entry_count(t: &Task, a: u64, b: u64) -> usize {
 /// First-fit a `len`-page VMA in the mmap arena — holes are just
 /// space between recorded ranges, so munmap'd VA is reused naturally.
 fn mmap_find(t: &Task, len: u64) -> Option<u64> {
-    let mut c = MMAP_LO;
+    let (alo, ahi) = if t.is_compat {
+        (CMMAP_LO, CMMAP_HI)
+    } else {
+        (MMAP_LO, MMAP_HI)
+    };
+    let mut c = alo;
     loop {
         let end = c.checked_add(len)?;
-        if end > MMAP_HI {
+        if end > ahi {
             return None;
         }
         let mut bump = 0u64;
@@ -7507,10 +7725,11 @@ pub fn sys_mmap(
     else {
         return ENOMEM;
     };
+    let (ulo, uhi) = user_window(t);
     let va = if addr != 0 {
         if addr & (PAGE - 1) != 0
-            || addr < elf::USER_VA_LO
-            || addr.checked_add(len).is_none_or(|e| e > elf::USER_VA_HI)
+            || addr < ulo
+            || addr.checked_add(len).is_none_or(|e| e > uhi)
         {
             return if flags & MAP_FIXED != 0 { EINVAL } else { ENOMEM };
         }
@@ -7589,12 +7808,13 @@ pub fn sys_munmap(addr: u64, len: u64) -> u64 {
     // Clip to the user window — wild VA is not an error, just
     // nothing-to-do (Linux's permissive semantic). Length rounds UP
     // to whole pages like Linux: unmapping 1 byte still zaps the page.
-    let lo = addr.max(elf::USER_VA_LO);
+    let (ulo, uhi) = user_window(t);
+    let lo = addr.max(ulo);
     let len = match len.checked_add(PAGE - 1) {
         Some(v) => v & !(PAGE - 1),
         None => u64::MAX - (PAGE - 1),
     };
-    let hi = addr.saturating_add(len).min(elf::USER_VA_HI);
+    let hi = addr.saturating_add(len).min(uhi);
     if lo >= hi {
         return 0;
     }
@@ -7624,7 +7844,8 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
         return 0;
     }
     let Some(end) = addr.checked_add(len) else { return ENOMEM };
-    if addr < elf::USER_VA_LO || end > elf::USER_VA_HI {
+    let (ulo, uhi) = user_window(t);
+    if addr < ulo || end > uhi {
         return ENOMEM;
     }
     let hi = (end + PAGE - 1) & !(PAGE - 1);
@@ -7860,6 +8081,96 @@ fn setup_stack(
     Some(sp)
 }
 
+/// The ia32 initial stack: same shape as setup_stack — argv/envp
+/// strings pushed top-down, AT_RANDOM bytes, then argc + pointer
+/// vectors + auxv pairs — but every slot is a u32 (an ia32 auxv
+/// pair is 8 bytes). rsp 16-alignment still applies in compat mode.
+fn setup_stack32(
+    t: &mut Task,
+    e: &elf::Elf,
+    img: &[u8],
+    args: &ExecArgs,
+    at_base: u64,
+) -> Option<u64> {
+    let mut sp = t.stack_top;
+    let mut str_va = |s: &[u8]| -> u64 {
+        sp -= s.len() as u64;
+        write_task_bytes(t.pml4, sp, s);
+        sp
+    };
+    let mut argv = [0u64; MAX_EXEC_ARGS];
+    for (i, (s, &l)) in args.argv.iter().zip(args.argv_len.iter()).enumerate().take(args.argc) {
+        argv[i] = str_va(&s[..l]);
+    }
+    let mut envv = [0u64; MAX_EXEC_ENVS];
+    for (i, (s, &l)) in args.envp.iter().zip(args.envp_len.iter()).enumerate().take(args.envc) {
+        envv[i] = str_va(&s[..l]);
+    }
+    // AT_RANDOM: 16 real bytes — glibc seeds its stack canary here.
+    sp -= 16;
+    let mut rnd = [0u8; 16];
+    rnd[..8].copy_from_slice(&crate::rand::next_u64().to_le_bytes());
+    rnd[8..].copy_from_slice(&crate::rand::next_u64().to_le_bytes());
+    write_task_bytes(t.pml4, sp, &rnd);
+    let at_random = sp;
+    sp &= !15u64;
+    // AT_PHDR needs the VA where the phdr table was mapped — the
+    // PT_LOAD covering e_phoff (headers land in the first segment).
+    let mut at_phdr = 0u64;
+    for p in e.phdrs(img) {
+        if p.ty == elf::PT_LOAD
+            && (p.off..p.off + p.filesz).contains(&(e.phoff() as u64))
+        {
+            at_phdr = p.va + (e.phoff() as u64 - p.off);
+        }
+    }
+    let auxv: [(u64, u64); 16] = [
+        (3, at_phdr),          // AT_PHDR
+        (4, e.phentsize() as u64),
+        (5, e.phnum() as u64),
+        (6, PAGE),             // AT_PAGESZ
+        (7, at_base),          // AT_BASE (0 = no interp)
+        (8, 0),                // AT_FLAGS
+        (9, e.entry),          // AT_ENTRY
+        (11, 0),               // AT_UID
+        (12, 0),               // AT_EUID
+        (13, 0),               // AT_GID
+        (14, 0),               // AT_EGID
+        (16, 0),               // AT_HWCAP
+        (17, 100),             // AT_CLKTCK — apic runs at 100Hz
+        (23, 0),               // AT_SECURE
+        (25, at_random),       // AT_RANDOM
+        (0, 0),                // AT_NULL
+    ];
+    let slots = 1 + args.argc + 1 + args.envc + 1 + auxv.len() * 2;
+    sp -= (slots as u64) * 4;
+    sp &= !15u64;
+    let w = |v: u64, i: usize| {
+        write_task_bytes(t.pml4, sp + (i as u64) * 4, &(v as u32).to_le_bytes());
+    };
+    let mut i = 0;
+    w(args.argc as u64, i);
+    i += 1;
+    for &a in argv.iter().take(args.argc) {
+        w(a, i);
+        i += 1;
+    }
+    w(0, i);
+    i += 1;
+    for &e in envv.iter().take(args.envc) {
+        w(e, i);
+        i += 1;
+    }
+    w(0, i);
+    i += 1;
+    for (k, v) in auxv {
+        w(k, i);
+        w(v, i + 1);
+        i += 2;
+    }
+    Some(sp)
+}
+
 /// arch_prctl(code, addr): x86_64 TLS control. SET_FS installs the
 /// task's FS base (validated inside the user window or zero); GET_FS
 /// writes it through a validated pointer. GS ops are EINVAL — no user
@@ -7897,12 +8208,19 @@ pub fn sys_uname(buf: u64) -> u64 {
     if !range_ok_w(buf, 390) {
         return EFAULT;
     }
+    // machine reports the task's bitness like a real 32-bit
+    // personality would — uname -m on an ia32 task is i686.
+    let machine: &[u8] = if cur_mut().is_some_and(|t| t.is_compat) {
+        b"i686"
+    } else {
+        b"x86_64"
+    };
     let fields: [&[u8]; 6] = [
         b"Rustux",
         b"rustux",
         b"0.1.0",
         b"rustux kernel",
-        b"x86_64",
+        machine,
         b"(none)",
     ];
     for (i, f) in fields.iter().enumerate() {
@@ -10188,6 +10506,11 @@ pub fn task_is_nt() -> bool {
     cur_mut().is_some_and(|t| t.pers == PERS_NT)
 }
 
+/// The running task's bitness — syscall.rs's int80/SYSCALL guards.
+pub fn task_is_compat() -> bool {
+    cur_mut().is_some_and(|t| t.is_compat)
+}
+
 /// nt::NTH_* tag for handle h (1-based slot), 0 when free/invalid.
 /// Windows handles are process objects: an NT thread resolves the
 /// leader's table so a handle opened by any thread works for all.
@@ -11600,6 +11923,7 @@ pub fn nt_thread_create(
         sid: p.sid,
         did_exec: false,
         pers: p.pers,
+        is_compat: p.is_compat,
         gs_base: teb,
         // Windows handles are process objects: the table lives on
         // the leader only (mm_owner routes there), so a thread's
@@ -21593,11 +21917,20 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     // PT_INTERP: a dynamic image's interpreter maps next, into the
     // mmap arena — its VMAs land after the main binary's so the
     // first-fit gap comes after them. Userspace starts at the
-    // interp's entry; it hands control to AT_ENTRY.
+    // interp's entry; it hands control to AT_ENTRY. An ELF32 naming
+    // an interp would pull in a 64-bit dynamic linker the task
+    // can't run — fail like an unresolvable interpreter path.
+    if e.is32 && e.interp(img).is_some() {
+        return false;
+    }
     let Some((entry, at_base)) = interp_load(t, &e, img) else {
         return false;
     };
-    let Some(rsp) = setup_stack(t, &e, img, args, at_base) else {
+    let Some(rsp) = (if e.is32 {
+        setup_stack32(t, &e, img, args, at_base)
+    } else {
+        setup_stack(t, &e, img, args, at_base)
+    }) else {
         return false;
     };
     t.entry = entry;
@@ -21615,7 +21948,11 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     }
     // SAFETY: read of the init-time capture -- exec resets FPU too.
     t.fx = unsafe { *core::ptr::addr_of!(INIT_FX) };
-    *ctx = UCtx::launch(t.entry, rsp);
+    *ctx = if t.is_compat {
+        UCtx::launch_compat(t.entry, rsp)
+    } else {
+        UCtx::launch(t.entry, rsp)
+    };
     true
 }
 
@@ -21668,16 +22005,28 @@ fn spawn_idx(img: &[u8], name: &str, hold: bool) -> Option<usize> {
         t.ctx = UCtx::launch(t.entry, t.stack_top - 0x28);
     } else {
         let e = e.unwrap();
+        if e.is32 && e.interp(img).is_some() {
+            t.reap();
+            return None;
+        }
         let Some((entry, at_base)) = interp_load(&mut t, &e, img) else {
             t.reap();
             return None;
         };
         t.entry = entry;
-        let Some(rsp) = setup_stack(&mut t, &e, img, &args, at_base) else {
+        let Some(rsp) = (if e.is32 {
+            setup_stack32(&mut t, &e, img, args, at_base)
+        } else {
+            setup_stack(&mut t, &e, img, args, at_base)
+        }) else {
             t.reap();
             return None;
         };
-        t.ctx = UCtx::launch(t.entry, rsp);
+        t.ctx = if t.is_compat {
+            UCtx::launch_compat(t.entry, rsp)
+        } else {
+            UCtx::launch(t.entry, rsp)
+        };
     }
     t.tgid = t.pid;
     t.pgid = t.pid; // each spawned task leads its own group in sid 1
@@ -22211,19 +22560,21 @@ pub fn tick(img: &mut UCtx) -> *const UCtx {
 /// (clone's ctid, a sigframe rsp, an argv walker) must never reach
 /// kernel memory through this path.
 fn translate(pml4: u64, va: u64) -> Option<u64> {
-    if !(elf::USER_VA_LO..elf::USER_VA_HI).contains(&va) {
-        return None;
-    }
+    // The U/S chain IS the window bound: kernel slots a task pml4
+    // shares never carry USER at any level, and compat-PT identity
+    // fills are IDENT-tagged at the leaf — so a user-controlled VA
+    // can only ever resolve to a task-owned frame, whether it lives
+    // in the 64-bit window or the low-4GiB compat space.
     let mut tab = pml4;
     for shift in [39u64, 30, 21] {
         let e = rd64(tab + 8 * ((va >> shift) & 0x1ff));
-        if e & PRESENT == 0 || e & (1 << 7) != 0 {
+        if e & (PRESENT | USER) != (PRESENT | USER) || e & (1 << 7) != 0 {
             return None;
         }
         tab = e & PHYS_MASK;
     }
     let e = rd64(tab + 8 * ((va >> 12) & 0x1ff));
-    if e & PRESENT == 0 || e & WRITE == 0 {
+    if e & (PRESENT | USER | WRITE) != (PRESENT | USER | WRITE) {
         return None;
     }
     Some((e & PHYS_MASK) | (va & 0xfff))
@@ -22234,19 +22585,22 @@ fn translate(pml4: u64, va: u64) -> Option<u64> {
 /// read source even though no write path may touch it). Bounded to
 /// the user window for the same kernel-half reason as translate().
 pub fn translate_r(pml4: u64, va: u64) -> Option<u64> {
-    if !(elf::USER_VA_LO..elf::USER_VA_HI).contains(&va) {
-        return None;
-    }
+    // Same U/S-chain bound as translate() — kernel slots can't be
+    // reached — but no WRITE/USER leaf gate: a PROT_NONE or
+    // read-only leaf is a legal kernel READ target (a read-only
+    // page is a legal read source even though no write path may
+    // touch it). IDENT fills are the one exception — those mirror
+    // kernel phys under a user-walkable chain and must stay opaque.
     let mut tab = pml4;
     for shift in [39u64, 30, 21] {
         let e = rd64(tab + 8 * ((va >> shift) & 0x1ff));
-        if e & PRESENT == 0 || e & (1 << 7) != 0 {
+        if e & (PRESENT | USER) != (PRESENT | USER) || e & (1 << 7) != 0 {
             return None;
         }
         tab = e & PHYS_MASK;
     }
     let e = rd64(tab + 8 * ((va >> 12) & 0x1ff));
-    if e & PRESENT == 0 {
+    if e & (PRESENT | IDENT) != PRESENT {
         return None;
     }
     Some((e & PHYS_MASK) | (va & 0xfff))
@@ -22260,8 +22614,66 @@ pub fn translate_r(pml4: u64, va: u64) -> Option<u64> {
 fn fork_address_space(c: &mut Task, ppml4: u64) -> bool {
     for i in 0..128u64 {
         let e = rd64(ppml4 + 8 * i);
-        if e & PRESENT != 0 {
+        if e & PRESENT == 0 {
+            continue;
+        }
+        if !c.is_compat || e & USER == 0 {
+            // Shared kernel slot (or slot 0 of a task that never
+            // mapped compat pages) — copy by reference like always.
             wr64(c.pml4 + 8 * i, e);
+            continue;
+        }
+        // Compat parent's private PDPT: shared supervisor PD
+        // pointers copy verbatim, USER-marked private PDs get the
+        // same deep copy the 64-bit window gets below — inside a
+        // PT, IDENT fills copy verbatim (kernel mirrors), USER
+        // leaves get fresh frames.
+        let Some(cpdpt) = kalloc::alloc_frame() else { return false };
+        wr64(c.pml4 + 8 * i, cpdpt | PRESENT | WRITE | USER);
+        let pdpt = e & PHYS_MASK;
+        for j in 0..512u64 {
+            let pe = rd64(pdpt + 8 * j);
+            if pe & PRESENT == 0 {
+                continue;
+            }
+            if pe & USER == 0 {
+                wr64(cpdpt + 8 * j, pe); // shared supervisor PD
+                continue;
+            }
+            let Some(cpd) = kalloc::alloc_frame() else { return false };
+            wr64(cpdpt + 8 * j, cpd | PRESENT | WRITE | USER);
+            let pd = pe & PHYS_MASK;
+            for k in 0..512u64 {
+                let te = rd64(pd + 8 * k);
+                if te & PRESENT == 0 {
+                    continue;
+                }
+                if te & USER == 0 || te & (1 << 7) != 0 {
+                    wr64(cpd + 8 * k, te); // unsplit identity leaf
+                    continue;
+                }
+                let Some(cpt) = kalloc::alloc_frame() else { return false };
+                wr64(cpd + 8 * k, cpt | PRESENT | WRITE | USER);
+                let pt = te & PHYS_MASK;
+                for l in 0..512u64 {
+                    let le = rd64(pt + 8 * l);
+                    if le & IDENT != 0 {
+                        wr64(cpt + 8 * l, le); // identity fill — verbatim
+                        continue;
+                    }
+                    if le & PRESENT == 0 {
+                        continue;
+                    }
+                    let Some(nf) = kalloc::alloc_frame() else { return false };
+                    // SAFETY: both frames are owned, identity-mapped,
+                    // full 4 KiB each — a verbatim copy.
+                    unsafe {
+                        (nf as *mut u8)
+                            .copy_from((le & PHYS_MASK) as *const u8, 4096)
+                    };
+                    wr64(cpt + 8 * l, nf | (le & !PHYS_MASK));
+                }
+            }
         }
     }
     for i in 128..256u64 {
@@ -22418,6 +22830,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         sid: p.sid,
         did_exec: false, // fork resets the child-exec'd flag
         pers: p.pers,
+        is_compat: p.is_compat,
         gs_base: p.gs_base,
         nth: p.nth,
         nth_fd: p.nth_fd,
@@ -22595,6 +23008,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         sid: p.sid,
         did_exec: false,
         pers: p.pers,
+        is_compat: p.is_compat,
         gs_base: p.gs_base,
         nth: p.nth,
         nth_fd: p.nth_fd,

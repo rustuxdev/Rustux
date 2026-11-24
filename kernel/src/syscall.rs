@@ -92,6 +92,58 @@ syscall_entry:
     pop rsp                    // back to the user stack
     sysretq
 
+    .globl int80_entry
+int80_entry:
+    // ia32 compat syscall vector. The CPU pushed the privilege frame
+    // [eip][cs][eflags][esp][ss] onto TSS.rsp0's stack (INTR_STACK,
+    // not the task kstack); nr is in eax. Rebuild the full UCtx on
+    // the task's kstack — same shape syscall_entry makes — copying
+    // the frame down with push [rax+n] so NO user GPR is clobbered
+    // (ia32 code may hold live state in r8-r15 via REX). iretq to
+    // return — never sysretq, which cannot load a compat CS.
+    push rax                     // save user eax (nr) below the frame
+    mov rax, qword ptr [rip + CUR_KSTACK]
+    and rax, -16                 // kstack top is 16-aligned; belt&braces
+    xchg rax, rsp                // rsp=kstack, rax=&saved-eax/frame
+    push qword ptr [rax + 40]    // user ss
+    push qword ptr [rax + 32]    // user esp
+    push qword ptr [rax + 24]    // user eflags
+    push qword ptr [rax + 16]    // user cs (the compat CS)
+    push qword ptr [rax + 8]     // user eip
+    push qword ptr [rax]         // ctx.rax = user eax = nr
+    push rcx                     // ctx.rcx = ia32 a2
+    push rdx                     // a3
+    push rsi                     // a4
+    push rdi                     // a5
+    push r8
+    push r9
+    push r10
+    push r11
+    push rbx                     // ctx.rbx = ia32 a1
+    push rbp                     // a6
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rcx, rsp                 // arg: &mut UCtx (Windows x64 ABI)
+    call handle_int80
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax                      // ctx.rax = the return value
+    iretq                        // frame cs restores compat mode
+
     .globl sched_launch
 sched_launch:
     // First scheduler entry. Windows x64 args: rcx = &UCtx,
@@ -156,6 +208,7 @@ user_terminate:
 unsafe extern "win64" {
     fn user_terminate() -> !;
     fn syscall_entry();
+    fn int80_entry();
     /// Resume a task ctx: cr3 = pml4, rsp = ctx, pop GPRs, iretq.
     /// Never returns — the caller's stack is abandoned.
     pub fn sched_iret(ctx: *const user::UCtx, pml4: u64) -> !;
@@ -167,6 +220,11 @@ unsafe extern "win64" {
 /// Address the LSTAR MSR should point at.
 pub fn entry_addr() -> u64 {
     syscall_entry as *const () as u64
+}
+
+/// Address the IDT's int 0x80 gate should point at.
+pub fn int80_addr() -> u64 {
+    int80_entry as *const () as u64
 }
 
 /// Unwind to the kernel frame sched_launch saved — the last task's
@@ -344,6 +402,14 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
     // before the Linux number table reads rdi-args that aren't set.
     if user::task_is_nt() {
         ctx.rax = crate::nt::dispatch(ctx, ctx.rax as u32);
+        return;
+    }
+    if user::task_is_compat() {
+        // A compat-mode `syscall` insn reaching the x86_64 LSTAR
+        // (AMD executes it from compat mode; Intel #UDs first):
+        // there is no x86_64 ABI contract here to honor — the
+        // task's args aren't even in the right registers.
+        ctx.rax = ENOSYS;
         return;
     }
     let (nr, a1, a2, a3) = (ctx.rax, ctx.rdi, ctx.rsi, ctx.rdx);
@@ -574,6 +640,81 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
     };
     // Signals deliver on the way back to user mode — a handler
     // redirects this ctx; a default-fatal signal never returns.
+    user::deliver_current(ctx);
+}
+
+/// int 0x80 — the ia32 compat syscall table. nr in eax, args
+/// ebx/ecx/edx/esi/edi/ebp; -errno in eax like the 64-bit ABI.
+/// Every wired number shares its argument shapes with the 64-bit
+/// impl — calls whose ABI structs differ (timeval32, iovec32,
+/// stat64, linux_dirent, old rlimit) are ENOSYS until their compat
+/// shims land; fork/clone/exec and all signal calls are out of
+/// scope for compat tasks this rung.
+#[no_mangle]
+extern "win64" fn handle_int80(c: *mut user::UCtx) {
+    // SAFETY: int80_entry built this UCtx on the current kstack.
+    let ctx = unsafe { &mut *c };
+    // Linux's compat entry loads the arg registers as 32-bit values —
+    // high halves a REX-literate compat task could have set never
+    // reach the ABI. nr likewise (eax's write already zero-extends,
+    // this is belt-and-braces).
+    let (nr, a1, a2, a3, a4, a5, a6) = (
+        ctx.rax as u32 as u64,
+        ctx.rbx as u32 as u64,
+        ctx.rcx as u32 as u64,
+        ctx.rdx as u32 as u64,
+        ctx.rsi as u32 as u64,
+        ctx.rdi as u32 as u64,
+        ctx.rbp as u32 as u64,
+    );
+    ctx.rax = match nr {
+        1 | 252 => sys_exit(a1),                 // exit / exit_group
+        3 => user::fd_read(ctx, a1, a2, a3.min(MAX_READ)),
+        4 => sys_write(ctx, a1, a2, a3),
+        5 => sys_open(a1, a2, a3),
+        6 => user::fd_close(a1),
+        10 => sys_unlinkat(u64::MAX, a1, 0),
+        15 => sys_chmod(a1, a2),
+        // lseek's off is i32 — sign-extend like the wait4 pid fix.
+        19 => user::fd_lseek(a1, a2 as u32 as i32 as i64, a3),
+        20 => user::getpid(),
+        24 | 47 | 49 | 50 | 199..=202 => 0,      // {g,u,eu,eg}id{,32}
+        33 => sys_access(u64::MAX, a1, a2),
+        37 => user::kill(a1 as u32 as i32 as i64, a2),
+        39 => sys_mkdirat(u64::MAX, a1, a2),
+        40 => sys_rmdir(a1),
+        41 => user::fd_dup(a1),
+        42 => user::fd_pipe(a1, 0),
+        45 => user::sys_brk(a1),
+        54 => user::sys_ioctl(a1, a2, a3),
+        55 => user::sys_fcntl(a1, a2, a3),
+        60 => user::sys_umask(a1),
+        63 => user::fd_dup2(a1, a2),
+        64 => user::getppid(),
+        85 => sys_readlink(a1, a2, a3),
+        91 => user::sys_munmap(a1, a2),
+        93 => user::fd_ftruncate(a1, a2),
+        118 => user::fd_fsync(a1),
+        122 => user::sys_uname(a1),
+        125 => user::sys_mprotect(a1, a2, a3),
+        158 => user::sys_sched_yield(ctx),
+        183 => user::sys_getcwd(a1, a2),
+        // mmap2's offset is in 4KiB units — byte offset shifts 12.
+        192 => match a6.checked_shl(12) {
+            Some(off) => user::sys_mmap(a1, a2, a3, a4, a5, off),
+            None => (-12i64) as u64, // ENOMEM
+        },
+        // getdents64: linux_dirent64 keeps u64 fields on both ABIs.
+        220 => user::fd_getdents(a1, a2, a3),
+        224 => user::sys_gettid(),
+        258 => user::sys_set_tid_address(),
+        340 => user::sys_prlimit64(a1, a2, a3, a4),
+        355 => user::sys_getrandom(a1, a2, a3),
+        _ => {
+            log::printk(format_args!("rustux: enosys: ia32 nr {nr}"));
+            ENOSYS
+        }
+    };
     user::deliver_current(ctx);
 }
 

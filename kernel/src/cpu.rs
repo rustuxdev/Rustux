@@ -29,19 +29,32 @@ const TSS_SEL: u16 = 0x18;
 pub const UDATA_SEL: u16 = 0x28 | 3;
 #[allow(dead_code)]
 pub const UCODE_SEL: u16 = 0x30 | 3;
+/// 32-bit user code segment (GDT slot 7) — L=0,D=1 drops the CPU
+/// into IA-32e compatibility mode on iret. Compat tasks always
+/// return via iretq: SYSRET's CS is STAR-derived and can never
+/// land a compat descriptor (Linux's entry_SYSCALL_compat does
+/// the same). Data segments need no compat variant — DS/ES/SS
+/// bases and limits are ignored in IA-32e mode.
+pub const UC32_SEL: u16 = 0x38 | 3;
 
 // Flat 64-bit segments: base/limit ignored by the CPU in long mode.
 // code: P|DPL0|S|Exec|Read|L   data: P|DPL0|S|Write
 // User variants are the same shapes with DPL=3 (access 0xf2/0xfa).
 // Slots 3-4 hold the TSS descriptor, filled at init (needs the runtime base).
-static mut GDT: [u64; 7] = [
+static mut GDT: [u64; 8] = [
     0,
     0x00af_9a00_0000_ffff, // 0x08 kernel code
     0x00af_9200_0000_ffff, // 0x10 kernel data
     0,
     0,                     // 0x18-0x1f TSS (filled at init)
-    0x00af_f200_0000_ffff, // 0x28 user data (DPL3)
+    // user data: D/B=1 like Linux's __USER_DS — ignored in 64-bit
+    // mode, but a compat task's pushes on this SS take the stack
+    // width from B (B=0 would truncate esp to sp, 16 bits).
+    0x00cf_f200_0000_ffff, // 0x28 user data (DPL3)
     0x00af_fa00_0000_ffff, // 0x30 user code (DPL3)
+    // 32-bit compat code: P|DPL3|S|Exec|Read, D=1 L=0 (0xcf/0xfa) —
+    // a task iret'd here runs its ring-3 code in IA-32e compat mode.
+    0x00cf_fa00_0000_ffff, // 0x38 user32 code (DPL3)
 ];
 
 /// x86_64 task state segment. Only the IST entries matter today: no
@@ -122,13 +135,19 @@ const EMPTY: IdtEntry = IdtEntry {
 static mut IDT: Idt = Idt([EMPTY; 256]);
 
 fn set_gate(v: usize, handler: u64, ist: u8) {
+    set_gate_attr(v, handler, ist, 0x8e); // present, DPL0, int gate
+}
+
+/// `set_gate` with an explicit descriptor DPL — user-invoked gates
+/// (int 0x80, the ia32 syscall vector) need DPL3 or CPL3 code #GPs.
+fn set_gate_attr(v: usize, handler: u64, ist: u8, attr: u8) {
     // SAFETY: single-threaded early boot; writes stay inside the static IDT.
     unsafe {
         (*core::ptr::addr_of_mut!(IDT)).0.as_mut_ptr().add(v).write(IdtEntry {
             off_lo: handler as u16,
             sel: KCODE,
             ist,
-            attr: 0x8e, // present, DPL0, 64-bit interrupt gate (clears IF)
+            attr,
             off_mid: (handler >> 16) as u16,
             off_hi: (handler >> 32) as u32,
             zero: 0,
@@ -549,7 +568,7 @@ pub fn init() {
     }
 
     let gdtr = TablePtr {
-        limit: (7 * 8 - 1) as u16,
+        limit: (8 * 8 - 1) as u16,
         base: core::ptr::addr_of!(GDT) as u64,
     };
     // SAFETY: gdtr points at our valid flat GDT; CS reload uses a far return
@@ -631,6 +650,9 @@ pub fn init() {
     for (v, h, ist) in gates {
         set_gate(v, h, ist);
     }
+    // int 0x80 — the ia32 compat syscall vector. DPL3 interrupt gate
+    // or a CPL3 caller #GPs; it enters on TSS.rsp0 like any user int.
+    set_gate_attr(0x80, crate::syscall::int80_addr(), 0, 0xee);
 
     let idtr = TablePtr {
         limit: (256 * 16 - 1) as u16,

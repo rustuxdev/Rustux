@@ -20,9 +20,13 @@ pub const PF_R: u32 = 4;
 
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
+const EHDR32_SIZE: usize = 52;
+const PHDR32_SIZE: usize = 32;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 0x3e;
+const EM_386: u16 = 3;
+const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
@@ -58,15 +62,17 @@ fn u64le(b: &[u8], off: usize) -> u64 {
     ])
 }
 
-/// Validated ELF64 header fields of a static executable.
-/// `entry` and every `phdrs()` `va` are already biased — for ET_DYN
-/// (static-PIE) that's LOAD_BIAS, for ET_EXEC it's 0.
+/// Validated ELF header fields of a static executable — 64-bit or
+/// 32-bit (IA-32 compat). `entry` and every `phdrs()` `va` are
+/// already biased — for ET_DYN (static-PIE) that's LOAD_BIAS, for
+/// ET_EXEC it's 0. `is32` selects the phdr layout at iteration.
 pub struct Elf {
     pub entry: u64,
     bias: u64,
     phoff: usize,
     phentsize: usize,
     phnum: usize,
+    pub is32: bool,
 }
 
 /// A parsed program header.
@@ -94,17 +100,23 @@ pub fn parse(b: &[u8]) -> Option<Elf> {
 /// and re-parses there, like Linux's elf_map over mmap_base.
 /// ET_EXEC ignores `dyn_bias`: its vaddrs are absolute.
 pub fn parse_at(b: &[u8], dyn_bias: u64) -> Option<Elf> {
-    if b.len() < EHDR_SIZE {
+    if b.len() < EHDR32_SIZE {
         return None;
     }
-    if b[0..4] != *b"\x7fELF" {
+    if b[0..4] != *b"\x7fELF" || b[5] != ELFDATA2LSB {
         return None;
     }
-    if b[4] != ELFCLASS64 || b[5] != ELFDATA2LSB {
-        return None;
-    }
+    let is32 = match b[4] {
+        ELFCLASS32 => true,
+        ELFCLASS64 => false,
+        _ => return None,
+    };
     let ty = u16le(b, 16);
-    if (ty != ET_EXEC && ty != ET_DYN) || u16le(b, 18) != EM_X86_64 {
+    if ty != ET_EXEC && ty != ET_DYN {
+        return None;
+    }
+    let machine = u16le(b, 18);
+    if machine != if is32 { EM_386 } else { EM_X86_64 } {
         return None;
     }
     // ET_DYN self-relocates; the loader just picks a base and adds
@@ -113,11 +125,28 @@ pub fn parse_at(b: &[u8], dyn_bias: u64) -> Option<Elf> {
     if u32le(b, 20) != 1 {
         return None;
     }
-    let entry = u64le(b, 24);
-    let phoff = u64le(b, 32) as usize;
-    let phentsize = u16le(b, 54) as usize;
-    let phnum = u16le(b, 56) as usize;
-    if phnum == 0 || phnum > MAX_PHNUM || phentsize < PHDR_SIZE {
+    // ELF32 headers are field-identical but narrower: entry/phoff
+    // are u32, sizes are u16s at different offsets.
+    let (entry, phoff, phentsize, phnum) = if is32 {
+        (
+            u32le(b, 24) as u64,
+            u32le(b, 28) as usize,
+            u16le(b, 42) as usize,
+            u16le(b, 44) as usize,
+        )
+    } else {
+        if b.len() < EHDR_SIZE {
+            return None;
+        }
+        (
+            u64le(b, 24),
+            u64le(b, 32) as usize,
+            u16le(b, 54) as usize,
+            u16le(b, 56) as usize,
+        )
+    };
+    let phdr_min = if is32 { PHDR32_SIZE } else { PHDR_SIZE };
+    if phnum == 0 || phnum > MAX_PHNUM || phentsize < phdr_min {
         return None;
     }
     // The phdr table must lie fully inside the image — checked
@@ -127,9 +156,15 @@ pub fn parse_at(b: &[u8], dyn_bias: u64) -> Option<Elf> {
     if end > b.len() {
         return None;
     }
-    // Entry point must be a canonical user address after the bias.
+    // Entry point must be a canonical user address after the bias:
+    // the 64-bit window for ELF64, the low 4 GiB a compat-mode CPU
+    // can reach for ELF32.
     let entry = entry.checked_add(bias)?;
-    if !(USER_VA_LO..USER_VA_HI).contains(&entry) {
+    if is32 {
+        if entry >= 0x1_0000_0000 {
+            return None;
+        }
+    } else if !(USER_VA_LO..USER_VA_HI).contains(&entry) {
         return None;
     }
     Some(Elf {
@@ -138,6 +173,7 @@ pub fn parse_at(b: &[u8], dyn_bias: u64) -> Option<Elf> {
         phoff,
         phentsize,
         phnum,
+        is32,
     })
 }
 
@@ -174,23 +210,37 @@ impl Elf {
         None
     }
 
-    /// Iterate the validated program headers.
+    /// Iterate the validated program headers — ELF32 entries are
+    /// 32 bytes with filesz/memsz ahead of flags; ELF64 is 56 with
+    /// flags second.
     pub fn phdrs<'a>(&'a self, img: &'a [u8]) -> impl Iterator<Item = Phdr> + 'a {
         (0..self.phnum).map(move |i| {
             // SAFETY: parse() proved phoff + phentsize*phnum <= img.len().
             let off = self.phoff + i * self.phentsize;
-            let p = &img[off..off + PHDR_SIZE];
-            Phdr {
-                ty: u32le(p, 0),
-                flags: u32le(p, 4),
-                off: u64le(p, 8),
-                // Load-biased virtual address. Saturating keeps a
-                // hostile non-LOAD va from wrapping; consumers only
-                // act on PT_LOAD, whose range load_inner validates.
-                va: u64le(p, 16).saturating_add(self.bias),
-                filesz: u64le(p, 32),
-                memsz: u64le(p, 40),
-                align: u64le(p, 48),
+            let p = &img[off..off + if self.is32 { PHDR32_SIZE } else { PHDR_SIZE }];
+            if self.is32 {
+                Phdr {
+                    ty: u32le(p, 0),
+                    off: u32le(p, 4) as u64,
+                    va: (u32le(p, 8) as u64).saturating_add(self.bias),
+                    filesz: u32le(p, 16) as u64,
+                    memsz: u32le(p, 20) as u64,
+                    flags: u32le(p, 24),
+                    align: u32le(p, 28) as u64,
+                }
+            } else {
+                Phdr {
+                    ty: u32le(p, 0),
+                    flags: u32le(p, 4),
+                    off: u64le(p, 8),
+                    // Load-biased virtual address. Saturating keeps a
+                    // hostile non-LOAD va from wrapping; consumers only
+                    // act on PT_LOAD, whose range load_inner validates.
+                    va: u64le(p, 16).saturating_add(self.bias),
+                    filesz: u64le(p, 32),
+                    memsz: u64le(p, 40),
+                    align: u64le(p, 48),
+                }
             }
         })
     }
