@@ -9,7 +9,9 @@
 #![no_std]
 
 
+#[cfg(target_os = "uefi")]
 use uefi::mem::memory_map::{MemoryMap, MemoryType};
+#[cfg(target_os = "uefi")]
 use uefi::prelude::*;
 
 mod acpi;
@@ -36,9 +38,12 @@ mod syscall;
 mod uart;
 mod user;
 
+#[cfg(not(target_os = "uefi"))]
+mod bios;
+
 /// printk-style console fan-out: every write goes to COM1 and, when the GOP
 /// framebuffer is available, to the emulated display as text.
-struct Console {
+pub(crate) struct Console {
     pub(crate) uart: uart::Uart16550,
     pub(crate) fb: Option<fbcon::FbConsole>,
 }
@@ -65,6 +70,37 @@ fn qemu_exit(code: u32) -> ! {
     }
 }
 
+/// Static slots the boot front ends fill before `rustux_main` — the
+/// normalized memory map must outlive the caller's scope.
+const MAX_BOOT_ENTS: usize = 512;
+static mut BOOT_ENTS: [mm::MapEnt; MAX_BOOT_ENTS] =
+    [mm::MapEnt { phys_start: 0, page_count: 0, usable: false }; MAX_BOOT_ENTS];
+static mut BOOT_N: usize = 0;
+
+/// Normalize one firmware map record into BOOT_ENTS. Shared by the UEFI
+/// and Multiboot2 front ends; entries past the cap are dropped.
+pub(crate) fn push_ent(phys_start: u64, page_count: u64, usable: bool) {
+    unsafe {
+        let n = *core::ptr::addr_of!(BOOT_N);
+        if n < MAX_BOOT_ENTS {
+            (*core::ptr::addr_of_mut!(BOOT_ENTS))[n] =
+                mm::MapEnt { phys_start, page_count, usable };
+            *core::ptr::addr_of_mut!(BOOT_N) = n + 1;
+        }
+    }
+}
+
+/// The live prefix of BOOT_ENTS — the normalized map the front end built.
+pub(crate) fn boot_map() -> &'static [mm::MapEnt] {
+    unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(BOOT_ENTS) as *const mm::MapEnt,
+            *core::ptr::addr_of!(BOOT_N),
+        )
+    }
+}
+
+#[cfg(target_os = "uefi")]
 #[entry]
 fn main() -> Status {
     let mut con = Console {
@@ -81,6 +117,49 @@ fn main() -> Status {
     log::init();
     log::set_console(&mut con);
     kprintln!(con, "rustux: Rust kernel alive under UEFI");
+
+    // The ACPI RSDP pointer lives in the UEFI system table — boot-time
+    // only. Snapshot it now; the tables themselves stay readable post-EBS.
+    match acpi::grab_rsdp() {
+        Some(p) => {
+            kprintln!(con, "rustux: acpi: RSDP at {:#x} (from UEFI config table)", p);
+        }
+        None => {
+            kprintln!(con, "rustux: acpi: no RSDP in UEFI config table");
+        }
+    }
+
+    // Load the initrd from the ESP while boot services are still
+    // legal — \initrd.cpio sits next to BOOTX64.EFI. The pages come
+    // back as LOADER_DATA, which our buddy deliberately does not
+    // claim, so the buffer survives EBS under the identity map.
+    let initrd = load_initrd();
+    match initrd {
+        Some((a, l)) => kprintln!(con, "rustux: initrd: {l}B at {a:#x}"),
+        None => kprintln!(con, "rustux: initrd: none found"),
+    }
+
+    kprintln!(con, "rustux: exiting boot services...");
+    // SAFETY: every firmware call this program makes happens before this
+    // point; nothing afterwards touches boot or runtime services.
+    let mmap = unsafe { uefi::boot::exit_boot_services(None) };
+    for d in mmap.entries() {
+        push_ent(d.phys_start, d.page_count, d.ty == MemoryType::CONVENTIONAL);
+    }
+    rustux_main(con, boot_map(), initrd, &[])
+}
+
+/// Firmware-agnostic kernel main: each boot front end (UEFI `main`,
+/// Multiboot2 `bios::entry`) collects its map/framebuffer/RSDP/initrd,
+/// then lands here. `con` moves in by value and is re-registered with the
+/// panic path — the caller's frame stays live forever since we diverge.
+pub(crate) fn rustux_main(
+    mut con: Console,
+    mmap: &'static [mm::MapEnt],
+    initrd: Option<(u64, usize)>,
+    extra_reserved: &[(u64, u64)],
+) -> ! {
+    log::set_console(&mut con);
     kprintln!(con, "rustux: serial console up on COM1");
     let rng_hw = rand::init();
     kprintln!(con,
@@ -719,64 +798,37 @@ fn main() -> Status {
         assert_eq!(&rbuf[..5], b"hello");
     }
 
-    // Claim the machine from the firmware. ExitBootServices hands back the
-    // final memory map and marks every BootServices* range free for our use.
-    // From here no UEFI boot-services call is legal; the console keeps working
-    // because it is pure port I/O + framebuffer memory, both of which survive
-    // the transition.
-    // The ACPI RSDP pointer lives in the UEFI system table — boot-time
-    // only. Snapshot it now; the tables themselves stay readable post-EBS.
-    match acpi::grab_rsdp() {
-        Some(p) => {
-            kprintln!(con, "rustux: acpi: RSDP at {:#x} (from UEFI config table)", p);
-        }
-        None => {
-            kprintln!(con, "rustux: acpi: no RSDP in UEFI config table");
-        }
-    }
-
-    // Load the initrd from the ESP while boot services are still
-    // legal — \initrd.cpio sits next to BOOTX64.EFI. The pages come
-    // back as LOADER_DATA, which our buddy deliberately does not
-    // claim, so the buffer survives EBS under the identity map.
-    let initrd = load_initrd();
-    match initrd {
-        Some((a, l)) => kprintln!(con, "rustux: initrd: {l}B at {a:#x}"),
-        None => kprintln!(con, "rustux: initrd: none found"),
-    }
-
-    kprintln!(con, "rustux: exiting boot services...");
-    // SAFETY: every firmware call this program makes happens before this
-    // point; nothing afterwards touches boot or runtime services.
-    let mmap = unsafe { uefi::boot::exit_boot_services(None) };
-
-    // Own the CPU state the firmware still lent us. This must happen after
-    // exit_boot_services: firmware code can reload GDTR/IDTR and raise
-    // interrupts internally, and a stray IRQ vectoring through our IDT whose
-    // selector doesn't exist in a firmware GDT would triple-fault the boot.
+    // Own the CPU state the firmware still lent us. Under UEFI this ran
+    // after ExitBootServices for the same reason it runs first here:
+    // firmware can reload GDTR/IDTR and raise interrupts internally, and a
+    // stray IRQ vectoring through our IDT whose selector doesn't exist in
+    // a firmware GDT would triple-fault the boot.
     cpu::init();
     kprintln!(con, "rustux: cpu: own GDT+IDT active");
-    let (mut n, mut conv, mut bsvc, mut largest) = (0usize, 0u64, 0u64, (0u64, 0u64));
-    for d in mmap.entries() {
+    let (mut n, mut conv, mut reserved_pages, mut largest) =
+        (0usize, 0u64, 0u64, (0u64, 0u64));
+    for d in mmap {
         n += 1;
-        match d.ty {
-            MemoryType::CONVENTIONAL => {
-                conv += d.page_count;
-                if d.page_count > largest.1 {
-                    largest = (d.phys_start, d.page_count);
-                }
+        if d.usable {
+            conv += d.page_count;
+            if d.page_count > largest.1 {
+                largest = (d.phys_start, d.page_count);
             }
-            MemoryType::BOOT_SERVICES_CODE | MemoryType::BOOT_SERVICES_DATA => {
-                bsvc += d.page_count;
-            }
-            _ => {}
+        } else {
+            reserved_pages += d.page_count;
         }
+        kprintln!(con,
+            "rustux:   map {:#010x}..{:#010x} {}",
+            d.phys_start,
+            d.phys_start + d.page_count * 4096,
+            if d.usable { "usable" } else { "rsv" }
+        );
     }
     kprintln!(con,
-        "rustux: boot services exited -- {} mmap entries, {} MiB usable, {} KiB reclaimable",
+        "rustux: memory map: {} entries, {} MiB usable, {} KiB reserved",
         n,
         conv / 256,
-        bsvc * 4
+        reserved_pages * 4
     );
     kprintln!(con,
         "rustux: largest free region {:#010x}..{:#010x} ({} MiB)",
@@ -785,14 +837,23 @@ fn main() -> Status {
         largest.1 / 256
     );
 
-    // Own page tables: carve table frames from the head of the largest
-    // ConventionalMemory region, build a 4-level identity map, switch CR3.
-    // The carve stays reserved so the allocator never hands it out; our image
-    // and stack live in LOADER/BOOT_SERVICES ranges, which are never pooled.
-    let ngib = mm::map_gib(&mmap);
-    let carve = (largest.0 + mm::PAGE - 1) & !(mm::PAGE - 1);
-    let carve_end = carve + mm::table_frames(ngib) * mm::PAGE;
-    let pml4 = mm::build_identity_map(&mmap, carve);
+    // Own page tables: carve table frames from the TAIL of the largest
+    // usable region, build a 4-level identity map, switch CR3. Tail —
+    // not head: under BIOS the kernel image sits at the head of this
+    // very region (1 MiB), so a head carve would zero the executing
+    // text mid-write. The carve stays reserved either way.
+    let ngib = mm::map_gib(mmap);
+    let tframes = mm::table_frames(ngib);
+    // Keep the carve below 4 GiB: the BIOS trampoline's provisional map
+    // only covers 4 GiB, and these writes go through the CURRENT map.
+    let region_end = largest.0 + largest.1 * mm::PAGE;
+    let carve_hi = region_end.min(4 << 30);
+    let mut carve = carve_hi.saturating_sub(tframes * mm::PAGE) & !(mm::PAGE - 1);
+    if carve < largest.0 {
+        carve = (largest.0 + mm::PAGE - 1) & !(mm::PAGE - 1);
+    }
+    let carve_end = carve + tframes * mm::PAGE;
+    let pml4 = mm::build_identity_map(mmap, carve);
     mm::load_cr3(pml4);
     kprintln!(con,
         "rustux: own page tables active (identity map, {} GiB, {} table frames at {:#x})",
@@ -805,8 +866,22 @@ fn main() -> Status {
     // kmalloc pattern-write survives, kfree pushes the slot back (a
     // same-class realloc returns the recycled address), and a >4 KiB
     // request takes the direct-buddy path.
-    let reserved = [(carve, carve_end)];
-    kalloc::init(&mmap, &reserved);
+    // The carve plus whatever the front end marked off-limits: under UEFI
+    // that's nothing extra (image/stack live in LOADER ranges the buddy
+    // never pools); under BIOS the kernel image, mbi, and initrd module
+    // all sit inside usable RAM and must be excluded explicitly.
+    let mut resv = [(0u64, 0u64); 8];
+    resv[0] = (carve, carve_end);
+    let nr = 1 + extra_reserved.len().min(resv.len() - 1);
+    // Subtraction in add_range must land on page boundaries or the buddy
+    // seeds blocks at unaligned bases — round each reservation outward.
+    for (d, s) in resv[1..nr].iter_mut().zip(&extra_reserved[..nr - 1]) {
+        *d = (s.0 & !(mm::PAGE - 1), (s.1 + mm::PAGE - 1) & !(mm::PAGE - 1));
+    }
+    for r in &resv[..nr] {
+        kprintln!(con, "rustux:   resv {:#010x}..{:#010x}", r.0, r.1);
+    }
+    kalloc::init(mmap, &resv[..nr]);
     let free0 = kalloc::free_frames();
     let mut ok;
     let p1 = kalloc::kmalloc(100);
@@ -920,8 +995,8 @@ fn main() -> Status {
     // the promised validation — the claimed MMIO window must not overlap
     // any conventional-RAM range before the driver writes through it.
     let bar_is_mmio = |base: u64, size: u64| -> bool {
-        !mmap.entries().any(|d| {
-            d.ty == MemoryType::CONVENTIONAL
+        !mmap.iter().any(|d| {
+            d.usable
                 && base < d.phys_start + d.page_count * 4096
                 && base + size > d.phys_start
         })
@@ -1102,6 +1177,7 @@ fn main() -> Status {
 /// protocol. Boot-services-only: allocate LOADER_DATA pages (our buddy
 /// ignores that type, so the buffer survives EBS identity-mapped) and
 /// read the file into them. Returns (phys_addr, len) or None.
+#[cfg(target_os = "uefi")]
 fn load_initrd() -> Option<(u64, usize)> {
     use uefi::proto::media::file::{File, FileAttribute, FileMode, RegularFile};
 

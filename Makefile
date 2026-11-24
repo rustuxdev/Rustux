@@ -629,3 +629,49 @@ $(ISO_DOOM): $(ESP_DOOM) $(KERNEL) $(DOOM_INITRD)
 clean:
 	cargo clean
 	rm -rf $(ESP) $(ESP_IMG)
+
+# Legacy BIOS boot — the same kernel built for x86_64-unknown-none as a
+# static Multiboot2 ELF (kernel/bios.ld, image at 1 MiB). GRUB's
+# i386-pc core does the real-mode work we don't want to hand-roll (A20,
+# E820, VBE, disk reads); its multiboot2 loader hands bios::entry the
+# mmap/framebuffer/RSDP/initrd-module that UEFI used to provide, the
+# 32-bit trampoline enters long mode, and rustux_main runs unchanged.
+BIOS_TARGET  := x86_64-unknown-none
+KERNEL_BIOS  := target/$(BIOS_TARGET)/release/kernel
+ISO_BIOS     := rustux-bios.iso
+ISOROOT_BIOS := isoroot-bios
+BIOS_RUSTFLAGS := --cfg demo_net -C relocation-model=static \
+	-C link-args=-no-pie -C link-arg=-T$(CURDIR)/kernel/bios.ld
+
+$(KERNEL_BIOS): kernel/src/*.rs kernel/bios.ld kernel/Cargo.toml klib/src/*.rs FORCE
+	cd kernel && RUSTFLAGS="$(BIOS_RUSTFLAGS)" \
+		cargo build --release --target $(BIOS_TARGET)
+
+$(ISO_BIOS): $(KERNEL_BIOS) $(INITRD)
+	rm -rf $(ISOROOT_BIOS) && mkdir -p $(ISOROOT_BIOS)/boot/grub
+	cp $(KERNEL_BIOS) $(ISOROOT_BIOS)/boot/kernel.elf
+	cp $(INITRD) $(ISOROOT_BIOS)/boot/initrd.cpio
+	printf '%s\n' 'set timeout=0' 'set default=0' 'insmod all_video' \
+		'set gfxmode=auto' 'menuentry "Rustux" {' \
+		'    multiboot2 /boot/kernel.elf' \
+		'    module2 /boot/initrd.cpio' '}' \
+		> $(ISOROOT_BIOS)/boot/grub/grub.cfg
+	grub-mkrescue -o $@ $(ISOROOT_BIOS) 2>/dev/null
+
+# BIOS boot proof: SeaBIOS (QEMU's default firmware — no -bios flag)
+# -> GRUB i386-pc -> multiboot2 -> trampoline -> long mode -> the same
+# suite, gated on the same isa-debug-exit 33 contract as `make run`.
+run-bios: $(ISO_BIOS)
+	$(QEMU) \
+		-machine pc \
+		-m 1G \
+		-cpu qemu64,+rdrand \
+		-drive file=$(ISO_BIOS),format=raw,if=none,id=cd0,media=cdrom \
+		-device ide-cd,drive=cd0,bus=ide.1,unit=0 \
+		-netdev user,id=n0 -device e1000e,netdev=n0 \
+		-serial stdio -display none \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		-no-reboot; \
+	status=$$?; \
+	if [ $$status -eq 33 ]; then echo "bios boot test: PASS (qemu exit 33)"; \
+	else echo "bios boot test: FAIL (qemu exit $$status)"; exit 1; fi

@@ -10,9 +10,7 @@
 //! duration of every operation (irqsave/irqrestore) so an interrupt
 //! arriving mid-operation cannot corrupt the freelists.
 
-use uefi::mem::memory_map::{MemoryMap, MemoryType};
-
-use crate::mm::{Buddy, PAGE};
+use crate::mm::{Buddy, MapEnt, PAGE};
 
 const HDR: u64 = 16;
 /// Classes 2^5 .. 2^12; the smallest object stride (32) already covers
@@ -77,11 +75,11 @@ fn refill(alloc: &mut Kalloc, c: usize) {
 
 /// Seed the heap's buddy with every conventional frame minus `reserved`
 /// spans (the page-table carve). Called once, post-EBS, from main.
-pub fn init<M: MemoryMap>(mmap: &M, reserved: &[(u64, u64)]) {
+pub fn init(mmap: &[MapEnt], reserved: &[(u64, u64)]) {
     let alloc = unsafe { &mut *core::ptr::addr_of_mut!(ALLOC) };
     let mut total = 0u64;
-    for d in mmap.entries() {
-        if d.ty == MemoryType::CONVENTIONAL {
+    for d in mmap {
+        if d.usable {
             total += d.page_count;
             alloc.buddy.add_range(
                 d.phys_start,

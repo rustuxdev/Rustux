@@ -180,7 +180,7 @@ const NAMES: [&str; 32] = [
 /// Rust-side reporter. `rcx` carries `&mut TrapFrame` (set by `dispatch`) —
 /// the UEFI target uses the Windows x64 ABI, so the first arg arrives in
 /// rcx, not rdi.
-extern "C" fn report_frame(f: &mut TrapFrame, regs: *mut SavedRegs) {
+extern "win64" fn report_frame(f: &mut TrapFrame, regs: *mut SavedRegs) {
     // Hardware IRQs (LAPIC timer 0xf0, PIT-via-IOAPIC 0xf1, spurious 0xff)
     // take the cheap path: no serial port setup, no printing. The u64::MAX
     // unknown-vector sentinel stays on the report path — a stray IRQ must
@@ -311,12 +311,31 @@ extern "C" fn report_frame(f: &mut TrapFrame, regs: *mut SavedRegs) {
             }
             let _ = writeln!(
                 u,
-                "rustux: cpu: EXCEPTION {} rip={:#x} err={:#x} cs={:#x} cr2={:#x} -- halting",
-                name, f.rip, f.err, f.cs, cr2
+                "rustux: cpu: EXCEPTION {} (vec={:#x}) rip={:#x} err={:#x} cs={:#x} cr2={:#x} rsp={:#x} fl={:#x} f={:p} -- halting",
+                name, f.vec, f.rip, f.err, f.cs, cr2, f.rsp, f.rflags, f
+            );
+            // Caller identification: dump the interrupted stack top —
+            // for a call-site fault [rsp] is the return address.
+            if f.rsp >= 0x100000 && f.rsp < 0x4000_0000 {
+                for i in 0..6u64 {
+                    let a = f.rsp + i * 8;
+                    // SAFETY: rsp is inside the identity map (checked above).
+                    let v = unsafe { (a as *const u64).read_volatile() };
+                    let _ = writeln!(u, "rustux: cpu:   stk[{a:#x}] = {v:#x}");
+                }
+            }
+            let r = unsafe { &*regs };
+            let ir = f as *mut TrapFrame as *const u64;
+            // SAFETY: dispatch pushed interrupted rbp at f-16 and rcx at f-8.
+            let (rbp, rcx) = unsafe { (*ir.sub(2), *ir.sub(1)) };
+            let _ = writeln!(
+                u,
+                "rustux: cpu:   rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} rax={:#x} rbp={:#x}",
+                r.rdi, r.rsi, r.rdx, rcx, r.rax, rbp
             );
             crate::log::printk(format_args!(
-                "rustux: cpu: EXCEPTION {} rip={:#x} err={:#x} cs={:#x} cr2={:#x} -- halting",
-                name, f.rip, f.err, f.cs, cr2
+                "rustux: cpu: EXCEPTION {} (vec={:#x}) rip={:#x} err={:#x} cs={:#x} cr2={:#x} rsp={:#x} fl={:#x} f={:p} -- halting",
+                name, f.vec, f.rip, f.err, f.cs, cr2, f.rsp, f.rflags, f
             ));
             crate::log::drain_task();
             loop {
@@ -495,7 +514,7 @@ extern "C" fn sched_dispatch() -> ! {
 
 /// Rust half of the timer path: tick accounting, then the scheduler
 /// picks which ctx the stub resumes. rcx = &mut UCtx (Windows x64).
-extern "C" fn sched_tick_frame(
+extern "win64" fn sched_tick_frame(
     f: &mut crate::user::UCtx,
 ) -> *const crate::user::UCtx {
     crate::apic::timer_tick();

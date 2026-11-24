@@ -153,7 +153,7 @@ user_terminate:
 "
 );
 
-unsafe extern "C" {
+unsafe extern "win64" {
     fn user_terminate() -> !;
     fn syscall_entry();
     /// Resume a task ctx: cr3 = pml4, rsp = ctx, pop GPRs, iretq.
@@ -336,7 +336,7 @@ const MAX_READ: u64 = 1 << 20;
 /// whole ctx (fork), rewrite it (exec), block on it (wait4), or
 /// diverge entirely (exit).
 #[no_mangle]
-extern "C" fn handle_syscall(c: *mut user::UCtx) {
+extern "win64" fn handle_syscall(c: *mut user::UCtx) {
     // SAFETY: the stub built this UCtx on the current task's kstack.
     let ctx = unsafe { &mut *c };
     // NT-personality tasks share this stub but speak the Windows

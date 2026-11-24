@@ -50,6 +50,7 @@ impl Madt {
 
 /// Snapshot the RSDP address from the UEFI configuration table. Must run
 /// before `exit_boot_services` — the system table is boot-time only.
+#[cfg(target_os = "uefi")]
 pub fn grab_rsdp() -> Option<u64> {
     use uefi::table::cfg::ConfigTableEntry;
     let mut rsdp = None::<u64>;
@@ -65,6 +66,14 @@ pub fn grab_rsdp() -> Option<u64> {
     });
     // Prefer ACPI2 (XSDT); fall back to ACPI1 (RSDT).
     let p = rsdp.or(rsdp1)?;
+    RSDP.store(p, Ordering::Relaxed);
+    Some(p)
+}
+
+/// Record an RSDP address obtained outside UEFI — the BIOS entry hands
+/// us the Multiboot2 ACPI tag or a firmware-area scan result.
+#[cfg(not(target_os = "uefi"))]
+pub fn provide_rsdp(p: u64) -> Option<u64> {
     RSDP.store(p, Ordering::Relaxed);
     Some(p)
 }

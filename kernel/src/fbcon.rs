@@ -10,7 +10,9 @@
 use core::fmt::{self, Write};
 use core::ptr;
 
+#[cfg(target_os = "uefi")]
 use uefi::boot;
+#[cfg(target_os = "uefi")]
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
 
 use klib::font::{FONT_8X16, FONT_8X16_H, FONT_8X16_W};
@@ -120,6 +122,7 @@ pub struct FbConsole {
 impl FbConsole {
     /// Locate the GOP framebuffer and claim it. Returns `None` when no GOP is
     /// present or the active mode is not a direct-write 32bpp format.
+    #[cfg(target_os = "uefi")]
     pub fn new() -> Option<Self> {
         let handle = boot::get_handle_for_protocol::<GraphicsOutput>().ok()?;
         let mut gop = boot::open_protocol_exclusive::<GraphicsOutput>(handle).ok()?;
@@ -134,6 +137,21 @@ impl FbConsole {
         let mut fb = gop.frame_buffer();
         let base = fb.as_mut_ptr();
         let size = fb.size();
+        Self::from_desc(base, size, stride, width, height, bgr)
+    }
+
+    /// Build a console over any firmware-provided 32bpp linear framebuffer
+    /// — GOP under UEFI, VBE LFB under BIOS. `base`/`size` name the mapped
+    /// window, `stride` is pixels per scanline, `bgr` picks lane order.
+    /// Returns `None` when the geometry is unusable.
+    pub fn from_desc(
+        base: *mut u8,
+        size: usize,
+        stride: usize,
+        width: usize,
+        height: usize,
+        bgr: bool,
+    ) -> Option<Self> {
         if base.is_null() || size < stride * 4 || width < FONT_8X16_W || height < FONT_8X16_H {
             return None;
         }

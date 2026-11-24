@@ -5,8 +5,10 @@ edition = "2021"
 publish = false
 
 [dependencies]
-uefi = "0.41"
 klib = { path = "../klib" }
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = "0.41"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(demo_net)"] }

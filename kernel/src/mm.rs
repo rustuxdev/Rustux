@@ -10,7 +10,15 @@
 //! u64 — so the allocator needs zero backing memory — with merge-on-free
 //! and split-on-alloc semantics mirroring mm/page_alloc.c.
 
-use uefi::mem::memory_map::MemoryMap;
+/// One normalized memory-map entry: the firmware-agnostic descriptor
+/// every boot front end produces (UEFI memory map, Multiboot2 mmap tag).
+/// `usable` marks allocator-eligible RAM — EFI CONVENTIONAL / E820 type 1.
+#[derive(Clone, Copy)]
+pub struct MapEnt {
+    pub phys_start: u64,
+    pub page_count: u64,
+    pub usable: bool,
+}
 
 pub const PAGE: u64 = 4096;
 const PAGE_2M: u64 = 2 * 1024 * 1024;
@@ -36,9 +44,9 @@ unsafe fn read64(addr: u64) -> u64 {
 /// GiB of address space the identity map must cover: end of the highest
 /// memory-map descriptor, rounded up, but never less than 4 GiB so 32-bit
 /// BARs (framebuffer included) remain mapped.
-pub fn map_gib<M: MemoryMap>(mmap: &M) -> u64 {
+pub fn map_gib(mmap: &[MapEnt]) -> u64 {
     let mut end = 0u64;
-    for d in mmap.entries() {
+    for d in mmap {
         let e = d
             .phys_start
             .saturating_add(d.page_count.saturating_mul(PAGE));
@@ -62,7 +70,7 @@ pub fn table_frames(ngib: u64) -> u64 {
 /// the PD covering GiB 512*p+i; each PD holds 512 x 2 MiB entries.
 /// Everything is P|RW — this is a boot map; W^X and userspace splits belong
 /// to the real page-table layer.
-pub fn build_identity_map<M: MemoryMap>(mmap: &M, table_base: u64) -> u64 {
+pub fn build_identity_map(mmap: &[MapEnt], table_base: u64) -> u64 {
     let ngib = map_gib(mmap);
     let npdpt = ngib.div_ceil(512);
     let bytes = table_frames(ngib) * PAGE;
@@ -228,7 +236,8 @@ impl Buddy {
         }
         let a = self.free_area[o];
         // SAFETY: list heads are owned free blocks; link is first u64.
-        self.free_area[o] = unsafe { read64(a) };
+        let nxt = unsafe { read64(a) };
+        self.free_area[o] = nxt;
         while o > order {
             o -= 1;
             self.push(o, a + (PAGE << o));
