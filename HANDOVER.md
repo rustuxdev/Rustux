@@ -4255,3 +4255,74 @@ CVE-2012-0217, CVE-2010-3081, CVE-2021-47364/CVE-2023-53035 — first
 three protected by masking + iretq-only + no compat_alloc_user_space;
 ioctl classes N/A this rung). One self-review fix (PROT_NONE compat
 leaf teardown). needs_validation: none.
+
+## run-173 — physmap: supervisor mirror of all RAM + compat window opens to <4GiB
+
+The run-172 note "exec's shared-mm np path unaffected" was WRONG and is
+corrected here (see the slot-source fix). This rung is the enabler for
+REAL i386 binaries: busybox-i386 and every stock i386 ELF link at
+0x08048000, below the old 1GiB compat floor. The floor existed because
+the kernel dereferenced phys AS LINEAR under whatever cr3 was loaded —
+a user PTE at VA=P would hijack kernel access to phys P. Fix: a
+supervisor-only physmap so kernel phys access can never be shadowed.
+
+* mm.rs: PHYSMAP = 0xFFFF_8000_0000_0000 (PML4 slot 256, inside the
+  kernel-shared band every task cr3 copies). build_identity_map now
+  also lays one physmap PDPT per 512 GiB + one PD per GiB mirroring
+  phys 0..map_gib GiB at PHYSMAP+phys, supervisor-only; table_frames =
+  1 + 2*(npdpt+ngib). (First cut used ONE PDPT for the whole mirror —
+  1024 GiB overflowed entry 511 into the adjacent PDs; the kmalloc
+  proof caught it, kind=0 on every free.)
+* pmap(p) = p + PHYS_OFF, unpmap(l) = l>=PHYSMAP ? l-PHYSMAP : l.
+  PHYS_OFF is 0 pre-switch (identity, during table build) and PHYSMAP
+  after physmap_on() — called right after load_cr3 in rustux_main, so
+  both UEFI and BIOS paths flip at the same point, BEFORE kalloc::init
+  (no identity-era heap pointer survives). unpmap passes identity
+  values through so either-era linear addresses convert correctly.
+* All phys-as-linear derefs converted: rd64/wr64/write64/read64 (one
+  place), alloc_frame zeroing, kalloc freelist/headers (buddy stays in
+  raw phys; kmalloc returns pmap'd linear), pipe ring buffers,
+  procfs scratch, fork copy loops, all ~20 translate()-result sites,
+  initrd slice, acpi rd, apic lread/lwrite/ioapic, e1000 rd/wr + DMA
+  (descriptors/registers get raw phys via unpmap), fbcon (stores raw
+  phys, pmaps at each deref — from_desc runs pre-flip).
+* Slot copies extended to (0..128).chain(256..512) in load_inner,
+  pe_load_inner, exec's np path, fork_address_space — every cr3
+  carries the physmap.
+* Compat window widened: COMPAT_LO=0x1000, COMPAT_HI=0x1_0000_0000.
+  KRESV spans (4 slots, overflow now asserts) ban VAs that would
+  shadow identity PTEs the kernel still derefs as linear: kernel image
+  (UEFI LoadedImage.info / BIOS __kernel_start..__kernel_end) and the
+  boot-stack 2MiB region (rsp snapshot). map_page32 rejects them.
+  CMMAP arena 0x40000000-0xf0000000; CSTACK 0x7fef0000 unchanged.
+* map_page32 mechanics unchanged (private PDPT/PD clones, 2M-leaf
+  splits into IDENT fills, U/S chain as the translate bound).
+* SLOT-SOURCE FIX (audit): exec's np copy and load_inner/pe_load_inner
+  sourced kernel slots from opml4 / cpu::read_cr3() — under a compat
+  caller slot 0 is the task's private USER-marked PDPT, so np[0] would
+  alias a user-owned hierarchy by reference (double-free on teardown).
+  Now all three source from mm::kernel_pml4() (KPML4 stored in
+  build_identity_map); cpu::read_cr3 removed. Latent today — ia32
+  handle_int80 has no execve/fork/clone — live the moment compat exec
+  lands. fork_address_space already had the right slot-0 rule
+  (!c.is_compat || e & USER == 0).
+* Proof: ia32test relinked at 0x08048000 (Makefile
+  -Wl,-Ttext-segment,0x08048000) — the canonical i386 base, previously
+  banned — entry 0x8049020, LOADs at 0x08048000+, exit(0).
+
+Suite: make run PASS exit 33 — 73 tasks incl. ia32test exit(0) at
+0x08048000; frames 213333 -> 213333 zero leak on clean runs; ptytest
+slave-write EIO flake (run-138 item) still intermittent and still
+leaks its 2 ring frames on failing runs — attribution confirmed again
+this rung (leak rides with the flake, zero on clean runs).
+Audit: scoped quick run (run-1 in the audit output dir) + cve.now
+(CVE-2026-99463 page-table lifecycle UAF, CVE-2025-71089 IOMMU
+caching kernel PTEs, ret2dir 0 hits, plus the run-172 compat classes
+re-checked: CVE-2007-4573/CVE-2010-3301 masking, CVE-2012-0217
+iretq-only, CVE-2010-3081 N/A, CVE-2021-47364/CVE-2023-53035 N/A).
+Findings: one latent slot-source defect found+fixed+independently
+verified (needs_validation record — no runtime trigger until ia32
+execve); KRESV overflow now asserts. Hunter subagents and the final
+coverage critic were rate-limited; parent performed both passes, so
+no independent clean-coverage claim. Follow-on: ia32 execve/clone/
+fork/wait4 + set_thread_area TLS; then PE32 loader + int 0x2e.
