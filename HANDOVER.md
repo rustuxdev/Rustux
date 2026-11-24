@@ -4875,3 +4875,30 @@ established:
 Next session should capture the shell's own stderr during a failing
 pipeline (ash prints "can't ..." messages) and trace the two cat
 children's exit statuses, rather than the ECHILD path.
+
+## run-193 — pipeline: the children are re-parented (no code change)
+
+Correlation-safe trace filtered to the shell itself (user_out, exe
+"uname"):
+
+    E145/4294967295/0|999999
+
+i.e. the shell (pid 145) calls wait4(-1) with ZERO children of its
+own, while the tasks in its pid neighbourhood exist but carry a
+parent that is NOT the shell. So the pipeline's `cat` children are
+re-parented (or belong to an intermediate child) before the shell
+waits — the shell then correctly sees no children, answers ECHILD,
+and ash reports the pipeline as failed.
+
+That explains every observation: the status reads -1 (wait4 never
+wrote it), plain commands and redirects are fine (one child, exec'd
+in place by vfork), and only pipelines break (two children that
+outlive the process that spawned them).
+
+Next session: find the intermediate. Print every task's pid/ppid at
+the shell's ECHILD (not a clamped neighbourhood) and check whether
+ash's pipeline children are being spawned by the vfork child rather
+than the shell — if so, our vfork's shared-mm/blocking model differs
+from Linux's in a way that changes ash's process tree. Also worth
+checking exit_bookkeeping's orphan sweep for normal (non-thread)
+exits.
