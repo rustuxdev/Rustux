@@ -4564,3 +4564,35 @@ Suite: make run PASS exit 33, zero leak.
 Audit: scoped quick run (run-7). No findings — the arm is a remap
 onto the audited sys_clone, and SETTLS cannot install a privileged
 selector (DPL forced 3, entries restricted to the TLS slots).
+
+## run-180 — ia32 signal frames: rt_sigaction + i386 sigframe + sigreturn
+
+Compat tasks get real signal delivery.
+
+* user.rs: i386_sigframe_write builds [pretcode][signo][88-byte
+  sigcontext] at (rsp - 104) & !15 and redirects the task into the
+  handler (cdecl: the signo is at [esp+4]). sigaction32 reads/writes
+  the 16-byte i386 struct sigaction (handler, mask, flags, restorer)
+  and deliberately does NOT store the user restorer; rt_sigprocmask32
+  takes a 4-byte sigset; rt_sigreturn32 reads the sigcontext at rsp
+  and restores the ctx.
+* Frame forgery is closed the same way as the 64-bit path: cs/ss are
+  PINNED to the compat user selectors and eflags masked, so a forged
+  frame can only resume at CPL3.
+* The trampoline lives on its own executable page
+  (COMPAT_SIGTRAMP_VA = 0x7fe00000, range-tracked so the mmap arena
+  never hands it out). The first cut embedded the retcode bytes in
+  the frame — compat stacks are NX, so the handler's return faulted
+  fetching there. That fault is what pointed at the fix.
+* ia32 arms: 67/174 sigaction, 126/175 sigprocmask, 119/173
+  sigreturn. fault_signal's compat gate is gone — a caught fault now
+  takes the frame path like any other signal.
+* Divergence: the i386 frame carries no siginfo/fpstate, so an
+  SA_SIGINFO i386 handler would read a null info pointer.
+
+Suite: 4 boots PASS exit 33, 75 tasks, frames X -> X zero leak,
+ia32test signal round-trip green (handler ran with signo 10 and
+sigreturn restored the interrupted context).
+Audit: scoped quick run (run-8). No findings — sigreturn pins the
+privilege fields, sigaction32 refuses SIGKILL/SIGSTOP changes and
+never stores a user restorer.
