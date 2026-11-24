@@ -111,6 +111,22 @@ pub fn reserve_kernel_span(lo: u64, hi: u64) {
     }
 }
 
+/// True when the 2 MiB region containing `va` intersects a KRESV
+/// span. map_page32 splits a 2M identity leaf into a PT when a user
+/// page lands under it, and teardown frees that PT without restoring
+/// the leaf — so a split region loses its identity mapping after the
+/// task dies. The kernel image (and boot stack) must never share a
+/// 2M region with a compat user page: when UEFI loads the image below
+/// 4 GiB, a page-exact reservation alone is not enough.
+fn kresv_2m(va: u64) -> bool {
+    const PS2M: u64 = 1 << 21;
+    let lo = va & !(PS2M - 1);
+    let hi = lo + PS2M;
+    let n = unsafe { *core::ptr::addr_of!(NKRESV) };
+    let k = unsafe { &*core::ptr::addr_of!(KRESV) };
+    k[..n].iter().any(|&(slo, shi)| slo < hi && shi > lo)
+}
+
 /// True when `va` falls inside a kernel-reserved span.
 fn kreserved(va: u64) -> bool {
     let n = unsafe { *core::ptr::addr_of!(NKRESV) };
@@ -2362,7 +2378,12 @@ impl Task {
                     kalloc::free_frame(pd);
                 }
                 kalloc::free_frame(pdpt);
-                wr64(self.pml4, 0);
+                // Restore the shared kernel PDPT — do NOT zero the
+                // slot. When UEFI loads the image below 4 GiB the
+                // kernel's own code/statics live in slot 0, and exec
+                // and exit keep running on this cr3 until the next
+                // switch: zeroing it unmaps the kernel under itself.
+                wr64(self.pml4, rd64(crate::mm::kernel_pml4()));
             }
         }
         for i in 128..256u64 {
@@ -2730,7 +2751,7 @@ fn map_page(t: &mut Task, va: u64, flags: u64) -> Option<u64> {
 /// chain for user access) but never a kernel leaf, so the identity
 /// map stays supervisor-only to the task.
 fn map_page32(t: &mut Task, va: u64, flags: u64) -> Option<u64> {
-    if !(COMPAT_LO..COMPAT_HI).contains(&va) || kreserved(va) {
+    if !(COMPAT_LO..COMPAT_HI).contains(&va) || kreserved(va) || kresv_2m(va) {
         // The whole <4GiB range is fair game now that kernel phys
         // access runs through the physmap — except VA 0 (null page)
         // and the KRESV spans whose identity PTEs the kernel still
@@ -7993,21 +8014,25 @@ fn collect_strs(
     va_base: u64,
     dest: &mut [[u8; EXEC_STR_CAP]],
     destlen: &mut [usize],
+    compat: bool,
 ) -> Result<usize, u64> {
     const E2BIG: u64 = (-7i64) as u64;
     if va_base == 0 {
         return Ok(0);
     }
+    // The pointer array itself is ABI-sized: 8-byte slots on x86_64,
+    // 4-byte slots under the i386 compat ABI.
+    let stride = if compat { 4u64 } else { 8u64 };
     let mut n = 0usize;
     loop {
         if n >= dest.len() {
             return Err(E2BIG);
         }
-        let slot = va_base + (n as u64) * 8;
-        if !range_ok(slot, 8) {
+        let slot = va_base + (n as u64) * stride;
+        if !range_ok(slot, stride) {
             return Err(EFAULT);
         }
-        let Some(ptr) = read_task_u(pml4, slot, 8) else {
+        let Some(ptr) = read_task_u(pml4, slot, stride) else {
             return Err(EFAULT);
         };
         if ptr == 0 {
@@ -8026,11 +8051,12 @@ fn collect_strs(
 pub fn collect_exec_args(argv_va: u64, envp_va: u64, out: &mut ExecArgs) -> u64 {
     const E2BIG: u64 = (-7i64) as u64;
     let Some(t) = cur_mut() else { return E2BIG };
-    match collect_strs(t.pml4, argv_va, &mut out.argv, &mut out.argv_len) {
+    let compat = t.is_compat;
+    match collect_strs(t.pml4, argv_va, &mut out.argv, &mut out.argv_len, compat) {
         Ok(n) => out.argc = n,
         Err(e) => return e,
     }
-    match collect_strs(t.pml4, envp_va, &mut out.envp, &mut out.envp_len) {
+    match collect_strs(t.pml4, envp_va, &mut out.envp, &mut out.envp_len, compat) {
         Ok(n) => out.envc = n,
         Err(e) => return e,
     }
