@@ -4731,3 +4731,22 @@ Verified: 2 boots PASS exit 33, 75 tasks, frames X -> X zero leak,
 both ia32test tasks exit 0.
 Audit: scoped quick run (run-13) — the arm is a one-liner onto the
 audited fcntl.
+
+## run-187 — ia32 pipe2: pipelines get further, still hang
+
+Tracing the shell's pipeline (per-syscall printk on the ia32
+dispatch for exe "uname"/"cat") showed the failure point:
+pipe2 (i386 nr 331) answered ENOSYS, then the shell closed fd -1 and
+wrote its error. Wired arm 331 -> user::fd_pipe (the audited 64-bit
+implementation, same flags).
+
+With pipe2 wired the pipeline proceeds past the pipe creation but
+still HANGS, so the case stays out of the suite (documented in the
+test and here). Next session: trace the two `cat` children (their
+exe becomes "cat") — the hang is likely a pipe read that never wakes,
+or the second fork blocking behind vfork's parent wait.
+
+Verified: PASS exit 33, 75 tasks, frames 213333 -> 213333 zero leak,
+both ia32test tasks exit 0 (plain + redirect cases).
+Audit: scoped quick run (run-14) — the arm is a one-liner onto the
+audited pipe implementation.
