@@ -4816,3 +4816,34 @@ redirects through the i386 shell are reliable; the pipeline still
 needs a correlation-safe trace (write the diagnostic to a per-task
 buffer or to the console via user_out instead of printk) to see the
 shell's own children at its ECHILD point.
+
+## run-191 — pipeline status: children lose their parent (no code change)
+
+Correlation-safe trace (user_out straight to the UART, so nothing is
+dropped). One pipeline run produced:
+
+    E41/0/0   x3881     <- a task spinning on wait4 with no children
+    E41/0/1   x111      <- a zombie exists, none of it is its child
+    E184/0/1, E198/0/1, E203/0/1, E221/0/0, E223/0/0 ...
+
+Format is E<caller pid>/<children of caller>/<zombies alive>. The
+pattern is unambiguous: parents call wait4 while zombies EXIST but
+none carries their ppid, so wait4 answers ECHILD and the shell
+reports an error — that is the pipeline's unreliable status.
+
+Prime suspect: something clears a child's ppid before the parent
+collects it. The only code that sets ppid = 0 is exit_bookkeeping's
+thread path ("never a waitable zombie") and the orphan sweep for a
+dying thread's children. So a task the shell spawned is being treated
+as a THREAD (tgid != pid) when it exits — check clone_vm's tgid
+assignment on the vfork path and whether an exec preserves tgid
+correctly for a compat child.
+
+Also visible: pid 41 spins 3881 times on wait4 instead of blocking —
+that caller believes it has children (the earlier `relevant` scan
+passed) but each call then finds none. Same root cause, and it means
+a user-space busy loop follows every mis-reap.
+
+Next: at the ECHILD point print the zombie's pid + tgid + ppid (not
+just counts) — if tgid != pid on the zombie, the thread path is the
+bug; if ppid is 0 with tgid == pid, the orphan sweep is.
