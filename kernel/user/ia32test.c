@@ -39,6 +39,16 @@ static long sc6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
 
 static const char msg[] = "ia32: compat task alive\n";
 
+// Signal proof: a caught SIGUSR1 must enter the handler with the
+// signo on the stack and return through the kernel's sigreturn
+// trampoline, restoring the interrupted context.
+static volatile int got_sig;
+static volatile int got_arg;
+static void on_usr1(int s) {
+    got_sig = 1;
+    got_arg = s;
+}
+
 // Compat clone child: a real function so the child's prologue builds
 // its own frame on the new stack (what glibc's clone stub does) —
 // resuming straight into the parent's frame would read garbage.
@@ -242,6 +252,21 @@ void main32(void) {
     check(sc3(3, tpipe[0], (long)&rb, 1) == 1);
     check(twrite_ret == 1);
     check(rb == 'T');
+
+    // ---- signals: rt_sigaction (174) + rt_sigreturn (173).
+    // i386 struct sigaction: handler, mask, flags, restorer.
+    {
+        unsigned int sa[4];
+        sa[0] = (unsigned int)(long)on_usr1;
+        sa[1] = 0;
+        sa[2] = 0;
+        sa[3] = 0;
+        check(sc6(174, 10, (long)sa, 0, 4, 0, 0) == 0); // SIGUSR1
+    }
+    check(sc3(37, sc0(20), 10, 0) == 0); // kill(self, SIGUSR1)
+    // The handler runs before the kill syscall returns to user mode.
+    check(got_sig == 1);
+    check(got_arg == 10);
 
     // Unknown ia32 number -> -ENOSYS (38), not a crash.
     check(sc0(999) == -38);

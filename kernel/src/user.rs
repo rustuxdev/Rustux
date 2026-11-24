@@ -59,6 +59,13 @@ const SIGTRAMP_VA: u64 = USTACK_VA - PAGE;
 /// zeroed (ud2-equivalent landing pad for off-stub jumps).
 const SIGTRAMP_CODE: [u8; 9] = [0x48, 0xc7, 0xc0, 0x0f, 0, 0, 0, 0x0f, 0x05];
 
+/// Compat (i386) sigreturn trampoline: `pop %eax; mov $173,%eax;
+/// int $0x80`. It needs an EXECUTABLE page — compat stacks are mapped
+/// NX — so it gets a dedicated page below the compat stack (range-
+/// tracked so the mmap arena never hands it out).
+const COMPAT_SIGTRAMP_VA: u64 = 0x7fe0_0000;
+const SIGTRAMP_CODE32: [u8; 8] = [0x58, 0xb8, 0xad, 0, 0, 0, 0xcd, 0x80];
+
 /// Per-task kernel stack for SYSCALL entries — replaces the shared
 /// static stack so a task's kernel state can't bleed into the next.
 const KSTACK_SIZE: usize = 49152;
@@ -1009,6 +1016,172 @@ fn sig_record(t: &mut Task, sig: u64, fd: bool) -> [u8; 128] {
     fill_sig_rec(sig, si, fd)
 }
 
+/// i386 sigframe: [pretcode][signo][sigcontext][retcode]. The
+/// sigcontext is Linux's 88-byte i386 layout; the 8-byte retcode is
+/// the kernel trampoline (`pop %eax; mov $173,%eax; int $0x80`) —
+/// used when the action carries no SA_RESTORER, and harmless to use
+/// unconditionally since a restorer does the same thing.
+const I386_SC_LEN: u64 = 88;
+const I386_SIGFRAME: u64 = 104;
+
+fn i386_sigframe_write(t: &mut Task, ctx: &UCtx, sig: u64, saved_mask: u32) -> Option<u64> {
+    let frame = (ctx.rsp.wrapping_sub(I386_SIGFRAME)) & !15;
+    let mut b = [0u8; I386_SIGFRAME as usize];
+    b[0..4].copy_from_slice(&(COMPAT_SIGTRAMP_VA as u32).to_le_bytes()); // pretcode
+    b[4..8].copy_from_slice(&(sig as u32).to_le_bytes());
+    // sigcontext at frame+8: segs, GPRs, trap/err, ip/cs/flags,
+    // sp_at_signal/ss, fpstate, oldmask, cr2.
+    let sc = 8usize;
+    for i in 0..4 {
+        let sel = 0x2bu16; // user data for gs/fs/es/ds
+        b[sc + i * 4..sc + i * 4 + 2].copy_from_slice(&sel.to_le_bytes());
+    }
+    let gprs = [
+        ctx.rdi, ctx.rsi, ctx.rbp, ctx.rsp, ctx.rbx, ctx.rdx, ctx.rcx, ctx.rax,
+    ];
+    for (i, v) in gprs.iter().enumerate() {
+        let off = sc + 16 + i * 4;
+        b[off..off + 4].copy_from_slice(&(*v as u32).to_le_bytes());
+    }
+    let f = |off: usize, v: u32| {
+        let mut o = [0u8; 4];
+        o.copy_from_slice(&v.to_le_bytes());
+        o
+    };
+    b[sc + 48..sc + 52].copy_from_slice(&f(0, 0)); // trapno
+    b[sc + 52..sc + 56].copy_from_slice(&f(0, 0)); // err
+    b[sc + 56..sc + 60].copy_from_slice(&(ctx.rip as u32).to_le_bytes()); // ip
+    b[sc + 60..sc + 64].copy_from_slice(&(ctx.cs as u32).to_le_bytes()); // cs
+    b[sc + 64..sc + 68].copy_from_slice(&(ctx.rflags as u32).to_le_bytes()); // flags
+    b[sc + 68..sc + 72].copy_from_slice(&(ctx.rsp as u32).to_le_bytes()); // sp_at_signal
+    b[sc + 72..sc + 76].copy_from_slice(&(ctx.ss as u32).to_le_bytes()); // ss
+    b[sc + 76..sc + 80].copy_from_slice(&f(0, 0)); // fpstate = NULL
+    b[sc + 80..sc + 84].copy_from_slice(&saved_mask.to_le_bytes()); // oldmask
+    b[sc + 84..sc + 88].copy_from_slice(&f(0, 0)); // cr2
+    // The 8 bytes after the sigcontext are reserved (Linux keeps a
+    // retcode there for restorer-less actions; ours lives on the
+    // trampoline page because the stack is NX).
+    if write_task_bytes(t.pml4, frame, &b) {
+        Some(frame)
+    } else {
+        None
+    }
+}
+
+/// rt_sigreturn for i386: the trampoline popped pretcode, so rsp is
+/// frame+4 and the sigcontext sits at rsp+4. Privilege fields are
+/// PINNED (cs/ss to the compat user selectors) — a forged frame can
+/// never resume at CPL0 (the sigreturn-frame-forgery class).
+pub fn rt_sigreturn32(ctx: &mut UCtx) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    let Some(t) = cur_mut() else { return EFAULT_ };
+    // The trampoline popped pretcode and then the signo, so rsp is
+    // the sigcontext base (frame+8).
+    let sc = ctx.rsp;
+    if !range_ok(sc, I386_SC_LEN) {
+        return EFAULT_;
+    }
+    // SAFETY: sc validated readable for 88 bytes in the task's map.
+    let b = unsafe { core::slice::from_raw_parts(sc as *const u8, I386_SC_LEN as usize) };
+    let r32 = |off: usize| u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]) as u64;
+    ctx.rdi = r32(16);
+    ctx.rsi = r32(20);
+    ctx.rbp = r32(24);
+    ctx.rsp = r32(28);
+    ctx.rbx = r32(32);
+    ctx.rdx = r32(36);
+    ctx.rcx = r32(40);
+    ctx.rax = r32(44);
+    ctx.rip = r32(56);
+    ctx.cs = cpu::UC32_SEL as u64; // pinned
+    ctx.rflags = (r32(64) & 0x0033_ffff) | 0x200;
+    ctx.rsp = r32(68); // sp_at_signal
+    ctx.ss = 0x2b | 3; // pinned
+    t.sigmask = r32(80) as u32; // oldmask
+    0
+}
+
+/// sigaction/rt_sigaction for i386: 16-byte struct sigaction
+/// (handler, mask, flags, restorer). The restorer is not stored —
+/// delivery always uses the in-frame trampoline.
+pub fn sigaction32(sig: u64, act: u64, oldact: u64) -> u64 {
+    if sig == 0 || sig > 31 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let i = (sig - 1) as usize;
+    if oldact != 0 {
+        if !range_ok_w(oldact, 16) {
+            return EFAULT;
+        }
+        let (h, f, m) = {
+            let s = sigt(t);
+            (
+                s.handlers[i],
+                s.flags.get(i).copied().unwrap_or(0) as u32,
+                s.masks.get(i).copied().unwrap_or(0) as u32,
+            )
+        };
+        // SAFETY: validated writable user range (16 bytes).
+        unsafe {
+            (oldact as *mut u32).write_unaligned(h as u32);
+            (oldact as *mut u32).add(1).write_unaligned(m);
+            (oldact as *mut u32).add(2).write_unaligned(f);
+            (oldact as *mut u32).add(3).write_unaligned(0);
+        }
+    }
+    if act != 0 {
+        if !range_ok(act, 16) {
+            return EFAULT;
+        }
+        // SAFETY: validated readable user range.
+        let (h, m, f) = unsafe {
+            (
+                (act as *const u32).read_unaligned() as u64,
+                (act as *const u32).add(1).read_unaligned(),
+                (act as *const u32).add(2).read_unaligned(),
+            )
+        };
+        if sig as usize == SIGKILL || sig as usize == SIGSTOP {
+            return EINVAL;
+        }
+        let s = sigt(t);
+        s.handlers[i] = h;
+        s.flags[i] = f;
+        s.masks[i] = m;
+    }
+    0
+}
+
+/// rt_sigprocmask for i386: a 4-byte sigset.
+pub fn rt_sigprocmask32(how: u64, set: u64, old: u64, sigsetsize: u64) -> u64 {
+    if sigsetsize != 4 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return ENOENT };
+    if old != 0 {
+        if !range_ok_w(old, 4) {
+            return EFAULT;
+        }
+        // SAFETY: validated writable user range.
+        unsafe { (old as *mut u32).write_unaligned(t.sigmask) };
+    }
+    if set != 0 {
+        if !range_ok(set, 4) {
+            return EFAULT;
+        }
+        // SAFETY: validated readable user range.
+        let m = unsafe { (set as *const u32).read_unaligned() };
+        t.sigmask = match how {
+            0 => t.sigmask | m,
+            1 => t.sigmask & !m,
+            2 => m,
+            _ => return EINVAL,
+        };
+    }
+    0
+}
+
 fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
     while let Some(sig) = unmasked_pending(t) {
         t.pending &= !(1u32 << (sig - 1));
@@ -1036,14 +1209,40 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                 return;
             }
             handler => {
-                // A caught signal needs the x86_64 frame ABI — a
-                // restorer stub, a 160-byte UCtx, siginfo. Compat
-                // tasks can't consume that shape (the ia32 frame
-                // ABI is a follow-on rung), so a caught signal takes
-                // the default-fatal path like SIG_DFL would.
+                // Compat tasks get the i386 sigframe ABI: pretcode +
+                // signo + 88-byte sigcontext + an in-frame sigreturn
+                // trampoline. The handler is entered cdecl-style with
+                // its argument at [esp+4].
                 if t.is_compat {
-                    t.state = TaskState::Exited;
-                    t.exit_status = sig as u64;
+                    let i = sig - 1;
+                    let (fl, hm) = {
+                        let s = sigt(t);
+                        (
+                            s.flags.get(i).copied().unwrap_or(0),
+                            s.masks.get(i).copied().unwrap_or(0),
+                        )
+                    };
+                    let saved_mask = if t.frame_mask != u64::MAX {
+                        t.frame_mask as u32
+                    } else {
+                        t.sigmask
+                    };
+                    t.frame_mask = u64::MAX;
+                    let Some(frame) = i386_sigframe_write(t, ctx, sig as u64, saved_mask) else {
+                        t.state = TaskState::Exited;
+                        t.exit_status = SIGSEGV as u64;
+                        return;
+                    };
+                    if fl & SA_RESETHAND != 0 {
+                        sigt(t).handlers[i] = SIG_DFL;
+                    }
+                    let mut add = hm;
+                    if fl & SA_NODEFER == 0 {
+                        add |= 1u32 << i;
+                    }
+                    t.sigmask |= add;
+                    ctx.rip = handler;
+                    ctx.rsp = frame;
                     return;
                 }
                 // [restorer][signo][UCtx][siginfo_t][saved sigmask]:
@@ -1128,11 +1327,9 @@ pub fn fault_signal(signo: u64, code: i32, addr: u64, ctx: &mut UCtx) -> (u64, u
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
     if let Some(t) = tasks.get_mut(cur).and_then(|s| s.as_mut()) {
-        // Compat tasks have no ia32 signal-frame ABI — a caught
-        // disposition is treated as uncaught (fatal with the fault
-        // signo, like maybe_deliver's compat gate).
-        let caught = !t.is_compat
-            && sigt(t)
+        // Caught dispositions take the frame path for both ABIs —
+        // maybe_deliver builds the x86_64 frame or the i386 one.
+        let caught = sigt(t)
                 .handlers
                 .get(signo.saturating_sub(1) as usize)
                 .copied()
@@ -2931,16 +3128,27 @@ fn load_inner(t: &mut Task, e: &elf::Elf, img: &[u8]) -> bool {
             return false;
         }
     }
-    // The sigreturn trampoline is a 64-bit facility — it lives at
-    // SIGTRAMP_VA in the 64-bit window, which a compat task can't
-    // reach; maybe_deliver takes the default-fatal path for caught
-    // signals on compat tasks instead of pushing the x86_64 frame.
+    // Each ABI gets its own sigreturn trampoline: the 64-bit one at
+    // SIGTRAMP_VA (out of a compat task's reach) and the i386 one at
+    // COMPAT_SIGTRAMP_VA, which must be executable because compat
+    // stacks are NX.
     if !t.is_compat {
         let Some(tp) = map_page(t, SIGTRAMP_VA, USER) else {
             return false;
         };
         // SAFETY: tp is an identity-mapped frame we just allocated.
         unsafe { (crate::mm::pmap(tp) as *mut u8).copy_from_nonoverlapping(SIGTRAMP_CODE.as_ptr(), SIGTRAMP_CODE.len()) };
+    } else {
+        let Some(tp) = map_page(t, COMPAT_SIGTRAMP_VA, USER) else {
+            return false;
+        };
+        // SAFETY: tp is an identity-mapped frame we just allocated.
+        unsafe { (crate::mm::pmap(tp) as *mut u8).copy_from_nonoverlapping(SIGTRAMP_CODE32.as_ptr(), SIGTRAMP_CODE32.len()) };
+        if t.nranges >= MAX_RANGES {
+            return false;
+        }
+        t.ranges[t.nranges] = (COMPAT_SIGTRAMP_VA, COMPAT_SIGTRAMP_VA + PAGE, RNG_R);
+        t.nranges += 1;
     }
     t.stack_top = stop;
     if t.nranges >= MAX_RANGES {

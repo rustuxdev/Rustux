@@ -706,6 +706,13 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         },
         // getdents64: linux_dirent64 keeps u64 fields on both ABIs.
         220 => user::fd_getdents(a1, a2, a3),
+        // i386 signal surface: sigaction(67), sigprocmask(126),
+        // sigreturn(119), rt_sigaction(174), rt_sigprocmask(175),
+        // rt_sigreturn(173). Struct sigaction is 16 bytes and the
+        // sigset is 4 bytes under this ABI.
+        67 | 174 => user::sigaction32(a1, a2, a3),
+        119 | 173 => user::rt_sigreturn32(ctx),
+        126 | 175 => user::rt_sigprocmask32(a1, a2, a3, if nr == 175 { a4 } else { 4 }),
         // i386 process creation: fork(2), waitpid(7), execve(11).
         2 => user::fork(ctx, false, false),
         7 => user::wait4(ctx, a1 as u32 as i32 as i64, a2, a3),
