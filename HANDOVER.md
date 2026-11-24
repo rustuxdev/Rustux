@@ -4532,3 +4532,35 @@ Suite: make run PASS exit 33, 75 tasks, zero leak, ia32test exit(0).
 Audit: scoped quick run (run-6). No trust-boundary finding (the bug
 is a reference-count/identity error confined to the caller's own
 pty), recorded as a lifecycle-correctness fix.
+
+## run-179 — ia32 clone: compat threads
+
+A compat (i386) task can now create a thread.
+
+* syscall.rs arm 120: i386 passes clone's TLS in esi and ctid in edi —
+  the reverse of x86_64 — so the arm maps (flags, stack, ptid, tls,
+  ctid) onto sys_clone(flags, stack, ptid, ctid, tls).
+* user.rs: parse_user_desc factored out of sys_set_thread_area;
+  clone_vm's compat CLONE_SETTLS path parses the user_desc and
+  installs it into the CHILD's TLS slot array (a raw FS base is the
+  x86_64 convention — under i386 the argument is a descriptor
+  pointer). A bad pointer leaves the parent's TLS in place.
+* ia32test.c: a glibc-shaped clone stub (issue clone, branch on the
+  return in eax, call a real function so the child's prologue builds
+  a frame on the NEW stack) plus a pipe handshake — the child writes
+  one byte, the parent blocks reading it.
+* Two test-harness bugs found the hard way, both worth remembering:
+  - the child resumes at the instruction after int 0x80 on a new
+    stack, so it must not read the parent's frame — the earlier
+    attempts read garbage locals and hung or faulted;
+  - the sc* asm wrappers lacked a "memory" clobber, so buffers the
+    kernel filled were read as stale registers. That masked a real
+    statx comparison bug (size checked against a struct the console
+    fstat had already overwritten) — fixed by saving motd's size.
+* Verified: 3 consecutive boots PASS exit 33, 75 tasks, frames
+  213335 -> 213335 zero leak, thread + leader both exit 0.
+
+Suite: make run PASS exit 33, zero leak.
+Audit: scoped quick run (run-7). No findings — the arm is a remap
+onto the audited sys_clone, and SETTLS cannot install a privileged
+selector (DPL forced 3, entries restricted to the TLS slots).
