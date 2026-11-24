@@ -4326,3 +4326,63 @@ execve); KRESV overflow now asserts. Hunter subagents and the final
 coverage critic were rate-limited; parent performed both passes, so
 no independent clean-coverage claim. Follow-on: ia32 execve/clone/
 fork/wait4 + set_thread_area TLS; then PE32 loader + int 0x2e.
+
+## run-174 — real i386 busybox runs: set_thread_area + i386 TLS via GDT slots
+
+Milestone: the unmodified Ubuntu i386 static busybox (ELFCLASS32,
+linked 0x08048000, 2.0 MB, glibc-static) loads, runs glibc startup,
+dispatches its multicall applet from argv[0], calls sys_uname and
+prints "Rustux" to the console, then exit(0). Proof task is the
+initrd entry named "uname" (the cpio name IS argv[0]).
+
+* Root blocker was TLS: static i386 glibc calls set_thread_area
+  (nr 243) before it touches %gs-based errno/TCB. Implemented:
+  - cpu.rs: GDT grown to 12 slots; 8-11 are the TLS entries
+    (selectors 0x43/0x4b/0x53/0x5b). install_tls(slot, desc) writes
+    a slot (long mode re-reads GDT memory per segment load — no
+    lgdt needed); load_gs(sel) lets CPL0 reload a DPL3 data segment
+    (max(CPL,RPL)<=DPL). GDTR limit now derived from the array.
+  - Task gains tls:[u64;4] + gs_sel:u16; inherited at fork/clone,
+    reset at NT thread creation. switch_to installs all four slots
+    from the incoming task and reloads its %gs selector (0 clears).
+  - sys_set_thread_area (compat-only): validates the 16-byte
+    struct user_desc — the flags are ONE u32 bitfield at offset 12
+    (seg_32bit:1, contents:2, read_exec_only:1, limit_in_pages:1,
+    seg_not_present:1, useable:1, lm:1) — builds the descriptor the
+    way fill_ldt does (DPL forced 3, S=1, ACCESS bit set), entry -1
+    picks the first free slot, explicit entries must be 8..11,
+    writes the entry NUMBER back (glibc derives sel = entry*8+3).
+* Three bugs found by boot:
+  1. descriptor packing dropped base31_24 (<<56) — glibc's TLS base
+     0x0824c380 arrived as 0x24c380 -> gs:8 #PF.
+  2. user_desc flag offsets: they are a bitfield u32 at 12, not six
+     u16s (the first cut read garbage).
+  3. IA-32e takes FS/GS BASE from the MSR whenever the segment is
+     loaded at CPL0 in 64-bit mode — the descriptor alone is not
+     enough. Fixed by mirroring base_addr into t.gs_base (written to
+     MSR_GS_BASE on every switch); a compat-mode load (the task's
+     own `mov gs`) reads the descriptor, which carries the same base.
+* New ia32 nrs, each reusing a validated 64-bit implementation:
+  172 prctl, 191 ugetrlimit (i386 rlimit32, 8 bytes), 243
+  set_thread_area, 305 readlinkat, 311 set_robust_list (len==12),
+  386 rseq (32-byte struct). Still ENOSYS (recorded divergences):
+  300 fstatat64 (i386 stat64 layout — next rung's struct shims),
+  383 name_to_handle_at. Busybox tolerates both.
+* Makefile: kernel/user/busybox-i386 (Ubuntu busybox-static:i386
+  1:1.36.1) added to USER_ELFS + initrd as "uname"; lstest count 56.
+
+Suite: make run PASS exit 33 — 74 tasks incl. ia32test exit(0) and
+uname exit(0) with "Rustux" on the console; frames 213330 -> 213330
+zero leak on the clean run. Known flakes seen and attributed: ptytest
+slave-write EIO (run-138 item; its 2-frame leak rides with the failing
+run) and one run-147-class userspace stall after bashtest (heartbeat
+spinning, no progress) that cleared on re-run.
+Audit: scoped quick run (run-2) + cve.now (TLS/GDT descriptor class,
+CVE-2014-9322-family IRET segment confusion — N/A, no kernel-mode iret
+with a user segment). No findings; DPL forced 3 and u32 bases keep
+%gs inside the task's own U/S checks. Parent performed hunt/critic
+inline (rate limit) — no independent clean-coverage claim.
+Follow-on: ia32 fstatat64/stat64 + timeval32/iovec32 shims (unblocks
+`ls`, `cat`, `sh` applets), then fork/clone/execve/wait4 + ia32
+signal frames (makes the run-173 slot-source fix's validation plan
+executable).
