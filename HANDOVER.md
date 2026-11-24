@@ -4635,3 +4635,25 @@ cannot pass silently (a failed exec exits 9 and the status check
 fails).
 Next: SA_SIGINFO i386 frame (siginfo + fpstate), then i386 pipelines
 with external commands (busybox sh -c "cat /motd.txt | wc -c").
+
+## run-183 — cross-ABI exec: a compat task execs an ELF64 image
+
+No kernel changes — the proof shows a compat child exec'ing the
+initrd's 64-bit busybox as `cat /motd.txt`. load_inner flips
+is_compat off inside exec and builds the 64-bit window/stack for a
+task that started in compat mode; the motd text appears on the
+console and wait4 reports status 0.
+
+* ia32test: fork -> child execs /bin/cat (ELF64) with /motd.txt ->
+  parent checks pid + status 0.
+
+Known gap recorded: `sh -c "cat /motd.txt | cat > /dev/null"` exits
+2, so busybox-shell PIPELINES are not yet working (a redirect to a
+fresh absolute path also fails). The shell itself runs builtins fine
+(run-182), so the next investigation is the shell's pipeline setup
+(pipe/dup2/close through our fd layer) and absolute-path creation in
+the RAM fs.
+
+Verified: PASS exit 33, 75 tasks, frames 213333 -> 213333 zero leak,
+both ia32test tasks exit 0, motd text on the console.
+Audit: scoped quick run (run-11) — no kernel code changed.
