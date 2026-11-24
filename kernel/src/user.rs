@@ -9135,9 +9135,15 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 return (-5i64) as u64; // EIO — still locked
             }
             // Find the slave node — its rdev minor is this index.
+            // The SLOT index is what OFDs name: flatten().position()
+            // counts only live entries, so a hole in VFILES would
+            // hand back a different (possibly master) node and the
+            // close would decrement the wrong pty count.
             let vs = unsafe { &*core::ptr::addr_of!(VFILES) };
-            let Some(svi) = vs.iter().flatten().position(|v| {
-                v.fmt == 0o20000 && v.rdev == ((136 << 8) | id as u32)
+            let Some(svi) = vs.iter().position(|v| {
+                v.as_ref().is_some_and(|v| {
+                    v.fmt == 0o20000 && v.rdev == ((136 << 8) | id as u32)
+                })
             }) else {
                 return (-2i64) as u64; // ENOENT — node unlinked
             };
