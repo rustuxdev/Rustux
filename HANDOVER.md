@@ -4657,3 +4657,25 @@ the RAM fs.
 Verified: PASS exit 33, 75 tasks, frames 213333 -> 213333 zero leak,
 both ia32test tasks exit 0, motd text on the console.
 Audit: scoped quick run (run-11) — no kernel code changed.
+
+## run-184 — ia32 vfork: the i386 shell spawns external commands
+
+* syscall.rs arm 190: i386 vfork -> the audited user::sys_vfork
+  (clone_vm with the parent's rsp, the parent blocks in
+  WaitOn::Vfork(child) until the child execs or exits). busybox ash
+  and glibc's i386 spawn path both use it.
+* ia32test: run_sh() forks, the child execs the real i386 busybox as
+  `sh -c <static cmd>`, the parent asserts status 0. `cat /motd.txt`
+  now prints the motd — the shell vforks and execs the initrd's
+  64-bit cat (cross-ABI exec) through our fd layer.
+
+Still open (recorded, not fixed): i386 busybox-shell PIPELINES
+(`sh -c "cat /motd.txt | cat > /dev/null"`) exit 2, and a redirect
+to a fresh absolute path exits 1, while plain external commands
+work. Next investigation: ash's pipeline setup (two forks +
+pipe/dup2/close) and absolute-path creation in the RAM fs.
+
+Verified: PASS exit 33, 75 tasks, frames 213333 -> 213333 zero leak,
+both ia32test tasks exit 0, motd text on the console.
+Audit: scoped quick run (run-12) — the arm is a one-liner onto the
+audited vfork path.
