@@ -728,6 +728,8 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         // i386 process creation: fork(2), waitpid(7), execve(11).
         2 => user::fork(ctx, false, false),
         7 => user::wait4(ctx, a1 as u32 as i32 as i64, a2, a3),
+        // wait4: the 4-arg form busybox ash uses to reap a pipeline.
+        114 => user::wait4(ctx, a1 as u32 as i32 as i64, a2, a3),
         11 => sys_execve(ctx, a1, a2, a3),
         // clone(flags, stack, ptid, tls, ctid) — i386 passes TLS in
         // esi and ctid in edi, the reverse of the x86_64 order.
