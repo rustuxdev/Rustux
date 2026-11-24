@@ -3452,3 +3452,806 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
 - next: VMware boot with the diagnostic ISO (still the open user test);
   DOS personality (v86 + DPMI + int 21h + VGA 13h) for real DOOM.EXE;
   pty ofd_release EIO flake.
+
+## run-149 — DOS16M kernel deep-dive in tools/dosemu (untracked research harness)
+- Goal: boot DOOM.EXE's *authentic* DOS16M stub (not the direct-LE path).
+  The stub loads its own resident kernel (file 0x400-0xa290 -> 0x400,
+  0xa290-0x10000 -> 0xa090), self-relocates to para 0x2238, lgdt/lidt
+  itself (standalone, no DPMI host), runs 16-bit PM.
+- Emulator bugs fixed this session:
+  - guest-IDT: kernel executes `lidt base=0` in PM deliberately (overlays
+    its IDT on the IVT). soft_int now bypasses the guest IDT for software
+    ints >=0x20 -> native svc; only exceptions/<0x20 consult it with
+    strict gate-type validation. int21 file I/O works.
+  - int31 0x0300/0x0301/0x0302: register clobber (struct eax/ebx read
+    before dispatch) fixed; real PM->RM->PM round-trip implemented
+    (rmcall_pending/frame/sentinel + step() return hook; 0x301 copies cx
+    param words below the iret frame). Kernel RM-call struct layout
+    confirmed: dwords edi..eax @+0..0x1c, then fl@+0x20, es@+0x22,
+    ds@+0x24, ip@+0x28, cs@+0x2a, sp@+0x2c, ss@+0x2e.
+  - PM far-transfer RM reflect (load_seg rm_seg): the operand's "segment"
+    is resolved via the descriptor — present sel -> desc_base, else
+    paragraph sel<<4, null -> 0. Fixes the DOS16M stack-trampoline idiom
+    (call far {bp-0xa, ss=0x20} -> RM 0:off). PM->RM->PM round trip now
+    completes cleanly (verified: int15 trampoline -> retf -> PM resume).
+  - svc vector seed: call far [ds:0x1e] gets off=0x7344 (proven kernel
+    dispatcher; builds task frame, int31/302 to IVT[svc#]).
+  - DOS16M service-vector template: file 0x1c-0x47 = {off,seg} entries
+    (offs 0x2800/0x8c09/0x9409/...) copied to IVT at load; kernel reloc
+    loop patches seg halves to the relocated para. int15 AH=0x31 stubbed
+    CF=0 (kernel probe service).
+- Current blocker: after the int15 svc returns, the caller function's
+  epilogue `leave; ret` pops a corrupt return off (0x20 -> executes IDT
+  bytes -> hlt). The frame was already wrong entering the unwind —
+  consistent with the never-run DOS16M task/DPMI-variant init (service
+  tables at ds:0xf6a empty, task switcher scratch cs:0x1f90 zero, no
+  int21/25 vector hooks installed). Next: find the standalone-mode init
+  that populates task state, or synthesize the current-task record.
+- Vector table decode (Rosetta): entries @0x1e,0x22,0x26..4-byte {off,seg};
+  callf[ds:0x22]->2238:7344 = generic svc dispatcher ([bp+6]=svc#,
+  IVT[svc*4] via ds:0xc2c flat = the IVT itself). int15 AH=0x31 in the
+  stack trampoline = "invoke RM int15 svc" via the kernel's reg-frame
+  wrapper at kernrm 0x41fc (int#=[bp+4] al).
+- audit: safe-anything scoped on tools/dosemu/dosemu.c — clean, no
+  findings (untracked scratch tooling); cve.now entities.search "DOS
+  emulator DPMI extender" — no mapped class. security-audit skill still
+  absent; safe-anything MCP used per run-148 precedent.
+
+## run-150 — DOS16M sel-0x88 resolved: kernel runs end-to-end to app entry
+- Root cause of the "corrupt unwind" from run-149: NOT a task-init bug.
+  The PM kernel hardcodes `call far 0x88:0x30f9` (its RM-code dispatch);
+  sel 0x88's GDT slot is empty in the template — DOS16M expects it
+  populated at runtime with a code16 descriptor for the RELOCATED RM
+  kernel image. With it empty, para-synth gave base 0x880 -> executed the
+  LOW kernrm copy whose `leave;ret` popped pushed-ds (0x20) -> IDT -> hlt.
+- Relocated image discovery: kernrm exists twice in guest — low copy at
+  0x400 (file image) and a 1:1 relocated copy at image base 0x20bb0
+  (para 0x20bb). ds:0x20=0x2238 = image offset 0x17d0 (the RM/PM twin
+  delta). Signature-match: routine `26 8b 77 06` at 0x3979 and 0x24129;
+  delta 0x207b0 -> image base 0x20bb0.
+- Fix: SELMAP=sel:base env writes a present code16 descriptor {lim ffff}
+  into the guest GDT at lgdt time (dosemu.c ~line 1746). SELMAP=88:20bb0
+  -> pmcs resolves 88:->20bb0, RM->PM restore keeps the base.
+- Result — kernel runs END TO END: svc call -> pathscan routine
+  (0x23ca9, filename canonicalization) -> ret->0x20 -> relocated 0x20bd0
+  (0x27-entry vector seg-patch loop — real code) -> more svc calls ->
+  int15 ax=0x8700 block-move (app -> XMS copy) -> DPMI-client init block
+  RUNS (int31/0x204 get-vector, IVT writes, f000:xxx stub construction)
+  -> RM->PM raw-mode-switch stub (f000:fba0: push edx(cs);push eax(eip);
+  retfd) -> lands in app at cs=0xab1.
+- New blocker: retfd pops eip=0xd22b0646 (garbage eax — the app entry
+  eip read/loaded wrong; cs=0xab1 = app para is CORRECT). Executes ~90
+  insns in wrapped high-mem fetch then int1. Suspect: app entry eip not
+  staged — likely an int31 service result or task-record field we stub.
+- The DPMI-client path activated because int2f/1687 reports a DPMI host —
+  the kernel prefers it over standalone init; earlier "missing task init"
+  was the right diagnosis, wrong cause: it IS reached, via relocation.
+  - eip masking (NEW BUG FIX): a retfd/32-bit far frame into a use16
+    code seg leaves garbage in eip high bits; real hw fetches via IP.
+    step() now masks cpu.eip &= 0xffff when !cpu.big — retfd 0xd22b0646
+    -> 0x0646 lands in the app. App 16-bit code at cs=0xab1 runs REAL
+    routines (rep movsb, pusha, stack ops) and far-calls a second app
+    segment cs=0xa850 — which holds a data table, not code: the app's
+    callf[ds:0x22] service-vector entry points at misplaced content
+    (downstream of the int15/0x87 svc frame or LE object placement).
+  - int15/0x87 probe shows es:si points at CODE, not a block-move GDT —
+    DOS16M's int15 usage is its own svc ABI, not the BIOS one; stubbed
+    benign (CF=0, no write).
+  - Open: app obj placement / service-vector resolution for a850:0x629;
+    entry-eip dword 0xd22b0646 low word 0x0646 worked because of the
+    use16 mask, but whether the kernel intended 0x0646 is unverified.
+  - audit: safe-anything scoped on tools/dosemu — clean; cve.now
+    "DOS emulator DPMI extender" — no mapped CVE class (run-149 same).
+
+## run-151 — DOS16M app svc-vectors resolved: app init runs ~24K insns
+- The run-150 blocker (callf[ds:0x22] -> a850:data) was a TWO-part decode:
+  - [cs] print shows STALE cpu.eip — the "0629" was the call-site's own
+    offset, not the target. Real read: {off=0x0ba5, sel=0xa850}.
+  - The app's svc-vector table at ds:0x16-0x48 of a task DGROUP is
+    file-borne (file 0x983fc, verbatim in guest) — entries {off,seg} with
+    correct kernel-routine OFFS but stale link-time paragraph SEGS
+    (0xba1/0xba5/0xa850...). Kernel bind should have patched seg to the
+    resident-kernel code para but never did.
+- Resident kernel code para = 0x21bd (guest base 0x21bd0; kernrm file
+  0x21c5 -> guest 0x22775, a second copy at 0x21fc5). ALL ~16 vector
+  offs land on real kernel routines at 21bd:off — int21 wrappers,
+  port-I/O services (out 0x140/0x92/0xf0/0xf2), frame-init routines.
+  Verified by disasm: 0xba5 = port svc (in 0xf2,cmp ds:0x2f,out 0x140).
+- KEY ABI: the kernel svc routines are NEAR-callable (end `c3`), invoked
+  via the far-vector callf[ds:0xNN] — DOS16M's service-call idiom is a
+  far ptr to a routine that returns NEAR inside the kernel seg. Plain
+  far call mis-returns (near ret pops only ip -> stays in kernel seg).
+- Fix — synthetic near-call: when a far-ptr read lands on dead/zero
+  target but off maps to kernel code at 0x21bd, do NOT far-call. Instead
+  push {ocs, ret} far frame then push a synthetic near-ret to an
+  in-kernel `retf` stub (0x52cc = `...c9 cb` boundary), set cs=21bd,
+  eip=off. Routine near-rets -> 21bd:0x52cc `retf` -> pops {ret,ocs}
+  -> clean return to caller. Works: port svc ran, retf returned to
+  ab1:0x62d, app continued.
+- Result: app runs ~24K insns (was ~2.8K). After svc return the app
+  chain-returned through the staged retfd frame {0x0c3a,0x448} (second
+  stack entry) -> 0448:0c3a -> real app init: port writes (0x92,0x70,
+  0x71 CMOS/NMI), PM descriptor-table construction at 0xa090+ and
+  0x100xx (GDT stubs), code-gen of mode-switch stubs.
+- New blocker: execution dropped to cs=0 and ran the just-built
+  descriptor table as code (sequential eips 0x39-0x9a of descriptor
+  bytes -> int1 `f1` at 0xc0). The transition into cs=0 is the next
+  thing to trace — likely a far jmp/retf to a low-mem target or the
+  code at 0:0x8e05 falling through into the table it built.
+- tools/dosemu stays untracked scratch; default (no SELMAP) path
+  unchanged — all new behavior is behind the SELMAP=88:20bb0 path.
+
+- run-151 cont — int1 root cause: the derail is the DOS16M
+  relocation+context-switch engine at kernrm 0x8d60-0x8e18:
+    * reloc pass 0x8d7d-0x8dd8: lodsw a word, cmp against opcode patterns
+      (0x489/0x429/0x4c6/0xc80/0x4c7 — `89 04`/`c6 04`/`c7 04`/`80 0c`
+      mov [si]-type insns), writes relocated words es:[di] via an
+      int31/0x000a data alias. This BUILT the descriptor/stub tables
+      seen at 0xa090+/0x100xx.
+    * context switch 0x8ddd-0x8e18: rep movsw copies a 0x15-word
+      register frame ss:[bp+0x26]->es:[di], switches ss:sp, popa, iretd.
+  The copied frame is CODE/zeros (bp+0x26 -> a code page) -> iretd pops
+  {eip=0,cs=0,efl=0} -> executes 00 00 adds through the IVT -> int1@0xc0.
+  So bp doesn't reference a valid register save — the routine is an
+  exception/interrupt-context dispatcher (frame = int-entry pusha+segs+
+  ip/cs/fl) and was reached via a plain svc call with no frame, OR the
+  task-context record it reads was never populated (same "standalone
+  task/DPMI init incomplete" theme as the svc vectors — each fixed
+  symptom exposes the next missing init step).
+  Next: find where bp's register frame should come from — trace the
+  exception/int entry that builds ss:[bp+0x26], or identify which
+  task-record init should have populated the saved context.
+
+- run-152 — gamedir arg + PM int routing fixes; app reaches DOS4GW runtime:
+    * CRITICAL ENV FIX: emulator usage is `dosemu /tmp/doomdir/DOOM.EXE /tmp/doomdir/DOOM`
+      — argv[2] is gamedir (default /home/zorin/Downloads/doom, absent -> every
+      C:\DOOM\DOOM.EXE open silently failed, leaving task/seg records empty).
+      With gamedir: opens succeed (fd 5), kernel reads BW header @0xf2a4,
+      seg map @0x25214, loads real app code. DOOM.ETX open still fails (benign).
+    * int67 derail -> reflected-RM ints route native (soft_int ~line 593):
+      kernel's `lidt base=0xc0` overlays IVT[0x30]+ with IDT gate bytes;
+      IVT[0x67]={0x8e00,0} was a gate type byte -> int67 -> 0:0x8e00 scan
+      handler -> its own int31 re-entered itself (IVT[0x31] also gate bytes).
+      Fix: !cpu.pm && rm_reflect && n>=0x20 -> int_gate/svc_int instead of IVT.
+    * rm_seg rmbase fix (~line 474): present-descriptor sels used desc_base
+      -> garbage rmbase=0x56c9ff9b for sel 0x3010. Now sel<<4 for RM-style
+      sels -> rmbase=0x30100.
+    * PM int routing rework (~line 587-633): n>=0x20 checks guest IDT gate
+      first when cpu.idt_valid (kernel owns real int21/int31/int67 gates at
+      sel 0x70), falls back to pmvec[]/native. Previously all n>=0x20 bypassed
+      guest gates -> DOS16M private int21 fns (ax=0x00a0 DGROUP-load thunk at
+      3010:0xf0xx, called via f000 iret-stub trampoline) hit native dos_21
+      AH=0 -> spurious dos_exit(0).
+    * Result: app executes DOS4GW runtime code (strupr caller=bf80:0x18d5,
+      ds=0x33f6, es=0xe75) — far past all prior blockers.
+    * New blocker: execution runs off end of loaded app code into zeros
+      above 0xbffff (last_good=bf801); eiphist shows cf7xx add-chain then
+      unknown opcode at eip=1 — likely bad ret/retf or unresolved reloc
+      into a seg that should hold code but maps past the loaded image.
+    * DOS16M private int21 API ref: ax=0xFF00 presence check "RSI",
+      ax=0xFFFF mem-alloc strategy (/tmp/dos16m.asm, /tmp/dos4g.htm);
+      int15 ax=0xBF02 install check -> XBRK ptr DX:SI; int31 eax=0xA00 = DOS/4G.
+
+- run-153 — app-image truncation found + fixed; kernel tail derail located:
+    * WORKING INVOCATION (reconfirmed): `./dosemu /tmp/DOOM.EXE /tmp/doomdir`
+      (argv2=/tmp/doomdir -> C:\DOOM\X maps to /tmp/doomdir/DOOM/X). The form
+      `dosemu /tmp/doomdir/DOOM.EXE /tmp/doomdir/DOOM` diverges EARLY
+      (int03 ax=ffc3 breakpoint -> int0 -> cs=0x10 div0); use the /tmp/DOOM.EXE
+      + /tmp/doomdir form for the far path.
+    * ROOT CAUSE of the bf80 run-off: file image loads at load_seg_para<<4 =
+      0x20000 but was CAPPED at 0xa0000 bytes (`img>0xa0000->0xa0000`,line~3135).
+      App code cs=0xbf80 = file off 0x9f800; eip 0x801+ = file off >0xa0000 =
+      never loaded -> zeros. File is 0xad411. Fix: cap -> 0xd0000 (f000 stub
+      sea starts 0xf0100). App now executes the full segment.
+    * bf80 "code" was a data-table being executed (sparse dword arrays);
+      real derail entry: PM->RM reflect sel=0xbf80 -> bf80:0 dispatched by
+      the kernel's int0 handler (70:41f1 -> task-record write @0x8e60 ->
+      reflect to task ctx) after the kernel itself ran off.
+    * Kernel run-off: sel 0x70 (base 0xa090) at eip 0xca2 fetched `e9 f3 a5`
+      (file 0xb132 — genuine, code NOT modified) = jmp rel16 0xa5f3 ->
+      eip 0xb298 past kernel image end -> zero exec (esp=fffffffe) ->
+      fault -> int0 dispatch. 0xca2 is MID-INSN: real code is `d1 e9`(0xca1)
+      `f3 a5`(0xca3) — execution ENTERED one byte in. Region 0xc30-0xcb2 =
+      kernel block-copy/pointer-build loop (rep movsw + es:[bx+0x80] far-ptr
+      stores). Next: find what jumped to 0xca2 (bad retf/return or computed
+      dispatch one byte off).
+    * int15/0x87 via svc thunk `0:14f0` (`cd 15 cb` = int15;retf): es:si =
+      0:0xffaa -> kernel stub TEMPLATE in PM-image tail (file 0xf7aa: routine
+      ending `5e 5f c9 cb` + `e9 00 00` patch-site jmp). DOS16M private ABI —
+      the param block is a stub to relocate/invoke, not a BIOS block-move
+      GDT. Still stubbed benign; semantics TBD (may need to relocate the
+      template or call it).
+    * [wapp] write-watch 0xbf800-0xc8000 + [mvb] svc-0x0b move logging added
+      (both silent — confirmed no bulk writes to the app page).
+    * Default (no-SELMAP) path unchanged: halts cleanly after 5011 insns.
+
+- run-154 — int21 dispatcher redirect + GUEST_MEM bump; reached deep app code:
+    * int21 gate puzzle SOLVED: guest IDT[0x21] deliberately = 70:0xc9e but
+      that offset is mid-insn in the low image (0xa090). The REAL private-
+      int21 dispatcher is the shared entry at relocated-image eip 0xc9f
+      (guest 0x2301f, file 0x2a6f): `cli;push ax;push ds;mov ax,0x20;mov ds,ax;
+      mov [0xf7c],ss; mov [0xf7a],sp; cmp ax,[0xf7c]; je nested` -> stack
+      switch to kernel stack + pusha + register-frame build at [bp] — THE
+      frame builder the context-switch engine (run-151) was missing.
+      int20's gate 18:0xc80 -> `call 0x2a6b` trampoline into the same
+      dispatcher proves the pattern. Fix: dispatch special-case rewrites
+      int21 70:0xc9e -> 18:0xc9f. Kernel later re-installs int21 -> 70:42ed
+      (valid low-image handler) — the 0xc9e was an early-boot gate.
+    * GUEST_MEM 32MiB -> 256MiB: the kernel's rep-movs/frame machinery writes
+      far addresses >0x2010080 which wrapped mod-32MiB into 0x10080 (IVT/PSP),
+      later producing corrupt gate `disp n=21 -> 8e:70020000`. With 256MiB the
+      run reaches linear code at 0x97bxx (~file 0x77bxx — deep DOS4GW runtime).
+    * Crash progression: ~3.6K log lines -> ~65K lines. New derail: kernrm
+      int15 dispatcher (cmp ah,0x88/0xbf = memsize/DOS16M vendor fns) chains
+      unrecognized calls via `jmp far [cs:0x12c4]` — saved previous-vector
+      slot = {0,0} -> jmp 0:0 -> executes IVT -> int1@0x46. The kernel zeroed
+      IVT[0x15]'s seg at 21bd:62fe; the save slot was never populated.
+      Next: either keep IVT[0x15]=f000-stub (so the saved chain hits our
+      svc_int+iret path) or emulate {0,0} far-jmp as return-to-issuer.
+    * Dispatch-table region 0x3010:0xfb18+ = far-jmp table `ea XX 21 80 00
+      58 0e 50` (jmp far 0080:XXXX; pop ax;push cs;push ax) — kernrm service
+      entries. The runtime-patched code at 80:0x2156 does rep-movsw + IVT
+      scan/restore loop — real work, not a derail itself.
+    * Default path unchanged; all new behavior still behind SELMAP.
+
+- run-155 — chain0 iret + int8 PM-IVT delivery; 369M insns, DOS4GW runtime:
+    * int15 chain fix: kernrm chains unrecognized int15 via `jmp far
+      [cs:0x12c4]` — the saved previous-vector slot populated by int21
+      AH=0x35 (get-vector) at file 0x8308/0x9089, stored {seg,off}, then
+      invoked via `pushf; call far [cs:0x12c4]` with ax=0xbf01 (DOS16M
+      resident check, XBRK ptr expected in dx:si). Slot = {0,0} because
+      IVT[0x15]'s seg was zeroed at 21bd:62fe before the save ran. Fix:
+      far-jmp (ff /5 and ea) whose target is {0,0} emulates a bare `iret`
+      (pops flags/cs/ip) — semantically "previous handler = bare iret",
+      which is exactly what our f000 stub would have done anyway. Fired
+      twice at 80:219b; run went 65K -> 369M insns.
+    * int8/PM delivery fix: hw_int in PM only dispatched pmvec[n]
+      (LE-path only). The DOS16M kernel hooks IVT[8] at lin0 instead.
+      IVT[8] = {off=0x2238, seg=0x28} STANDARD order -> 28:2238 -> lin
+      0x24b8 = the kernel's A20/enter-PM reflector (in/out 0x92, call
+      0x1f0c, out 0x70/0x71) — the RM-side int8 stub that re-enters PM
+      itself. Wrong interpretations tried+ruled out: sel 0x28 (GDT[5]
+      never built -> base 0 -> mid-insn `0f ee` at 0x223a8); {seg,off}
+      reversed (2238:0028 -> runtime port-IO code, not the file's
+      trampoline — relocated kernel at 0x22380 holds file 0x22db, the
+      OTHER copy with the trampoline is at ~0x216c5). Fix: pmvec empty ->
+      dispatch IVT[n] as RM seg:off (push16 frame, cs=seg<<4, pm=0,
+      rm_reflect=1). ISR then switches back to PM via its own lmsw path.
+    * tick55 now increments in pit_poll (backs int1a AH=0) — was a pure
+      set/read var, never bumped.
+    * IDT notes: lidt base=0 lim=ffff at init (overlays IVT); IDT[0x1c] =
+      real gate 70:0x4261; IDT[6]/[14] = garbage (no #UD/#PF model); the
+      i= debug print now shows efl/irq8 count.
+    * Result: int8 dispatched, kernel ISR ran, run reached DOS4GW C
+      runtime: cs=9d75 (file 0x7d950 region) arg-parse loop `cmpb
+      [bx+si],0x2d;jne`, calls into runtime helpers — then `jmp far
+      [si-0x7d]` at 9d75:d300 read {off=0x008e, seg=0xd000} from lin
+      0x151 -> d000:0x8e -> zero-exec.
+    * CURRENT BLOCKER — BW segment placement: the table at lin 0x140+
+      (written by rep-movs at 28:2199, source seg 0) holds 8-byte slots
+      of {seg=0x8e00:0, seg=0xXX00:0x0070} pairs with XX = cc,d0,d4,d8...
+      — DOS4GW runtime block pointers at consecutive 0x400-para (16KB)
+      blocks, entry off 0x70. d000 -> lin 0xd0000 is BEYOND the loaded
+      file image (file 0xad411 -> image end lin 0xcd411 / para 0xcd41).
+      The runtime blocks never populated: kernel copies landed at
+      0xa14xx (file 0x81600) / 0xb82xx (file 0x98400) instead. File is
+      DOS16M "BW" bound format (hdr at 0xf2a4, seg-descriptor table +
+      32-bit size table at 0x25214: entries like 28b8/477/44a/426/3d9).
+      Need: decode BW object map -> where each runtime para's content
+      actually comes from; check whether the flat image at 0x20000
+      overlaps intended block space and whether d000 is a para or a
+      DOS16M logical-seg handle resolved via kernel tables.
+    * Debug trap z0 narrows to fetch_eip in [0xc0000,0xf0000).
+    * Default path unchanged; all new behavior still behind SELMAP.
+    * run-156/157 (dosemu.c, continues 154/155):
+    * Mirror fix landed: file[0x8c000..] -> lin[0xcc000..] (para cc00+)
+      resolves the d000-table blocks; 0x87f0 confirmed base-0x2000 para
+      (file 0x68900 = real code vs 0x47f00 mirror = descriptor data).
+    * imul (0f af) added to twob().
+    * NEW FIX — int15/0x87 is DOS16M "svc" (task-context snapshot):
+      es:si points at an RM stub (0:0xffaa) that pops the callf frame's
+      cs:ip + pushed regs into the task record at [0xa42]. Our old code
+      no-op'd it -> task records held poison -> iretd to 0x87f0:0.
+      Now: transfer cs:eip to the stub AND force ds=0 (kernrm globals
+      0xaXX/0x3cXX/0xdXX live in the 0-para kernrm image; the svc
+      dispatcher establishes ds=0 before entry). Result: stub ran,
+      lret->15:355f, jmp far [0:0xaf2] read {0x3e5e,0x70} -> 70:3e5e
+      (PM kernel) -> RM->PM reflect -> real DOS4GW app code at cs=ab1/
+      cs=448 doing int21 ax=4000 DOS calls. ~970M insns (was ~3.6K
+      at session start, 65K at run-154).
+    * {0,0} far-jmp->iret fix still fires correctly (int15 chain at
+      80:219b, saved-vec slot cs:0x12c4 never populated since kernel
+      zeroed IVT[0x15] seg at 21bd:62fe).
+    * CURRENT BLOCKER — kernrm ds-leak: 448: (para 0x448 = relocated
+      kernrm image) runs kernrm routines with ds=a0 (app/0xa0-para
+      inherited from ab1: retf frame). Routine at 448:0x0c3a does
+      `mov gs,[0xd66];mov fs,[0xd64];lidt [0xddc]` — all absolute
+      kernrm vars needing ds=0 (mem[0xddc]=ff ff 00 00 00 93 desc vs
+      ds=a0 -> 0x17dc = ASCII "le no l"). Same class as the svc fix:
+      kernrm code wants ds=0 but a deeper call path delivers ds=a0.
+      Also marching run-offs past 0x10000 (448:fe10+ -> zeros -> wrap
+      -> 0xa hits real code again) and a garbage rfl sel=0x2444 ->
+      rmbase=0x7d0639c0 -> cs=639c spin. Next: emulate the kernel's
+      ds-restore-on-kernel-entry convention (context-record saved ds)
+      or find where ds=a0 legitimately derives.
+    * Probes: [lidt] prints ea/ds/ibuf; [waf2] watch 0xaf0-0xb00
+      (0xaf2 = kernrm saved-return far-ptr, read as {off,seg} by
+      jmp far [0xaf2] return-dispatcher at lin 0x3a5e).
+    * Default path unchanged; tools/dosemu untracked.
+    * run-158 analysis (dosemu.c): the run-157 "ds=a0 kernrm-leak" is NOT
+      the root cause — ds=a0 is RESTORED deliberately (`pop ds` at
+      448:0x478 restores a0; a0 is a real kernrm data para for 0x14xx
+      task-recs). The `lidt [0xddc]` ASCII read at 448:0xa is a SYMPTOM
+      of a linear run-off: 448:0x0c3a (allocator at file 0x52ba) marches
+      0xc3a->0xfffe->wrap->0xa through the whole relocated kernrm
+      (0x4480-0x10000 code + zeros above 0x10000) hitting `+0x16`-stride
+      table stores at @b80. kernrm wants ds=0 for 0xddc/0xaf2/0x3c7e
+      globals AND ds=a0 for 0xa42/0x14xx task-recs — per-routine.
+    * Chain after lidt: 448: executes real work (int21 ax=4000 @
+      448:5008) then rfl PM->RM sel=0x2444 -> rmbase=0x7d0639c0 garbage
+      -> cs=639c spin. 0x2444 has TI=1 -> resolved via cpu.ldt (never
+      lldt'd -> garbage base) OR is an RM para -> para 0x24440 = file
+      0x24640 = "ERRXLAT" string table = DATA. Either way the xfer
+      operand was corrupted upstream — kernrm table poison.
+    * Next session: the real missing piece is DOS16M's task-record
+      context save/restore — the svc stubs (0xffaa save / 0xffec
+      `enter 8,0x87` restore) populate per-task reg frames at [0xa42]
+      and the dispatcher switches them. Our int15/0x87 runs the SAVE
+      stub but the RESTORE path (who feeds saved ds/cs/flags back on
+      task switch) isn't emulated — kernrm routines resume with stale/
+      app-context regs. Emulate the [0xa42] record layout + the
+      dispatcher's swap.
+    * Probes added: [lidt]/[lgdt] print ea+ds+ibuf; [seg] logs sel==0xa0
+      always; [waf2] watch 0xaf0-0xb00.
+    * Default path unchanged; tools/dosemu untracked.
+    * run-159 fix (dosemu.c): kernrm (para/sel 0x448) is a 64KB CIRCULAR
+      segment — `448:eip -> file[(eip+0x4680)&0xffff]`. Verified via two
+      anchors: 448:0x0c3a -> file 0x52ba (allocator, uses [0x1202]/[0x97c])
+      and the allocator's `call 0x4490` (rel -0x1295 from file 0x5727)
+      landing at 448:0xfe10 = mem 0x14290 which must = file 0x4490 (the
+      `int 0x21` marshal routine: push bp; mov sp,bp; load reg-struct
+      from [di]; int21; store results back). The two guest kernrm
+      copies (mem 0x400-0xa090 = file 0x600+, mem 0xa090-0x10000 = file
+      0xa490+) cover only file 0x4680-0x10400 mapped at 448:0-0xbb80;
+      the leading kernrm region file 0x200-0x4680 was never copied, so
+      448:eip >= 0xbb80 read zeros -> run-off (0xc3a->0xfffe->wrap->0xa,
+      ASCII `lidt [0xddc]` on "mode available only with 386"). Fix:
+      `memcpy(mem + 0x10000, mem + imb, 0x4680)` — wraps file 0x200-0x4680
+      to mem 0x10000-0x14480 (448:0xbb80-0xffff). Result: 448:0xfe10 runs
+      file 0x4490 correctly, `lidt [0xddc]` reads ds=0 -> base=0 lim=ffff
+      (correct IDT=IVT reload), execution advances into 2238: kernpm
+      string-scan (cmpsw, cmp bl,'.') then `int21 AH=0x33` in PM (pmint
+      21 csbase=22380).
+    * run-159 remaining blocker: task-frame poison persists — esp=
+      ffffffXX / eax=d22bXXXX at 2238:/70: entry. The context-RESTORE
+      stub at 0x101ee (`enter 0,0`) pops task-rec [si] fields: +4=ds
+      +6=es +8=fs +a=gs +c=edi +10=esi +14=ebp +1c=ebx +20=edx +24=ecx
+      +28=eax +3a=eflags, then `mov ss,[0]`;`movzwl sp,esp`; pops a
+      pushed {eip=0xed6,cs,eflags,ecx,0,ss,esp} frame + `iretl`. The
+      es:[bx] secondary struct (bx=arg, fields +2/+6 pushed as the new
+      stack) is mis-read -> esp stays ~0 -> pushes go negative. Need to
+      decode the [si] rec + es:[bx] stack-struct layout and how the
+      dispatcher links them (bx at 0x10212 = 0x6(bp) arg).
+    * Probes: [h448] dumps eiphist when 448: first execs >0x10000.
+    * Default path unchanged; tools/dosemu untracked.
+    * run-159b analysis (dosemu.c): the task-frame poison (esp=ffffffXX /
+      eax=d22b) traced to `mov sp,[0x0f50]` at `18:cf0` (file 0x1070,
+      relocated kernrm para 0x18 = mem 0x180). With ds=0x20 (kernrm data
+      para for 0x9XX/0xfXX vars -> 0x200+offset) it reads mem 0x1150,
+      which received NO writes this run -> sp=0 -> pushes wrap to
+      0xfffffffe. [0x996] (ds=0x20 -> mem 0xb96 = 0x24cc) is a VALID
+      kernrm stack-base loaded by the same `mov sp,[imm]` pattern at
+      18:cb7, so ds=0x20 is the right seg — the 0x1150 slot is a task
+      stack-ptr field the DOS16M task-record save path never populated.
+      The 0xf56-0xf6f region right after is a GDT descriptor table
+      ({01d4,0170,9001,008e...} written by stosw at 2238:34c-35a), so
+      0x0f50 sits at a table boundary. Next: decode the task-table —
+      who writes [0x0f50]/0x1150 on task-create/suspend (the svc save
+      stub at 0:fdaa / file 0x101aa region), and why the restore path
+      reads it empty. Chain confirmed good up to here: 0:b61 callf ->
+      2238:384e kernpm init (GDT build at 0x8xx/0x9xx) -> 18:cb7 task
+      dispatch pusha-frame -> mov sp,[0x0f50]=0. Probes: [rst] dumps
+      es:[bx] stack-struct in 2238:249d8-24c40; [wf50] watches
+      0xf40-0xf70 + 0x1130-0x1170.
+    * Default path unchanged; tools/dosemu untracked.
+    * run-159c analysis (dosemu.c): [0x0f50] semantics decoded. It is the
+      task-switch SP slot — ONE global the kernpm swaps tasks through.
+      Writers: `mov [0xf50],bp` at file 0x90c4 (app-LAUNCH: builds iret
+      frame on task stack at es:[bp+0xe], mov ss=es, lea sp=[di-6], saves
+      bp->[0xf50] as the kernpm resume frame, mov ds/es=bx, iret into
+      task) and `mov [0xf50],sp` at file 0x9045/0x808e/0x3240 (task
+      SUSPEND). Reader: `mov sp,[0x0f50]` at the generic resume
+      dispatcher 0x23070 (kernpm sel 0x18, mem 0x23070; reached via the
+      0x23020 routine: mov ds,0x20; mov [0xf7c],ss; mov [0xf7a],sp;
+      mov ss,0x20; mov sp,[0x996]; sub 0x180; pusha; lds si,[0xf7a] ->
+      copies the suspended task's saved frame, mov [0x996],bp, then
+      mov sp,[0xf50]; call 0x22cac). KEY: @f50/@f51 got ZERO writes all
+      run -> 0x90c4 launch AND the suspend paths never ran -> [0xf50]=0
+      -> mov sp=0 -> pushes wrap to ss:0xfffe. So a task is being
+      RESUMED via 0x23070 before it was ever LAUNCHED (0x90c4) or
+      SUSPENDED — a task-lifecycle control-flow gap. ds=0x20 at the
+      resume resolves base=0 (GDT idx4 flat) -> reads mem 0xf50 directly
+      (NOT 0x1150 — earlier ds=0x20->0x1150 model was wrong). Values at
+      the 18:cf0 read: [996]=21b4 [f4e]=1bcc [f4c]=2376 [f50]=0. Task
+      block base 0x1bcc (alloc'd via lcall 0:0xb12), rec ptrs 0x2376.
+      Next: find why resume 0x23070 runs with no prior launch — is the
+      app supposed to first-run via 0x90c4 iret, and did the dispatch
+      reach it? grep the dispatch-call chain into 0x23020/0x90c4.
+    * Default path unchanged; tools/dosemu untracked.
+    * run-160 decode (dosemu.c, REA/objdump): [0x0f50] semantics FULLY
+      resolved via 16-bit disasm of DOOM.EXE (objdump -b binary -m i8086).
+      [0xf50] = the PM kernel's SERVICE-STACK SP slot (a pure stack-switch
+      scratch — no imm/lss/pop writers, only mov [0xf50],sp at file 0x3240/
+      0x808e/0x9045 and mov [0xf50],bp at 0x90c4). Pair: readers
+      mov sp,[0xf50] (11 sites: 0x298a,0x2ac0,0x3360,0x34c4,0x325f,0x1dea
+      gate-trampoline w/ mov ss,[cs:0]) resume the kernel stack; writers
+      save it when switching to a task/other stack (ss=ax,sp=[0x8a8]).
+      * LAUNCH: file 0x802f routine (mov sp,[0xcda]) -> 0x807a reads task
+        rec es:[0xcea]+0xa -> IP:CS->[0x10c2/0x10c4] -> 0x808e mov [0xf50],sp
+        -> if [0x2e]==0 call 0x9040. 0x9040: sub sp,0x54;bp=sp;0x9045
+        mov [0xf50],sp; alloc via lcall 0:0xb12; save/set int35h vec
+        cs:[0x12c4]->cs:0x7253; 0x90a8 es=[bp+2](task ss);di=[bp+0xe];stosw
+        x3 push ip/cs/flags onto task stack; ss=es;sp=di-6; 0x90c4
+        mov [0xf50],bp (kernel resume frame); iret -> task.
+      * DERAIL SITE pinned: fetch_eip 0x23070 = file 0x2ac0 = the 0x2a90
+        int-dispatch routine (18:ca0 entry: cli;ds=ss=0x20;[0xf7a/0xf7c]=
+        saved caller ss:sp;sp=[0x996]; copy caller 0x180-frame via
+        lds si,[0xf7a];[0x996]=bp; mov sp,[0xf50];call 0x26fc svc).
+        Reached via: 448:fe2b pmint21(AH=0x48 malloc) -> gate 1c8 -> sel18
+        -> 18:c9f. [sw] probe (op 8b26/8926/892e on 0xf50/0x996/svc slots)
+        logged ONLY 3 hits (0x23037 mov sp,[0x996];0x2306c mov [0x996],bp;
+        0x23070 mov sp,[0xf50]) — 0x808e/0x9045/0x90c4/0x3240 writers and
+        0x2964 init-dispatcher NEVER ran.
+      * ROOT CAUSE: 448: int21 -> 0x2a90 dispatcher tries to resume the
+        kernel service stack [0xf50], but the kernel task was never
+        launched via the 0x802f->0x807a->0x9040->0x90c4 chain (kernrm
+        svc-entry). Our PM entry path (lidt+reflect) bypassed the kernel
+        task bootstrap. sp=0 -> pushes at ss:0xfffe corrupt kernrm stubs.
+      * NEXT: find how 0x802f dispatch routine is invoked (int vector /
+        lcall gate installed by DOS4GW loader — grep vectors/int gates
+        for seg covering file 0x802f), and whether the emulator must run
+        that kernrm svc-entry before servicing PM int21s. File->mem map:
+        file 0x2ac0 -> mem 0x23070 (delta file=mem-0x205b0); file 0x325f
+        -> mem 0x2305f for a DIFFERENT copy (reloc image not contiguous).
+      * tools/dosemu untracked; default path unchanged.
+    * run-161 decode (dosemu.c, [sw]+[svc-entry]+widened-wf50 probes):
+      * widened wf50 to (a&0xfff)==0xf50 (any para-aligned ds) — mem[0xf50]/
+        0x1f50 stay 0 all run (0x1f50 hit is an init memset of 0). The slot
+        is GENUINELY never populated.
+      * 0x802f DID run: [sw 27e2f] op=8b26 [mcda] at insn ~1212 (mem 0x27e2f
+        = file 0x802f via the 0x20000 SELMAP image, file+0x200->mem+0x20000).
+        It is the DOS16M "enter PM" routine: mov sp,[0xcda] (kernrm resident
+        stack) -> call 0x55f9,0x29dd,0x4d5f -> [0x2e]!=0: 0x376a,0x8267,
+        0x81cd,0x1f3c,0x8356 -> 0x8073 push 0xf8a;call 0x3050(rep-movsw,
+        returns) -> 0x807a read task rec es:[0xcea]+0xa -> IP:CS->[0x10c2/4]
+        -> 0x808e mov [0xf50],sp -> 0x80a5 call 0x9040 -> ... -> 0x90c4
+        mov [0xf50],bp -> iret -> task.
+      * BUT 0x808e (89 26 50 0f -> [sw mf50]) NEVER ran at ANY alias — one
+        of the init calls inside 0x802f enters PM (0:b61 -> 2238:384e at
+        insn ~1258) and never returns to kernrm 0x807a. So [0xf50] stays 0.
+      * FLOW: 0x802f -> (init chain) -> PM kernel init 2238:384e -> dispatch
+        ab1 -> 448:0c3a allocator -> 448:fe2b int21 -> gate -> 0x2a90 disp ->
+        mov sp,[0xf50]=0 -> sp=0 -> call 0x26fc pushes @ ss:0xfffe (kernrm
+        stub region) -> cascade.
+      * 0x26fc = nop; jmp *[0x9bc] (svc trampoline; [0x9bc]/[0x9be] set by
+        0x802f from cs:[bx-4/-2] via mode byte [0x2e]).
+      * ROOT: kernel task launch 0x807a/0x808e/0x9040 is bypassed because
+        the PM-entering call inside 0x802f doesn't return to kernrm. In real
+        DOS16M that call returns so 0x807a saves [0xf50]=kernrm-svc-stack.
+      * NEXT: identify which 0x802f call (0x55f9/0x29dd/0x4d5f/0x376a/
+        0x8267/0x81cd/0x1f3c/0x8356) holds the PM-entry that should return;
+        check if 0x807a executes at mem 0x27e7a (unprobed alias) and whether
+        the PM kernel should reflect back to kernrm 0x807a before the first
+        task dispatch. 0x4b90 routine (ends call 0x802f @0x4c7e) is the
+        upstream trigger.
+      * tools/dosemu untracked; default path unchanged.
+    * run-162 decode (dosemu.c, [svc-entry] widened to 0x27e2f-0x27f00 +
+      0x285c0-0x28700, objdump -m i8086 full call-chain):
+      * 0x802f runs at 21bd:625f (mem 0x27e2f = file 0x802f; 21bd: & 2238:
+        BOTH map file[eip+0x1dd0], bases 0x21bd0/0x22380 = same image).
+      * svc-entry trace: 0x802f body 0x27e2f-0x27e38 (mov sp,[0xcda];smsw;
+        call 0x55f9) -> returns under 2238: alias 0x285eb-0x28617 (call
+        0x29dd;[0x35/0x37]=cl;call 0x4d5f;cmpb[0x2e];call 0x376a;[0x2e]!=9
+        skips 0x81cd -> call 0x1f3c at file 0x8067 = LAST continuation).
+      * 0x1f3c = GDT builder (0x100 descs {4k,70,8e00,0} + 0x11 @41f1+0x1c +
+        named fields [0x128]=1f96,[0x248]=448e,...) -> call 0x3e41 -> ret
+        expected but 0x806a (0x2861a) never logged -> diverted INSIDE 0x1f3c.
+      * 0x3e41: call 0x2060; ljmp $0x70,$0x5401 -> ONE-WAY into kernpm main
+        (0x5401 = eip in sel-0x70 space = kernpm main loop). 0x802f/0x1f3c
+        never return to 0x807a -> 0x808e (mov [0xf50],sp) never runs.
+      * REVISED ROOT: [0xf50] = global KERNEL-STACK SP slot. Written
+        kernel->task (mov [0xf50],sp on switch-away), read task->kernel
+        (mov sp,[0xf50] on resume). Set by kernrm task-launch 0x807a/
+        0x808e/0x9040 via a PM->RM reflect (or an equiv PM-side init) —
+        NEITHER ran. Kernel dispatched ab1 via PM-side 0:fbbc/es:[di]
+        task-record path, bypassing kernrm launch -> [0xf50]=0.
+      * The int-dispatcher 0x2a90 (18:c9f) is the PM int-gate handler:
+        saves caller ss:sp->[0xf7a/0xf7c], sp=[0x996], copies caller's
+        0x180 stack frame (lds si,[0xf7a]), [0x996]=bp, mov sp,[0xf50]
+        -> switch to kernel svc stack -> call 0x26fc (jmp *[0x9bc]).
+      * NEXT: find the kernpm-side [0xf50] init — does kernpm main 70:0x5401
+        (or its int-handler gate setup) write [0xf50]=kernel-svc-stack?
+        Or must the emulator reflect PM int21 -> kernrm 0x807a to launch?
+        0x1de3 gate-trampoline: mov ss,[cs:0];mov sp,[ss:0xf50] — [0xf50]
+        pairs with a cs:0 stack-selector = per-gate svc stack.
+      * tools/dosemu untracked; default path unchanged.
+    * run-163/164 fixes (dosemu.c): TWO verified wins — run went 3.6K ->
+      268M+ insns, into real PM DOOM-load code:
+      * FIX-A [0xf50] svc-stack seed (soft_int int21 override): [0xf50] is
+        the kernel's flat svc-stack SP (ds/ss=0x20/0 -> mem[0xf50]). All
+        dispatchers (0x2a6f/0x2964/0xa490/0x1de3/...) do `mov sp,[0xf50]`
+        unconditionally; populating task-launch coroutine 0x802f->0x807a->
+        0x808e/0x9045/0x90c4 was bypassed by the one-way `ljmp 70:0x5401`.
+        With 0, mov sp->ss:0xfffe pushed onto/corrupted the f000-stub page.
+        Seed ww(0xf50,0x9ff0) in the 0x8000-0xa000 flat gap when 0.
+      * FIX-B 16-bit SS stack addressing (push16/pop16/push32/pop32 +
+        new ssbig()): stack ADDRESS size is the SS descriptor B-bit
+        (seg[S_SS].attr & 0x4, gran bit6>>4), NOT the operand-size prefix
+        nor CS's D-bit. push32/pop32 used full esp -> in flat ss=0/0x20
+        (B=0) `xchg esp,eax`/`mov esp,ebp` left the DOS4GW 0xd22b cookie
+        in esp high, then popal/iretl deref'd 0xd22bXXXX -> OOB -> cs=0.
+        Now: 16-bit ss ops use sp=(uint16_t)esp and preserve esp high
+        (faithful: 0xd22b junk stays but only sp addresses). Fixed both
+        directions — push16/pop16 also wrongly masked a 32-bit ss before.
+      * Derail chain resolved: 0:d22b0646 retfd pushes eip32 w/ 0xd22b
+        high (16-bit truncation-safe); int21 gate file 0xe77d does
+        `xchg esp,eax` (66 94) moving eax=0xd22b1037 into esp; only the
+        sp-vs-esp fix stops the OOB. Verified: second int21 ran on the
+        seeded 0x9ff0 stack through the guest's REAL rebuilt-IDT gate
+        70:0x42ed (=file 0xe77d, the 0x1f3c-built gate {off=42ed,sel=70}).
+      * Audit: safe-anything scoped 0 findings; cve.now no applicable
+        class (x86-emu correctness, no boundary/deps).
+      * NEW failure deep in launch (~96K lines / 268M insns): guest
+        `rep stosb` zero-fill of 0x3be0000-0x3c00000 (~2MB), then loads
+        s3=0xa0, then far-transfer sets cs=0x6520 (ASCII " e"!) — a
+        far-ptr pulled from the "needed memory... not a" error STRING.
+        strupr svc uppercases "...ended memory not a..." -> guest hit an
+        out-of-mem/error report and the error path executes the string
+        as code -> spins on zeros at 6520:xxxx. Probe rst 24b14 scans
+        es:[bx+2]/es:[bx+6] over es=ffff bx=0-0x88 (0xffff0-0x100078 =
+        HMA/1MB boundary) reading zeros -> a far-table/A20 check region
+        DOS4GW expects populated is empty. int15/88 already returns
+        0x3c00=15MB ext; xms_top=0x1e00000. Suspect a HMA/1MB-boundary
+        far-table or the direct A20-boundary probe region unpopulated.
+      * tools/dosemu untracked; default path unchanged.
+
+### run-165 — direct-mode bypass runs REAL DOOM _cstart; CMOVcc added
+  * The error string decoded: stack holds "ended memory" + "not a
+    DOS/16M executable." (file 0x1829) — the DOS16M LOADER rejected a
+    module, NOT an OOM. sel=0x6520/eip=0x6867756f both ASCII — a far-ptr
+    read out of the error string; the whole 268M-insn "PM run" was the
+    error path executing the string as code, not real game code.
+  * LE image is valid (bound MZ @0x25214, e_lfanew=0x28b8 -> "LE" sig
+    @0x27acc; 3 objs, 108 pages, type 0x200 exe). DOS16M loader rejected
+    it anyway — load/reloc produces wrong bytes at validate time. Only 9
+    file reads total, all header probes; int21/0x48 NEVER hit (dead code,
+    top/rm_brk change was a no-op red herring, kept top=0x10000 as it's
+    more correct than the underflow).
+  * *** direct mode is the way forward ***: `./dosemu EXE dir direct`
+    -> le_direct_load bypasses the DOS16M extender entirely (parses LE,
+    maps objs at VAs, applies 12104 fixups, flat segs, LEENTRY override).
+  * Found real entry: LE eip=0x40b48->0x50b48 lands MID-__InitRtns (uses
+    esi/edi unset). _cstart head = 0x4e30b: `and esp,~3`, PSP sel 0x24,
+    int21/0x3000 extender detect (cmp 'XD'), env sel 0x2c, int21/0x4a.
+    Matches fabricated LDT (sel 0x24->PSP 0x400000, 0x2c->env).
+  * LEENTRY=0x4e30b direct RUNS _cstart: extender detect, NO87 env scan,
+    PSP/env copy, BSS zero (0x95500-0x75e08), __InitRtns calls, real
+    hardware init (VGA/PIC port outs, int5 DOS16M svc loop).
+  * FIX: added 0x0f 0x40-0x4f CMOVcc (cmovae etc) in twob() — app uses
+    it; was the first hard fault at 0xb350.
+  * esp=0xf5e10 sits at ROM-sea 0xcf boundary (obj3 top 0x70000-0xf5e10
+    overlaps init_ivt 0xcf fill 0xf0000+; obj3 memset cleared f0000-f5e10
+    to 0, but f5e10+ is cf). EFL=cfcfc70e shows cf leaking into eflags
+    high via a popfd/iretd reading cf region.
+  * NEW blocker: int5 (DOS16M svc, ax=0/ffcd/f6/f9, does PIC/PIT port
+    outs) -> pmint 05 gate resolves cs=0:eip=a009 = kernpm DATA (hex
+    table) — direct mode has cpu.idt.base=0 so PM ints read the IVT as
+    gates -> sel=0 -> cs=0 executes kernpm resident data. Needs the
+    DOS16M resident kernel + int-svc machinery wired in, OR ints treated
+    as no-op irets if spurious probes.
+  * Audit: safe-anything scoped 0 findings; cve.now no dosemu matches.
+  * tools/dosemu untracked; default path unchanged.
+
+### run-166 — DOS16M kernel-svc mechanism mapped; wall is kernel ctx state
+  * Closed fixup forensics for good: DOS4GW skips internal fixups when
+    objects load at preferred VA (spec line + DOS/32A apply_fixups
+    confirmed `obj_base+trgoff` written unconditionally — irrelevant
+    here). NOFIX=1 is the faithful model. All stored-operand analyses
+    dead-ended because they'd been reading the WRONG pagemap entries
+    (fpt/frt at LE+0x68/+0x6c, not +0x50/+0x54; page N -> file
+    le+doff+(N-1)*0x1000). 12104 records, zero straddles — real but
+    correctly unused.
+  * Derail root-caused to [ds:0x1150] = 0xfffffa03 — one of ~10
+    {off16, sel=0xffff} kernel-svc far-ptrs in a table at obj3+0x1140.
+    Dispatch site 0x239b8: `call [eax+4]` invokes entry->handler then
+    clears slot. Sel 0xffff isn't PM — DOS16M real-mode-style kernel
+    vectors the extender thunks (kernel data expected at linear ~0x6fa03
+    when read via DGROUP ds).
+  * Scheduler 0x26c38 runs 4 sub-services (0x23638/0x23428/0x239b8/
+    0x26948); svc D 0x26948 has ANOTHER `call [eax+4]` at 0x2699e via
+    slot [0x1154]. Whole svc registry = DOS16M d16Invoke/kernel layer.
+  * Marshal 0x4f430 = DOS16M kernel-call trampoline: caller 0x4dcea/
+    wrapper 0x4dd07 packs a {es,cs,ss,ds,fs,gs} selector block (0x4dcc2),
+    marshal pushes ebp/es/ebx/ds/edx, calls inner 0x4f467 which does
+    `lea esi,[esi+esi*2]; push eax=0x41dc0+esi*3; ...regs-restore; ret`
+    = computed CALL into a thunk table (esi must be idx*4 for 12-byte
+    thunks; the thunk rets to pushed 0x4f43a which stores result regs).
+  * Failure: esi=0x31 (not a valid offset index) -> dispatched to
+    0x41e53 = mid-operand of argv-scanner 0x41e38 -> wanders to its ret
+    -> pops stale saved-ebp 0xf5ae0 -> executes stack. esi came from
+    eax=0x31 = a kernel callback's return value — our ret-stub left
+    eax=[0x1154] instead of a real ctx index.
+  * Stub experiments: Z1150 (null slot) and KSTUB (0x55-fill kernel zone
+    + ret seas at 0x05500000/0x0ffe0000) both move the crash, not fix it
+    — the marshal is correct app code needing kernel ctx state, not a
+    byte fix. NOTICK proved IRQ8 frame delivery innocent (identical
+    crash). Stack primitives/pusha/enter/leave/pop-r-m/sreg widths all
+    verified correct.
+  * Wall: DOS16M resident-kernel service layer required. Options: (A)
+    map the bound kernpm kernel image at its expected region (kernel
+    data at ~0x6xxxx + kern code reachable via the 0xffff:off vectors);
+    (B) implement the ~dozen svc semantics (d16GetProc/allocCBack/int
+    reflection — each `call [eax+4]` needs its return contract); (C)
+    return to non-direct kernpm path (prev. abandoned for complexity).
+  * Debug scaffolding in dosemu.c (env-gated, uncommitted): KSTUB,
+    Z1150, NOTICK (tick w/o frame), [bad0]/[badret]/[marsh]/[wstk]
+    watches. Recipe: NOFIX=1 DG=1 LEENTRY=0x4e30b [KSTUB=1] -> log.
+
+run-170: option C — kernpm-path LE rejection root-caused to a MEMORY error, not format.
+  * Reproduced: SELMAP=88:20bb0 ./dosemu -> 436M insns -> cs=6520 executing
+    the DOS16M error-table STRING as code (pmcs sel=6520 tbl=8c0
+    base=e0c48ac2). Selector AND descriptor are ASCII — a far-ptr into
+    string data used as code.
+  * String = error #1 "not enough extended memory" (table @file 0x17f0:
+    err0 involuntary-switch, err1 not-enough-ext-mem, err2 not-a-DOS16M).
+    NOT the format reject run-164/165 assumed — a memory-config failure.
+  * File I/O verified byte-perfect: the seek->0x25214 MZ read lands exactly
+    (cmp True) — reads are NOT corrupt. Loader opens DOOM.EXE fd5, probes
+    0xf2a4 "BWp" bound sig, seeks 0x25214 (bound MZ e_lfanew=0x28b8->LE
+    @0x27acc), tries DOOM.ETX (fail=ok, bound internally).
+  * Kernel RUNS: does PM int21s (pmint ga=1c8/108), resident-kernel calls
+    (callf->svc 21bd:ba5), writes IVT/GDT (wivt/wgdt), builds a memory
+    table spanning ~16MB ([wkpm] writes di->0xfff690 at 18:d020). So it
+    detected ~15MB ext mem — then the svc/init path far-jumps through a
+    ptr table whose entries are string bytes -> executes err text.
+  * DPMI detect via int2f/1687 returns present (entry f000:0100); NO int31
+    calls ever happen — kernel doesn't use DPMI-alloc for ext mem.
+  * CMOS fix attempted: added cmos_idx/cmos_reg, port 70/71 rd+wr, init
+    0x15/16=640K 0x17/18+0x30/31=15360K (matches int15/88=0x3c00) —
+    IDENTICAL crash. CMOS is not the detection path.
+  * Same wall as direct mode: the resident-kernel svc/vector table that
+    should hold code-farptrs holds string offsets — the kernel-side
+    install that populates it never ran its init (table read from bound
+    image's string region). The 80K-insn memory-table build IS the kernel
+    init; it completes then transfers through the unpopulated table.
+  * Next: find the far-ptr table the 0x2f451->6520 jump read (which
+    seg/addr the bad {6520,756f} came from) and the init that's supposed
+    to populate it — likely the SAME svc-slot/marshal state as direct mode.
+
+run-170b: the bad fetch is a stack-frame read, not a code-table read.
+  * [emu] stack shows ss=0 esp=0x9110f pointing INTO the error table:
+    stack bytes decode literally to "ened memory\x02\x00no t a DOS/16M
+    execuable...\x00\x03 no DOS". So a retf/pop/iret off a stack that
+    overlaps the error-string region pops {off,sel} = ASCII -> cs=6520.
+  * pmcs at= shows the 6520 re-load came from cs ALREADY =6520 (string
+    bytes contain seg-load patterns) — original entry via retf/iret/pop,
+    not a logged callf. So: kernel decided error #1, built a frame on a
+    buffer holding the error table, and the report path executed the
+    strings (secondary artifact; real fault is the error decision).
+  * Kernel DID detect ~16MB (filled mem table di->0xfff690) — so
+    "not enough" is a specific allocation/region it can't satisfy, not
+    total size. int15/88=15MB, CMOS fixed, no int31, own PM via smsw/lmsw.
+  * Honest state: this is faithful DOS16M resident-kernel bootstrap —
+    research-grade RE, both paths converge on kernel svc-table state.
+    Most tractable route forward = direct-mode + implement the ~dozen
+    DOS16M svc semantics DOOM actually calls (option B), since svc-table
+    slots/marshal are already mapped. kernpm full-init is far deeper.
+
+run-171: kernpm crash root-caused to a thunk-vs-stack layout collision.
+  * Mechanism (fully traced): DOS16M ctx-restore `pop ds;pop es;popad;
+    add esp,2;retf` at seg18:0x2f454 (lin ~0x517d4) runs with esp inside
+    the svc-thunk table -> pops thunk code as far-frame -> cs=6520.
+  * The kernel's svc scheduler WORKS: normal task-switch via popad/iretd
+    to 0x87f0:0 contexts running thunks `mov edx,N;mov eax,ecx;call svc`.
+  * Thunk table is RUNTIME-GENERATED at 0x90eac-0x927xx (~370 thunks)
+    by a copy at 18:d020: moves [0x91300..0x92d00]->[0x90e00..0x92800]
+    via es=a (GDT-alias, base=0x8c0). Dest 0x90e00 is a fixed abs addr.
+  * The collision: this copy executes with esp=0x910e1 INSIDE [0x90e00,
+    0x92800) -> clobbers the live task stack mid-copy. esp legitimately
+    ran at ~0x91187-0x91200 for ~95K insns before the copy (C-function
+    frames at d1:ab8d region). So thunks land on an in-use stack.
+  * Ruled out: CMOS 30/31+17/18, XMEM, int15/88=15MB, BDA 0x413=640K —
+    none change it. Kernel detects ~16MB on its own; "not enough ext mem"
+    (err#1) is just the string adjacent to the thunk table it executes.
+  * Stack should likely be ~0x9ff00 (task-stack tbl [f50]=0x9ff0) not
+    0x91187 -> a task-context ss:esp or kernel workspace base is off.
+  * This is faithful DOS/4GW-Professional kernel bootstrap: preemptive
+    scheduler + svc-thunk dispatch + conventional-mem layout. No
+    watcom/dos16m source on disk. Deep RE; next = find the task-context
+    esp field / workspace base that placed the stack at 0x91187.
+  * dosemu.c additions (uncommitted, env-gated/debug): cmos_idx/cmos_reg
+    + port70/71, BDA 0x413=640, XMEM knob, espw/wthunk watches, bad0
+    guest+stack dump. CMOS/BDA are correct improvements regardless.
+
+## run-172 — ia32 compat foundation: ELF32 + int 0x80 + low-4GiB address spaces
+
+DOS/DOOM emulation abandoned per user directive — pivot to real
+32/64-bit app support. This rung is the SHARED foundation both i386
+ELF and a future PE32 need: compat-mode execution + a second
+syscall-entry path + a low-4GiB user address space.
+
+* cpu.rs: GDT slot 7 = 32-bit user code segment (0x00cffa00 — D=1,L=0
+  -> IA-32e compat mode on iret); UC32_SEL=0x3b. USER DATA (0x28) D/B
+  bit 0->1 like Linux __USER_DS — compat SS.B governs push width
+  (B=0 truncated esp to 16 bits: first boot faulted esp 0x7ffeff50
+  -> 0xff50, found by cr2). set_gate DPL variant; IDT 0x80 = DPL3
+  interrupt gate (0xee -> IF masked) to int80_entry.
+* elf.rs: class-agnostic parse — ELF32 ehdr (52B)/phdr (32B) layout,
+  EM_386, u32 fields at their own offsets; Elf.is32 flag; phdrs()
+  decodes both; parse_at bounds-checks the 64-bit path only.
+* syscall.rs: int80_entry stub — int gate lands on TSS.rsp0
+  (INTR_STACK); xchg to CUR_KSTACK, copy the 5-word frame down with
+  push [rax+n] so NO user GPR is clobbered (ia32 REX code may hold
+  r8-r15). Builds the same UCtx shape, calls handle_int80, iretq —
+  never sysretq (can't load compat CS; CVE-2012-0217 class). Compat
+  `syscall` insn -> handle_syscall ENOSYS guard (AMD runs it, Intel
+  #UDs — either way the 64-bit ABI contract doesn't apply).
+* handle_int80: ia32 numbers (1=exit,4=write,20=getpid,45=brk,122=
+  uname,192=mmap2-offset-shl-12,224=gettid,252=exit_group,...) routed
+  to existing sys_*; nr + all 6 args masked to u32 like the real
+  compat entry (CVE-2007-4573/CVE-2010-3301 class — OOB table index);
+  bounded match not an index; ENOSYS + printk otherwise.
+* user.rs: Task.is_compat (set by load_inner from e.is32, inherited
+  at fork like pers). COMPAT_LO..HI = [0x40000000,0x80000000) — the
+  1GiB dead zone between RAM top and PCI BARs (fb@0x80000000): phys
+  frames the identity map shadows there don't exist, so splicing user
+  pages over supervisor entries costs nothing. <1GiB VAs are REJECTED
+  by map_page32 — real phys frames there would alias kernel phys
+  accesses made under the task's cr3.
+* map_page32: PML4[0] copied kernel PDPT -> private PDPT clone on
+  first map; per-GiB private PD clones spliced in place of shared
+  kernel PDs; 2M supervisor identity leaves SPLIT into PTs of IDENT
+  supervisor fills (PTE bit 9, CPU-ignored) around the user page.
+  USER rides every spliced TABLE entry — kernel leaves never gain it.
+* translate/translate_r: the U/S chain IS the window bound now —
+  kernel slots never carry USER at any level, IDENT fills rejected at
+  the leaf; covers the 64-bit window AND the compat space (a real
+  generalization, not a special case). translate_r keeps PROT_NONE
+  acceptance for write_task_bytes_force.
+* unmap/leaf_ent/mprotect skip IDENT fills (kernel mirrors, never
+  task-owned); free_user_mappings frees only USER-marked private
+  tables + present non-IDENT leaves (PROT_NONE compat pages too —
+  one audit fix landed here); fork_address_space deep-copies a compat
+  parent's private PDPT (shared kernel PDs by reference, IDENT leaves
+  verbatim, user leaves fresh frames); exec's shared-mm np path
+  unaffected (load_inner re-stamps slot 0 from the kernel pml4).
+* Stack/auxv: CSTACK 0x7fef0000 (1MiB), setup_stack32 = u32 slots
+  (argc/argv/envp + 8-byte auxv pairs, same auxv ids); mmap arena
+  0x60000000-0x70000000 via mmap_find. sys_uname -> "i686".
+* Signal gate: no ia32 frame ABI — caught signals on compat tasks
+  take the default-fatal path (maybe_deliver + fault_signal both);
+  SIG_IGN/default semantics unchanged. SIGTRAMP page skipped.
+* Divergences recorded: no sysenter/sysenter32 (int 0x80 only);
+  ELF32+PT_INTERP fails exec (no 32-bit dynlinker); ia32 fork/clone/
+  execve/wait4/signals not wired (ctx-forging paths stay off this
+  rung's table); compat struct ABIs (timeval32, iovec32, stat64,
+  linux_dirent) ENOSYS until their shims.
+* Proof: kernel/user/ia32test.c — gcc -m32 -nostdlib raw int 0x80,
+  linked 0x50000000; argv0 read via naked _start (esp BEFORE the C
+  prologue); write/getpid/gettid/brk+touch/uname-i686/mmap2/munmap/
+  getrandom/ENOSYS(999)/exit all pass.
+* Bugs found by boot: udata D/B=0 (esp truncation above); headers
+  LOAD at 0x08048000 out-of-window fixed by -Ttext-segment.
+* Follow-on rungs: full ia32 table (fork/clone/execve/wait4, ia32
+  signal frames, set_thread_area TLS, sysenter32); PE32 loader +
+  int 0x2e on the same foundation.
+
+Suite: make run PASS exit 33 — 73 tasks incl. ia32test exit(0);
+frames 214356 -> 214356 zero leak; ptytest slave-write EIO flake
+(known run-138 item) failed once in 3 runs and leaked its 2 ring
+frames — attribution confirmed, unrelated to compat teardown.
+Audit: scoped quick review + cve.now (CVE-2007-4573, CVE-2010-3301,
+CVE-2012-0217, CVE-2010-3081, CVE-2021-47364/CVE-2023-53035 — first
+three protected by masking + iretq-only + no compat_alloc_user_space;
+ioctl classes N/A this rung). One self-review fix (PROT_NONE compat
+leaf teardown). needs_validation: none.
