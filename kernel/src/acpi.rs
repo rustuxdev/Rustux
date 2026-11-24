@@ -80,9 +80,9 @@ pub fn provide_rsdp(p: u64) -> Option<u64> {
 
 #[inline]
 fn rd<T>(p: u64, off: u64) -> T {
-    // SAFETY: callers pass addresses inside firmware-provided ACPI tables,
-    // all covered by the identity map; reads are unaligned-safe via ptr::read.
-    unsafe { ((p + off) as *const T).read_unaligned() }
+    // SAFETY: callers pass phys addresses inside firmware-provided ACPI
+    // tables, reachable via the physmap; reads are unaligned-safe.
+    unsafe { ((crate::mm::pmap(p) + off) as *const T).read_unaligned() }
 }
 
 /// Standard 36-byte SDT header: signature, length, revision, checksum.

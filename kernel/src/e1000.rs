@@ -125,12 +125,13 @@ struct TxDesc {
 
 #[inline]
 unsafe fn rd(base: usize, off: usize) -> u32 {
-    unsafe { ((base + off) as *const u32).read_volatile() }
+    // SAFETY: base is a BAR phys address reachable via the physmap.
+    unsafe { ((crate::mm::pmap(base as u64) as usize + off) as *const u32).read_volatile() }
 }
 
 #[inline]
 unsafe fn wr(base: usize, off: usize, v: u32) {
-    unsafe { ((base + off) as *mut u32).write_volatile(v) }
+    unsafe { ((crate::mm::pmap(base as u64) as usize + off) as *mut u32).write_volatile(v) }
 }
 
 /// Probe for the NIC. `is_mmio` must confirm the claimed BAR does not
@@ -249,8 +250,9 @@ pub fn tx_once(base: usize, frame: &[u8]) -> bool {
     // clobber an IMS unmask done before the transmit (MSI-X path).
     unsafe {
         let _ = rd(base, ICR); // drain pending causes
-        wr(base, TDBAL, ring as u32);
-        wr(base, TDBAH, ((ring as usize) >> 32) as u32);
+        let rphys = crate::mm::unpmap(ring as u64);
+        wr(base, TDBAL, rphys as u32);
+        wr(base, TDBAH, (rphys >> 32) as u32);
         wr(base, TDLEN, (N_TX * 16) as u32);
         wr(base, TDH, 0);
         wr(base, TDT, 0);
@@ -262,7 +264,7 @@ pub fn tx_once(base: usize, frame: &[u8]) -> bool {
     // SAFETY: ring names N_TX owned descriptors in the page.
     unsafe {
         let d = &mut *ring;
-        d.addr = buf as u64;
+        d.addr = crate::mm::unpmap(buf as u64);
         d.len = frame.len() as u16;
         d.cso = 0;
         d.cmd = TXD_EOP | TXD_IFCS | TXD_RS;
@@ -454,10 +456,11 @@ fn rx_init(base: usize) -> Option<(*mut RxDesc, *mut u8)> {
     unsafe {
         core::ptr::write_bytes(ring, 0, N_RX);
         for i in 0..N_RX {
-            (*ring.add(i)).addr = bufs.add(i * RX_BUF) as u64;
+            (*ring.add(i)).addr = crate::mm::unpmap(bufs.add(i * RX_BUF) as u64);
         }
-        wr(base, RDBAL, ring as u32);
-        wr(base, RDBAH, ((ring as usize) >> 32) as u32);
+        let rphys = crate::mm::unpmap(ring as u64);
+        wr(base, RDBAL, rphys as u32);
+        wr(base, RDBAH, (rphys >> 32) as u32);
         wr(base, RDLEN, (N_RX * 16) as u32);
         wr(base, RDH, 0);
         wr(base, RDT, 0);

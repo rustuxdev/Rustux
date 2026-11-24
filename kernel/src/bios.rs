@@ -342,5 +342,8 @@ pub extern "C" fn bios_entry(magic: u32, mbi: u64) -> ! {
         )
     };
     let resv = [(ks, ke), mbi_span, initrd_span];
+    // The image keeps its identity PTEs under every cr3 (code fetch,
+    // statics, IDT/GDT/TSS) — compat user pages must not shadow it.
+    crate::user::reserve_kernel_span(ks, ke);
     rustux_main(con, boot_map(), initrd, &resv)
 }

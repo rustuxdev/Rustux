@@ -67,24 +67,56 @@ const KSTACK_SIZE: usize = 49152;
 //
 // A compat-mode CPU emits only <4 GiB linear addresses, so an ELF32
 // image must live in the low half — under PML4[0], the slot every
-// other pml4 aliases to the kernel identity map. COMPAT_LO..HI carves
-// the dead zone between the 1 GiB RAM top and the PCI MMIO hole
-// (BARs sit at 0x80000000+ on q35): the phys frames these VAs shadow
-// in the identity map don't exist, so splicing user pages over the
-// supervisor entries costs the kernel nothing.
-const COMPAT_LO: u64 = 0x4000_0000;
-const COMPAT_HI: u64 = 0x8000_0000;
+// other pml4 aliases to the kernel identity map. COMPAT_LO..HI is the
+// whole below-4GiB range the physmap made safe: every kernel phys
+// access goes through PHYSMAP in the kernel-shared slot band, so a
+// user PTE spliced into a compat slot-0 can never shadow a frame the
+// kernel touches. The only VAs still off-limits are the kernel-
+// reserved spans (KRESV) whose identity PTEs remain load-bearing.
+const COMPAT_LO: u64 = 0x1000;
+const COMPAT_HI: u64 = 0x1_0000_0000;
 /// Compat user stack: USTACK_PAGES high, top below COMPAT_HI.
 const CSTACK_VA: u64 = 0x7fef_0000;
 /// Compat mmap first-fit arena — inside the window, clear of the
 /// image (~0x5000…) and the stack (~0x7ff0…).
-const CMMAP_LO: u64 = 0x6000_0000;
-const CMMAP_HI: u64 = 0x7000_0000;
+const CMMAP_LO: u64 = 0x4000_0000;
+const CMMAP_HI: u64 = 0xf000_0000;
 /// PTE software bit (ignored by the CPU) marking a supervisor
 /// identity-fill entry inside a compat PT: phys == va, a mirror of
 /// the kernel map, never task-owned — unmap_page and teardown must
 /// never free it, and translate/mprotect must never expose it.
 const IDENT: u64 = 1 << 9;
+
+/// Phys spans whose identity PTEs stay load-bearing under every cr3:
+/// the kernel image (instruction fetch, statics, IDT/GDT/TSS) and the
+/// boot stack rustux_main runs on for the kernel's whole lifetime.
+/// Compat user pages may not shadow these — a user PTE at image
+/// phys P would hijack the kernel's fetch/static access at VA=P.
+/// Registered once at boot, before the first compat map.
+static mut KRESV: [(u64, u64); 4] = [(0, 0); 4];
+static mut NKRESV: usize = 0;
+
+/// Reserve a phys span from compat user mappings. The boot front end
+/// calls this for the kernel image and the boot-stack region before
+/// any compat task exists.
+pub fn reserve_kernel_span(lo: u64, hi: u64) {
+    unsafe {
+        let n = *core::ptr::addr_of!(NKRESV);
+        let k = &mut *core::ptr::addr_of_mut!(KRESV);
+        // A silently dropped span would leave kernel identity PTEs
+        // shadowable by a compat user page — fail loudly instead.
+        assert!(n < k.len(), "KRESV full: kernel span would be unprotected");
+        k[n] = (lo, hi);
+        *core::ptr::addr_of_mut!(NKRESV) = n + 1;
+    }
+}
+
+/// True when `va` falls inside a kernel-reserved span.
+fn kreserved(va: u64) -> bool {
+    let n = unsafe { *core::ptr::addr_of!(NKRESV) };
+    let k = unsafe { &*core::ptr::addr_of!(KRESV) };
+    k[..n].iter().any(|&(lo, hi)| va >= lo && va < hi)
+}
 
 /// The task's user-VA window: the high half for 64-bit images, the
 // compat dead-zone window for ELF32.
@@ -542,7 +574,7 @@ fn pty_read(
         // SAFETY: ring frame is pipe-owned, index wraps in bounds;
         // buf is a validated user window under the current cr3.
         unsafe {
-            let b = ((p.buf + ((p.head + i) % PIPE_SIZE) as u64) as *const u8).read();
+            let b = ((crate::mm::pmap(p.buf) + ((p.head + i) % PIPE_SIZE) as u64) as *const u8).read();
             ((buf + i as u64) as *mut u8).write(b);
         }
     }
@@ -608,7 +640,7 @@ fn pty_write(
         // the ring index wraps inside the pipe-owned frame.
         unsafe {
             let b = ((buf + i as u64) as *const u8).read();
-            ((p.buf + ((p.tail + i) % PIPE_SIZE) as u64) as *mut u8).write(b);
+            ((crate::mm::pmap(p.buf) + ((p.tail + i) % PIPE_SIZE) as u64) as *mut u8).write(b);
         }
     }
     p.tail += wlen;
@@ -869,7 +901,7 @@ fn write_task_bytes(pml4: u64, va: u64, data: &[u8]) -> bool {
             return false;
         };
         // SAFETY: pa is a present, writable user frame in pml4.
-        unsafe { (pa as *mut u8).write(b) };
+        unsafe { (crate::mm::pmap(pa) as *mut u8).write(b) };
     }
     true
 }
@@ -883,7 +915,7 @@ fn write_task_bytes_force(pml4: u64, va: u64, data: &[u8]) -> bool {
             return false;
         };
         // SAFETY: pa is a present user frame in pml4.
-        unsafe { (pa as *mut u8).write(b) };
+        unsafe { (crate::mm::pmap(pa) as *mut u8).write(b) };
     }
     true
 }
@@ -1356,7 +1388,7 @@ fn child_change(cpid: u64, cpgid: u64, cppid: u64, status: u64, flag: u64) {
             if p.wait_ptr != 0 {
                 if let Some(pa) = translate(p.pml4, p.wait_ptr) {
                     // SAFETY: pa is a writable user dword in p's map.
-                    unsafe { (pa as *mut u32).write_unaligned(status as u32) };
+                    unsafe { (crate::mm::pmap(pa) as *mut u32).write_unaligned(status as u32) };
                 }
             }
             p.state = TaskState::Runnable;
@@ -2627,14 +2659,15 @@ fn mm_owner_mut() -> Option<&'static mut Task> {
 }
 
 fn rd64(p: u64) -> u64 {
-    // SAFETY: callers only name page-table frames inside the identity
-    // map; the kernel runs under an identity mapping.
-    unsafe { (p as *const u64).read_volatile() }
+    // SAFETY: callers only name page-table frames the kernel owns;
+    // pmap() lands them on the physmap so a compat task's slot-0 user
+    // PTEs can't shadow the access.
+    unsafe { (crate::mm::pmap(p) as *const u64).read_volatile() }
 }
 
 fn wr64(p: u64, v: u64) {
     // SAFETY: see rd64.
-    unsafe { (p as *mut u64).write_volatile(v) }
+    unsafe { (crate::mm::pmap(p) as *mut u64).write_volatile(v) }
 }
 
 /// Map `va` -> a fresh zeroed frame under `t.pml4`, creating PDPT/PD/PT
@@ -2689,12 +2722,11 @@ fn map_page(t: &mut Task, va: u64, flags: u64) -> Option<u64> {
 /// chain for user access) but never a kernel leaf, so the identity
 /// map stays supervisor-only to the task.
 fn map_page32(t: &mut Task, va: u64, flags: u64) -> Option<u64> {
-    if !(COMPAT_LO..0x1_0000_0000).contains(&va) {
-        // Below COMPAT_LO the identity-map VAs shadow REAL phys
-        // frames: a user PTE there would alias kernel phys accesses
-        // made under this task's cr3 (table writes, frame fills)
-        // into user memory and back. The window keeps compat pages
-        // in the dead zone where no kernel access can collide.
+    if !(COMPAT_LO..COMPAT_HI).contains(&va) || kreserved(va) {
+        // The whole <4GiB range is fair game now that kernel phys
+        // access runs through the physmap — except VA 0 (null page)
+        // and the KRESV spans whose identity PTEs the kernel still
+        // dereferences as linear addresses.
         return None;
     }
     let e0 = rd64(t.pml4);
@@ -2811,10 +2843,10 @@ fn map_loads(t: &mut Task, e: &elf::Elf, img: &[u8], track_brk: bool) -> bool {
             let hi = core::cmp::min(v + PAGE, p.va + p.filesz);
             if lo < hi {
                 let src = p.off + (lo - p.va);
-                // SAFETY: frame is an owned page in the identity map;
-                // n <= PAGE and src..src+n <= img.len() (fend check).
+                // SAFETY: frame is an owned page reachable via the
+                // physmap; n <= PAGE and src..src+n <= img.len().
                 unsafe {
-                    ((frame + (lo - v)) as *mut u8)
+                    ((crate::mm::pmap(frame) + (lo - v)) as *mut u8)
                         .copy_from(img.as_ptr().add(src as usize), (hi - lo) as usize);
                 }
             }
@@ -2847,8 +2879,10 @@ fn load_inner(t: &mut Task, e: &elf::Elf, img: &[u8]) -> bool {
     // mappings are shared. User-window slots (128..256) are skipped:
     // under a syscall caller's cr3 (CreateProcess) they'd alias the
     // caller's tables by reference, and teardown of either mm would
-    // free frames the other still walks.
-    let kpml4 = cpu::read_cr3() & !0xfff;
+    // free frames the other still walks. The source is the boot pml4,
+    // never the current cr3 — under a compat caller slot 0 is the
+    // task's private PDPT (USER), not a kernel slot.
+    let kpml4 = crate::mm::kernel_pml4();
     for i in (0..128u64).chain(256..512) {
         let ent = rd64(kpml4 + 8 * i);
         if ent & PRESENT != 0 {
@@ -2877,7 +2911,7 @@ fn load_inner(t: &mut Task, e: &elf::Elf, img: &[u8]) -> bool {
             return false;
         };
         // SAFETY: tp is an identity-mapped frame we just allocated.
-        unsafe { (tp as *mut u8).copy_from_nonoverlapping(SIGTRAMP_CODE.as_ptr(), SIGTRAMP_CODE.len()) };
+        unsafe { (crate::mm::pmap(tp) as *mut u8).copy_from_nonoverlapping(SIGTRAMP_CODE.as_ptr(), SIGTRAMP_CODE.len()) };
     }
     t.stack_top = stop;
     if t.nranges >= MAX_RANGES {
@@ -2896,7 +2930,8 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
     t.brk_base = 0;
     t.brk_cur = 0;
     t.is_compat = false; // PE32+ images are 64-bit-only today
-    let kpml4 = cpu::read_cr3() & !0xfff;
+    // Canonical kernel pml4, never the caller's cr3 (see load_inner).
+    let kpml4 = crate::mm::kernel_pml4();
     for i in (0..128u64).chain(256..512) {
         let ent = rd64(kpml4 + 8 * i);
         if ent & PRESENT != 0 {
@@ -3769,7 +3804,7 @@ fn read_task_str(pml4: u64, va: u64, out: &mut [u8]) -> usize {
             return 0;
         };
         // SAFETY: pa is a present user frame in pml4.
-        let b = unsafe { (pa as *const u8).read() };
+        let b = unsafe { (crate::mm::pmap(pa) as *const u8).read() };
         if b == 0 {
             return i;
         }
@@ -8547,7 +8582,7 @@ fn stdin_wake() {
             let b = unsafe { *(core::ptr::addr_of!(READY) as *const u8).add(done) };
             match translate(t.pml4, t.wait_ptr + done as u64) {
                 // SAFETY: pa is a present user frame in t's tables.
-                Some(pa) => unsafe { (pa as *mut u8).write(b) },
+                Some(pa) => unsafe { (crate::mm::pmap(pa) as *mut u8).write(b) },
                 None => break,
             }
             done += 1;
@@ -8622,7 +8657,7 @@ fn evdev_wake() {
             for j in 0..24u64 {
                 match translate(t.pml4, t.wait_ptr + done as u64 + j) {
                     // SAFETY: present user frame in t's tables.
-                    Some(pa) => unsafe { (pa as *mut u8).write(rec[j as usize]) },
+                    Some(pa) => unsafe { (crate::mm::pmap(pa) as *mut u8).write(rec[j as usize]) },
                     None => { fault = true; break }
                 }
             }
@@ -11121,7 +11156,8 @@ fn nt_read_path(pml4: u64, va: u64, wide: bool) -> Option<([u8; 256], usize)> {
             let hi = translate_r(pml4, va + 2 * n as u64 + 1)?;
             // SAFETY: both are present user bytes in pml4.
             let u = unsafe {
-                *(lo as *const u8) as u16 | (*(hi as *const u8) as u16) << 8
+                *(crate::mm::pmap(lo) as *const u8) as u16
+                    | (*(crate::mm::pmap(hi) as *const u8) as u16) << 8
             };
             if u == 0 {
                 break;
@@ -11383,7 +11419,7 @@ pub fn nt_pathop(sub: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 return STATUS_ACCESS_VIOLATION;
             };
             // SAFETY: pa is a present user frame in pml4.
-            let cap = unsafe { (pa as *const u32).read_unaligned() } as u64;
+            let cap = unsafe { (crate::mm::pmap(pa) as *const u32).read_unaligned() } as u64;
             if cap < 7 {
                 return STATUS_BUFFER_TOO_SMALL;
             }
@@ -12016,7 +12052,7 @@ fn read_task_u64(pml4: u64, va: u64) -> Option<u64> {
     for i in 0..8u64 {
         let pa = translate_r(pml4, va + i)?;
         // SAFETY: pa is a present user frame in pml4.
-        v |= ((unsafe { (pa as *const u8).read() }) as u64) << (i * 8);
+        v |= ((unsafe { (crate::mm::pmap(pa) as *const u8).read() }) as u64) << (i * 8);
     }
     Some(v)
 }
@@ -13236,10 +13272,10 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                 return EFAULT;
             }
             // SAFETY: same user-window proof as File; the proc frame
-            // is kernel-owned, identity-mapped, OFD-lifetime.
+            // is kernel-owned, physmap-reachable, OFD-lifetime.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    (*kbuf as *const u8).add(o.pos),
+                    (crate::mm::pmap(*kbuf) as *const u8).add(o.pos),
                     buf as *mut u8,
                     n,
                 )
@@ -13335,7 +13371,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                 // SAFETY: ring index wraps inside the pipe-owned frame;
                 // buf is validated user memory under the current cr3.
                 unsafe {
-                    let b = ((p.buf + ((p.head + i) % PIPE_SIZE) as u64) as *const u8).read();
+                    let b = ((crate::mm::pmap(p.buf) + ((p.head + i) % PIPE_SIZE) as u64) as *const u8).read();
                     ((buf + i as u64) as *mut u8).write(b);
                 }
             }
@@ -13541,7 +13577,7 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         // the ring index wraps inside the pipe-owned frame.
         unsafe {
             let b = ((buf + i as u64) as *const u8).read();
-            ((p.buf + ((p.tail + i) % PIPE_SIZE) as u64) as *mut u8).write(b);
+            ((crate::mm::pmap(p.buf) + ((p.tail + i) % PIPE_SIZE) as u64) as *mut u8).write(b);
         }
     }
     p.tail += wlen;
@@ -13627,7 +13663,7 @@ pub fn sys_sendfile(out_fd: u64, in_fd: u64, off_va: u64, count: u64) -> u64 {
         // inside the pipe-owned frame.
         unsafe {
             let b = src.add(spos + i).read();
-            ((p.buf + ((p.tail + i) % PIPE_SIZE) as u64) as *mut u8).write(b);
+            ((crate::mm::pmap(p.buf) + ((p.tail + i) % PIPE_SIZE) as u64) as *mut u8).write(b);
         }
     }
     p.tail += n;
@@ -15140,9 +15176,10 @@ fn proc_open(path: &[u8]) -> Option<FdKind> {
     }
     let buf = kalloc::alloc_frame()?;
     let len = {
-        // SAFETY: buf is a fresh 4096-byte frame, identity-mapped.
-        let dst =
-            unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 4096) };
+        // SAFETY: buf is a fresh 4096-byte frame, physmap-reachable.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(crate::mm::pmap(buf) as *mut u8, 4096)
+        };
         let mut s = klib::seqbuf::SeqBuf::new(dst);
         proc_fill(&ent, &mut s);
         s.used()
@@ -17289,11 +17326,11 @@ fn wake_pipe_readers(id: usize) -> usize {
         while done < n {
             // SAFETY: ring frame is pipe-owned, index wraps in bounds.
             let b = unsafe {
-                ((p.buf + ((p.head + done) % PIPE_SIZE) as u64) as *const u8).read()
+                ((crate::mm::pmap(p.buf) + ((p.head + done) % PIPE_SIZE) as u64) as *const u8).read()
             };
             match translate(t.pml4, t.wait_ptr + done as u64) {
                 // SAFETY: pa is a present user frame in t's tables.
-                Some(pa) => unsafe { (pa as *mut u8).write(b) },
+                Some(pa) => unsafe { (crate::mm::pmap(pa) as *mut u8).write(b) },
                 None => break,
             }
             done += 1;
@@ -17345,8 +17382,8 @@ fn wake_pipe_writers(id: usize) -> usize {
                 // SAFETY: pa is a present user frame in t's tables;
                 // the ring index wraps inside our frame.
                 Some(pa) => unsafe {
-                    let b = (pa as *const u8).read();
-                    ((p.buf + ((p.tail + done) % PIPE_SIZE) as u64) as *mut u8)
+                    let b = (crate::mm::pmap(pa) as *const u8).read();
+                    ((crate::mm::pmap(p.buf) + ((p.tail + done) % PIPE_SIZE) as u64) as *mut u8)
                         .write(b)
                 },
                 None => break,
@@ -17392,7 +17429,7 @@ fn read_task_u(pml4: u64, va: u64, len: u64) -> Option<u64> {
     for i in 0..len {
         let pa = translate_r(pml4, va + i)?;
         // SAFETY: pa is a present user frame in pml4.
-        v |= (unsafe { (pa as *const u8).read() } as u64) << (i * 8);
+        v |= (unsafe { (crate::mm::pmap(pa) as *const u8).read() } as u64) << (i * 8);
     }
     Some(v)
 }
@@ -17402,7 +17439,7 @@ fn write_task_u16(pml4: u64, va: u64, v: u16) {
     for i in 0..2u64 {
         if let Some(pa) = translate(pml4, va + i) {
             // SAFETY: pa is a present user frame in pml4.
-            unsafe { (pa as *mut u8).write((v >> (i * 8)) as u8) };
+            unsafe { (crate::mm::pmap(pa) as *mut u8).write((v >> (i * 8)) as u8) };
         }
     }
 }
@@ -17412,7 +17449,7 @@ fn write_task_u32(pml4: u64, va: u64, v: u32) {
     for i in 0..4u64 {
         if let Some(pa) = translate(pml4, va + i) {
             // SAFETY: pa is a present user frame in pml4.
-            unsafe { (pa as *mut u8).write((v >> (i * 8)) as u8) };
+            unsafe { (crate::mm::pmap(pa) as *mut u8).write((v >> (i * 8)) as u8) };
         }
     }
 }
@@ -17422,7 +17459,7 @@ fn write_task_u64(pml4: u64, va: u64, v: u64) {
     for i in 0..8u64 {
         if let Some(pa) = translate(pml4, va + i) {
             // SAFETY: pa is a present user frame in pml4.
-            unsafe { (pa as *mut u8).write((v >> (i * 8)) as u8) };
+            unsafe { (crate::mm::pmap(pa) as *mut u8).write((v >> (i * 8)) as u8) };
         }
     }
 }
@@ -21838,14 +21875,19 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
         // slots (identity map, slots 0..127) before adoption, and
         // CR3 must switch NOW — the syscall path never reloads it,
         // so returning on the old shared table would exec-fetch
-        // fault at entry. Loading np early also keeps load_inner's
-        // read_cr3 slot-copy a self-copy: without the switch it
-        // would import the SHARED user page tables by reference and
-        // map the new image into the still-shared mm.
-        let opml4 = t.pml4;
+        // fault at entry. Loading np early also keeps the later
+        // kernel-slot copy a self-copy: without the switch the new
+        // image would map into the still-shared mm.
         t.pml4 = np;
-        for i in 0..128u64 {
-            let e = rd64(opml4 + 8 * i);
+        // Kernel-shared slots: identity map (0..128) plus the physmap
+        // band (256..512) — a task cr3 must carry both or kernel phys
+        // accesses through pmap() fault under it. Copy them from the
+        // canonical boot pml4, not opml4: under a compat caller slot 0
+        // is the task's private PDPT (USER), and importing it by
+        // reference would alias the still-shared old mm's hierarchy.
+        let kpml4 = crate::mm::kernel_pml4();
+        for i in (0..128u64).chain(256..512) {
+            let e = rd64(kpml4 + 8 * i);
             if e & PRESENT != 0 {
                 wr64(np + 8 * i, e);
             }
@@ -22313,7 +22355,7 @@ fn exit_bookkeeping(n: usize) {
                 if let Some(pa) = translate(p.pml4, p.wait_ptr) {
                     // SAFETY: pa is a translated, present user frame.
                     unsafe {
-                        ((pa) as *mut u32)
+                        ((crate::mm::pmap(pa)) as *mut u32)
                             .write_unaligned((wstatus & 0xffff) as u32)
                     };
                 }
@@ -22612,7 +22654,10 @@ pub fn translate_r(pml4: u64, va: u64) -> Option<u64> {
 /// at this scale). Kernel slots are shared by reference like every
 /// load. Returns false on allocation failure — caller reaps `c`.
 fn fork_address_space(c: &mut Task, ppml4: u64) -> bool {
-    for i in 0..128u64 {
+    // Kernel-shared slots copy by reference: the identity map in
+    // 0..128 plus the physmap band 256..512 (all supervisor entries,
+    // so the USER check below never deep-copies them).
+    for i in (0..128u64).chain(256..512) {
         let e = rd64(ppml4 + 8 * i);
         if e & PRESENT == 0 {
             continue;
@@ -22668,8 +22713,8 @@ fn fork_address_space(c: &mut Task, ppml4: u64) -> bool {
                     // SAFETY: both frames are owned, identity-mapped,
                     // full 4 KiB each — a verbatim copy.
                     unsafe {
-                        (nf as *mut u8)
-                            .copy_from((le & PHYS_MASK) as *const u8, 4096)
+                        (crate::mm::pmap(nf) as *mut u8)
+                            .copy_from(crate::mm::pmap(le & PHYS_MASK) as *const u8, 4096)
                     };
                     wr64(cpt + 8 * l, nf | (le & !PHYS_MASK));
                 }
@@ -22715,8 +22760,8 @@ fn fork_address_space(c: &mut Task, ppml4: u64) -> bool {
                     // SAFETY: both frames are owned, identity-mapped,
                     // full 4 KiB each — a verbatim copy.
                     unsafe {
-                        (nf as *mut u8)
-                            .copy_from((le & PHYS_MASK) as *const u8, 4096)
+                        (crate::mm::pmap(nf) as *mut u8)
+                            .copy_from(crate::mm::pmap(le & PHYS_MASK) as *const u8, 4096)
                     };
                     // Leaf flags verbatim — USER/RW/NX preserved.
                     wr64(cpt + 8 * l as u64, nf | (le & !PHYS_MASK));

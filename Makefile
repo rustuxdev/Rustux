@@ -60,12 +60,12 @@ kernel/user/%.elf: kernel/user/%.c
 	gcc -static-pie -O2 -o $@ $<
 
 # ia32test is ELFCLASS32/EM_386 — gcc -m32 with no libc at all, raw
-# int 0x80 syscalls. Linked at 0x50000000, inside the compat window
-# (0x40000000..0x80000000) where map_page32 can splice user pages
-# over the identity map's dead zone. More specific than the .c
-# pattern rule above, so make prefers it.
+# int 0x80 syscalls. Linked at 0x08048000, the canonical i386 load
+# base real 32-bit binaries use — reachable now that the physmap
+# opened the whole below-4GiB compat window. More specific than the
+# .c pattern rule above, so make prefers it.
 kernel/user/ia32test.elf: kernel/user/ia32test.c
-	gcc -m32 -static -nostdlib -no-pie -Wl,-Ttext-segment,0x50000000 -O2 -o $@ $<
+	gcc -m32 -static -nostdlib -no-pie -Wl,-Ttext-segment,0x08048000 -O2 -o $@ $<
 
 # dyntest is deliberately DYNAMIC — PT_INTERP names the real glibc
 # loader, which the kernel maps into the mmap arena; ld.so then maps

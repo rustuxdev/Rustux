@@ -28,17 +28,65 @@ const PRESENT: u64 = 1;
 const RW: u64 = 1 << 1;
 const PS: u64 = 1 << 7; // large page at this level
 
+/// Physmap: all of phys `0..map_gib` GiB mirrored at `PHYSMAP + phys`
+/// in PML4 slot 256 — the first kernel-shared slot, so every task
+/// pml4 copies it as supervisor-only. Once physmap_on() runs, kernel
+/// phys accesses go through pmap() and a user PTE spliced into a
+/// compat task's slot-0 can never shadow a frame the kernel touches.
+pub const PHYSMAP: u64 = 0xffff_8000_0000_0000;
+
+/// Active phys->linear offset: 0 while only the identity map exists
+/// (table build, pre-switch), PHYSMAP after physmap_on().
+static mut PHYS_OFF: u64 = 0;
+
+/// phys -> the linear address the kernel should dereference it at.
+#[inline]
+pub fn pmap(p: u64) -> u64 {
+    p + unsafe { *core::ptr::addr_of!(PHYS_OFF) }
+}
+
+/// Inverse of pmap() — a physmap linear address back to its phys.
+/// Identity pointers (below the physmap window) pass through so a
+/// linear address from either era converts correctly.
+#[inline]
+pub fn unpmap(l: u64) -> u64 {
+    if l >= PHYSMAP {
+        l - PHYSMAP
+    } else {
+        l
+    }
+}
+
+/// Flip phys accesses to the physmap. Call once, right after the
+/// pml4 carrying it is live on this CPU.
+pub fn physmap_on() {
+    unsafe { *core::ptr::addr_of_mut!(PHYS_OFF) = PHYSMAP };
+}
+
+/// Physical address of the boot PML4 — the canonical source of the
+/// kernel's supervisor slots. Task setup must copy kernel slots from
+/// here, NOT from the caller's current cr3: a compat task's slot 0 is
+/// its private PDPT (USER bit set), so reading cr3 under a compat
+/// context would splice a user-owned hierarchy in as a kernel slot.
+static mut KPML4: u64 = 0;
+
+#[inline]
+pub fn kernel_pml4() -> u64 {
+    unsafe { *core::ptr::addr_of!(KPML4) }
+}
+
 #[inline]
 unsafe fn write64(addr: u64, v: u64) {
-    // SAFETY: callers only touch addresses inside the active identity map
-    // (table memory pre-switch, free frames post-switch).
-    unsafe { (addr as *mut u64).write_volatile(v) }
+    // SAFETY: callers only name phys addresses the kernel owns —
+    // pmap() lands them on the identity map pre-switch, the physmap
+    // after.
+    unsafe { (pmap(addr) as *mut u64).write_volatile(v) }
 }
 
 #[inline]
 unsafe fn read64(addr: u64) -> u64 {
     // SAFETY: same contract as write64.
-    unsafe { (addr as *const u64).read_volatile() }
+    unsafe { (pmap(addr) as *const u64).read_volatile() }
 }
 
 /// GiB of address space the identity map must cover: end of the highest
@@ -57,19 +105,22 @@ pub fn map_gib(mmap: &[MapEnt]) -> u64 {
     core::cmp::max(4, end.div_ceil(GIB))
 }
 
-/// Number of 4 KiB table frames the identity map needs for `map_gib` GiB:
-/// one PML4, one PDPT per 512 GiB, one PD per GiB.
+/// Number of 4 KiB table frames the identity map + physmap need for
+/// `map_gib` GiB: one PML4, one PDPT per 512 GiB for each map, one PD
+/// per GiB for each map.
 pub fn table_frames(ngib: u64) -> u64 {
-    1 + ngib.div_ceil(512) + ngib
+    1 + 2 * (ngib.div_ceil(512) + ngib)
 }
 
-/// Build the identity map in `table_frames(ngib)` frames at `table_base`
-/// (physical). Returns the PML4 physical address.
+/// Build the identity map + physmap in `table_frames(ngib)` frames at
+/// `table_base` (physical). Returns the PML4 physical address.
 ///
-/// Layout: [PML4][PDPT x npdpt][PD x ngib]. PML4[p] -> PDPT p; PDPT[p][i] ->
-/// the PD covering GiB 512*p+i; each PD holds 512 x 2 MiB entries.
-/// Everything is P|RW — this is a boot map; W^X and userspace splits belong
-/// to the real page-table layer.
+/// Layout: [PML4][PDPT x npdpt][PD x ngib][PHYSMAP PDPT][PD x ngib].
+/// PML4[p] -> PDPT p; PDPT[p][i] -> the PD covering GiB 512*p+i; each
+/// PD holds 512 x 2 MiB entries. PML4[256] -> the physmap PDPT whose
+/// PDs mirror phys 0..ngib GiB at PHYSMAP+phys, supervisor-only.
+/// Everything is P|RW — this is a boot map; W^X and userspace splits
+/// belong to the real page-table layer.
 pub fn build_identity_map(mmap: &[MapEnt], table_base: u64) -> u64 {
     let ngib = map_gib(mmap);
     let npdpt = ngib.div_ceil(512);
@@ -95,6 +146,27 @@ pub fn build_identity_map(mmap: &[MapEnt], table_base: u64) -> u64 {
             unsafe { write64(pd + i * 8, phys | PRESENT | RW | PS) };
         }
     }
+    // Physmap: PML4[256..256+npdpt) -> PDPTs mirroring the same phys
+    // range at PHYSMAP+phys — one PDPT per 512 GiB like the identity
+    // map (a single PDPT frame would overflow past entry 511 and
+    // corrupt the adjacent PDs). Lives in the kernel-shared slot band
+    // (256..512 is what load_inner copies into task pml4s) so it exists
+    // under every cr3 while staying ring-3 unreachable.
+    let pm_base = table_base + (1 + npdpt + ngib) * PAGE;
+    for p in 0..npdpt {
+        let pm_pdpt = pm_base + p * PAGE;
+        unsafe { write64(pml4 + (256 + p) * 8, pm_pdpt | PRESENT | RW) };
+    }
+    for g in 0..ngib {
+        let pd = pm_base + (npdpt + g) * PAGE;
+        let pm_pdpt = pm_base + (g / 512) * PAGE;
+        unsafe { write64(pm_pdpt + (g % 512) * 8, pd | PRESENT | RW) };
+        for i in 0..512u64 {
+            let phys = g * GIB + i * PAGE_2M;
+            unsafe { write64(pd + i * 8, phys | PRESENT | RW | PS) };
+        }
+    }
+    unsafe { *core::ptr::addr_of_mut!(KPML4) = pml4 };
     pml4
 }
 

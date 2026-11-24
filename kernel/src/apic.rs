@@ -84,8 +84,8 @@ fn lread(off: u64) -> u32 {
         unsafe { rdmsr(0x800 + (off / 16) as u32).0 }
     } else {
         // SAFETY: base was programmed from IA32_APIC_BASE in init(); off is
-        // a fixed LAPIC register offset; identity map covers <4 GiB MMIO.
-        unsafe { ((LAPIC_BASE.load(Ordering::Relaxed) + off) as *const u32).read_volatile() }
+        // a fixed LAPIC register offset; the physmap covers <4 GiB MMIO.
+        unsafe { ((crate::mm::pmap(LAPIC_BASE.load(Ordering::Relaxed)) + off) as *const u32).read_volatile() }
     }
 }
 
@@ -94,7 +94,7 @@ fn lwrite(off: u64, v: u32) {
     if X2APIC.load(Ordering::Relaxed) {
         unsafe { wrmsr(0x800 + (off / 16) as u32, v, 0) }
     } else {
-        unsafe { ((LAPIC_BASE.load(Ordering::Relaxed) + off) as *mut u32).write_volatile(v) }
+        unsafe { ((crate::mm::pmap(LAPIC_BASE.load(Ordering::Relaxed)) + off) as *mut u32).write_volatile(v) }
     }
 }
 
@@ -224,9 +224,9 @@ const IOREDTBL: u32 = 0x10; // + 2*gsi low dword, +1 high dword
 static IOAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
 fn ioapic_read(reg: u32) -> u32 {
-    let base = IOAPIC_BASE.load(Ordering::Relaxed);
+    let base = crate::mm::pmap(IOAPIC_BASE.load(Ordering::Relaxed));
     // SAFETY: base was programmed from the MADT I/O APIC address (<4 GiB
-    // on PC, inside the identity map); IOREGSEL/IOWIN are 32-bit regs.
+    // on PC, covered by the physmap); IOREGSEL/IOWIN are 32-bit regs.
     unsafe {
         ((base + IOREGSEL) as *mut u32).write_volatile(reg);
         ((base + IOWIN) as *const u32).read_volatile()
@@ -234,7 +234,7 @@ fn ioapic_read(reg: u32) -> u32 {
 }
 
 fn ioapic_write(reg: u32, v: u32) {
-    let base = IOAPIC_BASE.load(Ordering::Relaxed);
+    let base = crate::mm::pmap(IOAPIC_BASE.load(Ordering::Relaxed));
     unsafe {
         ((base + IOREGSEL) as *mut u32).write_volatile(reg);
         ((base + IOWIN) as *mut u32).write_volatile(v);

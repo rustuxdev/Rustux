@@ -1,8 +1,9 @@
 // 32-bit compat-mode proof for the ia32 rung: built ELFCLASS32 /
-// EM_386, runs in IA-32e compatibility mode — its image maps in the
-// low-4GiB compat window (link base 0x50000000) and syscalls arrive
-// on int 0x80's ia32 numbering (write=4, getpid=20, brk=45, uname=
-// 122, mmap2=192, munmap=91, gettid=224, getrandom=355, exit=1).
+// EM_386, runs in IA-32e compatibility mode — its image maps at the
+// canonical i386 link base 0x08048000 (the physmap made the whole
+// below-4GiB compat window safe) and syscalls arrive on int 0x80's
+// ia32 numbering (write=4, getpid=20, brk=45, uname=122, mmap2=192,
+// munmap=91, gettid=224, getrandom=355, exit=1).
 // check() convention like the 64-bit suite: exit status = failures.
 
 static int fails;

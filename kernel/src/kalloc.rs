@@ -10,7 +10,7 @@
 //! duration of every operation (irqsave/irqrestore) so an interrupt
 //! arriving mid-operation cannot corrupt the freelists.
 
-use crate::mm::{Buddy, MapEnt, PAGE};
+use crate::mm::{pmap, unpmap, Buddy, MapEnt, PAGE};
 
 const HDR: u64 = 16;
 /// Classes 2^5 .. 2^12; the smallest object stride (32) already covers
@@ -66,7 +66,7 @@ fn refill(alloc: &mut Kalloc, c: usize) {
     let Some(b) = alloc.buddy.alloc(order) else { return };
     let n = (PAGE << order) / obj;
     for i in 0..n {
-        let slot = b + i * obj;
+        let slot = pmap(b + i * obj);
         // SAFETY: slot is inside the owned block just allocated.
         unsafe { (slot as *mut u64).write_volatile(alloc.cache[c]) };
         alloc.cache[c] = slot;
@@ -124,20 +124,21 @@ pub fn kmalloc(size: usize) -> *mut u8 {
             .next_power_of_two()
             .trailing_zeros() as usize;
         alloc.buddy.alloc(order).map_or(0, |b| {
-            // SAFETY: b is an owned block inside the identity map.
+            let lb = pmap(b);
+            // SAFETY: lb is an owned block inside the physmap.
             unsafe {
-                (b as *mut u64).write_volatile(KIND_DIRECT);
-                ((b + 8) as *mut u64).write_volatile(order as u64);
+                (lb as *mut u64).write_volatile(KIND_DIRECT);
+                ((lb + 8) as *mut u64).write_volatile(order as u64);
             }
-            b + HDR
+            lb + HDR
         })
     };
     unsafe { irq_restore(f) };
     obj as *mut u8
 }
 
-/// One zeroed 4KiB frame as an identity-mapped physical address —
-/// page-table and user-page allocator.
+/// One zeroed 4KiB frame as a physical address — page-table and
+/// user-page allocator. Deref it through mm::pmap().
 pub fn alloc_frame() -> Option<u64> {
     let f = irq_save();
     let alloc = unsafe { &mut *core::ptr::addr_of_mut!(ALLOC) };
@@ -145,8 +146,8 @@ pub fn alloc_frame() -> Option<u64> {
     // SAFETY: f was produced by the matching irq_save above.
     unsafe { irq_restore(f) };
     if let Some(p) = b {
-        // SAFETY: p is an owned frame inside the identity map.
-        unsafe { core::ptr::write_bytes(p as *mut u8, 0, 4096) };
+        // SAFETY: p is an owned frame, physmap-reachable.
+        unsafe { core::ptr::write_bytes(pmap(p) as *mut u8, 0, 4096) };
     }
     b
 }
@@ -186,7 +187,7 @@ pub unsafe fn kfree(p: *mut u8) {
     let kind = unsafe { (hdr as *const u64).read_volatile() };
     if kind == KIND_DIRECT {
         let order = unsafe { ((hdr + 8) as *const u64).read_volatile() } as usize;
-        alloc.buddy.free_pages(hdr, order);
+        alloc.buddy.free_pages(unpmap(hdr), order);
     } else if (kind as usize) < N_CLASSES {
         // Reuse the header slot as the freelist link.
         unsafe { (hdr as *mut u64).write_volatile(alloc.cache[kind as usize]) };

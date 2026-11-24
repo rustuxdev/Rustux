@@ -139,6 +139,18 @@ fn main() -> Status {
         None => kprintln!(con, "rustux: initrd: none found"),
     }
 
+    // The loaded image keeps its identity PTEs under every cr3 —
+    // instruction fetch, statics, IDT/GDT/TSS all resolve at the
+    // image VMA — so compat user pages may never shadow that phys
+    // span. Snapshot it while the protocol is still legal.
+    if let Ok(img) = uefi::boot::open_protocol_exclusive::<
+        uefi::proto::loaded_image::LoadedImage,
+    >(uefi::boot::image_handle())
+    {
+        let (base, size) = img.info();
+        user::reserve_kernel_span(base as u64, base as u64 + size);
+    }
+
     kprintln!(con, "rustux: exiting boot services...");
     // SAFETY: every firmware call this program makes happens before this
     // point; nothing afterwards touches boot or runtime services.
@@ -161,6 +173,16 @@ pub(crate) fn rustux_main(
 ) -> ! {
     log::set_console(&mut con);
     kprintln!(con, "rustux: serial console up on COM1");
+    // rustux_main runs on the boot stack for the kernel's whole
+    // lifetime — reserve its containing 2 MiB identity region so a
+    // compat task's user page can never shadow it. rsp is a linear
+    // address that equals its phys under the identity map.
+    let boot_rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) boot_rsp, options(nomem, nostack)) };
+    user::reserve_kernel_span(
+        boot_rsp & !(2 * 1024 * 1024 - 1),
+        (boot_rsp & !(2 * 1024 * 1024 - 1)) + 2 * 1024 * 1024,
+    );
     let rng_hw = rand::init();
     kprintln!(con,
         "rustux: rand: CSPRNG seeded ({})",
@@ -855,6 +877,7 @@ pub(crate) fn rustux_main(
     let carve_end = carve + tframes * mm::PAGE;
     let pml4 = mm::build_identity_map(mmap, carve);
     mm::load_cr3(pml4);
+    mm::physmap_on();
     kprintln!(con,
         "rustux: own page tables active (identity map, {} GiB, {} table frames at {:#x})",
         ngib,
@@ -1103,8 +1126,10 @@ pub(crate) fn rustux_main(
     // Falls back to the embedded image when no initrd was loaded or
     // the archive has no entries.
     // SAFETY: initrd names LOADER_DATA pages we allocated pre-EBS;
-    // they are identity-mapped and still owned.
-    let arc = initrd.map(|(a, l)| unsafe { core::slice::from_raw_parts(a as *const u8, l) });
+    // physmap-reachable and still owned.
+    let arc = initrd.map(|(a, l)| unsafe {
+        core::slice::from_raw_parts(mm::pmap(a) as *const u8, l)
+    });
     // Boot-time /dev population — device nodes and their links are
     // kernel-lifetime objects like the initrd, so they belong outside
     // the task-leak window.

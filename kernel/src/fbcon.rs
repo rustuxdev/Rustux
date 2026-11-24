@@ -86,7 +86,9 @@ enum EscState {
 }
 
 pub struct FbConsole {
-    base: *mut u8,
+    /// Framebuffer phys address — dereferenced via fb() (pmap at use
+    /// time) because the console is created before physmap_on().
+    base: u64,
     size: usize,
     stride: usize, // pixels per scanline
     width: usize,
@@ -155,6 +157,10 @@ impl FbConsole {
         if base.is_null() || size < stride * 4 || width < FONT_8X16_W || height < FONT_8X16_H {
             return None;
         }
+        // `base` arrives as a phys address and is stored raw — the
+        // console is created before physmap_on(), so dereferences go
+        // through fb() which pmap()s at use time.
+        let base = base as u64;
         let cols = (width / FONT_8X16_W).min(MAX_COLS);
         let rows = (height / FONT_8X16_H).min(MAX_ROWS);
         // Record the tty grid for TIOCGWINSZ before the console moves
@@ -198,6 +204,13 @@ impl FbConsole {
         Some(con)
     }
 
+    /// Linear address the framebuffer is dereferenceable at — the
+    /// physmap once physmap_on() has run, the identity map before.
+    #[inline]
+    fn fb(&self) -> *mut u8 {
+        crate::mm::pmap(self.base) as *mut u8
+    }
+
     /// fbdev geometry: (width, height, stride in pixels, bgr lane order).
     pub fn fb_info(&self) -> (u32, u32, u32, bool) {
         (self.width as u32, self.height as u32, self.stride as u32, self.bgr)
@@ -213,7 +226,7 @@ impl FbConsole {
             return 0;
         }
         // SAFETY: off..off+n is inside `size` mapped bytes per fb_byte_len.
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(off), n) };
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.fb().add(off), n) };
         n
     }
     /// /dev/fb0 read: copy framebuffer bytes out at byte offset.
@@ -223,7 +236,7 @@ impl FbConsole {
             return 0;
         }
         // SAFETY: same bounds as fb_write_at.
-        unsafe { core::ptr::copy_nonoverlapping(self.base.add(off), dst.as_mut_ptr(), n) };
+        unsafe { core::ptr::copy_nonoverlapping(self.fb().add(off), dst.as_mut_ptr(), n) };
         n
     }
 
@@ -236,7 +249,7 @@ impl FbConsole {
         // SAFETY: off+3 is inside the framebuffer per the bounds check above;
         // volatile because this is MMIO-backed memory.
         unsafe {
-            let p = self.base.add(off) as *mut u32;
+            let p = self.fb().add(off) as *mut u32;
             // Constants are 0x00RRGGBB. Bgr memory order is [B,G,R,X] so the
             // u32 can go out as-is; Rgb wants [R,G,B,X] — swap the R/B lanes.
             let v = if self.bgr {
@@ -381,8 +394,8 @@ impl FbConsole {
         // all below rows*gh <= height*stride*4 <= size. memmove semantics.
         unsafe {
             ptr::copy(
-                self.base.add(src_px * rb),
-                self.base.add(dst_px * rb),
+                self.fb().add(src_px * rb),
+                self.fb().add(dst_px * rb),
                 move_bytes,
             );
         }

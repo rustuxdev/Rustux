@@ -334,11 +334,16 @@ extern "win64" fn report_frame(f: &mut TrapFrame, regs: *mut SavedRegs) {
                 name, f.vec, f.rip, f.err, f.cs, cr2, f.rsp, f.rflags, f
             );
             // Caller identification: dump the interrupted stack top —
-            // for a call-site fault [rsp] is the return address.
-            if f.rsp >= 0x100000 && f.rsp < 0x4000_0000 {
+            // for a call-site fault [rsp] is the return address. Kernel
+            // stacks live in the physmap post-physmap_on; identity
+            // addresses cover the pre-flip era.
+            let pm = crate::mm::PHYSMAP;
+            let in_ram = (f.rsp >= 0x100000 && f.rsp < 0x4000_0000)
+                || (f.rsp >= pm + 0x100000 && f.rsp < pm + 0x4000_0000);
+            if in_ram {
                 for i in 0..6u64 {
                     let a = f.rsp + i * 8;
-                    // SAFETY: rsp is inside the identity map (checked above).
+                    // SAFETY: rsp is inside the physmap (checked above).
                     let v = unsafe { (a as *const u64).read_volatile() };
                     let _ = writeln!(u, "rustux: cpu:   stk[{a:#x}] = {v:#x}");
                 }
@@ -703,15 +708,6 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
 }
 
 /// Current CR3 (PML4 physical base, flags in low 12 bits).
-pub fn read_cr3() -> u64 {
-    let v: u64;
-    // SAFETY: reading CR3 is privileged; we are ring 0.
-    unsafe {
-        core::arch::asm!("mov {}, cr3", out(reg) v, options(nostack, nomem));
-    }
-    v
-}
-
 const MSR_EFER: u32 = 0xc000_0080;
 const MSR_STAR: u32 = 0xc000_0081;
 const MSR_LSTAR: u32 = 0xc000_0082;
