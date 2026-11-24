@@ -706,7 +706,18 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         },
         // getdents64: linux_dirent64 keeps u64 fields on both ABIs.
         220 => user::fd_getdents(a1, a2, a3),
+        172 => user::sys_prctl(a1, a2),
+        191 => user::sys_ugetrlimit(a1),
         224 => user::sys_gettid(),
+        // i386 TLS install — glibc's startup calls this before it
+        // touches %gs-based errno/TCB.
+        243 => user::sys_set_thread_area(a1),
+        // i386 robust-futex list head is 12 bytes (3 x u32).
+        311 => user::sys_set_robust_list32(a1, a2),
+        // i386 readlinkat — same dirfd/path/buf/len shape.
+        305 => sys_readlinkat(a1, a2, a3, a4),
+        // rseq: the 32-byte struct rseq layout is ABI-identical.
+        386 => user::sys_rseq(a1, a2, a3, a4),
         258 => user::sys_set_tid_address(),
         340 => user::sys_prlimit64(a1, a2, a3, a4),
         355 => user::sys_getrandom(a1, a2, a3),

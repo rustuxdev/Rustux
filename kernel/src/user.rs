@@ -1761,6 +1761,14 @@ pub struct Task {
     /// page (Windows threads read TEB fields via gs:[]); restored
     /// to MSR_GS_BASE on every switch like fs_base.
     gs_base: u64,
+    /// i386 TLS descriptors (set_thread_area): raw 8-byte GDT
+    /// descriptors installed into the GDT TLS slots on every switch —
+    /// a compat task's %gs base comes from its descriptor, so the
+    /// slots must hold this task's entries while it runs.
+    tls: [u64; 4],
+    /// Compat task's %gs selector (0 = none), reloaded on switch so
+    /// the hidden descriptor base matches the task's TLS entry.
+    gs_sel: u16,
     /// NT handle table — small indices like the real one; slots
     /// hold nt::NTH_* object tags. Fork copies it (a cloned
     /// handle stays open in the child like DuplicateHandle).
@@ -7249,6 +7257,8 @@ fn load(img: &[u8]) -> Option<Task> {
         pers: PERS_LINUX,
         is_compat: false,
         gs_base: 0,
+        tls: [0; 4],
+        gs_sel: 0,
         nth: [0; crate::nt::MAX_NTH],
         nth_fd: [0xff; crate::nt::MAX_NTH],
         nth_dirpat: [[0; 96]; crate::nt::MAX_NTH],
@@ -8236,6 +8246,75 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
         }
         _ => EINVAL,
     }
+}
+
+/// set_thread_area(u_info): i386 TLS install — Linux's GDT TLS-entry
+/// scheme. Validates struct user_desc (24 bytes), fills an 8-byte GDT
+/// descriptor the way fill_ldt does (DPL3, S=1, ACCESS bit set), keeps
+/// it in the task's TLS slot array and installs it in the GDT, then
+/// writes the chosen entry NUMBER back (glibc derives the %gs selector
+/// as entry*8+3 itself). Compat-only: 64-bit TLS is arch_prctl's MSR.
+pub fn sys_set_thread_area(u_info: u64) -> u64 {
+    const ESRCH: u64 = (-3i64) as u64;
+    let Some(t) = cur_mut() else { return ESRCH };
+    if !t.is_compat || !range_ok(u_info, 16) || !range_ok_w(u_info, 4) {
+        return EINVAL;
+    }
+    // SAFETY: validated user range in this task's address space.
+    let (entry, base, limit) = unsafe {
+        (
+            (u_info as *const u32).read_unaligned(),
+            ((u_info + 4) as *const u32).read_unaligned(),
+            ((u_info + 8) as *const u32).read_unaligned(),
+        )
+    };
+    // struct user_desc packs its flags into ONE u32 at offset 12:
+    // seg_32bit:1, contents:2, read_exec_only:1, limit_in_pages:1,
+    // seg_not_present:1, useable:1, lm:1 (Linux's layout).
+    let f = unsafe { ((u_info + 12) as *const u32).read_unaligned() };
+    let (seg_32bit, contents, read_exec_only) = (f & 1, (f >> 1) & 3, (f >> 3) & 1);
+    let (limit_in_pages, seg_not_present, useable) = ((f >> 4) & 1, (f >> 5) & 1, (f >> 6) & 1);
+    let mut ty = (((read_exec_only ^ 1) & 1) << 1) | ((contents & 1) << 2);
+    ty |= 1; // ACCESS — mapped-readonly detection, like Linux
+    let desc = (limit as u64 & 0xffff)
+        | ((base as u64 & 0xffff) << 16)
+        | (((base as u64 >> 16) & 0xff) << 32)
+        | ((ty as u64) << 40)
+        | (1u64 << 44) // S
+        | (3u64 << 45) // DPL3
+        | (((seg_not_present as u64 ^ 1) & 1) << 47)
+        | (((limit as u64 >> 16) & 0xf) << 48)
+        | ((useable as u64 & 1) << 52)
+        | ((seg_32bit as u64 & 1) << 54) // D/B
+        | ((limit_in_pages as u64 & 1) << 55) // G
+        | (((base as u64 >> 24) & 0xff) << 56); // base31_24
+    // -1 asks the kernel to pick the first free slot (glibc's startup
+    // call); an explicit entry must be one of our TLS slots.
+    let slot = if entry == u32::MAX {
+        match (0..cpu::TLS_SLOTS).find(|&i| t.tls[i] == 0) {
+            Some(i) => i,
+            None => return ESRCH,
+        }
+    } else if (cpu::TLS_SLOT_BASE..cpu::TLS_SLOT_BASE + cpu::TLS_SLOTS)
+        .contains(&(entry as usize))
+    {
+        entry as usize - cpu::TLS_SLOT_BASE
+    } else {
+        return EINVAL;
+    };
+    t.tls[slot] = desc;
+    cpu::install_tls(slot, desc);
+    let num = (cpu::TLS_SLOT_BASE + slot) as u32;
+    t.gs_sel = (num * 8 + 3) as u16;
+    // IA-32e takes the FS/GS BASE from the MSR whenever the segment is
+    // loaded at CPL0 in 64-bit mode, so the descriptor alone is not
+    // enough — mirror the base into gs_base (written to the MSR on
+    // every switch). A compat-mode load (the task's own `mov gs`)
+    // reads the descriptor, which carries the same base.
+    t.gs_base = base as u64;
+    // SAFETY: validated writable user range (entry_number).
+    unsafe { (u_info as *mut u32).write_unaligned(num) };
+    0
 }
 
 /// uname(buf): Linux struct utsname — 6 fields ?-- 65 bytes.
@@ -9805,6 +9884,29 @@ pub fn sys_set_tid_address() -> u64 {
 /// death needs futexes first. Linux EINVALs a wrong struct size.
 pub fn sys_set_robust_list(_head: u64, len: u64) -> u64 {
     if len != 24 {
+        return EINVAL;
+    }
+    0
+}
+
+/// ugetrlimit(rlim): i386's 32-bit struct rlimit — two u32 fields,
+/// both RLIM_INFINITY like prlimit64 reports. nr 76/191.
+pub fn sys_ugetrlimit(rlim: u64) -> u64 {
+    if !range_ok_w(rlim, 8) {
+        return EFAULT;
+    }
+    // SAFETY: validated writable user range.
+    unsafe {
+        (rlim as *mut u32).write_unaligned(u32::MAX);
+        (rlim as *mut u32).add(1).write_unaligned(u32::MAX);
+    }
+    0
+}
+
+/// set_robust_list compat variant: struct robust_list_head is 12
+/// bytes on i386 (three u32 pointers), 24 on x86_64.
+pub fn sys_set_robust_list32(_head: u64, len: u64) -> u64 {
+    if len != 12 {
         return EINVAL;
     }
     0
@@ -11961,6 +12063,8 @@ pub fn nt_thread_create(
         pers: p.pers,
         is_compat: p.is_compat,
         gs_base: teb,
+        tls: [0; 4],
+        gs_sel: 0,
         // Windows handles are process objects: the table lives on
         // the leader only (mm_owner routes there), so a thread's
         // own nth must stay empty — a copied snapshot could be
@@ -22176,14 +22280,23 @@ fn switch_to(n: usize) -> ! {
         fxsave(t);
     }
     unsafe { *core::ptr::addr_of_mut!(CUR_I) = n };
-    let (ctx, pml4, kst) = {
+    let (ctx, pml4, kst, gs_sel) = {
         let t = unsafe { (*core::ptr::addr_of!(TASKS))[n].as_ref().unwrap() };
         fxrstor(&t.fx);
         // SAFETY: MSR write of a task-owned user FS base.
         unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
         unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
-        (&t.ctx as *const UCtx, t.pml4, t.kstack_top)
+        // i386 TLS: the task's descriptors must occupy the GDT TLS
+        // slots while it runs (compat %gs bases come from them), and
+        // its selector has to be reloaded so the hidden base matches.
+        for (i, &d) in t.tls.iter().enumerate() {
+            cpu::install_tls(i, d);
+        }
+        (&t.ctx as *const UCtx, t.pml4, t.kstack_top, t.gs_sel)
     };
+    // 0 clears the segment: harmless in 64-bit mode (the MSR base
+    // governs there) and correct for a compat task with no TLS yet.
+    cpu::load_gs(gs_sel);
     syscall::set_kstack(kst);
     unsafe { syscall::sched_iret(ctx, pml4) }
 }
@@ -22877,6 +22990,8 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         pers: p.pers,
         is_compat: p.is_compat,
         gs_base: p.gs_base,
+        tls: p.tls,
+        gs_sel: p.gs_sel,
         nth: p.nth,
         nth_fd: p.nth_fd,
         nth_dirpat: p.nth_dirpat,
@@ -23055,6 +23170,8 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         pers: p.pers,
         is_compat: p.is_compat,
         gs_base: p.gs_base,
+        tls: p.tls,
+        gs_sel: p.gs_sel,
         nth: p.nth,
         nth_fd: p.nth_fd,
         nth_dirpat: p.nth_dirpat,

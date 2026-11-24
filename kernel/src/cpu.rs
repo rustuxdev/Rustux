@@ -41,7 +41,11 @@ pub const UC32_SEL: u16 = 0x38 | 3;
 // code: P|DPL0|S|Exec|Read|L   data: P|DPL0|S|Write
 // User variants are the same shapes with DPL=3 (access 0xf2/0xfa).
 // Slots 3-4 hold the TSS descriptor, filled at init (needs the runtime base).
-static mut GDT: [u64; 8] = [
+// Slots 8-11 are the i386 TLS descriptors (set_thread_area): per-task
+// state installed into these slots on every switch, Linux's GDT
+// TLS-entry scheme. Compat %gs bases come from the descriptor, so the
+// slots must be live while the task runs.
+static mut GDT: [u64; 12] = [
     0,
     0x00af_9a00_0000_ffff, // 0x08 kernel code
     0x00af_9200_0000_ffff, // 0x10 kernel data
@@ -55,7 +59,41 @@ static mut GDT: [u64; 8] = [
     // 32-bit compat code: P|DPL3|S|Exec|Read, D=1 L=0 (0xcf/0xfa) —
     // a task iret'd here runs its ring-3 code in IA-32e compat mode.
     0x00cf_fa00_0000_ffff, // 0x38 user32 code (DPL3)
+    0, // 0x40-0x5f i386 TLS slots 8-11 (set_thread_area, per task)
+    0,
+    0,
+    0,
 ];
+
+/// First GDT slot of the i386 TLS entries (selectors 0x43/0x4b/0x53/0x5b
+/// with RPL 3) and how many there are — Linux's GDT_ENTRY_TLS_MIN
+/// analogue, sized to match the array above.
+pub const TLS_SLOT_BASE: usize = 8;
+pub const TLS_SLOTS: usize = 4;
+
+/// Install one TLS descriptor into its GDT slot. Long mode reads GDT
+/// entries from memory on every segment load, so no lgdt is needed —
+/// the task's own `mov gs, sel` (or the switch-time reload) picks the
+/// new descriptor up.
+pub fn install_tls(slot: usize, desc: u64) {
+    if slot >= TLS_SLOTS {
+        return;
+    }
+    // SAFETY: single-CPU; the slot index is bounded above and the GDT
+    // outlives every task.
+    unsafe { (*core::ptr::addr_of_mut!(GDT))[TLS_SLOT_BASE + slot] = desc };
+}
+
+/// Load a user GS selector (0 clears the segment). CPL0 may load a
+/// DPL3 data segment when RPL <= DPL, so the switch path can restore a
+/// compat task's %gs on its behalf.
+pub fn load_gs(sel: u16) {
+    // SAFETY: sel is a validated GDT TLS selector or 0; the GDT entry
+    // is a present DPL3 data descriptor by the time this runs.
+    unsafe {
+        core::arch::asm!("mov gs, {0:x}", in(reg) sel as u64, options(nostack, preserves_flags));
+    }
+}
 
 /// x86_64 task state segment. Only the IST entries matter today: no
 /// privilege transitions exist yet, so the rsp fields stay zeroed. iopb
@@ -573,7 +611,7 @@ pub fn init() {
     }
 
     let gdtr = TablePtr {
-        limit: (8 * 8 - 1) as u16,
+        limit: (core::mem::size_of::<[u64; 12]>() - 1) as u16,
         base: core::ptr::addr_of!(GDT) as u64,
     };
     // SAFETY: gdtr points at our valid flat GDT; CS reload uses a far return
