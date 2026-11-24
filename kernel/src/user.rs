@@ -9813,6 +9813,100 @@ pub fn sys_rt_sigprocmask(how: u64, set: u64, old: u64, sigsetsize: u64) -> u64 
     0
 }
 
+/// gettimeofday for i386: struct timeval32 is two i32 fields.
+pub fn sys_gettimeofday32(tv: u64, _tz: u64) -> u64 {
+    if tv != 0 {
+        if !range_ok_w(tv, 8) {
+            return EFAULT;
+        }
+        let (s, ns) = crate::rtc::wall_now();
+        // SAFETY: tv validated writable for 8 bytes (timeval32).
+        unsafe {
+            (tv as *mut i32).write_unaligned(s as i32);
+            (tv as *mut i32).add(1).write_unaligned((ns / 1000) as i32);
+        }
+    }
+    0
+}
+
+/// nanosleep for i386: struct timespec32 is two i32 fields. Shares
+/// the deadline machinery; the remainder pointer is a 32-bit
+/// timespec too, so it is not handed to the signal-wake filler.
+pub fn sys_nanosleep32(ctx: &mut UCtx, req: u64, rem: u64) -> u64 {
+    const EINTR: u64 = (-4i64) as u64;
+    if !range_ok(req, 8) {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let sec = unsafe { (req as *const i32).read_unaligned() } as i64;
+    let nsec = unsafe { (req as *const i32).add(1).read_unaligned() } as i64;
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        return EINVAL;
+    }
+    let ticks = (sec as u64)
+        .saturating_mul(100)
+        .saturating_add((nsec as u64).div_ceil(10_000_000));
+    if ticks == 0 {
+        return 0;
+    }
+    if rem != 0 && !range_ok_w(rem, 8) {
+        return EFAULT;
+    }
+    if deliverable(t) {
+        return EINTR;
+    }
+    t.wait_on = WaitOn::Timer;
+    t.wait_ptr = 0; // no 64-bit remainder buffer to fill
+    t.wait_ptr2 = 0;
+    t.wait_deadline = crate::apic::TICKS
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .saturating_add(ticks);
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
+/// readv for i386: struct iovec32 is {base: u32, len: u32} — 8
+/// bytes per element instead of 16. writev32 lives in syscall.rs
+/// beside sys_write (it needs the console fan-out).
+pub fn fd_readv32(ctx: &mut UCtx, fd: u64, iov: u64, cnt: u64) -> u64 {
+    if cnt == 0 {
+        return 0;
+    }
+    if cnt > 32 || !range_ok(iov, cnt * 8) {
+        return EINVAL;
+    }
+    let mut done = 0u64;
+    for i in 0..cnt {
+        let (base, len) = unsafe {
+            (
+                ((iov + i * 8) as *const u32).read_unaligned() as u64,
+                ((iov + i * 8 + 4) as *const u32).read_unaligned() as u64,
+            )
+        };
+        if len == 0 {
+            continue;
+        }
+        if done > 0 {
+            let ready = cur_mut()
+                .map(|t| poll_revents(t, fd as i32, 1) & (1 | 8 | 16) != 0)
+                .unwrap_or(false);
+            if !ready {
+                break;
+            }
+        }
+        let n = fd_read(ctx, fd, base, len);
+        if (n as i64) < 0 {
+            return if done > 0 { done } else { n };
+        }
+        done += n;
+        if n < len {
+            break;
+        }
+    }
+    done
+}
+
 /// getcwd(buf, len): "/" + the shared cwd bytes + NUL; ERANGE
 /// when the caller's buffer can't hold it — Linux semantics.
 pub fn sys_getcwd(buf: u64, len: u64) -> u64 {
@@ -10806,19 +10900,6 @@ fn ofd(t: &mut Task, fd: u64) -> Option<&'static mut OpenFile> {
 }
 
 /// May `fd` be a write() target? Only the console streams.
-/// Debug: describe the current task's fd kind.
-pub fn fd_kind_dbg(fd: u64) -> u32 {
-    let Some(t) = cur_mut() else { return 0xdead };
-    match ofd(t, fd).map(|o| &o.kind) {
-        Some(FdKind::Stdin) => 1,
-        Some(FdKind::Console) => 2,
-        Some(FdKind::Ram(_)) => 3,
-        Some(FdKind::Dev(i)) => 0x100 + (*i as u32 & 0xff),
-        Some(_) => 4,
-        None => 0xff,
-    }
-}
-
 pub fn fd_is_console(fd: u64) -> bool {
     let Some(t) = cur_mut() else { return false };
     matches!(ofd(t, fd).map(|o| &o.kind), Some(FdKind::Console))

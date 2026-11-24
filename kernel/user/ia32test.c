@@ -268,6 +268,49 @@ void main32(void) {
     check(got_sig == 1);
     check(got_arg == 10);
 
+    // ---- compat struct shims: timeval32 (78), nanosleep32 (162),
+    // iovec32 readv/writev (145/146), poll (168).
+    {
+        int tv[2];
+        check(sc3(78, (long)tv, 0, 0) == 0);
+        check(tv[0] > 0); // seconds since the epoch
+    }
+    {
+        int ts[2];
+        ts[0] = 0;
+        ts[1] = 2 * 1000 * 1000; // 2 ms
+        check(sc3(162, (long)ts, 0, 0) == 0);
+    }
+    {
+        static int vp[2];
+        check(sc1(42, (long)vp) == 0);
+        char a = 'A', b = 'B';
+        unsigned int iov[4];
+        iov[0] = (unsigned int)(long)&a;
+        iov[1] = 1;
+        iov[2] = (unsigned int)(long)&b;
+        iov[3] = 1;
+        check(sc3(146, vp[1], (long)iov, 2) == 2); // writev32
+        char ra = 0, rb = 0;
+        unsigned int riov[4];
+        riov[0] = (unsigned int)(long)&ra;
+        riov[1] = 1;
+        riov[2] = (unsigned int)(long)&rb;
+        riov[3] = 1;
+        check(sc3(145, vp[0], (long)riov, 2) == 2); // readv32
+        check(ra == 'A' && rb == 'B');
+        // poll: the pipe is drained now, so a zero timeout reports 0.
+        struct {
+            int fd;
+            short ev;
+            short re;
+        } pf;
+        pf.fd = vp[0];
+        pf.ev = 1; // POLLIN
+        pf.re = 0;
+        check(sc3(168, (long)&pf, 1, 0) == 0);
+    }
+
     // Unknown ia32 number -> -ENOSYS (38), not a crash.
     check(sc0(999) == -38);
 

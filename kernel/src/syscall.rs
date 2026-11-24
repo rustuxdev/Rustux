@@ -711,6 +711,13 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         // rt_sigreturn(173). Struct sigaction is 16 bytes and the
         // sigset is 4 bytes under this ABI.
         67 | 174 => user::sigaction32(a1, a2, a3),
+        // compat struct shims: timeval32/timespec32 are two i32,
+        // iovec32 is 8 bytes, and struct pollfd is ABI-identical.
+        78 => user::sys_gettimeofday32(a1, a2),
+        145 => user::fd_readv32(ctx, a1, a2, a3),
+        146 => sys_writev32(ctx, a1, a2, a3),
+        162 => user::sys_nanosleep32(ctx, a1, a2),
+        168 => user::fd_poll(ctx, a1, a2, a3 as i32 as i64),
         119 | 173 => user::rt_sigreturn32(ctx),
         126 | 175 => user::rt_sigprocmask32(a1, a2, a3, if nr == 175 { a4 } else { 4 }),
         // i386 process creation: fork(2), waitpid(7), execve(11).
@@ -1481,6 +1488,37 @@ fn sys_write(ctx: &mut user::UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     // user output is lost before it reaches the console.
     log::drain_task();
     len
+}
+
+/// writev for i386: struct iovec32 is {base: u32, len: u32}.
+fn sys_writev32(ctx: &mut user::UCtx, fd: u64, iov: u64, cnt: u64) -> u64 {
+    if cnt == 0 {
+        return 0;
+    }
+    if cnt > 32 || !user::range_ok(iov, cnt * 8) {
+        return EINVAL;
+    }
+    let mut done = 0u64;
+    for i in 0..cnt {
+        let (base, len) = unsafe {
+            (
+                ((iov + i * 8) as *const u32).read_unaligned() as u64,
+                ((iov + i * 8 + 4) as *const u32).read_unaligned() as u64,
+            )
+        };
+        if len == 0 {
+            continue;
+        }
+        let n = sys_write(ctx, fd, base, len);
+        if (n as i64) < 0 {
+            return if done > 0 { done } else { n };
+        }
+        done += n;
+        if n < len {
+            break;
+        }
+    }
+    done
 }
 
 /// writev(fd, iov, cnt): gather-write each iovec through sys_write —
