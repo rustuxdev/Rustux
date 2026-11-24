@@ -170,6 +170,27 @@ void main32(void) {
     check(sc3(403, 1, (long)&ts64, 0) == 0);
     check(ts64.sec >= 0);
 
+    // ---- fork + execve + wait4 (ia32 nr 2 / 11 / 7): the child
+    // execs /ia32child — a second ELFCLASS32 image at 0x08048000 —
+    // which prints a line and exits 7; the parent collects the wait
+    // status. argv is a 4-byte-pointer array under this ABI.
+    long cpid = sc0(2);
+    if (cpid == 0) {
+        static char a0[] = "ia32child";
+        unsigned int argv32[2];
+        argv32[0] = (unsigned int)a0;
+        argv32[1] = 0;
+        sc3(11, (long)"/ia32child", (long)argv32, 0);
+        sc1(1, 9); // exec failed — exit 9, never returns
+        for (;;) {}
+    }
+    check(cpid > 0);
+    static volatile int wstatus;
+    wstatus = -1;
+    long w = sc3(7, cpid, (long)&wstatus, 0);
+    check(w == cpid);
+    check(wstatus == (7 << 8)); // normal exit, status 7
+
     // Unknown ia32 number -> -ENOSYS (38), not a crash.
     check(sc0(999) == -38);
 

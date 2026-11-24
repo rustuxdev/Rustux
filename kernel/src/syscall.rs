@@ -706,6 +706,10 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         },
         // getdents64: linux_dirent64 keeps u64 fields on both ABIs.
         220 => user::fd_getdents(a1, a2, a3),
+        // i386 process creation: fork(2), waitpid(7), execve(11).
+        2 => user::fork(ctx, false, false),
+        7 => user::wait4(ctx, a1 as u32 as i32 as i64, a2, a3),
+        11 => sys_execve(ctx, a1, a2, a3),
         172 => user::sys_prctl(a1, a2),
         191 => user::sys_ugetrlimit(a1),
         // i386 stat64 family — glibc's stat/lstat/fstat land on 195/

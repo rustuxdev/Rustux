@@ -53,7 +53,7 @@ _start:
     add %r13, %rax              # buf end
     cmp %rax, %rbx
     jb 4b
-    cmp $56, %ebp
+    cmp $57, %ebp
     jae 5f
     inc %r15d
 5:
