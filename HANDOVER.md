@@ -5276,3 +5276,29 @@ Also open: keyboard IRQ1 never asserts on this firmware (controller
 armed 0x67, GSI1 entry 0xf2 unmasked edge/high, vector classified,
 EOI fine, PIT works). Workaround landed: kbd::poll() reads the
 controller every 100 Hz tick — needs a keypress confirmation.
+
+## run-211 — block layer step 1: ATA multi-drive (sda + sdb)
+
+First piece of the d-i class installer port (run-210 plan): the ATA
+driver now knows about more than one disk.
+
+* ata.rs: identify(sel) probes 0xa0 (master) and 0xb0 (slave) on the
+  primary PIIX channel; per-drive sector table SECTORS[2]; every
+  entry point takes a drive index (sectors_d/capacity_d/read_d/
+  write_d) with SECTORS[d.min(1)] clamping the index; cmd() derives
+  the master/slave select bit from that clamped index only. Boot log
+  now prints `ata: sda=NMIB sdb=MMIB`.
+* user.rs: /dev/sdb minted only when the slave probe found hardware
+  (rdev major 8 minor 16, matching Linux); sd_drive() maps minor 0 ->
+  master and >=16 -> slave with everything else falling back to the
+  master; sd_read/sd_write take capacity and I/O from the SAME drive.
+
+Verified: `-machine pc` with two 64 MiB IDE disks ->
+`ata: sda=64MiB sdb=64MiB`, 75 tasks, frames X -> X zero leak. Standard
+`make run` (q35, if=ide lands on AHCI so the PIIX driver sees nothing)
+still PASS exit 33, zero leak.
+
+NOTE for the next step: q35 exposes SATA via AHCI, not the legacy
+ports — an installer targeting q35 machines needs an AHCI driver or
+must be run with -machine pc. Decide before the partition-table work.
+Audit: scoped quick run-18. cve-now MCP was unreachable (recorded).
