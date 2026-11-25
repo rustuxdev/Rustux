@@ -5482,3 +5482,31 @@ count is being mis-packed for the first command (suspect: the very
 first command after the port start, or a stale PxCI slot). If lba 0 is
 never issued, the bug is in ahci_write's offset math on the first
 chunk.
+
+## run-219 — AHCI read/write transfer nothing; IDENTIFY works
+
+Probes so far (all with the installer's own copy loop):
+
+* `dbg: w#1 lba=0 n=8 b0=0xeb` — the FIRST write is issued at lba 0
+  with the right data, and issue() returns success.
+* The target file's offset 0 is still zeros afterwards (checked with
+  od on the host image file), so nothing was written.
+* Setting the command-header W bit (DW0 bit 5, host->device) changed
+  nothing.
+* BATCH=1 (single-sector READ/WRITE DMA EXT) also fails.
+* IDENTIFY works — the disk capacities are right, so the command
+  list, command table, PRDT, DMA buffer and completion poll are all
+  sound.
+
+Therefore the fault is specific to the LBA-carrying FIS we build for
+READ/WRITE DMA EXT, not to the command machinery. Prime suspects, in
+order: (a) the device byte at FIS offset 7 — 0x40 sets the obsolete
+bit and LBA; some controllers want 0xE0-style (LBA + drive/head), and
+IDENTIFY passes 0xA0-style values through a different path; (b) the
+LBA48 count placement (bytes 12-13) versus featurel/featureh; (c) the
+order of PxIS clear vs PxCI doorbell.
+
+Also note: `issue()` zeroes only 256 of the 4096-byte data frame, so a
+failed READ returns partially-stale data — the "512 zeros" the verify
+prints may be our own buffer, not the disk. Zero the whole frame
+before a read to make the diagnostic honest.
