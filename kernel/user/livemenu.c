@@ -330,6 +330,14 @@ static void install(void)
         if (!fgets(buf, sizeof buf, stdin))
             sleep(1);
     }
+    // The installed disk carries a payload-free initrd (no /hd.img),
+    // so it boots straight to login. But if the installation medium
+    // is still attached the firmware will boot THAT again and the
+    // menu reappears — which reads as "the install did nothing".
+    printf("\ninstall: done. REMOVE the installation media now.\n");
+    printf("install: rebooting in 5s — the disk boots straight to login.\n");
+    for (int i = 0; i < 5; i++)
+        sleep(1);
     printf("install: rebooting into the installed system\n");
     reboot(RB_AUTOBOOT);
     printf("install: reboot: %s\n", strerror(errno));
