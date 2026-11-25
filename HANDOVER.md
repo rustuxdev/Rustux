@@ -6365,3 +6365,25 @@ NEXT FIX (small, one place): in the shebang loop, strip leading '/'
 from whatever resolve_links returns before the next lookup (or call
 canon_path on the resolved output). My earlier attempts stripped the
 INPUT rather than the OUTPUT, which is why they did not help.
+
+## run-257 — init ENOENT OBSERVED (not inferred): the interpreter arrives absolute
+
+The loop-iteration trace settles it:
+
+    dbg: it0 cur=etc/rcS shebang=true
+    dbg: it1 MISS cur=/bin/sh
+
+Iteration 0 finds the script and sees the shebang; iteration 1 misses
+because `cur` is "/bin/sh" WITH the leading slash, and archive names
+carry none. So the fix is exactly: strip leading '/' from the
+interpreter before assigning `cur` (and before the resolve_links call
+and its fallback — all three places must use the stripped slice).
+
+My two earlier attempts failed because they stripped one place but the
+fallback still assigned the unstripped `interp[..interp_len]`. The
+current code path to edit is the `Err(_) =>` arm around line 1024 of
+kernel/src/syscall.rs plus the `cur = &lname[..lname_len]` assignment.
+
+State: tree clean at ba104c7, pivot on `sh`, suite green, both boot
+paths PASS with zero leak. The fix is a five-line change with a
+one-boot verification (look for "init script running" / "uname:").
