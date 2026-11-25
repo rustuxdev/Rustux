@@ -5019,3 +5019,25 @@ exec pipeline works.
 
 Suite: PASS exit 33, 75 tasks, frames X -> X zero leak, every
 ia32test task exit 0.
+
+## run-199/200 — pipeline: every kernel primitive verified (test-only)
+
+Added two more regression guards to ia32test, both green:
+
+* dup2-onto-fd-1: the child dup2's the pipe write end onto fd 1,
+  closes both originals and writes; the parent reads the byte back.
+* exec-through-pipe (the shells' FULL pattern): the same dup2/close
+  then execs /bin/cat with /motd.txt; the parent reads the pipe and
+  asserts bytes + status 0.
+
+Together with run-198's shell-free fork/pipe/wait test this covers
+every kernel primitive a shell pipeline uses — fork, pipe, dup2,
+exec, wait4 — from the compat ABI, deterministically.
+
+So the two-external shell pipeline failure (runs 189-199) is
+shell-internal. What the shells do that we have NOT reproduced:
+process groups / tcsetpgrp, fcntl(F_SETFD) on the dup'd fds, and
+their own pipe-capacity assumptions. That is where the next session
+should look — ideally by tracing the shell's syscalls again with the
+correlation-safe user_out method and watching for an unexpected
+error return right after the dup2/exec pair.
