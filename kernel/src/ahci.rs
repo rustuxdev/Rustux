@@ -229,12 +229,23 @@ fn issue(p: usize, m: &PortMem, cmd: u8, lba: u64, count: u16, write: bool) -> b
         prdt.add(3).write_volatile(((count as u32) * 512 - 1) & 0x3f_ffff);
     }
 
-    // Program the port and start it.
+    // Per spec the command-list and FIS base registers may only be
+    // written while the port is STOPPED (PxCMD.ST = 0 and CR clear);
+    // writes while ST is set are ignored. Stop, program, then start
+    // once — the previous order set ST and rewrote the bases on every
+    // command.
+    let cmd_r = port_reg(p, PXCMD);
+    w32(cmd_r, r32(cmd_r) & !CMD_ST);
+    for _ in 0..100_000u32 {
+        if r32(cmd_r) & CMD_CR == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
     w32(port_reg(p, PXCLB), m.cl as u32);
     w32(port_reg(p, PXCLB) + 4, (m.cl >> 32) as u32);
     w32(port_reg(p, PXFB), m.fis as u32);
     w32(port_reg(p, PXFB) + 4, (m.fis >> 32) as u32);
-    let cmd_r = port_reg(p, PXCMD);
     w32(cmd_r, r32(cmd_r) | CMD_FRE | CMD_ST);
     // Clear pending status, then ring the doorbell for slot 0.
     w32(port_reg(p, PXIS), 0xffff_ffff);

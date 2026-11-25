@@ -5539,3 +5539,32 @@ That last point is a real candidate: our port_start sequence sets
 FRE|ST on every command and rewrites PxCLB/PxFB unconditionally. A
 clean implementation stops the port (ST=0, wait CR=0), programs the
 base addresses, then starts it once.
+
+## run-221 — THE INSTALLER WORKS (AHCI writes verified)
+
+Root cause of the dead transfer: the AHCI command-list and FIS base
+registers (PxCLB/PxFB) were rewritten and FRE|ST set on EVERY
+command. Per spec those registers may only be written while the port
+is stopped (PxCMD.ST = 0, CR clear); writes while ST is set are
+ignored, so the port never had a valid command list for the LBA
+commands. issue() now stops the port, waits for CR, programs the
+bases, then starts once.
+
+Result on q35 + a 128 MiB SATA disk, driving the menu with a single
+Enter:
+
+    install: writing 48 MiB image to /dev/sda ...
+    install: verify disk lseek=0 read=512 [eb 3c 90 4d]
+             img  lseek=0 read=512 [eb 3c 90 4d]
+    install: verify first sector: ok
+
+and the host image file holds eb 3c 90 4d at offset 0.
+
+Also corrected in the same stretch: DW0 bit 5 is A (ATAPI) and bit 6
+is W — setting bit 5 marked writes as ATAPI packets, which is why
+IDENTIFY worked and every write silently did nothing.
+
+Suite PASS exit 33, 75 tasks, frames 213323 -> 213323 zero leak.
+
+NEXT: partitioning (MBR/GPT), mkfs, and the ESP boot entry — the block
+layer is now proven on both transports for both directions.
