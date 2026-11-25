@@ -371,6 +371,43 @@ static void install(const char *path)
         close(img);
         return;
     }
+    // State exactly what will be destroyed and require an explicit
+    // yes. This is the last point before the disk is written.
+    {
+        off_t cap0 = lseek(sd, 0, SEEK_END);
+        unsigned long long esp_secs =
+            (unsigned long long)(st.st_size / 512) - 2048;
+        unsigned long long root_secs = 0;
+        if (cap0 > 0) {
+            unsigned long long total = (unsigned long long)cap0 / 512;
+            if (total > 2048 + esp_secs + 2048) {
+                root_secs = total - 2048 - esp_secs;
+            }
+        }
+        printf("\n  target : %s (%llu MiB)\n", path,
+               (unsigned long long)((cap0 > 0 ? cap0 : 0) >> 20));
+        printf("  THIS WILL DESTROY EVERYTHING ON IT.\n");
+        printf("  partition 1  ESP   %llu MiB at LBA 2048 (FAT, boot files)\n",
+               esp_secs >> 11);
+        if (root_secs) {
+            printf("  partition 2  root  %llu MiB at LBA %llu (ext2)\n",
+                   root_secs >> 11, 2048 + esp_secs);
+        } else {
+            printf("  partition 2  root  (not enough space left)\n");
+        }
+        printf("  type 'yes' to continue: ");
+        fflush(stdout);
+        char line[16];
+        if (!fgets(line, sizeof line, stdin) || strncmp(line, "yes", 3) != 0) {
+            printf("\ninstall: cancelled - nothing was written.\n");
+            fflush(stdout);
+            close(img);
+            close(sd);
+            return;
+        }
+        printf("\n");
+        fflush(stdout);
+    }
     printf("install: writing %lld MiB image to %s ...\n",
            (long long)(st.st_size >> 20), path);
     fflush(stdout);

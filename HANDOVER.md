@@ -5955,3 +5955,21 @@ That is the whole loop carrying DATA: partition -> format -> write file
 Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.
 NEXT: populate the real tree (a directory walk instead of root-only
 files), then pivot into it as /, then the layout UI.
+
+## run-238 — the installer states what it will destroy, then asks
+
+Before the first write, install() prints the exact plan and requires an
+explicit "yes":
+
+    target : /dev/sda (256 MiB)
+    THIS WILL DESTROY EVERYTHING ON IT.
+    partition 1  ESP   47 MiB at LBA 2048 (FAT, boot files)
+    partition 2  root  208 MiB at LBA 98304 (ext2)
+    type 'yes' to continue:
+
+Anything else prints "install: cancelled - nothing was written" and
+returns before a byte is touched. Verified in a live boot.
+
+Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
+NEXT: a real layout choice (ESP/root sizes), then the directory tree,
+then pivoting into the root.
