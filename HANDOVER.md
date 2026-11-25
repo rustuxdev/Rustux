@@ -4979,3 +4979,25 @@ the shared stack must be respected) plus a dedicated test binary.
 
 Everything else in the i386 chain is green and audited; plain
 commands and redirects through the shell are reliable.
+
+## run-197 — pipeline: NOT vfork-specific (no code change)
+
+Decisive control experiment: the same pipeline
+(`cat /motd.txt | cat > /dev/null`) run through the **64-bit dash**
+(which uses fork, not vfork) fails 3 of 3 times as well. So the
+run-195 "vfork semantics" theory is wrong as the root cause — the
+failure is a general "two external commands connected by a pipe"
+issue in our kernel, not a vfork/process-tree divergence.
+
+What is still true:
+* a single external through either shell works (`cat /motd.txt`);
+* a redirect works (fcntl64 landed);
+* dashtest's own pipeline case passes — but that one is
+  `echo | cat` where the left side is a BUILTIN and the right side is
+  a re-exec of /proc/self/exe, i.e. one external, not two.
+
+So the next session should test the minimal kernel-level case
+directly (no shell): fork, pipe, fork, each child dup2's one end and
+exits after writing/reading, parent waits both — and see whether the
+second child's exit status survives. That isolates pipe+wait4 from
+any shell behaviour.
