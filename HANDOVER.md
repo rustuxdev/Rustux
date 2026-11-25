@@ -5769,3 +5769,22 @@ real image, not merely with our own assumptions. Suite PASS exit 33,
 NEXT: file content read (walk the block map for an inode's data, so a
 root filesystem's files can actually be read), then the root switch
 (mount partition 2, pivot).
+
+## run-230 — ext2: file content read (read-only driver is functional)
+
+* read_file(img, sb, ino, out): bounded by min(inode.size, out.len()),
+  per-block take of (bs - off).min(want - done), checked slice gets, and
+  a sparse hole STOPS the read rather than fabricating zeros.
+* lookup(img, sb, dir_ino, name): reuses dir_walk, stops at the match.
+
+Verified against the real mke2fs image at boot:
+  rustux: ext2: real image true hi.txt ino=12
+  rustux: ext2: content true bytes 11
+
+So the kernel now mounts, looks up and reads files from a real ext2
+filesystem. That is the whole read path a root filesystem needs.
+Suite PASS exit 33, 75 tasks, frames 212301 -> 212301 zero leak.
+
+NEXT: the root switch — mount partition 2 (block device, not an
+in-memory image) and pivot into it. Then mkfs/populate in userspace and
+the partitioning UI.

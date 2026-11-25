@@ -265,3 +265,44 @@ pub fn block_map(img: &[u8], sb: &Super, inode: &Inode, lblock: u32) -> Option<u
     }
     None // double/triple indirect: not needed for a root walk
 }
+
+/// Read up to `out.len()` bytes of inode `ino`'s content. Returns the
+/// number of bytes copied. Bounded by the inode's size and by every
+/// block-map lookup, so a hostile image cannot make us read past the
+/// end of the buffer or of the image.
+pub fn read_file(img: &[u8], sb: &Super, ino: u32, out: &mut [u8]) -> Option<usize> {
+    let node = inode(img, sb, ino)?;
+    if node.is_dir() {
+        return None;
+    }
+    let bs = sb.block_size() as usize;
+    let want = (node.size as usize).min(out.len());
+    let mut done = 0usize;
+    while done < want {
+        let lblock = (done / bs) as u32;
+        let off = done % bs;
+        let phys = block_map(img, sb, &node, lblock)?;
+        if phys == 0 {
+            break; // sparse hole: stop rather than fabricate data
+        }
+        let base = phys as usize * bs + off;
+        let take = (bs - off).min(want - done);
+        let src = img.get(base..base + take)?;
+        out[done..done + take].copy_from_slice(src);
+        done += take;
+    }
+    Some(done)
+}
+
+/// Look up `name` in directory `dir_ino` and return the entry's inode.
+pub fn lookup(img: &[u8], sb: &Super, dir_ino: u32, name: &[u8]) -> Option<u32> {
+    let mut found = None;
+    dir_walk(img, sb, dir_ino, |e| {
+        if &e.name[..e.name_len as usize] == name {
+            found = Some(e.ino);
+            return false;
+        }
+        true
+    })?;
+    found
+}

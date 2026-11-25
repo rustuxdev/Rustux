@@ -1108,6 +1108,21 @@ pub(crate) fn rustux_main(
             None => false,
         };
         kprintln!(con, "rustux: ext2: real image {real_ok} hi.txt ino={saw}");
+        // Read the file's CONTENT through the block map: lookup by
+        // name, then walk the inode's block map for the data.
+        let mut body = [0u8; 64];
+        let (content_ok, got) = match ext2::parse_super(real) {
+            Some(sb3) => match ext2::lookup(real, &sb3, 2, b"hi.txt") {
+                Some(ino) => {
+                    let n = ext2::read_file(real, &sb3, ino, &mut body).unwrap_or(0);
+                    let expect = b"hello ext2";
+                    (n >= expect.len() && &body[..expect.len()] == expect, n)
+                }
+                None => (false, 0),
+            },
+            None => (false, 0),
+        };
+        kprintln!(con, "rustux: ext2: content {content_ok} bytes {got}");
     }
     // AHCI: q35 and real machines expose their disks here, not on the
     // legacy PIIX ports ata.rs drives. Same MMIO validation.
