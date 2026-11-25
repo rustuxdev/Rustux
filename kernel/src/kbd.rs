@@ -193,6 +193,16 @@ pub fn init() -> bool {
 /// (extended keys unmapped for now), plain make codes map through the
 /// set-1 tables.
 pub fn poll() -> Option<char> {
+    // IRQ1 is the normal path, but some firmware never asserts the ISA
+    // IRQ1 line even though the i8042 is armed (command byte 0x67 read
+    // back) and the IOAPIC GSI1 entry reads back correctly programmed
+    // (vec 0xf2, unmasked, edge/active-high). Poll the controller here
+    // as well — this runs at the 100 Hz tick, so a keypress is picked
+    // up within 10 ms regardless. One status read when idle.
+    // SAFETY: fixed i8042 ports; on_irq is OBF-guarded.
+    if unsafe { inb(CMD) } & STS_OBF != 0 {
+        on_irq();
+    }
     // Drain queued escape-sequence bytes first (arrows/F-keys/nav).
     unsafe {
         let l = OUTQ_LEN;
