@@ -5001,3 +5001,21 @@ directly (no shell): fork, pipe, fork, each child dup2's one end and
 exits after writing/reading, parent waits both — and see whether the
 second child's exit status survives. That isolates pipe+wait4 from
 any shell behaviour.
+
+## run-198 — shell-free pipeline regression test (test-only)
+
+Landed a deterministic kernel-level pipeline test in ia32test:
+fork a writer (closes the read end, writes one byte, exits 0),
+fork a reader (closes the write end, reads it, exits 0/3), close
+both ends in the parent, wait both by pid, assert status 0.
+
+It passes 3/3 — so the compat fork + pipe + wait4 primitives are
+sound, which is the baseline that isolates the remaining shell
+pipeline issue (runs 189-197). Together with those runs the picture
+is: kernel primitives fine; both the i386 busybox shell and 64-bit
+dash fail the same *two-external* pipeline; CLOEXEC is honoured by
+exec; redirects and single externals work; dashtest's builtin|self-
+exec pipeline works.
+
+Suite: PASS exit 33, 75 tasks, frames X -> X zero leak, every
+ia32test task exit 0.
