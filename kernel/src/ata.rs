@@ -24,7 +24,7 @@ const CMD_IDENTIFY: u8 = 0xec;
 const CMD_PACKET: u8 = 0xa0; // ATAPI packet command
 
 /// LBA28 sector count from IDENTIFY — zero when no disk answered.
-static mut SECTORS: u32 = 0;
+static mut SECTORS: [u32; 2] = [0, 0]; // [master, slave]
 
 fn status() -> u8 {
     // SAFETY: fixed ISA port, read-only status.
@@ -77,14 +77,16 @@ fn reset() {
 /// Probe the primary master with IDENTIFY. Returns the LBA28 sector
 /// count — 0 means no ATA disk (the count is also the `sectors()`
 /// answer, so /dev/sda stays absent then).
-pub fn init() -> u32 {
+/// IDENTIFY one drive: `sel` is 0xa0 (master) or 0xb0 (slave).
+/// Returns the sector count, or 0 when absent / not an ATA disk.
+fn identify(sel: u8) -> u32 {
     // A floating bus reads 0xFF on every port — no controller at all.
     if status() == 0xff {
         return 0;
     }
     // SAFETY: classic primary-channel ports, single-threaded boot.
     unsafe {
-        outb(IO + 6, 0xa0); // master, LBA preamble bits irrelevant here
+        outb(IO + 6, sel); // master/slave, LBA preamble bits irrelevant
         outb(IO + 2, 0);
         outb(IO + 3, 0);
         outb(IO + 4, 0);
@@ -114,28 +116,53 @@ pub fn init() -> u32 {
     }
     // LBA28 addresses 28 bits of LBA — a larger disk is clamped
     // rather than silently aliasing sector 0x10000000+ onto low LBAs.
-    let secs = secs.min(0x1000_0000);
-    // SAFETY: single-threaded init.
-    unsafe { SECTORS = secs };
-    secs
+    secs.min(0x1000_0000)
 }
 
 /// LBA28 capacity in sectors; 0 when the probe found no disk.
-pub fn sectors() -> u32 {
-    // SAFETY: written once at init before tasks exist.
-    unsafe { SECTORS }
+/// Probe master and slave on the primary channel. Returns the
+/// master's sector count (the historical contract) and fills the
+/// per-drive table for dev_init to mint nodes from.
+pub fn init() -> u32 {
+    let m = identify(0xa0);
+    let sl = identify(0xb0);
+    // SAFETY: single-threaded boot, before any task exists.
+    unsafe {
+        SECTORS[0] = m;
+        SECTORS[1] = sl;
+    }
+    crate::log::printk(format_args!(
+        "rustux: ata: sda={}MiB sdb={}MiB",
+        (m as u64) / 2048,
+        (sl as u64) / 2048
+    ));
+    m
 }
 
-/// Capacity in bytes — the /dev/sda SEEK_END base.
+pub fn sectors_d(d: usize) -> u32 {
+    // SAFETY: written once at init before tasks exist.
+    unsafe { SECTORS[d.min(1)] }
+}
+
+pub fn sectors() -> u32 {
+    sectors_d(0)
+}
+
+/// Capacity in bytes — the /dev/sdX SEEK_END base.
+pub fn capacity_d(d: usize) -> u64 {
+    sectors_d(d) as u64 * 512
+}
+
 pub fn capacity() -> u64 {
-    sectors() as u64 * 512
+    capacity_d(0)
 }
 
 /// Set the task registers and issue a sector command.
-fn cmd(lba: u32, secs: u8, c: u8) {
+fn cmd(lba: u32, secs: u8, c: u8, d: usize) {
     // SAFETY: primary-channel registers, serialized syscalls.
     unsafe {
-        outb(IO + 6, 0xe0 | ((lba >> 24) as u8 & 0x0f)); // master + LBA28
+        let sel = if d == 1 { 0x10 } else { 0x00 }; // slave / master
+        outb(IO + 6, 0xe0 | sel | ((lba >> 24) as u8 & 0x0f)); // LBA28
         outb(IO + 2, secs);
         outb(IO + 3, lba as u8);
         outb(IO + 4, (lba >> 8) as u8);
@@ -146,11 +173,12 @@ fn cmd(lba: u32, secs: u8, c: u8) {
 }
 
 /// Read one 512-byte sector at `lba` into `buf`.
-pub fn read(lba: u32, buf: &mut [u8; 512]) -> bool {
-    if sectors() == 0 || lba >= sectors() || !wait(false) {
+pub fn read_d(lba: u32, buf: &mut [u8; 512], d: usize) -> bool {
+    let n = sectors_d(d);
+    if n == 0 || lba >= n || !wait(false) {
         return false;
     }
-    cmd(lba, 1, CMD_READ);
+    cmd(lba, 1, CMD_READ, d);
     if !wait(true) {
         reset(); // unwedge for the next command
         return false;
@@ -163,26 +191,28 @@ pub fn read(lba: u32, buf: &mut [u8; 512]) -> bool {
     true
 }
 
+
 /// Write `count` sectors (1..=256) starting at `lba` from `buf`
 /// (count*512 bytes). One command, one FLUSH CACHE at the end —
 /// flushing per sector costs a cache commit each and makes an
 /// image write take minutes instead of seconds. A timed-out
 /// attempt resets the channel and retries once — a transient
 /// wedge shouldn't cost the caller a failed write.
-pub fn write(lba: u32, count: u32, buf: *const u8) -> bool {
-    if try_write(lba, count, buf) {
+pub fn write_d(lba: u32, count: u32, buf: *const u8, d: usize) -> bool {
+    if try_write(lba, count, buf, d) {
         return true;
     }
     reset();
-    try_write(lba, count, buf)
+    try_write(lba, count, buf, d)
 }
 
-fn try_write(lba: u32, count: u32, buf: *const u8) -> bool {
+
+fn try_write(lba: u32, count: u32, buf: *const u8, d: usize) -> bool {
     let total = sectors();
     if count == 0 || count > 256 || lba >= total || lba + count > total || !wait(false) {
         return false;
     }
-    cmd(lba, count as u8, CMD_WRITE);
+    cmd(lba, count as u8, CMD_WRITE, d);
     for s in 0..count as usize {
         if !wait(true) {
             return false;

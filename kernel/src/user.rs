@@ -13501,8 +13501,24 @@ pub fn sleep_ms(ctx: &mut UCtx, ms: u64) {
 /// 512-byte granular, so unaligned edges bounce through a kernel
 /// sector buffer. Reads clip at the device end — Linux's short
 /// read, not an error.
+/// Which ATA drive backs this OFD: Linux's /dev/sda is minor 0,
+/// /dev/sdb minor 16 on major 8.
+fn sd_drive(o: &OpenFile) -> usize {
+    match &o.kind {
+        FdKind::Dev(i) => {
+            let v = unsafe { (*core::ptr::addr_of!(VFILES)).get(*i as usize).and_then(|x| x.as_ref()) };
+            match v {
+                Some(v) if (v.rdev & 0xff) >= 16 => 1,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
 fn sd_read(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
-    let cap = crate::ata::capacity();
+    let drv = sd_drive(o);
+    let cap = crate::ata::capacity_d(drv);
     if o.pos as u64 >= cap {
         return 0;
     }
@@ -13514,7 +13530,7 @@ fn sd_read(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
     let mut bounce = [0u8; 512];
     while done < n {
         let off = o.pos + done;
-        if !crate::ata::read((off / 512) as u32, &mut bounce) {
+        if !crate::ata::read_d((off / 512) as u32, &mut bounce, drv) {
             // EIO on hardware failure — bytes already delivered
             // still count, like Linux.
             return if done > 0 { done as u64 } else { (-5i64) as u64 };
@@ -13539,7 +13555,8 @@ fn sd_read(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
 /// device end is Linux's short write, a write starting past it is
 /// ENOSPC.
 fn sd_write(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
-    let cap = crate::ata::capacity();
+    let drv = sd_drive(o);
+    let cap = crate::ata::capacity_d(drv);
     if o.pos as u64 >= cap {
         return (-28i64) as u64; // ENOSPC
     }
@@ -13557,7 +13574,7 @@ fn sd_write(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
         if off.is_multiple_of(512) && n - done >= 512 {
             let run = ((n - done) / 512).min(256) as u32;
             let p = (buf + done as u64) as *const u8;
-            if !crate::ata::write((off / 512) as u32, run, p) {
+            if !crate::ata::write_d((off / 512) as u32, run, p, drv) {
                 return if done > 0 { done as u64 } else { (-5i64) as u64 };
             }
             done += run as usize * 512;
@@ -13565,7 +13582,7 @@ fn sd_write(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
         }
         let take = (512 - off % 512).min(n - done);
         // A partial sector keeps its untouched bytes — fetch first.
-        if !crate::ata::read((off / 512) as u32, &mut bounce) {
+        if !crate::ata::read_d((off / 512) as u32, &mut bounce, drv) {
             return if done > 0 { done as u64 } else { (-5i64) as u64 };
         }
         // SAFETY: `buf..buf+n` passed range_ok under cur cr3.
@@ -13576,7 +13593,7 @@ fn sd_write(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
                 take,
             )
         };
-        if !crate::ata::write((off / 512) as u32, 1, bounce.as_ptr()) {
+        if !crate::ata::write_d((off / 512) as u32, 1, bounce.as_ptr(), drv) {
             return if done > 0 { done as u64 } else { (-5i64) as u64 };
         }
         done += take;
@@ -15019,7 +15036,18 @@ pub fn dev_init() {
             if let Some(v) = vfile(r as usize) {
                 vfile_stamp(v, 0o660, 0);
                 v.fmt = 0o60000; // S_IFBLK
-                v.rdev = 8 << 8;
+                v.rdev = 8 << 8; // major 8, minor 0
+            }
+        }
+    }
+    // Slave on the primary channel — the installer's second target.
+    if crate::ata::sectors_d(1) > 0 {
+        let r = vfile_create(b"dev/sdb");
+        if (r as i64) >= 0 {
+            if let Some(v) = vfile(r as usize) {
+                vfile_stamp(v, 0o660, 0);
+                v.fmt = 0o60000; // S_IFBLK
+                v.rdev = (8 << 8) | 16; // major 8, minor 16 (Linux sdb)
             }
         }
     }
