@@ -508,7 +508,7 @@ LIVE_PAIRS := \
 	kernel/user/motd.txt motd.txt
 
 # livemenu links libcrypt for the real /etc/shadow check.
-kernel/user/livemenu.elf: kernel/user/livemenu.c
+kernel/user/livemenu.elf: kernel/user/livemenu.c kernel/user/mke2.c
 	gcc -static-pie -O2 -o $@ $< -lcrypt
 
 LIVE_DEPS := kernel/user/livemenu.elf kernel/user/busybox kernel/user/bash \

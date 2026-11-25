@@ -17149,7 +17149,18 @@ pub fn fd_lseek(fd: u64, off: i64, whence: u64) -> u64 {
                 let cap = if v.rdev >> 8 == 29 {
                     crate::log::fb_byte_len() as i64
                 } else {
-                    crate::ata::capacity() as i64
+                    // Whichever transport actually has this disk: the
+                    // PIIX capacity is 0 on AHCI machines, which made
+                    // SEEK_END answer 0 and left the installer unable to
+                    // size the space after its first partition.
+                    let drv = ((v.rdev & 0xff) / 16) as usize;
+                    let c = crate::ata::capacity_d(drv);
+                    let c = if c > 0 {
+                        c
+                    } else {
+                        crate::ahci::disk_capacity(drv)
+                    };
+                    c as i64
                 };
                 let base = match whence {
                     0 => 0i64,
@@ -17173,6 +17184,23 @@ pub fn fd_lseek(fd: u64, off: i64, whence: u64) -> u64 {
         FdKind::File(d) => d.len(),
         FdKind::Proc { len, .. } => *len,
         FdKind::Ram(i) => match vfile(*i) {
+            Some(v) => v.len,
+            None => return EBADF,
+        },
+        // Block devices are seekable like any file (Linux allows this);
+        // SEEK_END reports the device capacity, which is how an
+        // installer sizes the space left after its first partition.
+        FdKind::Dev(i) => match vfile(*i) {
+            Some(v) if v.fmt == 0o60000 => {
+                let drv = ((v.rdev & 0xff) / 16) as usize;
+                let cap = crate::ata::capacity_d(drv);
+                let cap = if cap > 0 {
+                    cap
+                } else {
+                    crate::ahci::disk_capacity(drv)
+                };
+                cap as usize
+            }
             Some(v) => v.len,
             None => return EBADF,
         },

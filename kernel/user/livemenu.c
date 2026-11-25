@@ -23,6 +23,8 @@
 #define IMG_PATH "/hd.img"
 #define SD_PATH "/dev/sda"
 
+#include "mke2.c"
+
 static void banner(void)
 {
     printf("\n");
@@ -280,6 +282,48 @@ static int copy_image(int img, int sd, off_t n)
 // image (FAT at LBA 0 covering the disk), so nothing that boots
 // changes — but the installer now OWNS the partition table, which is
 // the hook the layout choice will use (ESP at 1 MiB, root after it).
+static void mbr_entry(unsigned char *e, unsigned int start_lba,
+                      unsigned long long sectors, unsigned char type, int active)
+{
+    e[0] = active ? 0x80 : 0x00;
+    unsigned int c = start_lba / (255 * 63);
+    unsigned int h = (start_lba / 63) % 255;
+    unsigned int sec = (start_lba % 63) + 1;
+    e[1] = (unsigned char)h;
+    e[2] = (unsigned char)(((c >> 2) & 0xc0) | (sec & 0x3f));
+    e[3] = (unsigned char)(c & 0xff);
+    e[4] = type;
+    e[5] = 0xfe; e[6] = 0xff; e[7] = 0xff;   // LBA-only end marker
+    for (int i = 0; i < 4; i++)
+        e[8 + i] = (unsigned char)((start_lba >> (8 * i)) & 0xff);
+    for (int i = 0; i < 4; i++)
+        e[12 + i] = (unsigned char)((sectors >> (8 * i)) & 0xff);
+}
+
+// mke2's sink: absolute byte writes to the target fd.
+static int mke2_sink(void *ctx, uint64_t off, const void *buf, uint32_t len)
+{
+    int fd = *(int *)ctx;
+    if (lseek(fd, (off_t)off, SEEK_SET) < 0)
+        return 1;
+    return write(fd, buf, len) == (ssize_t)len ? 0 : 1;
+}
+
+static int write_mbr2(int sd, unsigned int esp_lba, unsigned long long esp_secs,
+                      unsigned int root_lba, unsigned long long root_secs)
+{
+    unsigned char mbr[512];
+    memset(mbr, 0, sizeof mbr);
+    mbr_entry(mbr + 446, esp_lba, esp_secs, 0xef, 1);   // ESP, active
+    if (root_secs > 0)
+        mbr_entry(mbr + 462, root_lba, root_secs, 0x83, 0); // Linux root
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    if (lseek(sd, 0, SEEK_SET) < 0)
+        return -1;
+    return write(sd, mbr, 512) == 512 ? 0 : -1;
+}
+
 static int write_mbr(int sd, unsigned int start_lba, unsigned long long sectors, unsigned char type)
 {
     unsigned char mbr[512];
@@ -368,12 +412,40 @@ static void install(const char *path)
     printf("install: verify first sector: %s\n", same ? "ok" : "MISMATCH");
     fflush(stdout);
     if (same) {
-        // The partition starts at PART_LBA, so it spans the image minus
-        // the blocks before it.
-        unsigned long long secs = (unsigned long long)(st.st_size / 512) - PART_LBA;
-        if (write_mbr(sd, PART_LBA, secs, 0xef) == 0)
-            printf("install: partition table written (ESP type 0xef at LBA %u, %llu sectors)\n",
-                   PART_LBA, secs);
+        // Partition 1: the ESP we just wrote (it starts at PART_LBA and
+        // runs to the end of the image).
+        unsigned long long esp_secs = (unsigned long long)(st.st_size / 512) - PART_LBA;
+        // Partition 2: everything after the ESP, formatted ext2. The
+        // kernel mounts ext2 read-only, so formatting happens here over
+        // raw writes — the same split real installers use.
+        // Capacity comes from SEEK_END: fstat on a block device does not
+        // report it, which is why the first attempt produced a zero-sized
+        // root partition.
+        unsigned long long root_secs = 0;
+        off_t cap = lseek(sd, 0, SEEK_END);
+        if (cap > 0) {
+            unsigned long long total = (unsigned long long)cap / 512;
+            unsigned int root_lba = PART_LBA + (unsigned int)esp_secs;
+            if (total > root_lba + 2048) {
+                root_secs = total - root_lba;
+                unsigned int blocks = (unsigned int)(root_secs / 2); // 1 KiB blocks
+                printf("install: formatting ext2 root at LBA %u (%u blocks)...\n",
+                       root_lba, blocks);
+                fflush(stdout);
+                int fr = mke2_format(mke2_sink, &sd, (uint64_t)root_lba * 512, blocks);
+                if (fr == 0) {
+                    printf("install: ext2 root formatted\n");
+                } else {
+                    printf("install: ext2 format FAILED code=%d\n", fr);
+                    root_secs = 0;
+                }
+                fflush(stdout);
+            }
+        }
+        if (write_mbr2(sd, PART_LBA, esp_secs,
+                       (unsigned int)(PART_LBA + esp_secs), root_secs) == 0)
+            printf("install: partition table written (ESP at %u +%llu, root at %u +%llu)\n",
+                   PART_LBA, esp_secs, PART_LBA + (unsigned int)esp_secs, root_secs);
         else
             printf("install: partition table write failed: %s\n", strerror(errno));
         fflush(stdout);

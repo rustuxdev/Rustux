@@ -5890,3 +5890,45 @@ still running gives a false "does not boot" (the file is held).
 Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
 NEXT: add the ext2 root partition (mke2 validated fsck-clean) beside
 the ESP, then mount it at boot.
+
+## run-236 — THE LOOP CLOSES: install → ext2 root → kernel mounts it
+
+Three pieces landed together:
+
+1. **kernel/user/mke2.c** — a real ext2 formatter (userspace, raw
+   block writes; the kernel stays read-only, as real installers split
+   it). Validated by Linux's own e2fsck at 8/16/64/128/256 MB and at
+   the real install size (212992 blocks) — every case CLEAN. Bugs the
+   host harness caught before a disk was touched: group-1 descriptors
+   pointing into group 0, the missing backup superblock+GDT at each
+   backup group, inode 11 written into the wrong table block, bitmap
+   padding vs free-count accounting, and a zero-length "guard" write.
+2. **installer** — formats partition 2 (everything after the ESP) and
+   writes a two-entry MBR: ESP type 0xEF at LBA 2048, Linux root type
+   0x83 after it. Capacity comes from lseek(SEEK_END); fstat does not
+   report a block device's size, and the kernel's SEEK_END was
+   PIIX-only, so both were fixed.
+3. **kernel** — reads each disk's MBR, bounds-checks every entry
+   (start+size <= capacity), and mounts each partition as ext2.
+
+VERIFIED, end to end, on the installer's own output:
+
+    install: ext2 root formatted
+    install: partition table written (ESP at 2048 +96256, root at 98304 +425984)
+
+then booting that disk:
+
+    rustux: ext2: disk0p1 type=0x83 MOUNTED lba=98304 block=1024 entries=3 walked=true
+    rustux: sched: launch livemenu (pid 1)
+
+and the extracted root partition passes fsck.ext2 with 0 errors
+(212992 blocks, 53248 inodes, state clean).
+
+Also fixed: the Makefile did not list kernel/user/mke2.c as a
+prerequisite of livemenu.elf (it is #included), so formatter fixes
+were silently not rebuilt — a class of "stale build" bug worth
+remembering.
+
+Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
+NEXT: make the ext2 root the actual ROOT (pivot into it), then populate
+it from userspace and add the layout UI.

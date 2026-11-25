@@ -1143,27 +1143,45 @@ pub(crate) fn rustux_main(
         let refused_disk = ext2::parse_super(&dio).is_none();
         kprintln!(con, "rustux: ext2: disk adapter len>0 {} refuses non-ext2 {refused_disk}",
                   ext2::BlockIo::len(&dio) > 0);
-        // Try to mount partition 1 (the conventional 1 MiB offset) on
-        // every disk and, if it is ext2, walk its root. A FAT disk
-        // simply reports no ext2 — the same code path a root mount uses.
+        // Read each disk's partition table and try to mount every
+        // partition as ext2 — the same path a root mount takes. The
+        // ESP is FAT, so it is refused; the root partition is mounted
+        // and its directory walked.
         for d in 0..4usize {
             let io = ext2::DiskIo { disk: d };
             let total = ext2::BlockIo::len(&io);
-            if total < 2 * 1024 * 1024 {
+            if total < 1024 * 1024 {
                 continue;
             }
-            let base = 1024 * 1024;
-            if let Some(m) = ext2::mount(&io, base, total - base) {
-                let part = ext2::PartIo { dev: &io, base, size: total - base };
-                let mut n = 0u32;
-                let walked = ext2::dir_walk(&part, &m.sb, 2, |_e| {
-                    n += 1;
-                    true
-                })
-                .is_some();
-                kprintln!(con,
-                    "rustux: ext2: disk{d} mounted at 1MiB block={} entries={n} walked={walked}",
-                    m.sb.block_size());
+            let mut mbr = [0u8; 512];
+            if !ext2::BlockIo::read(&io, 0, &mut mbr) || mbr[510] != 0x55 || mbr[511] != 0xaa {
+                continue;
+            }
+            for slot in 0..4usize {
+                let e = &mbr[446 + slot * 16..446 + slot * 16 + 16];
+                let ptype = e[4];
+                let start = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
+                let count = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64;
+                if ptype == 0 || count == 0 {
+                    continue;
+                }
+                let base = start * 512;
+                let size = count * 512;
+                if base + size > total {
+                    continue;
+                }
+                if let Some(m) = ext2::mount(&io, base, size) {
+                    let part = ext2::PartIo { dev: &io, base, size };
+                    let mut n = 0u32;
+                    let walked = ext2::dir_walk(&part, &m.sb, 2, |_e| {
+                        n += 1;
+                        true
+                    })
+                    .is_some();
+                    kprintln!(con,
+                        "rustux: ext2: disk{d}p{slot} type={:#x} MOUNTED lba={start} block={} entries={n} walked={walked}",
+                        ptype, m.sb.block_size());
+                }
             }
         }
     }
