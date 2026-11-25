@@ -6069,3 +6069,16 @@ looks like "does not boot". Always wait for the installer VM to exit,
 or copy the image, before booting it.
 NEXT: stream the rest of the payload (libs, dash, /etc files), then
 pivot into the root.
+
+## run-244 — payload placement is data-driven (and honest about what exists)
+
+The installer streams a fixed PAYLOAD list from the live initrd into
+the root. It placed only /bin/busybox, which is CORRECT: the live
+initrd contains exactly one binary entry (bin/busybox) — dash is in the
+test initrd, not the live payload. Verified by scanning
+initrd-live.cpio on the host (130 entries, only bin/busybox matches).
+
+So the mechanism is right and the payload list is the only thing to
+grow when more of the live initrd becomes part of the installed root.
+
+Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.

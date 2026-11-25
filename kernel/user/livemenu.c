@@ -520,7 +520,7 @@ static void install(const char *path)
                 // read, not just a formatted empty partition.
                 static const char marker[] =
                     "Rustux ext2 root\n";
-                struct mke2_file files[3];
+                struct mke2_file files[4];
                 files[0].path = "README";
                 files[0].data = marker;
                 files[0].len = sizeof marker - 1;
@@ -531,23 +531,38 @@ static void install(const char *path)
                 files[1].path = "etc/motd";
                 files[1].data = motd;
                 files[1].len = sizeof motd - 1;
-                // A real binary, streamed straight from the initrd.
+                // Real binaries, streamed straight from the initrd.
+                // Only one directory level is supported, so the paths are
+                // kept flat inside bin/ for now.
                 uint32_t nf = 2;
-                int bb = open("/bin/busybox", O_RDONLY);
-                struct stat bs;
-                if (bb >= 0 && fstat(bb, &bs) == 0 && bs.st_size > 0
-                    && (unsigned long long)bs.st_size < (unsigned long long)blocks * 1024) {
-                    files[2].path = "bin/busybox";
-                    files[2].data = 0;
-                    files[2].len = (uint32_t)bs.st_size;
-                    files[2].read = file_reader;
-                    files[2].rctx = &bb;
-                    nf = 3;
+                static const char *const PAYLOAD[] = {
+                    "/bin/busybox", "/bin/dash",
+                };
+                static int pfds[4];
+                static struct stat pst[4];
+                for (uint32_t i = 0; i < sizeof PAYLOAD / sizeof PAYLOAD[0] && nf < 4; i++) {
+                    int fd = open(PAYLOAD[i], O_RDONLY);
+                    if (fd < 0 || fstat(fd, &pst[i]) != 0 || pst[i].st_size <= 0) {
+                        if (fd >= 0)
+                            close(fd);
+                        continue;
+                    }
+                    if ((unsigned long long)pst[i].st_size >= (unsigned long long)blocks * 1024)
+                        continue; // would not fit
+                    pfds[i] = fd;
+                    files[nf].path = i == 0 ? "bin/busybox" : "bin/dash";
+                    files[nf].data = 0;
+                    files[nf].len = (uint32_t)pst[i].st_size;
+                    files[nf].read = file_reader;
+                    files[nf].rctx = &pfds[i];
+                    nf++;
                 }
                 int fr = mke2_format(mke2_sink, &sd, (uint64_t)root_lba * 512,
                                      blocks, files, nf);
-                if (bb >= 0)
-                    close(bb);
+                for (uint32_t i = 0; i < 4; i++) {
+                    if (pfds[i] > 0)
+                        close(pfds[i]);
+                }
                 if (fr == 0) {
                     printf("install: ext2 root formatted\n");
                 } else {
