@@ -6173,3 +6173,29 @@ their real paths.
 Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.
 NEXT: extend the list to the rest of the 29 MiB payload, add an init
 script, then the partition editor.
+
+## run-249 — two findings: FAT VBR mistaken for an MBR, and the real pivot gap
+
+1. REGRESSION (fixed): the partition scan treated any sector ending in
+   55AA as an MBR — but a FAT VBR does too. On the suite's superfloppy
+   ESP it parsed garbage partition entries and did spurious I/O, which
+   showed up as pgtest exit(5..8) on every boot while the suite still
+   gated on exit 33 (exactly the "hidden failure behind a green suite"
+   the repo rules warn about). The scan now skips sectors carrying a
+   FAT BPB signature at offset 54 or 82. pgtest is exit(0) again on two
+   consecutive runs.
+
+2. THE PIVOT IS INCOMPLETE — and this is the honest headline. Spawning
+   a binary from the ext2 root works, but the program's FILESYSTEM VIEW
+   is still the initrd: path resolution goes through the initrd RAM fs,
+   so /etc/inittab, /etc/init.d/rcS and /dev/tty* are not visible to it.
+   Evidence: busybox `init` as pid 1 tries /dev/tty2..4 and exits 1
+   even with an inittab present, because it cannot see the inittab.
+   That is why the pivot uses `sh` for now.
+
+   THE NEXT REAL RUNG is therefore a namespace pivot: make path
+   resolution consult the mounted ext2 root (with /proc, /dev layered
+   over it) instead of the initrd. Everything below that is proven —
+   mount, read, execute — so this is a VFS change, not a filesystem one.
+
+Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.

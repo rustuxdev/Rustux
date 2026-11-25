@@ -1162,6 +1162,12 @@ pub(crate) fn rustux_main(
             if !ext2::BlockIo::read(&io, 0, &mut mbr) || mbr[510] != 0x55 || mbr[511] != 0xaa {
                 continue;
             }
+            // A FAT VBR also ends in 55AA. Treating it as an MBR parses
+            // garbage partition entries and does spurious I/O, so skip
+            // anything that carries a FAT BPB signature.
+            if &mbr[54..57] == b"FAT" || &mbr[82..85] == b"FAT" {
+                continue;
+            }
             for slot in 0..4usize {
                 let e = &mbr[446 + slot * 16..446 + slot * 16 + 16];
                 let ptype = e[4];
@@ -1357,6 +1363,10 @@ pub(crate) fn rustux_main(
         // initrd payload — this is what makes the disk a system rather
         // than a filesystem the kernel reads.
         let img = unsafe { core::slice::from_raw_parts(p, n) };
+        // "sh": a shell from the installed root. busybox's init applet
+        // cannot be used yet — it opens /etc/inittab through the fs
+        // layer, which still resolves against the initrd, so the binary
+        // runs but cannot see its own root's files (HANDOVER run-249).
         if user::spawn(img, "sh") {
             kprintln!(con, "rustux: root: booting the installed system (pid 1 = sh from ext2)");
             queued += 1;
