@@ -5647,3 +5647,35 @@ To land a partitioned layout, the image must be built for it:
   inside the partition with mkfs.fat on an offset loopback), and the
   partition type set to 0xEF, then re-test the boot. That is a
   Makefile + tooling change, not an installer one.
+
+## run-225 — DESIGN CORRECTION: FAT is only for the ESP
+
+User correction (right): FAT is not a Linux filesystem — outdated,
+no journal, no ownership/permissions, no symlinks, 4 GB files on
+FAT32, corrupts on unclean shutdown. The all-FAT "install" we have is
+not a root filesystem at all: it is kernel + initrd sitting on the
+ESP, the same payload as the live media.
+
+The ONE legitimate FAT use is the ESP: the UEFI specification
+requires the EFI System Partition to be FAT (the firmware's loader
+only speaks FAT32). Everything else must not be FAT.
+
+Target layout:
+  partition 1, ESP, ~512 MiB, FAT32  -> \EFI\BOOT\BOOTX64.EFI
+                                        \initrd.cpio   (nothing else)
+  partition 2, root, remainder, ext4 -> the actual system
+
+THE REAL PREREQUISITE, in order (this is not an installer change):
+1. ext2/ext4 READ driver in the kernel: superblock, group descriptors,
+   inode table, extents (or block maps), directory entries. The kernel
+   today has ONLY the initrd-backed RAM fs, so it cannot mount a root
+   filesystem at all.
+2. Root switch: either mount partition 2 from the initrd and pivot, or
+   drop the initrd and mount root directly.
+3. mkfs + population: keep mkfs.ext4 and the file copy in the
+   installer (userspace) and let the kernel read-only mount the
+   result — avoids needing ext4 write/journal support in the kernel.
+4. Only then the partitioning UI and layout choice.
+
+Do NOT build a partitioned FAT install: it would look professional and
+still be unable to host a Linux system.
