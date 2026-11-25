@@ -6525,3 +6525,63 @@ is still an unauthenticated root sh (/tmp/auth-work.patch); one transient
 `sh: apt: not found` seen at t=0.5s post-boot, unreproduced on the same
 image at t=11s — likely a tty-input race in the test loop, not the fs
 (e2fsck clean, apt 2.8.4 runs from the identical disk).
+
+## run-260 — apt install nano works: the `#!` shebang exec fix + update-alternatives
+
+`apt install nano` reached "Setting up nano" then dpkg reported the
+postinst "No such file or directory" while `ls` showed the file right
+there and `sh nano.postinst` ran fine. Direct `#!` execve failed at the
+interpreter: the shebang line yields "/bin/sh" WITH the leading slash,
+but the flat namespace is canonical slashless — resolve_links scanned
+"/bin", "/bin/sh" components that never match, returned it unchanged,
+and fs_lookup("/bin/sh") missed every table (vfile_find/cpio::find are
+exact-match) -> ENOENT. Every `#!/bin/...` script was broken: dpkg
+postinsts, /etc/rcS-style boots, anything exec'd by path.
+syscall.rs now strips the leading '/' from the interp name BEFORE
+resolve_links so "bin/sh" resolves normally (cpio S_IFLNK -> target
+text -> canon -> "bin/busybox"), and argv[0] comes from the interp
+basename — not the resolved image — because busybox picks its applet
+from argv[0] ("sh", not "busybox").
+
+Second bug surfaced once the script actually ran: the rewritten argv
+copied a shorter string over the caller's longer old arg and trusted
+argv_len's +1 to be a NUL — the tail byte was the old arg's remnant
+("sh"+"m" = "shm\0-less"), so busybox's strrchr(argv[0]) walked off
+the highest stack string and faulted reading exactly stack_top
+(cr2=0x555600100000, __strrchr_sse2 movups). argv[0]/argv[1] now get
+explicit NUL writes after the copy (caps dropped to EXEC_STR_CAP-2).
+
+Payload: /usr/bin/update-alternatives (real dpkg ELF, libc-only) is
+now streamed + in initrd, var/lib/dpkg/alternatives/.keep seeds its
+admin dir — the nano postinst's `update-alternatives --install` calls
+succeed ("using /bin/nano to provide /usr/bin/editor|pico in auto
+mode"). kernel/user/terminfo_l/linux ships the real linux terminfo so
+TERM=linux binaries (htop) can open a terminal. run-iso gains a fourth
+phase gating on `apt install nano` -> apt-get exit(0), and both apt
+phases retype the command once when they see `apt: not found` or
+exit(100) (the t=0.5s transient seen twice — still unexplained, but
+now observed at every boot: stray `1\n` keys from the phase-2 wait
+loop also land as `sh: 1: not found`).
+
+Verified: headless disk boot -> apt update exit(0) -> apt install nano
+-> "Setting up nano" -> update-alternatives x2 exit(0) -> dpkg exit(0)
+-> apt-get exit(0) -> `nano --version` runs and exits 0. e2fsck -fn on
+the extracted root: all 5 passes CLEAN (140 files). make run: exit 33,
+75 tasks, frames 212293 -> 212293 zero leak (pgtest SA_SIGINFO FAILs =
+recorded open gap; a pre-existing dpkg-deb #PF in-suite exits clean).
+
+Audit run-260 scoped quick (security-audit skill): exec/shebang diff
+reviewed — interp strip bounded (<=127 extract cap), argv rewrite
+bounded (bn/sn <= EXEC_STR_CAP-2, explicit NUL, shift <=
+MAX_EXEC_ARGS, shebang chain capped at 4); argv==NULL fallback
+unchanged (CVE-2022-49264 class already enforced, CVE-2021-4034 is
+the userspace consumer). livemenu additions are data rows under
+MKE2_MAX_FILES. New binaries are trusted host copies. cve-now checked
+the exec-argv + binfmt classes. No confirmed findings.
+needs_validation: none.
+Known gaps: apt-key/keyrings absent -> Ign:1 tolerated by
+[trusted=yes]; copy-up RAM-only; unauthenticated root sh
+(/tmp/auth-work.patch); transient `apt: not found` at ~0.5s post-boot
+persists (retried around in run-iso) — unresolved, logged twice;
+htop runs under TERM=linux now but console fidelity unverified;
+enosys nr 435 (clone3) and nr 28 (madvise) logged during dpkg.

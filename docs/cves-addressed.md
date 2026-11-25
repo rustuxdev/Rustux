@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**160 unique CVEs recorded.**
+**161 unique CVEs recorded.**
 
 ## klib ports
 
@@ -97,6 +97,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2020-25284 | ATA PIO block driver + /dev/sda + live/install ISO: ata.rs polled LBA28 on the PIIX3 prim… | audit run-112 manual scoped + cve.now over HTTP JSON-RPC (entities.search — block-device-driver class checked: CVE-2020-25284-style perms not applicable to a single-user demo kern… |
 | CVE-2020-29369 | brk/mmap/munmap/mprotect: per-task VMA table + eager zeroed pages | VMA == ranges[] entry: gate, first-fit, and teardown share one truth, so a mapped page can never escape the syscall pointer gate; first-fit scans holes between entries (freed VA i… |
 | CVE-2020-29661 | unconditional SIGTTOU gate on background TIOCSPGRP: run-91 gate core factored into shared… | 29661 n/a by construction: the Linux bug is a missing lock around a refcounted tty freed mid-jobctl-op; Rustux's console is a static singleton and pgrp/sid/FG_PGID are plain integ… |
+| CVE-2021-4034 | shebang-exec rung: `#!` scripts all exec'd ENOENT — the shebang's absolute interp path ("… | audit run-260 scoped quick (security-audit skill): bounds verified (interp <=127, bn/sn <= CAP-2, shift <= MAX_EXEC_ARGS); cve-now exec-argv/binfmt classes checked (CVE-2022-49264… |
 | CVE-2021-43267 | real Debian apt-get update over slirp: aptprobe solo-initrd stages /etc/apt+/var layout +… | audit run-109 manual scoped + cve.now reached over HTTP JSON-RPC (entities.get confirmed the analogs above): verified pow2(need+16)-16 >= need for every need (exact-pow2 needs spi… |
 | CVE-2021-4440 | syscall reg preservation + boundary selftest | stub now saves/restores the full Windows-volatile set (rdx/rsi/r8-r10) so syscall clobbers only rax/rcx/r11 per Linux ABI; sysret rcx is CPU-saved rip, canonical by construction (… |
 | CVE-2021-4440 | task abstraction + frame reclaim | per-task page tables + kmalloc'd syscall stack, initrd iterates as process table; teardown freeing designed-in: reap walks user PML4 slots 128-255 only, PHYS_MASK strips NX/flags… |
@@ -114,6 +115,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-49073 | install prompt/eject + read-cap split + ATA recovery: demomenu verifies, ATAPI-ejects /de… | audit run-113 manual scoped + cve.now over HTTP JSON-RPC (entities.search — analogs above; no mapped sr/cdrom-ioctl CVE): verified every fd_read arm bounds n by source availabilit… |
 | CVE-2022-49264 | execve image replacement | user rip round-trips SAVED_UIP so sysret can be redirected; canonicality holds — only stub (CPU-saved rip) and exec_return (elf-bounded entry) write it; ZERO_CTX gives exec'd imag… |
 | CVE-2022-49264 | real-binary ABI: fs_base+arch_prctl, exec initial stack (argc/argv/envp/auxv), writev/rea… | argv==NULL discipline applied (49264): argc==0 gets the binary name as argv0 (stronger than upstream's empty string -- same "never argc<1" contract glibc relies on); exec argv/env… |
+| CVE-2022-49264 | shebang-exec rung: `#!` scripts all exec'd ENOENT — the shebang's absolute interp path ("… | audit run-260 scoped quick (security-audit skill): bounds verified (interp <=127, bn/sn <= CAP-2, shift <= MAX_EXEC_ARGS); cve-now exec-argv/binfmt classes checked (CVE-2022-49264… |
+| CVE-2022-49264 | shebang-exec rung: `#!` scripts all exec'd ENOENT — the shebang's absolute interp path ("… | audit run-260 scoped quick (security-audit skill): bounds verified (interp <=127, bn/sn <= CAP-2, shift <= MAX_EXEC_ARGS); cve-now exec-argv/binfmt classes checked (CVE-2022-49264… |
 | CVE-2022-49349 | writable file layer: VFile/Ram OFDs (O_CREAT/O_EXCL/O_TRUNC/O_APPEND), write/read/pread/l… | self-review catches FIXED pre-commit: write(fd,buf,0) at pos>len allocated+extended the file (now early-0 like Linux); fd_pread on an empty VFile took null.add(0) (now n==0 early… |
 | CVE-2022-50466 | PT_INTERP dynamic ELF: Elf::interp() (first-PT_INTERP-only, absolute NUL path bounded 4Ki… | RUN-TIME BUG CAUGHT BY REAL ld.so: glibc ld.so dedupes shared objects by (st_dev,st_ino) — sys_fstat reported ino=0 for every cpio member, so libc.so.6 aliased ld.so's own object,… |
 | CVE-2022-50531 | NT filesystem/path services round 2: RUX_PATH 0x100 multiplexed service (subs 0-10: GetCu… | audit run-100 quick scoped: 2 confirmed findings fixed in-diff — UTF-16 path reader loaded a u16 whose second byte could straddle a page end into the next physical frame (per-byte… |
