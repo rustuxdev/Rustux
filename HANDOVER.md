@@ -6082,3 +6082,22 @@ So the mechanism is right and the payload list is the only thing to
 grow when more of the live initrd becomes part of the installed root.
 
 Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.
+
+## run-245 — arbitrary directory depth in the formatter
+
+mke2 creates directories from file paths at any depth
+("lib/x86_64-linux-gnu/libc.so.6" makes lib, lib/x86_64-linux-gnu and
+puts the file in the innermost), with a recursive ensure that creates
+ancestors first.
+
+Bugs the fsck harness caught: the recursion did not terminate when no
+slash remained (segfault), each directory's ".." pointed at the root
+instead of its real parent, root links counted every directory instead
+of only top-level ones, and a directory's own links ignored its child
+directories.
+
+VERIFIED: three-level nesting passes e2fsck with 0 issues and the file
+reads back at its full path; the etc case, the 1 MiB file and the base
+format stay clean. Suite PASS exit 33, 75 tasks, zero leak.
+NEXT: place the real payload (libs need the nested paths this enables),
+then pivot into the root.

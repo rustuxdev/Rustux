@@ -60,6 +60,73 @@ static void setbit(uint8_t *bm, uint32_t i) {
     bm[i / 8] |= (uint8_t)(1u << (i % 8));
 }
 
+#define MKE2_MAX_DIRS 24
+struct mke2_dirrec {
+    char path[56]; // full prefix: "lib", "lib/x86_64-linux-gnu"
+    uint32_t ino;
+    uint32_t blk;
+};
+
+static int mke2_dir_find(struct mke2_dirrec *d, uint32_t n, const char *p,
+                         uint32_t len) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (strlen(d[i].path) == len && strncmp(d[i].path, p, len) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/// Create `path` (and every ancestor) if missing. Returns the index, or
+/// -1 when the table is full. Parents are created first, so a directory
+/// always has a lower index than its children.
+static int mke2_dir_ensure(struct mke2_dirrec *d, uint32_t *n, const char *p,
+                           uint32_t len) {
+    if (len == 0) {
+        return -1; // the root itself
+    }
+    if (len >= sizeof d[0].path) {
+        return -1;
+    }
+    int have = mke2_dir_find(d, *n, p, len);
+    if (have >= 0) {
+        return have;
+    }
+    if (*n >= MKE2_MAX_DIRS) {
+        return -1;
+    }
+    // Ancestors first.
+    // No slash left means this is a top-level name: cut must be 0, or
+    // the recursion below would call itself with the same length.
+    uint32_t cut = 0;
+    for (uint32_t i = len; i > 0; i--) {
+        if (p[i - 1] == '/') {
+            cut = i - 1;
+            break;
+        }
+    }
+    if (cut > 0 && mke2_dir_ensure(d, n, p, cut) < 0) {
+        return -1;
+    }
+    uint32_t idx = (*n)++;
+    memcpy(d[idx].path, p, len);
+    d[idx].path[len] = 0;
+    d[idx].ino = 0;
+    d[idx].blk = 0;
+    return (int)idx;
+}
+
+/// Index of a directory's parent, or -1 for the root.
+static int mke2_dir_parent(struct mke2_dirrec *d, uint32_t n, uint32_t idx) {
+    uint32_t len = (uint32_t)strlen(d[idx].path);
+    for (uint32_t i = len; i > 0; i--) {
+        if (d[idx].path[i - 1] == '/') {
+            return mke2_dir_find(d, n, d[idx].path, i - 1);
+        }
+    }
+    return -1;
+}
+
 /// Format `blocks` 1024-byte blocks starting at byte `base`.
 static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
                        uint32_t blocks, const struct mke2_file *files,
@@ -158,13 +225,10 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
     } placed[16];
     uint32_t nplaced = 0;
 
-    // Directories come from the file paths: "etc/motd" creates "etc" and
-    // puts the file inside it. One level is enough for /etc, /bin, /lib.
-    struct mke2_dir {
-        char name[16];
-        uint32_t ino;
-        uint32_t blk;
-    } subdirs[8];
+    // Directories come from the file paths, at any depth:
+    // "lib/x86_64-linux-gnu/libc.so.6" creates lib, lib/x86_64-linux-gnu
+    // and puts the file in the innermost one.
+    struct mke2_dirrec subdirs[MKE2_MAX_DIRS];
     uint32_t ndirs = 0;
     for (uint32_t f = 0; f < nfiles && f < 16; f++) {
         const char *p = files[f].path;
@@ -178,18 +242,9 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         const char *base = p;
         if (slash) {
             uint32_t n = (uint32_t)(slash - p);
-            if (n > 0 && n < sizeof subdirs[0].name) {
-                for (uint32_t i = 0; i < ndirs; i++) {
-                    if (strncmp(subdirs[i].name, p, n) == 0 && subdirs[i].name[n] == 0) {
-                        d = i;
-                        break;
-                    }
-                }
-                if (d == 0xffffffffu && ndirs < 8) {
-                    memcpy(subdirs[ndirs].name, p, n);
-                    subdirs[ndirs].name[n] = 0;
-                    d = ndirs++;
-                }
+            int di = mke2_dir_ensure(subdirs, &ndirs, p, n);
+            if (di >= 0) {
+                d = (uint32_t)di;
             }
             base = slash + 1;
         }
@@ -364,7 +419,17 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             put16(ino + 0, 0x41ed);
             // links: ".", "..", lost+found, plus one per subdirectory
             // (each subdir's ".." points back here).
-            put16(ino + 26, (uint16_t)(3 + ndirs));
+            {
+                // Only TOP-LEVEL directories add a link to the root
+                // (each contributes one ".."); nested ones do not.
+                uint32_t top = 0;
+                for (uint32_t k = 0; k < ndirs; k++) {
+                    if (mke2_dir_parent(subdirs, ndirs, k) == -1) {
+                        top++;
+                    }
+                }
+                put16(ino + 26, (uint16_t)(3 + top));
+            }
             put32(ino + 4, BLOCK);
             put32(ino + 28, 2);
             put32(ino + 40, root_blk);
@@ -400,7 +465,16 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         uint8_t ino[INODE_SIZE];
         memset(ino, 0, sizeof ino);
         put16(ino + 0, 0x41ed);              // S_IFDIR|0755
-        put16(ino + 26, 2);                  // links: "." and parent's entry
+        {
+            // "." and the parent's entry, plus one per child directory.
+            uint32_t kids = 0;
+            for (uint32_t k = 0; k < ndirs; k++) {
+                if (mke2_dir_parent(subdirs, ndirs, k) == (int)i) {
+                    kids++;
+                }
+            }
+            put16(ino + 26, (uint16_t)(2 + kids));
+        }
         put32(ino + 4, BLOCK);               // size
         put32(ino + 28, BLOCK / 512);        // i_blocks
         put32(ino + 40, subdirs[i].blk);
@@ -416,7 +490,28 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         } ents[2 + 16];
         uint32_t ne = 0;
         ents[ne].name = ".";  ents[ne].ino = subdirs[i].ino; ents[ne].type = 2; ne++;
-        ents[ne].name = ".."; ents[ne].ino = 2;           ents[ne].type = 2; ne++;
+        // ".." is the PARENT, not always the root — nested directories
+        // must point at their real parent or fsck rejects the link.
+        int par = mke2_dir_parent(subdirs, ndirs, i);
+        ents[ne].name = "..";
+        ents[ne].ino = par < 0 ? 2 : subdirs[par].ino;
+        ents[ne].type = 2;
+        ne++;
+        for (uint32_t k = 0; k < ndirs; k++) {
+            if (mke2_dir_parent(subdirs, ndirs, k) != (int)i) {
+                continue;
+            }
+            const char *nm = subdirs[k].path;
+            for (const char *q = subdirs[k].path; *q; q++) {
+                if (*q == '/') {
+                    nm = q + 1;
+                }
+            }
+            ents[ne].name = nm;
+            ents[ne].ino = subdirs[k].ino;
+            ents[ne].type = 2;
+            ne++;
+        }
         for (uint32_t f = 0; f < nplaced; f++) {
             if (placed[f].dir == i) {
                 ents[ne].name = placed[f].name;
@@ -586,7 +681,18 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         ents[ne].name = "..";         ents[ne].ino = 2;         ents[ne].type = 2; ne++;
         ents[ne].name = "lost+found"; ents[ne].ino = FIRST_INO; ents[ne].type = 2; ne++;
         for (uint32_t i = 0; i < ndirs; i++) {
-            ents[ne].name = subdirs[i].name;
+            if (mke2_dir_parent(subdirs, ndirs, i) != -1) {
+                continue; // belongs to a subdirectory, not the root
+            }
+            // The entry name is the last component of the path; the
+            // directory's parent decides which listing it appears in.
+            const char *nm = subdirs[i].path;
+            for (const char *q = subdirs[i].path; *q; q++) {
+                if (*q == '/') {
+                    nm = q + 1;
+                }
+            }
+            ents[ne].name = nm;
             ents[ne].ino = subdirs[i].ino;
             ents[ne].type = 2;
             ne++;
