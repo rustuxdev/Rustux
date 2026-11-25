@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**166 unique CVEs recorded.**
+**171 unique CVEs recorded.**
 
 ## klib ports
 
@@ -157,6 +157,9 @@ by hand; append to the matrix and regenerate.
 | CVE-2025-21887 | writable file layer: VFile/Ram OFDs (O_CREAT/O_EXCL/O_TRUNC/O_APPEND), write/read/pread/l… | self-review catches FIXED pre-commit: write(fd,buf,0) at pos>len allocated+extended the file (now early-0 like Linux); fd_pread on an empty VFile took null.add(0) (now n==0 early… |
 | CVE-2025-22060 | Windows-personality groundwork: Task.pers dual-personality dispatch, PE32+ parser/loader… | audit run-80 quick scoped: 2 confirmed fixed pre-commit — NtAllocateVirtualMemory out-ptrs used read-side probe (range_ok) then wrote through: a read-only arg silently corrupted u… |
 | CVE-2025-23161 | `pci` | **n/a to mechanism** — our CF8/CFC access has no save/restore arrays; reminder: all config ops must stay IRQ-safe (they are — port I/O only) |
+| CVE-2025-38222 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
+| CVE-2025-38314 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
+| CVE-2025-38314 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
 | CVE-2025-38349 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) — interest pins OFD index (… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
 | CVE-2025-38432 | udp/dhcp (ipv4) | csum field zeroed before csum4 (CVE-2025-38432 fix shape); no MSG_PEEK/socket layer — 2016-10229 n/a; malformed csums dropped-and-reposted not error-looped (2015-5364/66 class abs… |
 | CVE-2025-38432 | udp/dhcp (ipv4) | csum field zeroed before csum4 (CVE-2025-38432 fix shape); no MSG_PEEK/socket layer — 2016-10229 n/a; malformed csums dropped-and-reposted not error-looped (2015-5364/66 class abs… |
@@ -187,6 +190,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-31433 | NT directory enumeration: NtQueryDirectoryFile (FileDirectoryInformation records, wildcar… | audit run-85 quick scoped: no confirmed findings; 1 correctness fix applied - stale wildcard cell cleared on handle-slot reuse. Verified: [info,info+ilen) probed writable + <=1MiB… |
 | CVE-2026-31495 | tcp/ipv4 (mini) | exact seq+ack required on every transition (no blind RST/state jumps — 63913 class out); option walk bounded, wscale never shifted (31495); seq state fully initialized (72020); do… |
 | CVE-2026-31613 | legacy BIOS boot rung: Multiboot2 front end — kernel also builds for x86_64-unknown-none… | audit run-120 quick scoped via safe-anything MCP (kernel/ 119 files clean; security-audit skill still absent on disk — limitation recorded) + cve.now entities.search (parsing clas… |
+| CVE-2026-34961 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
+| CVE-2026-34961 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
 | CVE-2026-43445 | `e1000` TX | **design note** — no multi-buffer skb mapping yet; when TX gains error paths, unmap exactly the buffers mapped |
 | CVE-2026-45837 | NT VM reserve/commit split: MEM_RESERVE RNG_RES ledger entries (VA held, placeholder prot… | audit run-88 quick scoped: no confirmed findings; 1 consistency fix - nt_decommit_window now rejects [HEAP_VA,HEAP_MAX) like commit/protect/free already did (decommit would have l… |
 | CVE-2026-45866 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
@@ -219,6 +224,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-80590 | `net` (IPv4/ICMP) | **design-bound** — no reassembly queue at all; `parse_ipv4` drops MF/offset fragments. Reassembly = its own future audit. Only consumer-side ICMP hits (Smack DOI) — n/a |
 | CVE-2026-80758 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
 | CVE-2026-80776 | real Debian apt-get install end-to-end: aptprobe run() children now execve with PATH envp… | audit run-110 manual scoped + cve.now over HTTP JSON-RPC (entities.search confirmed the lost-wakeup class analogs): verified wait4_collect preserves Linux ordering (EINVAL on bad… |
+| CVE-2026-80808 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
 | CVE-2026-89560 | char devices + real /dev: VFile.fmt/rdev + FdKind::Dev + mknod/mknodat + dev_init boot no… | 89560 n/a (no overlayfs/LSM; no-CAP_MKNOD = standing no-cred-model divergence). audit caught+fixed: open() admitted all major-1/5 minors and fd_read's catch-all routed unhandled r… |
 | CVE-2026-89595 | inotify: init/init1/add_watch/rm_watch + path-keyed watch table, dir vs self event routin… | 1479 n/a (Rust, single commit point); 46040 defensive pattern followed (slot rollback on anon_fd failure, single-assignment watch commit); 54119/89595 n/a by construction (single-… |
 | CVE-2026-89596 | `pci` | **n/a to mechanism** — our CF8/CFC access has no save/restore arrays; reminder: all config ops must stay IRQ-safe (they are — port I/O only) |
@@ -236,3 +242,5 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-99116 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
 | CVE-2026-99463 | brk/mmap/munmap/mprotect: per-task VMA table + eager zeroed pages | VMA == ranges[] entry: gate, first-fit, and teardown share one truth, so a mapped page can never escape the syscall pointer gate; first-fit scans holes between entries (freed VA i… |
 | CVE-2026-99463 | physmap rung: supervisor mirror of all phys RAM at PML4 slot 256 (0xFFFF_8000_0000_0000)… | PRESENT |
+| CVE-2026-99682 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
+| CVE-2026-99682 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |

@@ -6869,3 +6869,49 @@ restoration of the audited call site + test check; cve-now
 sigreturn/frame class checked (CVE-2017-1000255, CVE-2026-80560,
 CVE-2019-13648, CVE-2026-46063 — privileged-frame-state classes,
 inapplicable: UCtx carries user GPRs only). 0 findings.
+
+## run-265 — ext3/ext4 read support + virtio-blk driver
+
+ext-family reader (ext2.rs): incompat whitelist mount policy —
+FILETYPE/RECOVER/EXTENTS/64BIT/MMP/FLEX_BG/EA_INODE/DIRDATA/CSUM_SEED/
+LARGEDIR accepted; JOURNAL_DEV, META_BG, INLINE_DATA, ENCRYPT, bigalloc
+refused rather than misread; RECOVER tolerated = same trade-off as
+Linux norecovery ro-mount. Per-inode EXT4_EXTENTS_FL selects the map —
+ext_walk walks the 60-byte iblock root then block nodes (depth<=5,
+eh_entries clamped to node capacity, 48-bit starts, holes+unwritten ->
+0). Classic map gained triple-indirect (iblock[14]) for huge ext3
+files. Group descriptors honor s_desc_size + hi dwords under 64bit;
+inode size_hi folded only for regular files. has_journal/uses_extents
+drive the mount-line family name (ext2/ext3/ext4).
+
+virtio.rs (new): transitional virtio-blk 1af4:1001 over the legacy I/O
+interface — no MSI-X, no capability walk, polling like ata.rs. Probe:
+io-BAR check, IO+busmaster, reset -> ACK|DRIVER -> features=0 ->
+FEATOK -> queue PFN -> capacity -> DRVOK. Request: fixed descs 0-2
+(header ctrl block, data block, status byte), avail bump, notify, spin
+on used.idx. Two real bugs caught by the boot proof: (1) QEMU's
+virtio-blk queue is 256-deep — laying the rings out at a 128 cap put
+avail where QEMU reads zeros (all I/O silently stalled); the queue is
+now allocated from the DEVICE's qsize. (2) snapshotting used.idx after
+notify loses the race to a microsecond-fast completion — prev is read
+before the kick. kalloc::alloc_frames(order) gives contiguous zeroed
+DMA blocks; pio::inw added.
+
+Proof: make run exit 33, 75 tasks, zero frame leak; ext3 and ext4 real
+mke2fs images pass (ext4's sparse big.bin forces a depth-1 extent tree
+— the recursive index->leaf path runs on Linux-written data); a
+16MB MBR disk carrying the ext4 partition attached -drive if=virtio
+mounts over the virtqueue (disk1p0 MOUNTED, 5 entries walked, hi.txt
+copied up). esp.img bumped 64->96M — embedded test images + initrd
+(57M) outgrew it. kbdtest 1 intermittent FAIL = pre-existing headless
+input flake (stray CPR bytes, unrelated to diff).
+
+Audit: scoped quick, security-audit skill, run-24 — 0 confirmed;
+nv-24-1 RECOVER tolerated recorded. cve-now: CVE-2026-34961
+(eh_entries OOB — handled by capacity clamp), CVE-2025-38314
+(used.len trust — n/a by design), CVE-2026-99682/-2026-80808/
+-2025-38222 n/a. Known limits (documented, next-rung candidates):
+first virtio device only, transitional transport only (modern-only
+1042 needs the cap-list interface), /dev/vdN not minted in the OFD
+block layer, no journal replay, no metadata checksum verify, virtio-net
+not written.
