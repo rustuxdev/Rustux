@@ -6012,3 +6012,20 @@ kernel can navigate, not a flat set of files.
 Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.
 NEXT: pivot into the root (mount it AS /), then populate a real tree
 from the initrd, then the partition editor.
+
+## run-241 — indirect blocks: files larger than 12 KiB
+
+mke2 allocates a single-indirect block for files over 12 blocks (so up
+to 268 KiB at 1 KiB blocks) and writes all twelve direct pointers plus
+block[12]. Three bugs the fsck harness caught: only block[0] was
+written (so blocks 1..11 were marked used but unreferenced), i_blocks
+did not count the indirect block, and the indirect array was written
+from the wrong base.
+
+VERIFIED: a 100 KiB file passes e2fsck with 0 issues, `debugfs stat`
+shows `(IND):364, (12-99):276-363`, and the dump is byte-identical to
+the source. Base format still clean at 16 MiB and 212992 blocks.
+
+Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.
+NEXT: place real files from the initrd into the root (busybox is ~1 MB,
+so double-indirect is needed for it), then pivot.

@@ -147,6 +147,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         uint32_t blk;
         uint32_t len;
         uint32_t dir; // index into dirs[], or 0xffffffff for the root
+        uint32_t ind; // single-indirect block, 0 when the file is small
         const char *name;
     } placed[16];
     uint32_t nplaced = 0;
@@ -191,6 +192,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         placed[nplaced].name = base;
         placed[nplaced].ino = 0;
         placed[nplaced].blk = 0;
+        placed[nplaced].ind = 0;
         nplaced++;
     }
     used_inodes += ndirs;    // one inode per created directory
@@ -246,10 +248,18 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
                 }
                 placed[f].ino = next_ino++;
                 placed[f].blk = next_data_blk;
-                for (uint32_t b = 0; b < nb; b++) {
+                // Data blocks are contiguous; a file over 12 blocks also
+                // needs one indirect block (256 more pointers at 1 KiB
+                // blocks, so up to 268 KiB per file here).
+                uint32_t ndata = nb <= 12 ? nb : nb;
+                for (uint32_t b = 0; b < ndata; b++) {
                     setbit(bm, placed[f].blk + b - gs);
                 }
-                next_data_blk += nb;
+                next_data_blk += ndata;
+                if (nb > 12) {
+                    placed[f].ind = next_data_blk++;
+                    setbit(bm, placed[f].ind - gs);
+                }
             }
         }
         // Padding: bits with no block behind them (the final bit of the
@@ -426,9 +436,24 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             if (nb == 0) {
                 nb = 1;
             }
-            put32(ino + 28, nb * (BLOCK / 512)); // i_blocks in 512B units
+            // i_blocks counts the indirect block too, in 512-byte units.
+            put32(ino + 28, (nb + (placed[f].ind ? 1 : 0)) * (BLOCK / 512));
         }
-        put32(ino + 40, placed[f].blk);         // block[0]
+        {
+            // All twelve direct pointers, not just the first: leaving
+            // 1..11 zero marked their blocks used but unreferenced.
+            uint32_t nb3 = (placed[f].len + BLOCK - 1) / BLOCK;
+            if (nb3 == 0) {
+                nb3 = 1;
+            }
+            uint32_t ndir = nb3 < 12 ? nb3 : 12;
+            for (uint32_t k = 0; k < ndir; k++) {
+                put32(ino + 40 + k * 4, placed[f].blk + k);
+            }
+            if (placed[f].ind != 0) {
+                put32(ino + 40 + 12 * 4, placed[f].ind); // block[12]
+            }
+        }
         // The inode table starts right after group 0's two bitmaps —
         // NOT at root_blk (the first data block), which is where the
         // first version of this wrote the inode.
@@ -454,6 +479,17 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             }
             b++;
         } while (left > 0);
+        if (placed[f].ind != 0) {
+            uint8_t ib[BLOCK];
+            memset(ib, 0, sizeof ib);
+            uint32_t nb2 = (placed[f].len + BLOCK - 1) / BLOCK;
+            for (uint32_t k = 12; k < nb2 && k - 12 < BLOCK / 4; k++) {
+                put32(ib + (k - 12) * 4, placed[f].blk + k);
+            }
+            if (wr(ctx, base + placed[f].ind * BLOCK, ib, BLOCK)) {
+                return -26;
+            }
+        }
     }
 
     // ---- root directory ----
