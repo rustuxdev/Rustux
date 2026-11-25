@@ -5125,7 +5125,7 @@ pipeline children end up as grandchildren of an intermediate that
 exits. The most promising lead is our vfork: it hands the child a
 UCtx on the parent's rsp but the child still has a private stack
 copy path, so ash's post-vfork code can fork-and-exit where Linux
-would exec in place. Implementing a真 true vfork (child never
+would exec in place. Implementing a true vfork (child never
 returns; parent stack genuinely shared; any fork inside is the
 caller's bug) is the principled next step, with a dedicated i386
 test that vforks and execs.
