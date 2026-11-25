@@ -4927,3 +4927,36 @@ its exit orphans them.
 Concrete next step (cheap): instrument the orphan sweep to print
 (dead pid, child pid) via user_out, and run the pipeline. That names
 the intermediate in one boot.
+
+## run-195 — pipeline: the intermediate is the vfork child (no code change)
+
+Orphan-sweep trace (user_out, every orphaned child):
+
+    O221>222
+    O225>226
+
+Format O<dying task>> <orphaned child>. So the pipeline's `cat` is a
+child of a task that then EXITS — and that task is the shell's vfork
+child. On Linux a vfork child shares the parent's stack and must
+exec; it cannot fork and exit. Our `sys_vfork` builds a normal UCtx
+(the child gets its own stack copy), so ash's post-vfork code can
+fork a child and exit where Linux would have exec'd in place — the
+cat ends up a grandchild, gets orphaned (ppid=0), and pick_next's
+zombie pass reaps it before the shell can wait, so wait4(-1)
+answers ECHILD and ash reports the pipeline as failed.
+
+That is a genuine vfork-semantics divergence, and it explains every
+observation in runs 189-194. Two candidate fixes for the next
+session:
+
+1. Make ia32 vfork a true vfork: the child runs on the PARENT's rsp
+   (share the stack), so the fork-and-exit pattern ash is using here
+   would be undefined — as on Linux — and ash would take its
+   exec-in-place path. Risky: needs care that the child never
+   returns.
+2. Keep the copy semantics but make orphans waitable: re-parent them
+   to a live reaper task instead of ppid = 0, so a shell that ends up
+   with grandchildren can still collect them. Diverges from Linux but
+   is contained.
+
+Option 1 is the principled one; option 2 is a compatibility hack.
