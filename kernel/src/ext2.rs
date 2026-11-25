@@ -1,23 +1,56 @@
 //! ext2 — read-only ext2 driver (the base ext4 builds on).
 //!
-//! The kernel's only filesystem so far is the initrd-backed RAM fs,
-//! so it cannot mount a Linux root partition at all. ext2 is the right
+//! The kernel's only filesystem was the initrd-backed RAM fs, so it
+//! could not mount a Linux root partition at all. ext2 is the right
 //! first rung: ext4 uses the same superblock, group descriptors, inode
 //! table and directory format, and differs mainly by extent trees and
 //! a journal — both of which layer on top of this.
 //!
-//! Layout (all little-endian):
-//!   block 0            boot sector (ignored)
-//!   byte 1024          superblock (1024 bytes)
-//!   block s_first_data_block + gdt            group descriptors
-//!   ...                block/inode bitmaps, inode table, data
+//! Everything goes through [`BlockIo`], so the same code reads an
+//! in-memory image (tests) or a real block device (a root partition).
 //!
-//! Everything here is bounds-checked against the image length: this
-//! parses untrusted on-disk data, so every offset is validated before
-//! it is used and every failure is `None` rather than a panic.
+//! Layout (little-endian):
+//!   block 0    boot sector (ignored)
+//!   byte 1024  superblock (1024 bytes)
+//!   ...        group descriptors, bitmaps, inode table, data
+//!
+//! This parses untrusted on-disk data: every offset is validated before
+//! use and every failure is `None` rather than a panic.
 
 /// ext2/3/4 superblock magic.
 pub const MAGIC: u16 = 0xef53;
+
+/// Largest block size we buffer (log_block_size <= 2 -> 4096).
+const MAX_BLOCK: usize = 4096;
+
+/// Random-access byte reader over a filesystem.
+pub trait BlockIo {
+    /// Total size in bytes.
+    fn len(&self) -> u64;
+    /// Fill `buf` from byte `off`. False if the range is not readable.
+    fn read(&self, off: u64, buf: &mut [u8]) -> bool;
+}
+
+/// A filesystem held in memory — the test path.
+pub struct MemIo<'a> {
+    pub data: &'a [u8],
+}
+
+impl BlockIo for MemIo<'_> {
+    fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+    fn read(&self, off: u64, buf: &mut [u8]) -> bool {
+        let start = off as usize;
+        match self.data.get(start..start + buf.len()) {
+            Some(s) => {
+                buf.copy_from_slice(s);
+                true
+            }
+            None => false,
+        }
+    }
+}
 
 /// Parsed superblock — only the fields a reader needs.
 #[derive(Clone, Copy)]
@@ -37,29 +70,23 @@ pub struct Super {
 }
 
 impl Super {
-    /// Filesystem block size in bytes (1024 << log_block_size).
     pub fn block_size(&self) -> u32 {
         1024u32 << self.log_block_size
     }
-
-    /// Group descriptor table's first byte, in blocks.
     pub fn gdt_block(&self) -> u32 {
         self.first_data_block + 1
     }
-
-    /// Number of block groups.
     pub fn groups(&self) -> u32 {
         if self.blocks_per_group == 0 {
             return 0;
         }
-        let data_blocks = self.blocks.saturating_sub(self.first_data_block);
-        data_blocks.div_ceil(self.blocks_per_group)
+        self.blocks
+            .saturating_sub(self.first_data_block)
+            .div_ceil(self.blocks_per_group)
     }
-
-    /// ext4 with extent trees — a reader must refuse rather than
-    /// misinterpret block maps as extents.
+    /// ext4 with extent trees — refuse rather than misread block maps.
     pub fn uses_extents(&self) -> bool {
-        self.incompat & 0x40 != 0 // EXT4_FEATURE_INCOMPAT_EXTENTS
+        self.incompat & 0x40 != 0
     }
 }
 
@@ -73,62 +100,59 @@ fn rd32(b: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-/// Parse the superblock at byte 1024 of a filesystem image.
-pub fn parse_super(img: &[u8]) -> Option<Super> {
-    const SB: usize = 1024;
-    if rd16(img, SB + 56)? != MAGIC {
+/// Parse the superblock at byte 1024.
+pub fn parse_super(io: &dyn BlockIo) -> Option<Super> {
+    let mut sb_buf = [0u8; 1024];
+    io.read(1024, &mut sb_buf).then_some(())?;
+    if rd16(&sb_buf, 56)? != MAGIC {
         return None;
     }
-    let inodes = rd32(img, SB + 0)?;
-    let blocks = rd32(img, SB + 4)?;
-    let first_data_block = rd32(img, SB + 20)?;
-    let log_block_size = rd32(img, SB + 24)?;
-    if log_block_size > 6 {
-        return None; // 64 KiB blocks are beyond ext2
+    let log_block_size = rd32(&sb_buf, 24)?;
+    if log_block_size > 2 {
+        return None; // > 4096-byte blocks are outside what we buffer
     }
-    let blocks_per_group = rd32(img, SB + 32)?;
-    let inodes_per_group = rd32(img, SB + 40)?;
-    let rev = rd32(img, SB + 76)?;
-    // rev 0 has no extended fields; inode_size is fixed at 128.
-    let inode_size = if rev == 0 {
-        128
-    } else {
-        rd16(img, SB + 88).unwrap_or(128).max(128)
-    };
+    let inodes = rd32(&sb_buf, 0)?;
+    let blocks = rd32(&sb_buf, 4)?;
+    let blocks_per_group = rd32(&sb_buf, 32)?;
+    let inodes_per_group = rd32(&sb_buf, 40)?;
     if blocks == 0 || inodes == 0 || blocks_per_group == 0 || inodes_per_group == 0 {
         return None;
     }
+    let rev = rd32(&sb_buf, 76)?;
+    let inode_size = if rev == 0 {
+        128
+    } else {
+        rd16(&sb_buf, 88).unwrap_or(128).max(128)
+    };
     Some(Super {
         inodes,
         blocks,
-        first_data_block,
+        first_data_block: rd32(&sb_buf, 20)?,
         log_block_size,
         blocks_per_group,
         inodes_per_group,
         inode_size,
         rev,
-        compat: rd32(img, SB + 92)?,
-        incompat: rd32(img, SB + 96)?,
-        ro_compat: rd32(img, SB + 100)?,
-        first_ino: rd32(img, SB + 84).unwrap_or(11),
+        compat: rd32(&sb_buf, 92)?,
+        incompat: rd32(&sb_buf, 96)?,
+        ro_compat: rd32(&sb_buf, 100)?,
+        first_ino: rd32(&sb_buf, 84).unwrap_or(11),
     })
 }
 
-/// Validate that a superblock's geometry fits the image we hold.
-pub fn validate(sb: &Super, img_len: u64) -> bool {
+/// Validate that the geometry fits the device we are reading.
+pub fn validate(sb: &Super, dev_len: u64) -> bool {
     let bs = sb.block_size() as u64;
-    if bs == 0 || img_len < bs * (sb.blocks as u64) {
+    if bs == 0 || dev_len < bs * (sb.blocks as u64) {
         return false;
     }
-    // The group descriptor table must exist.
-    let gdt = sb.gdt_block() as u64 * bs;
-    if gdt + 32 > img_len {
+    if sb.gdt_block() as u64 * bs + 32 > dev_len {
         return false;
     }
     sb.groups() <= 1024
 }
 
-/// One group descriptor — the fields a reader needs.
+/// One group descriptor.
 #[derive(Clone, Copy)]
 pub struct Group {
     pub block_bitmap: u32,
@@ -136,18 +160,19 @@ pub struct Group {
     pub inode_table: u32,
 }
 
-/// Read group descriptor `g` from the image.
-pub fn group(img: &[u8], sb: &Super, g: u32) -> Option<Group> {
-    let bs = sb.block_size() as usize;
-    let base = sb.gdt_block() as usize * bs + (g as usize) * 32;
+pub fn group(io: &dyn BlockIo, sb: &Super, g: u32) -> Option<Group> {
+    let bs = sb.block_size() as u64;
+    let off = sb.gdt_block() as u64 * bs + (g as u64) * 32;
+    let mut b = [0u8; 32];
+    io.read(off, &mut b).then_some(())?;
     Some(Group {
-        block_bitmap: rd32(img, base)?,
-        inode_bitmap: rd32(img, base + 4)?,
-        inode_table: rd32(img, base + 8)?,
+        block_bitmap: rd32(&b, 0)?,
+        inode_bitmap: rd32(&b, 4)?,
+        inode_table: rd32(&b, 8)?,
     })
 }
 
-/// A parsed inode — block map only (ext2); extents are refused.
+/// A parsed inode (block map only; extents are refused).
 #[derive(Clone, Copy)]
 pub struct Inode {
     pub mode: u16,
@@ -164,28 +189,25 @@ impl Inode {
     }
 }
 
-/// Read inode number `ino` (1-based, as on disk).
-pub fn inode(img: &[u8], sb: &Super, ino: u32) -> Option<Inode> {
-    if ino == 0 || ino > sb.inodes {
+/// Read inode number `ino` (1-based).
+pub fn inode(io: &dyn BlockIo, sb: &Super, ino: u32) -> Option<Inode> {
+    if ino == 0 || ino > sb.inodes || sb.inodes_per_group == 0 {
         return None;
     }
-    let bs = sb.block_size() as usize;
-    let per = sb.inodes_per_group;
-    if per == 0 {
-        return None;
-    }
-    let g = (ino - 1) / per;
-    let idx = (ino - 1) % per;
-    let grp = group(img, sb, g)?;
-    let off = grp.inode_table as usize * bs + idx as usize * sb.inode_size as usize;
-    let raw = img.get(off..off + 128)?;
+    let g = (ino - 1) / sb.inodes_per_group;
+    let idx = (ino - 1) % sb.inodes_per_group;
+    let grp = group(io, sb, g)?;
+    let off = grp.inode_table as u64 * sb.block_size() as u64
+        + idx as u64 * sb.inode_size as u64;
+    let mut raw = [0u8; 128];
+    io.read(off, &mut raw).then_some(())?;
     let mut block = [0u32; 15];
     for (i, b) in block.iter_mut().enumerate() {
-        *b = rd32(raw, 40 + i * 4)?;
+        *b = rd32(&raw, 40 + i * 4)?;
     }
     Some(Inode {
-        mode: rd16(raw, 0)?,
-        size: rd32(raw, 4)?,
+        mode: rd16(&raw, 0)?,
+        size: rd32(&raw, 4)?,
         block,
     })
 }
@@ -197,40 +219,59 @@ pub struct Dirent {
     pub name_len: u8,
 }
 
-/// Walk a directory's linear entries, calling `f` for each. ext2/3/4
-/// all use this format; htree adds an index but leaves the leaves in
-/// this shape.
+/// Logical block -> physical block via direct + single indirect.
+pub fn block_map(io: &dyn BlockIo, sb: &Super, node: &Inode, lblock: u32) -> Option<u32> {
+    let bs = sb.block_size();
+    let per = bs / 4;
+    if lblock < 12 {
+        return Some(node.block[lblock as usize]);
+    }
+    let l = lblock - 12;
+    if l < per {
+        let ind = node.block[12];
+        if ind == 0 {
+            return Some(0);
+        }
+        let mut b = [0u8; 4];
+        io.read(ind as u64 * bs as u64 + (l as u64) * 4, &mut b)
+            .then_some(())?;
+        return rd32(&b, 0);
+    }
+    None
+}
+
+/// Walk a directory's linear entries.
 pub fn dir_walk(
-    img: &[u8],
+    io: &dyn BlockIo,
     sb: &Super,
     ino: u32,
     mut f: impl FnMut(&Dirent) -> bool,
 ) -> Option<()> {
     let bs = sb.block_size() as usize;
-    let inode = inode(img, sb, ino)?;
-    if !inode.is_dir() {
+    let node = inode(io, sb, ino)?;
+    if !node.is_dir() {
         return None;
     }
+    let mut blk = [0u8; MAX_BLOCK];
     let mut pos = 0u32;
-    while pos < inode.size {
-        let blk = block_map(img, sb, &inode, pos / bs as u32)?;
-        if blk == 0 {
+    while pos < node.size {
+        let phys = block_map(io, sb, &node, pos / bs as u32)?;
+        if phys == 0 {
             pos += bs as u32;
             continue;
         }
-        let base = blk as usize * bs;
+        io.read(phys as u64 * bs as u64, &mut blk[..bs]).then_some(())?;
         let mut off = 0usize;
         while off + 8 <= bs {
-            let e = img.get(base + off..base + off + 8)?;
-            let e_ino = rd32(e, 0)?;
-            let rec_len = rd16(e, 4)? as usize;
-            let name_len = e[6] as usize;
+            let e_ino = rd32(&blk, off)?;
+            let rec_len = rd16(&blk, off + 4)? as usize;
+            let name_len = blk[off + 6] as usize;
             if rec_len < 8 || off + rec_len > bs {
                 break;
             }
-            if e_ino != 0 && name_len > 0 && name_len <= 255 {
+            if e_ino != 0 && name_len > 0 && name_len <= 255 && off + 8 + name_len <= bs {
                 let mut name = [0u8; 256];
-                name[..name_len].copy_from_slice(img.get(base + off + 8..base + off + 8 + name_len)?);
+                name[..name_len].copy_from_slice(&blk[off + 8..off + 8 + name_len]);
                 let d = Dirent {
                     ino: e_ino,
                     name,
@@ -247,57 +288,40 @@ pub fn dir_walk(
     Some(())
 }
 
-/// Logical file block -> physical block, via direct + single indirect.
-pub fn block_map(img: &[u8], sb: &Super, inode: &Inode, lblock: u32) -> Option<u32> {
-    let bs = sb.block_size();
-    let per = (bs / 4) as u32;
-    if lblock < 12 {
-        return Some(inode.block[lblock as usize]);
-    }
-    let l = lblock - 12;
-    if l < per {
-        let ind = inode.block[12];
-        if ind == 0 {
-            return Some(0);
-        }
-        let off = ind as usize * bs as usize + (l as usize) * 4;
-        return rd32(img, off);
-    }
-    None // double/triple indirect: not needed for a root walk
-}
-
-/// Read up to `out.len()` bytes of inode `ino`'s content. Returns the
-/// number of bytes copied. Bounded by the inode's size and by every
-/// block-map lookup, so a hostile image cannot make us read past the
-/// end of the buffer or of the image.
-pub fn read_file(img: &[u8], sb: &Super, ino: u32, out: &mut [u8]) -> Option<usize> {
-    let node = inode(img, sb, ino)?;
+/// Read up to `out.len()` bytes of inode `ino`'s content.
+pub fn read_file(
+    io: &dyn BlockIo,
+    sb: &Super,
+    ino: u32,
+    out: &mut [u8],
+) -> Option<usize> {
+    let node = inode(io, sb, ino)?;
     if node.is_dir() {
         return None;
     }
     let bs = sb.block_size() as usize;
     let want = (node.size as usize).min(out.len());
+    let mut blk = [0u8; MAX_BLOCK];
     let mut done = 0usize;
     while done < want {
-        let lblock = (done / bs) as u32;
-        let off = done % bs;
-        let phys = block_map(img, sb, &node, lblock)?;
+        let phys = block_map(io, sb, &node, (done / bs) as u32)?;
         if phys == 0 {
             break; // sparse hole: stop rather than fabricate data
         }
-        let base = phys as usize * bs + off;
+        let off = done % bs;
         let take = (bs - off).min(want - done);
-        let src = img.get(base..base + take)?;
-        out[done..done + take].copy_from_slice(src);
+        io.read(phys as u64 * bs as u64 + off as u64, &mut blk[..take])
+            .then_some(())?;
+        out[done..done + take].copy_from_slice(&blk[..take]);
         done += take;
     }
     Some(done)
 }
 
-/// Look up `name` in directory `dir_ino` and return the entry's inode.
-pub fn lookup(img: &[u8], sb: &Super, dir_ino: u32, name: &[u8]) -> Option<u32> {
+/// Look up `name` in directory `dir_ino`.
+pub fn lookup(io: &dyn BlockIo, sb: &Super, dir_ino: u32, name: &[u8]) -> Option<u32> {
     let mut found = None;
-    dir_walk(img, sb, dir_ino, |e| {
+    dir_walk(io, sb, dir_ino, |e| {
         if &e.name[..e.name_len as usize] == name {
             found = Some(e.ino);
             return false;

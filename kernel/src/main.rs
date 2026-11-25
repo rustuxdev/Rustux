@@ -1041,14 +1041,16 @@ pub(crate) fn rustux_main(
         img[SB + 40..SB + 40 + 4].copy_from_slice(&128u32.to_le_bytes()); // ipg
         img[SB + 76..SB + 80].copy_from_slice(&1u32.to_le_bytes()); // rev
         img[SB + 88..SB + 90].copy_from_slice(&128u16.to_le_bytes()); // inode_size
-        let ok = match ext2::parse_super(&img) {
+        let mio = ext2::MemIo { data: &img };
+        let ok = match ext2::parse_super(&mio) {
             Some(sb) => sb.block_size() == 1024 && sb.groups() == 1 && !sb.uses_extents()
                 && ext2::validate(&sb, img.len() as u64),
             None => false,
         };
         let mut bad = img;
         bad[SB + 56] ^= 0xff;
-        let refused = ext2::parse_super(&bad).is_none();
+        let bmio = ext2::MemIo { data: &bad };
+        let refused = ext2::parse_super(&bmio).is_none();
         kprintln!(con, "rustux: ext2: superblock parse {ok} reject {refused}");
         // Walk a minimal in-memory ext2: 1 KiB blocks, GDT at block 2,
         // inode table at block 3, inode 2 = / whose first block is 4
@@ -1076,9 +1078,10 @@ pub(crate) fn rustux_main(
         fs[d + 6] = 6;
         fs[d + 8..d + 14].copy_from_slice(b"hi.txt");
         let mut found = 0u32;
-        let walked = match ext2::parse_super(&fs) {
+        let fmio = ext2::MemIo { data: &fs };
+        let walked = match ext2::parse_super(&fmio) {
             Some(sb2) => {
-                let r = ext2::dir_walk(&fs, &sb2, 2, |e| {
+                let r = ext2::dir_walk(&fmio, &sb2, 2, |e| {
                     if &e.name[..e.name_len as usize] == b"hi.txt" {
                         found = e.ino;
                     }
@@ -1093,11 +1096,12 @@ pub(crate) fn rustux_main(
         // is the test that proves the driver reads what Linux writes,
         // not merely what our fixture assumes.
         let real: &[u8] = include_bytes!("ext2_test.img");
+        let rio = ext2::MemIo { data: real };
         let mut saw = 0u32;
-        let real_ok = match ext2::parse_super(real) {
+        let real_ok = match ext2::parse_super(&rio) {
             Some(sb3) => {
                 let v = ext2::validate(&sb3, real.len() as u64);
-                let w = ext2::dir_walk(real, &sb3, 2, |e| {
+                let w = ext2::dir_walk(&rio, &sb3, 2, |e| {
                     if &e.name[..e.name_len as usize] == b"hi.txt" {
                         saw = e.ino;
                     }
@@ -1111,10 +1115,10 @@ pub(crate) fn rustux_main(
         // Read the file's CONTENT through the block map: lookup by
         // name, then walk the inode's block map for the data.
         let mut body = [0u8; 64];
-        let (content_ok, got) = match ext2::parse_super(real) {
-            Some(sb3) => match ext2::lookup(real, &sb3, 2, b"hi.txt") {
+        let (content_ok, got) = match ext2::parse_super(&rio) {
+            Some(sb3) => match ext2::lookup(&rio, &sb3, 2, b"hi.txt") {
                 Some(ino) => {
-                    let n = ext2::read_file(real, &sb3, ino, &mut body).unwrap_or(0);
+                    let n = ext2::read_file(&rio, &sb3, ino, &mut body).unwrap_or(0);
                     let expect = b"hello ext2";
                     (n >= expect.len() && &body[..expect.len()] == expect, n)
                 }

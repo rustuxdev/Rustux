@@ -5788,3 +5788,22 @@ Suite PASS exit 33, 75 tasks, frames 212301 -> 212301 zero leak.
 NEXT: the root switch — mount partition 2 (block device, not an
 in-memory image) and pivot into it. Then mkfs/populate in userspace and
 the partitioning UI.
+
+## run-231 — ext2 over BlockIo (ready for a real partition)
+
+ext2.rs now reads through `trait BlockIo { len(); read(off, buf) }`
+instead of `&[u8]`, so the SAME code can read an in-memory image (the
+tests) or a block device (a root partition). MemIo implements it for a
+byte slice; the tests use that and all still pass:
+
+  rustux: ext2: real image true hi.txt ino=12
+  rustux: ext2: content true bytes 11
+
+The conversion also TIGHTENED a bound: parse_super now refuses
+log_block_size > 2, so block_size <= 4096 == MAX_BLOCK. The old code
+allowed up to 64 KiB blocks while buffering only 4096 bytes — a real
+over-read waiting for a filesystem with large blocks.
+
+NEXT: DiskIo over ahci::read_range / ata::read_d (sector-granular
+adapter, 512-byte bounce), then mount partition 2 at boot, then the
+root switch.
