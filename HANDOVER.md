@@ -5302,3 +5302,34 @@ NOTE for the next step: q35 exposes SATA via AHCI, not the legacy
 ports — an installer targeting q35 machines needs an AHCI driver or
 must be run with -machine pc. Decide before the partition-table work.
 Audit: scoped quick run-18. cve-now MCP was unreachable (recorded).
+
+## run-212 — AHCI driver: SATA disks visible (q35 and real hardware)
+
+The PIIX driver in ata.rs only sees legacy IDE ports; q35 and real
+machines put their disks behind AHCI, which is why `ata: sda=0MiB` on
+q35. New kernel/src/ahci.rs:
+
+* find_controller(): PCI class 0x01 / subclass 0x06 / prog-IF 0x01.
+* ABAR = BAR5, refused if I/O-space, zero, or failing the shared
+  is_mmio RAM-overlap check (same closure e1000 uses).
+* GHC.AE, PI scan; only ports with PxSSTS.DET == 3 and PxSIG == ATA
+  are touched (ATAPI/port-multiplier ports are skipped).
+* Per port: 4 frames from kalloc (command list, FIS, command table,
+  data), zeroed; H2D register FIS; single PRDT entry; PxCI doorbell;
+  bounded completion poll. IDENTIFY reads the LBA48 count (words
+  100-103, falling back to 60/61).
+* read_sector/write_sector (one sector per command for now).
+* user.rs: /dev/sda..sdd minted from the AHCI table when the PIIX
+  probe found nothing (rdev minor 16*i); sd_read/sd_write dispatch to
+  ahci_read/ahci_write with the same bounds/clipping/RMW contract.
+
+Verified: q35 + SATA disk -> `ahci: 2 disk(s)`, suite PASS exit 33, 75
+tasks, zero leak. ISO + SATA disk -> `ahci: 1 disk(s)`, menu shows
+`[1] install Rustux to disk` with NO "no writable disk" annotation
+(access("/dev/sda") succeeds) and a scripted keypress is accepted.
+
+KNOWN SLOW: one polled DMA command per 512-byte sector, so installing
+a 67 MB image is thousands of commands. Batching PRDT entries (up to
+128 sectors/command) is the next optimisation — the PIIX path already
+batches via ata::write(count).
+Audit: scoped quick run-19. cve-now MCP unreachable (recorded).
