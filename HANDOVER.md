@@ -5460,3 +5460,25 @@ message. Print the read return values and the first 8 bytes of each
 buffer to separate them — a short read means the block read path
 clips, a real mismatch means the write lands at the wrong LBA.
 Audit: scoped quick run-21. cve-now MCP unreachable (recorded).
+
+## run-218 — verify MISMATCH: sector 0 is zeros, image has the boot sector
+
+Split the verify (read returns + first bytes):
+
+    install: verify disk lseek=0 read=512 [00 00 00 00]
+             img  lseek=0 read=512 [eb 3c 90 4d]
+    install: verify first sector: MISMATCH
+
+Both reads return a full 512 bytes, so this is NOT a short read — the
+disk's LBA 0 genuinely contains zeros while the image's holds the FAT
+boot sector (0xEB 0x3C 0x90 'M'). The copy reported progress through
+lba 98296 (the payload's end), so writes are being issued, but the
+first one is not landing at LBA 0.
+
+Next probe (cheap): log the FIRST few `dbg: wr` lines (not the tail)
+to see whether lba=0 is ever issued, and log issue()'s return for the
+first write. If lba 0 is issued and returns true, the LBA field or the
+count is being mis-packed for the first command (suspect: the very
+first command after the port start, or a stale PxCI slot). If lba 0 is
+never issued, the bug is in ahci_write's offset math on the first
+chunk.

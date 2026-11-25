@@ -305,13 +305,27 @@ static void install(const char *path)
     }
     // Verify: the first sector on disk must match the image's.
     char a[512], b[512];
-    int ok = lseek(sd, 0, SEEK_SET) == 0 && read(sd, a, 512) == 512
-        && lseek(img, 0, SEEK_SET) == 0 && read(img, b, 512) == 512
-        && memcmp(a, b, 512) == 0;
-    printf("install: verify first sector: %s\n", ok ? "ok" : "MISMATCH");
+    memset(a, 0xaa, sizeof a);
+    memset(b, 0xbb, sizeof b);
+    long l1 = lseek(sd, 0, SEEK_SET);
+    long r1 = read(sd, a, 512);
+    long l2 = lseek(img, 0, SEEK_SET);
+    long r2 = read(img, b, 512);
+    int same = r1 == 512 && r2 == 512 && memcmp(a, b, 512) == 0;
+    printf("install: verify disk lseek=%lld read=%lld [%02x %02x %02x %02x]"
+           " img lseek=%lld read=%lld [%02x %02x %02x %02x]\n",
+           (long long)l1, (long long)r1,
+           (unsigned char)a[0], (unsigned char)a[1],
+           (unsigned char)a[2], (unsigned char)a[3],
+           (long long)l2, (long long)r2,
+           (unsigned char)b[0], (unsigned char)b[1],
+           (unsigned char)b[2], (unsigned char)b[3]);
+    fflush(stdout);
+    printf("install: verify first sector: %s\n", same ? "ok" : "MISMATCH");
+    fflush(stdout);
     close(img);
     close(sd);
-    if (!ok) {
+    if (!same) {
         printf("install: FAILED — disk image did not verify\n");
         return;
     }
