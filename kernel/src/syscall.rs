@@ -1001,8 +1001,23 @@ fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
                     script[..n2].copy_from_slice(&cur[..n2]);
                     script_len = n2;
                 }
-                lname_len = interp_len.min(127);
-                lname[..lname_len].copy_from_slice(&interp[..lname_len]);
+                // The interpreter may itself be a link ("bin/sh" ->
+                // /bin/busybox), so follow it before looking for an
+                // ELF; reading the link's target text as an image is
+                // what made exec report ENOENT.
+                let resolved = match user::resolve_links(&interp[..interp_len], true) {
+                    Ok((b2, n2, _)) => {
+                        lname_len = n2.min(127);
+                        lname[..lname_len].copy_from_slice(&b2[..lname_len]);
+                        true
+                    }
+                    Err(_) => {
+                        lname_len = interp_len.min(127);
+                        lname[..lname_len].copy_from_slice(&interp[..lname_len]);
+                        false
+                    }
+                };
+                let _ = resolved;
                 cur = &lname[..lname_len];
                 continue;
             }

@@ -6268,3 +6268,20 @@ called" and "the script runs"; it is NOT identified.
 
 State: the pivot stays on `sh` from the ext2 root (works, with /etc
 copied up). Do not assume the fs_lookup fix resolved the init path.
+
+## run-253 — shebang interpreter must be link-resolved (landed, still not the init blocker)
+
+A #! script's interpreter is often a link ("bin/sh" -> /bin/busybox).
+The shebang path read the link's TARGET TEXT as if it were the image,
+so the parse failed. It now runs the interpreter through resolve_links
+first. Correct in its own right and the suite is green.
+
+HONEST RESULT: still not the init blocker. With copy-up verified
+(`copy-up etc/rcS true lookup=true`, i.e. fs_lookup DOES find it), the
+interpreter link resolved, and execve traced arriving with
+path=/etc/rcS, busybox still reports "can't run '/etc/rcS': No such
+file or directory". So at least one further defect remains between
+execve entry and script execution, and it is NOT identified.
+
+Verified state: pivot stays on `sh` from the ext2 root (works, /etc
+copied up); suite PASS exit 33 with pgtest exit(0).
