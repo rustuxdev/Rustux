@@ -5106,3 +5106,26 @@ A better next experiment than disabling the reaper: keep the reaper
 but log (user_out) every reap with the zombie's pid/ppid and the
 reaping rule that fired, then run the pipeline once. That names the
 path without changing behaviour.
+
+## run-204 — pipeline: every reap is the ppid==0 rule (no code change)
+
+Logged every pick_next reap with the zombie's pid/ppid and the rule
+that fired. Across a pipeline run every single record was of the
+form `R<pid>/0/0` — i.e. the zombie had ppid == 0 and the
+"orphan" rule collected it. No reap used the "parent not live" rule.
+
+That closes the loop with run-195's `O221>222`: the pipeline's `cat`
+children are orphaned to ppid 0 by the intermediate's exit and then
+reaped immediately, so the shell's wait4(-1) legitimately answers
+ECHILD.
+
+Conclusion for the next session: the fix is NOT in the reaper (it is
+doing exactly what ppid == 0 means) — it is in why the shell's
+pipeline children end up as grandchildren of an intermediate that
+exits. The most promising lead is our vfork: it hands the child a
+UCtx on the parent's rsp but the child still has a private stack
+copy path, so ash's post-vfork code can fork-and-exit where Linux
+would exec in place. Implementing a真 true vfork (child never
+returns; parent stack genuinely shared; any fork inside is the
+caller's bug) is the principled next step, with a dedicated i386
+test that vforks and execs.
