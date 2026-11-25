@@ -5510,3 +5510,32 @@ Also note: `issue()` zeroes only 256 of the 4096-byte data frame, so a
 failed READ returns partially-stale data — the "512 zeros" the verify
 prints may be our own buffer, not the disk. Zero the whole frame
 before a read to make the diagnostic honest.
+
+## run-220 — AHCI: corrected the DW0 bits, transfer still fails
+
+Correction to run-219: in the AHCI command header DW0, bit 5 is
+**A (ATAPI)** and bit 6 is **W (write)**. My earlier "W bit" fix set
+bit 5, which marked every write as an ATAPI packet command — that
+alone explains why IDENTIFY (A=0, W=0) always worked while every
+WRITE DMA EXT silently transferred nothing. The bit is now 1 << 6.
+
+It still does not transfer. So there is at least one more defect in
+the LBA-command path, and guessing further is not productive. The
+right next move is to compare this FIS/PRDT/command-table construction
+against a known-good implementation (QEMU's own ahci.c, or libata's
+`ata_build_rw_tf`) field by field, rather than probing one bit at a
+time:
+
+* CFIS: type 0x27, C=1, cmd, device 0x40 for LBA48, count in bytes
+  12/13, LBA split 4-6 + 8-10.
+* Command table: CFIS at 0, ACMD at 0x20 (zeroed for ATA), PRDT at
+  0x80, DBC = bytes-1.
+* Header DW0: CFL=5, A=0, W=1 for writes, PRDTL=1, P at bit 31.
+* Port: PxCLB/PxFB written only while ST=0 (we currently rewrite them
+  with ST possibly set — the HBA ignores those writes, which happens
+  to be harmless with a cached frame but is wrong per spec).
+
+That last point is a real candidate: our port_start sequence sets
+FRE|ST on every command and rewrites PxCLB/PxFB unconditionally. A
+clean implementation stops the port (ST=0, wait CR=0), programs the
+base addresses, then starts it once.

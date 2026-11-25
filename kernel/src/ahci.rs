@@ -205,12 +205,12 @@ fn issue(p: usize, m: &PortMem, cmd: u8, lba: u64, count: u16, write: bool) -> b
     // SAFETY: m.cl is our frame.
     unsafe {
         let cl = phys_ptr(m.cl) as *mut u32;
-        // DW0: CFL=5 dwords, PRDTL=1, P=1, and the W (write) bit for
-        // host->device transfers. Without W the HBA treats a WRITE DMA
-        // command as a device->host transfer: the command completes and
-        // nothing is written, which is exactly how the installer lost
-        // every sector it copied.
-        let w_bit = if write { 1 << 5 } else { 0 };
+        // DW0: CFL=5 dwords, PRDTL=1, P=1, and W (bit 6) for a
+        // host->device transfer. Bit 5 is A (ATAPI) — setting that
+        // instead marked every write as an ATAPI packet command, which
+        // is why IDENTIFY (W=0, A=0) worked while every write silently
+        // transferred nothing.
+        let w_bit = if write { 1 << 6 } else { 0 };
         cl.write_volatile(5 | w_bit | (1 << 16) | (1 << 31));
         cl.add(1).write_volatile(0);
         cl.add(2).write_volatile(m.ct as u32);
