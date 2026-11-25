@@ -5386,3 +5386,28 @@ Note: the same install path over PIIX (ata.rs) also showed no
 progress in earlier runs, so this may not be AHCI-specific — test the
 PIIX install on -machine pc with a target disk before blaming the
 AHCI command path.
+
+## run-215 — installer targets /dev/sda only; hang is on the AHCI write
+
+Two facts from a PIIX install run (`-machine pc`, target on
+if=ide,index=1):
+
+* `ata: sda=0MiB sdb=128MiB` — the run-211 multi-drive code works;
+  the disk landed on the slave and was reported correctly.
+* The menu printed `[1] install Rustux to disk  (no writable disk
+  detected)` — because livemenu hardcodes `SD_PATH "/dev/sda"` and
+  the only disk here is `sdb`. So the installer has NO disk picker:
+  it installs to sda or nowhere. That is a hard blocker for the
+  "professional installer" goal independent of the write hang.
+
+And it narrows the hang: on q35 the same menu showed `[1] install
+Rustux to disk` with NO annotation (sda existed via AHCI), the key
+was accepted, and nothing progressed — so the hang is in the AHCI
+WRITE path, not the read and not the menu.
+
+Next, in order:
+1. Disk picker: enumerate every /dev/sd* that exists and let the user
+   choose (also fixes "no writable disk" when only sdb is present).
+2. Debug the AHCI write: print at the top of ahci_write and after
+   issue() returns, with the poll iteration count reached.
+3. Then partitioning (MBR/GPT), mkfs, ESP boot entry.
