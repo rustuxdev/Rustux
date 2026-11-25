@@ -4960,3 +4960,22 @@ session:
    is contained.
 
 Option 1 is the principled one; option 2 is a compatibility hack.
+
+## run-196 — pipeline: re-parenting tried, not shipped (no code change)
+
+Tested option 2 from run-195: re-parent a dying task's children onto
+its own parent (nearest live ancestor) instead of ppid = 0, so a
+shell that ends up with grandchildren can still reap them. Result:
+the pipeline failure rate improved (3 of 5 failing, was 4-5 of 5) but
+did not go to zero, so the change is NOT shipped — altering core
+process re-parenting semantics on partial evidence is not worth it.
+
+State: the pipeline's unreliability is a genuine vfork-semantics
+divergence (run-195: our vfork child can fork and exit where Linux's
+execs in place, so the pipeline's cat becomes a grandchild). The
+principled fix remains option 1 — make ia32 vfork a true vfork — and
+it needs a careful implementation (the child must never return, and
+the shared stack must be respected) plus a dedicated test binary.
+
+Everything else in the i386 chain is green and audited; plain
+commands and redirects through the shell are reliable.
