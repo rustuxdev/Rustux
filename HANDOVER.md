@@ -5606,3 +5606,23 @@ Design for the real installer (d-i class), in dependency order:
 Order matters: 1 and 2 are kernel/tooling and testable headlessly;
 3 is the first step that changes what boots; 4 is UI; 5 is a build
 invariant to re-verify after 3.
+
+## run-223 — the installer owns the partition table (MBR writer)
+
+livemenu gains write_mbr(sd, sectors, type): a 512-byte sector with one
+partition entry at 446, LBA-only CHS markers (0xFE 0xFF 0xFF), start 0
+and the count from the image size, sig 55AA. install() calls it after
+the copy verifies. Today the layout matches the image (FAT16 at LBA 0,
+whole disk), so nothing that boots changed — but the partition table is
+now OURS, which is the hook the layout choice needs.
+
+Verified on a real q35+SATA install:
+
+    install: verify first sector: ok
+    install: partition table written (1 x FAT16, 98304 sectors)
+    disk 446: 80 00 01 00 | 06 | fe ff ff | 00000000 | 00800100
+
+NEXT (from run-222): give write_mbr a start LBA and a size, then write
+the image at an offset (ESP at 1 MiB) and confirm the installed disk
+still boots by booting the written image as a disk in QEMU. Then GPT,
+then ext2 root.

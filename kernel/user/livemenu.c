@@ -276,6 +276,31 @@ static int copy_image(int img, int sd, off_t n)
     return 0;
 }
 
+// Write an MBR describing one partition. Today the layout matches the
+// image (FAT at LBA 0 covering the disk), so nothing that boots
+// changes — but the installer now OWNS the partition table, which is
+// the hook the layout choice will use (ESP at 1 MiB, root after it).
+static int write_mbr(int sd, unsigned long long sectors, unsigned char type)
+{
+    unsigned char mbr[512];
+    memset(mbr, 0, sizeof mbr);
+    unsigned char *e = mbr + 446;
+    e[0] = 0x80;              // bootable
+    e[1] = 0x00; e[2] = 0x01; e[3] = 0x00;   // CHS start (unused)
+    e[4] = type;              // 0x06 FAT16, 0x0c FAT32 LBA, 0xef EFI
+    e[5] = 0xfe; e[6] = 0xff; e[7] = 0xff;   // CHS end: LBA-only marker
+    unsigned int start = 0;   // LBA start
+    for (int i = 0; i < 4; i++)
+        e[8 + i] = (unsigned char)((start >> (8 * i)) & 0xff);
+    for (int i = 0; i < 4; i++)
+        e[12 + i] = (unsigned char)((sectors >> (8 * i)) & 0xff);
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    if (lseek(sd, 0, SEEK_SET) < 0)
+        return -1;
+    return write(sd, mbr, 512) == 512 ? 0 : -1;
+}
+
 static void install(const char *path)
 {
     int img = open(IMG_PATH, O_RDONLY);
@@ -323,6 +348,15 @@ static void install(const char *path)
     fflush(stdout);
     printf("install: verify first sector: %s\n", same ? "ok" : "MISMATCH");
     fflush(stdout);
+    if (same) {
+        unsigned long long secs = (unsigned long long)(st.st_size / 512);
+        if (write_mbr(sd, secs, 0x06) == 0)
+            printf("install: partition table written (1 x FAT16, %llu sectors)\n",
+                   secs);
+        else
+            printf("install: partition table write failed: %s\n", strerror(errno));
+        fflush(stdout);
+    }
     close(img);
     close(sd);
     if (!same) {
