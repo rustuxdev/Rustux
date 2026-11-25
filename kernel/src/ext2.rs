@@ -330,3 +330,48 @@ pub fn lookup(io: &dyn BlockIo, sb: &Super, dir_ino: u32, name: &[u8]) -> Option
     })?;
     found
 }
+
+/// A real disk as a `BlockIo`: sector-granular reads bounced through a
+/// 512-byte buffer, over whichever transport actually has the disk
+/// (legacy PIIX or AHCI). Both underlying paths are already verified —
+/// this is an adapter, not new I/O.
+pub struct DiskIo {
+    pub disk: usize,
+}
+
+impl BlockIo for DiskIo {
+    fn len(&self) -> u64 {
+        let p = crate::ata::capacity_d(self.disk);
+        if p > 0 {
+            p
+        } else {
+            crate::ahci::disk_capacity(self.disk)
+        }
+    }
+
+    fn read(&self, off: u64, buf: &mut [u8]) -> bool {
+        let total = self.len();
+        if off >= total || off + buf.len() as u64 > total {
+            return false;
+        }
+        let mut done = 0usize;
+        let mut sec = [0u8; 512];
+        while done < buf.len() {
+            let pos = off + done as u64;
+            let lba = pos / 512;
+            let insec = (pos % 512) as usize;
+            let ok = if crate::ata::sectors_d(self.disk) > 0 {
+                crate::ata::read_d(lba as u32, &mut sec, self.disk)
+            } else {
+                crate::ahci::read_range(self.disk, lba, 1, &mut sec)
+            };
+            if !ok {
+                return false;
+            }
+            let take = (512 - insec).min(buf.len() - done);
+            buf[done..done + take].copy_from_slice(&sec[insec..insec + take]);
+            done += take;
+        }
+        true
+    }
+}

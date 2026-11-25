@@ -1134,6 +1134,16 @@ pub(crate) fn rustux_main(
     if n_ahci > 0 {
         kprintln!(con, "rustux: ahci: {n_ahci} disk(s)");
     }
+    // DiskIo: the adapter that reads REAL sectors (placed after the
+    // disk probes so a disk is known). The boot disk is FAT, so ext2
+    // must refuse it cleanly — proving the adapter reads and that the
+    // parser rejects non-ext2 data instead of misparsing it.
+    if ata::sectors() > 0 || ahci::disks() > 0 {
+        let dio = ext2::DiskIo { disk: 0 };
+        let refused_disk = ext2::parse_super(&dio).is_none();
+        kprintln!(con, "rustux: ext2: disk adapter len>0 {} refuses non-ext2 {refused_disk}",
+                  ext2::BlockIo::len(&dio) > 0);
+    }
     let e1000_dev = e1000::probe(bar_is_mmio);
     if let Some((e_base, e_mac)) = e1000_dev {
         let tx_ok = e1000::tx_selftest(e_base, e_mac);

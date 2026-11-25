@@ -5807,3 +5807,21 @@ over-read waiting for a filesystem with large blocks.
 NEXT: DiskIo over ahci::read_range / ata::read_d (sector-granular
 adapter, 512-byte bounce), then mount partition 2 at boot, then the
 root switch.
+
+## run-232 — ext2 DiskIo: the driver reads real disks
+
+DiskIo implements BlockIo over whichever transport has the disk
+(ata::capacity_d/read_d for PIIX, ahci::disk_capacity/read_range for
+AHCI), bouncing through a 512-byte buffer and bounding every request
+by the device capacity before a sector is issued.
+
+Boot log:
+  rustux: ext2: disk adapter len>0 true refuses non-ext2 true
+
+That proves two things at once: the adapter reads REAL sectors off the
+AHCI boot disk (len > 0), and ext2 correctly REFUSES a FAT filesystem
+instead of misparsing it. Suite PASS exit 33, 75 tasks, zero leak.
+
+So the whole ext2 read path now works over a device. NEXT: mount
+partition 2 at boot (DiskIo{d}] + parse/validate + walk), then the root
+switch, then mkfs.ext4 + population in userspace, then the layout UI.
