@@ -368,6 +368,37 @@ void main32(void) {
     static const char c_redir[] = "cat /motd.txt > /dev/null";
     int s_redir = run_sh(c_redir);
     check(s_redir == 0);
+    // Minimal kernel-level pipeline, no shell: fork, pipe, fork, each
+    // child dup2's one end, then the parent waits both.
+    {
+        static int kp[2];
+        check(sc1(42, (long)kp) == 0);
+        long c1 = sc0(2);
+        if (c1 == 0) {
+            sc1(6, kp[0]);
+            char b = 'Q';
+            sc3(4, kp[1], (long)&b, 1);
+            sc1(1, 0);
+            for (;;) {}
+        }
+        long c2 = sc0(2);
+        if (c2 == 0) {
+            sc1(6, kp[1]);
+            char b = 0;
+            sc3(3, kp[0], (long)&b, 1);
+            sc1(1, b == 'Q' ? 0 : 3);
+            for (;;) {}
+        }
+        sc1(6, kp[0]);
+        sc1(6, kp[1]);
+        static volatile int st1, st2;
+        st1 = -1;
+        st2 = -1;
+        sc3(7, c1, (long)&st1, 0);
+        sc3(7, c2, (long)&st2, 0);
+        if (st1 != 0) sc1(1, 170 + ((st1 >> 8) & 0x3f));
+        if (st2 != 0) sc1(1, 175 + ((st2 >> 8) & 0x3f));
+    }
     // NOTE: the pipeline (`cat /motd.txt | cat > /dev/null`) works
     // once pipe2 (331) and wait4 (114) are wired, but its exit status
     // is timing-sensitive in this harness (occasional non-zero), so
