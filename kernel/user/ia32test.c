@@ -399,6 +399,31 @@ void main32(void) {
         if (st1 != 0) sc1(1, 170 + ((st1 >> 8) & 0x3f));
         if (st2 != 0) sc1(1, 175 + ((st2 >> 8) & 0x3f));
     }
+    // The shells' actual pattern: the child dup2's the pipe write end
+    // onto fd 1 and writes there.
+    {
+        static int dp[2];
+        check(sc1(42, (long)dp) == 0);
+        long c = sc0(2);
+        if (c == 0) {
+            sc3(63, dp[1], 1, 0); // dup2(dp[1], 1)
+            sc1(6, dp[0]);
+            sc1(6, dp[1]);
+            char b = 'R';
+            sc3(4, 1, (long)&b, 1);
+            sc1(1, 0);
+            for (;;) {}
+        }
+        sc1(6, dp[1]);
+        char rb = 0;
+        if (sc3(3, dp[0], (long)&rb, 1) != 1) sc1(1, 180);
+        if (rb != 'R') sc1(1, 181 + (rb & 0x3f));
+        sc1(6, dp[0]);
+        static volatile int dst;
+        dst = -1;
+        sc3(7, c, (long)&dst, 0);
+        if (dst != 0) sc1(1, 185 + ((dst >> 8) & 0x3f));
+    }
     // NOTE: the pipeline (`cat /motd.txt | cat > /dev/null`) works
     // once pipe2 (331) and wait4 (114) are wired, but its exit status
     // is timing-sensitive in this harness (occasional non-zero), so
