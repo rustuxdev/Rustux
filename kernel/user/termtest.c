@@ -98,9 +98,12 @@ int main(void) {
     errno = 0;
     check(ioctl(9999, FIONREAD, &n) < 0 && errno == EBADF,
           "ioctl bad fd -> EBADF");
-    errno = 0;
-    check(ioctl(0, FIONBIO, &n) < 0 && errno == EINVAL,
-          "FIONBIO -> EINVAL");
+    /* FIONBIO is generic O_NONBLOCK — Linux accepts it on any fd,
+       tty included. Set then clear so the reads below stay blocking. */
+    n = 1;
+    check(ioctl(0, FIONBIO, &n) == 0, "FIONBIO set nonblock -> 0");
+    n = 0;
+    check(ioctl(0, FIONBIO, &n) == 0, "FIONBIO clear -> blocking");
 
     /* Terminal-reply round-trip: write \e[6n to the console, the
        fbcon CSI parser injects "\e[<r>;<c>R" into stdin like a real

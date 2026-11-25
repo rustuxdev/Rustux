@@ -644,6 +644,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
     };
     // Signals deliver on the way back to user mode — a handler
     // redirects this ctx; a default-fatal signal never returns.
+    user::deliver_current(ctx);
 }
 
 /// int 0x80 — the ia32 compat syscall table. nr in eax, args
