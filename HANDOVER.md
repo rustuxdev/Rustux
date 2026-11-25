@@ -5568,3 +5568,41 @@ Suite PASS exit 33, 75 tasks, frames 213323 -> 213323 zero leak.
 
 NEXT: partitioning (MBR/GPT), mkfs, and the ESP boot entry — the block
 layer is now proven on both transports for both directions.
+
+## run-222 — partitioning: what exists today, and the design to build
+
+Fact check on the installed image (hd.img / target.img):
+
+    offset 446: 80 00 01 00 | 06 | 0f 3f 61 | 00000000 | e0810100
+                bootable      FAT16          LBA 0      98784 sectors
+    offset 510: 55 aa
+
+So the disk IS partitioned: an MBR with ONE FAT16 partition starting
+at LBA 0 and covering the whole disk (a "partition at LBA 0" layout
+that UEFI boots fine because the ESP is the whole partition). What
+does not exist is any CHOICE — the layout is baked into the image, so
+the installer cannot offer partitioning, filesystem choice, or
+multiple OSes. That is the gap the user called out.
+
+Design for the real installer (d-i class), in dependency order:
+
+1. GPT writer (kernel): protective MBR at LBA 0, GPT header at LBA 1,
+   partition entries at LBA 2..33, backup at the disk's end. Needs
+   CRC32 over the header and the entry array. Add MBR writer too
+   (4 primary entries at 446, CHS "0xFE 0xFF 0xFF" for LBA-only).
+2. mkfs: FAT for the ESP (busybox mkfs.vfat exists and is already in
+   the initrd); ext2 for root (busybox applet or a small in-kernel
+   formatter — decide by checking the busybox applet list).
+3. Layout: ESP 100-512 MiB at the start, root for the remainder.
+   Copy the kernel + initrd to the ESP as \EFI\BOOT\BOOTX64.EFI +
+   \initrd.cpio (that is all UEFI needs — no GRUB on the target).
+4. Installer UI: disk picker (done), then layout choice, then
+   confirmation showing exactly what will be destroyed.
+5. Installed-boot detection: the installed initrd must NOT carry
+   hd.img; INITRD_LIVE already satisfies that, so booting the
+   installed disk skips the menu today — keep that property when the
+   root moves to a real filesystem.
+
+Order matters: 1 and 2 are kernel/tooling and testable headlessly;
+3 is the first step that changes what boots; 4 is UI; 5 is a build
+invariant to re-verify after 3.
