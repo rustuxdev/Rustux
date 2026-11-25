@@ -5626,3 +5626,24 @@ NEXT (from run-222): give write_mbr a start LBA and a size, then write
 the image at an offset (ESP at 1 MiB) and confirm the installed disk
 still boots by booting the written image as a disk in QEMU. Then GPT,
 then ext2 root.
+
+## run-224 — partitioned layout does not boot yet (reverted)
+
+Tried the conventional ESP placement: image copied into partition 1 at
+LBA 2048, MBR entry start 0x800, type 0xEF. The install itself
+succeeds and verifies (`verify first sector: ok`, `partition table
+written (ESP type 0xef at LBA 2048, 98304 sectors)`, offset 446 =
+80 00 01 00 ef fe ff ff 00 08 00 00 00 80 01 00, and the FAT boot
+sector sits at offset 1 MiB).
+
+BUT booting that disk produces an EMPTY serial log — the kernel never
+runs, so the firmware did not find \EFI\BOOT\BOOTX64.EFI. Cause:
+hd.img is a filesystem image built by mkfs.fat to sit at LBA 0
+(hidden-sectors 0), not a partition VBR. Reverted PART_LBA to 0 so the
+installer keeps producing a disk that boots today.
+
+To land a partitioned layout, the image must be built for it:
+  mformat -i img -H <hidden-sectors=PART_LBA> ... (or build the FAT
+  inside the partition with mkfs.fat on an offset loopback), and the
+  partition type set to 0xEF, then re-test the boot. That is a
+  Makefile + tooling change, not an installer one.

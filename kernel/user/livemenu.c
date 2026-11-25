@@ -280,7 +280,7 @@ static int copy_image(int img, int sd, off_t n)
 // image (FAT at LBA 0 covering the disk), so nothing that boots
 // changes — but the installer now OWNS the partition table, which is
 // the hook the layout choice will use (ESP at 1 MiB, root after it).
-static int write_mbr(int sd, unsigned long long sectors, unsigned char type)
+static int write_mbr(int sd, unsigned int start_lba, unsigned long long sectors, unsigned char type)
 {
     unsigned char mbr[512];
     memset(mbr, 0, sizeof mbr);
@@ -289,7 +289,7 @@ static int write_mbr(int sd, unsigned long long sectors, unsigned char type)
     e[1] = 0x00; e[2] = 0x01; e[3] = 0x00;   // CHS start (unused)
     e[4] = type;              // 0x06 FAT16, 0x0c FAT32 LBA, 0xef EFI
     e[5] = 0xfe; e[6] = 0xff; e[7] = 0xff;   // CHS end: LBA-only marker
-    unsigned int start = 0;   // LBA start
+    unsigned int start = start_lba;
     for (int i = 0; i < 4; i++)
         e[8 + i] = (unsigned char)((start >> (8 * i)) & 0xff);
     for (int i = 0; i < 4; i++)
@@ -323,7 +323,15 @@ static void install(const char *path)
     printf("install: writing %lld MiB image to %s ...\n",
            (long long)(st.st_size >> 20), path);
     fflush(stdout);
-    if (lseek(sd, 0, SEEK_SET) < 0 || copy_image(img, sd, st.st_size) < 0) {
+    // The image is a FILESYSTEM image (mkfs.fat made it to sit at
+    // LBA 0 with hidden-sectors 0), not a partition VBR. Copying it
+    // into a partition at LBA 2048 produced a disk that does NOT
+    // boot (the firmware found no BOOTX64.EFI), so the copy stays at
+    // LBA 0 and the table describes that. A partitioned layout needs
+    // an image built for a partition offset first — see HANDOVER.
+    const unsigned int PART_LBA = 0;
+    if (lseek(sd, (off_t)PART_LBA * 512, SEEK_SET) < 0
+        || copy_image(img, sd, st.st_size) < 0) {
         close(img);
         close(sd);
         return;
@@ -332,7 +340,7 @@ static void install(const char *path)
     char a[512], b[512];
     memset(a, 0xaa, sizeof a);
     memset(b, 0xbb, sizeof b);
-    long l1 = lseek(sd, 0, SEEK_SET);
+    long l1 = lseek(sd, (off_t)PART_LBA * 512, SEEK_SET);
     long r1 = read(sd, a, 512);
     long l2 = lseek(img, 0, SEEK_SET);
     long r2 = read(img, b, 512);
@@ -350,9 +358,9 @@ static void install(const char *path)
     fflush(stdout);
     if (same) {
         unsigned long long secs = (unsigned long long)(st.st_size / 512);
-        if (write_mbr(sd, secs, 0x06) == 0)
-            printf("install: partition table written (1 x FAT16, %llu sectors)\n",
-                   secs);
+        if (write_mbr(sd, PART_LBA, secs, 0xef) == 0)
+            printf("install: partition table written (ESP type 0xef at LBA %u, %llu sectors)\n",
+                   PART_LBA, secs);
         else
             printf("install: partition table write failed: %s\n", strerror(errno));
         fflush(stdout);
