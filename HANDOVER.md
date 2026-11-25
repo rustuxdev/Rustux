@@ -6677,3 +6677,31 @@ Known gaps: the manifest is unsigned — it catches read corruption,
 not malicious media; methods/http still #PFs at the 1MiB stack guard
 when run manually (cr2=0x5555ffffff70); pid 1's /proc/self/exe -> /sh
 broken link persists (only affects applet self-exec, now moot).
+
+## run-261b — initrd.crc sidecar: load-time verify + one retry
+
+Follow-up to the integrity net: the archive now carries its expected
+zlib crc32 as `initrd.crc` next to `initrd.cpio` on every ESP that
+boots through load_initrd (hd.img's ESP for installed/live boots,
+esp-iso.img for the installer ISO). load_initrd reads the sidecar,
+crcs the archive as loaded, and on a mismatch re-opens the file and
+re-reads the whole archive once before declaring it Bad — a
+transient sector drop (the 35x2048B hole observed inside
+libapt-pkg.so) now self-heals at boot instead of shipping a hole to
+the installer verify. Boot log prints one of: `initrd crc32 = X
+(verified vs initrd.crc)` / `initrd CORRUPT — crc X != initrd.crc Y
+(still bad after re-read)` / nothing (older media, no sidecar). This
+also nails the (a)-vs-(b) question for any future corruption: a Bad
+at t=0 means firmware/load; an Ok at t=0 with a later installer
+verify failure means mid-session RAM scribble.
+
+Verified: ISO boot prints `verified vs initrd.crc` and the at-use
+recompute agrees; make run unaffected (suite boot has no sidecar —
+NoSidecar path is silent).
+
+Audit addendum: sidecar parse bounded (32B buf, utf8+hex parse,
+from_str_radix); retry re-reads into the same bounded MAX_INITRD
+buffer via the same read_all closure; a corrupt .crc read degrades
+to NoSidecar, never a false Bad. The sidecar is a build-time
+integrity tag, not a signature — it defends against read errors, not
+malicious media. No findings.
