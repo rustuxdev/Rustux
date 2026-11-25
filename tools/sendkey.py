@@ -42,7 +42,8 @@ def main() -> int:
     for item in sys.argv[2:]:
         keys = [item]
         if item.startswith("str:"):
-            keys = [CHARKEY.get(c, c) for c in item[4:]]
+            keys = [CHARKEY.get(c, "shift-" + c.lower() if c.isupper() else c)
+                    for c in item[4:]]
         for key in keys:
             s.sendall(f"sendkey {key}\n".encode())
             time.sleep(0.06)

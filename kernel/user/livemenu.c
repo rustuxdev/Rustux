@@ -332,6 +332,83 @@ static int mke2_sink(void *ctx, uint64_t off, const void *buf, uint32_t len)
     return write(fd, buf, len) == (ssize_t)len ? 0 : 1;
 }
 
+// zlib-compatible crc32 (reflected poly 0xEDB88320) — must match the
+// manifest mkinitrd emits (zlib.crc32) and the kernel's crc32_le.
+static uint32_t crc32_tab[256];
+static int crc32_ready;
+static uint32_t rx_crc32(uint32_t crc, const void *data, size_t len)
+{
+    if (!crc32_ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++)
+                c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            crc32_tab[i] = c;
+        }
+        crc32_ready = 1;
+    }
+    crc = ~crc;
+    const unsigned char *p = data;
+    while (len--)
+        crc = crc32_tab[(crc ^ *p++) & 0xff] ^ (crc >> 8);
+    return ~crc;
+}
+
+// rustux.manifest holds "name crc32" for every regular initrd member.
+// Re-reading each member and comparing is how a corrupted archive
+// aborts the install instead of writing a bricked disk — a firmware
+// read once dropped 35 CD sectors inside libapt-pkg.so, leaving a
+// 70 KiB zero hole that installed a silently-broken apt.
+static int verify_payload(const char *tag)
+{
+    static char mbuf[16384];
+    int mfd = open("/rustux.manifest", O_RDONLY);
+    if (mfd < 0) {
+        printf("install: %s verify: rustux.manifest missing\n", tag);
+        return -1;
+    }
+    ssize_t mn = read(mfd, mbuf, sizeof mbuf - 1);
+    close(mfd);
+    if (mn <= 0) {
+        printf("install: %s verify: empty manifest\n", tag);
+        return -1;
+    }
+    mbuf[mn] = 0;
+    int files = 0, bad = 0;
+    static char fbuf[65536];
+    char *p = mbuf;
+    while (*p) {
+        char *sp = strchr(p, ' ');
+        char *nl = sp ? strchr(sp, '\n') : NULL;
+        if (!sp || !nl)
+            break;
+        *sp = 0;
+        *nl = 0;
+        char path[512];
+        snprintf(path, sizeof path, "/%s", p);
+        unsigned int want = (unsigned int)strtoul(sp + 1, NULL, 16);
+        int fd = open(path, O_RDONLY);
+        uint32_t got = 0;
+        if (fd >= 0) {
+            ssize_t r;
+            while ((r = read(fd, fbuf, sizeof fbuf)) > 0)
+                got = rx_crc32(got, fbuf, (size_t)r);
+            close(fd);
+        }
+        files++;
+        if (fd < 0 || got != want) {
+            bad++;
+            printf("install: %s CORRUPT %s (crc %08x want %08x)\n",
+                   tag, p, got, want);
+        }
+        p = nl + 1;
+    }
+    printf("install: %s payload verify: %d files, %d bad\n",
+           tag, files, bad);
+    fflush(stdout);
+    return bad;
+}
+
 static int write_mbr2(int sd, unsigned int esp_lba, unsigned long long esp_secs,
                       unsigned int root_lba, unsigned long long root_secs)
 {
@@ -464,6 +541,18 @@ static void install(const char *path)
         }
         printf("\n");
         fflush(stdout);
+    }
+    // The payload underlay is the initrd image in RAM — one demo boot
+    // lost 35 CD sectors of it to a firmware read gap, which then
+    // installed a silently-broken apt. Verify every member against
+    // mkinitrd's manifest before touching the disk.
+    if (verify_payload("pre") != 0) {
+        printf("install: ABORTED — initrd payload corrupt, nothing written.\n");
+        printf("install: reboot and retry; if it persists the ISO is bad.\n");
+        fflush(stdout);
+        close(img);
+        close(sd);
+        return;
     }
     printf("install: writing %lld MiB image to %s ...\n",
            (long long)(st.st_size >> 20), path);
@@ -784,7 +873,7 @@ static void install(const char *path)
                 // instead of another copy of the file. Target must be
                 // an earlier PAYLOAD entry.
                 static const char *const ALIASES[][2] = {
-                    { "bin/sh", "bin/busybox" },
+                    { "bin/sh", "bin/dash" },
                     { "bin/ash", "bin/busybox" },
                     { "bin/ls", "bin/busybox" },
                     { "bin/cat", "bin/busybox" },
@@ -836,6 +925,32 @@ static void install(const char *path)
                     { "bin/whoami", "bin/busybox" },
                     { "bin/gzip", "bin/busybox" },
                     { "bin/gunzip", "bin/busybox" },
+                    // What Debian maintainer scripts actually exec —
+                    // perl-base's dpkg-maintscript-helper calls
+                    // basename; debconf wants mktemp; shebangs want
+                    // /usr/bin/env. All busybox applets.
+                    { "bin/basename", "bin/busybox" },
+                    { "bin/dirname", "bin/busybox" },
+                    { "bin/mktemp", "bin/busybox" },
+                    { "bin/readlink", "bin/busybox" },
+                    { "bin/cmp", "bin/busybox" },
+                    { "bin/cut", "bin/busybox" },
+                    { "bin/stat", "bin/busybox" },
+                    { "bin/seq", "bin/busybox" },
+                    { "bin/true", "bin/busybox" },
+                    { "bin/false", "bin/busybox" },
+                    { "bin/zcat", "bin/busybox" },
+                    { "bin/tee", "bin/busybox" },
+                    { "bin/uniq", "bin/busybox" },
+                    { "bin/printf", "bin/busybox" },
+                    { "usr/bin/env", "bin/busybox" },
+                    { "usr/bin/awk", "bin/busybox" },
+                    { "usr/bin/realpath", "bin/busybox" },
+                    { "usr/bin/getopt", "bin/busybox" },
+                    { "usr/bin/flock", "bin/busybox" },
+                    { "usr/bin/run-parts", "bin/busybox" },
+                    { "usr/bin/sha1sum", "bin/busybox" },
+                    { "usr/bin/sha256sum", "bin/busybox" },
                     { "usr/bin/id", "bin/busybox" },
                     { "usr/bin/logname", "bin/busybox" },
                     { "usr/bin/groups", "bin/busybox" },
@@ -888,6 +1003,13 @@ static void install(const char *path)
                                      blocks, files, nf);
                 if (fr == 0) {
                     printf("install: ext2 root formatted\n");
+                    // The archive could also be scribbled mid-format —
+                    // a second pass catches it before the MBR makes
+                    // the bricked root bootable.
+                    if (verify_payload("post") != 0) {
+                        printf("install: payload corrupted during format — not writing boot table\n");
+                        root_secs = 0;
+                    }
                 } else {
                     printf("install: ext2 format FAILED code=%d\n", fr);
                     root_secs = 0;

@@ -6,6 +6,7 @@
 import gzip
 import os
 import sys
+import zlib
 
 # A .gz source is decompressed into the archive; used for PE binaries
 # that host AV quarantines on sight (e.g. winheap.exe.gz -> "winheap").
@@ -24,6 +25,7 @@ def entry(name, data, ino, mode=0o100644):
 
 out = b""
 ino = 1
+manifest = []
 for path, arc in zip(sys.argv[1::2], sys.argv[2::2]):
     # A "link:<target>" source emits a symlink entry — multicall
     # binaries (busybox) get their applet names without duplicating
@@ -41,5 +43,12 @@ for path, arc in zip(sys.argv[1::2], sys.argv[2::2]):
         mode |= 0o111
     out += entry(arc, data, ino, 0o100000 | mode)
     ino += 1
+    manifest.append("%s %08x\n" % (arc, zlib.crc32(data)))
+# rustux.manifest: "name crc32" per regular member — the installer
+# re-reads every member and refuses to write a disk built from a
+# corrupted initrd (a dropped firmware read once left a 70KiB zero
+# hole inside libapt-pkg.so mid-archive).
+out += entry("rustux.manifest", "".join(manifest).encode(), ino)
+ino += 1
 out += entry("TRAILER!!!", b"", ino)
 sys.stdout.buffer.write(out)

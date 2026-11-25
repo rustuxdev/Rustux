@@ -379,7 +379,8 @@ ISOROOT     := isoroot
 LIVE_PAIRS := \
 	kernel/user/livemenu.elf livemenu \
 	kernel/user/busybox bin/busybox \
-	link:/bin/busybox bin/sh \
+	kernel/user/dash bin/sh \
+	kernel/user/dash bin/dash \
 	link:/bin/busybox bin/ash \
 	link:/bin/busybox bin/ls \
 	link:/bin/busybox bin/cat \
@@ -429,6 +430,30 @@ LIVE_PAIRS := \
 	link:/bin/busybox bin/which \
 	link:/bin/busybox bin/dmesg \
 	link:/bin/busybox bin/whoami \
+	link:/bin/busybox bin/gzip \
+	link:/bin/busybox bin/gunzip \
+	link:/bin/busybox bin/basename \
+	link:/bin/busybox bin/dirname \
+	link:/bin/busybox bin/mktemp \
+	link:/bin/busybox bin/readlink \
+	link:/bin/busybox bin/cmp \
+	link:/bin/busybox bin/cut \
+	link:/bin/busybox bin/stat \
+	link:/bin/busybox bin/seq \
+	link:/bin/busybox bin/true \
+	link:/bin/busybox bin/false \
+	link:/bin/busybox bin/zcat \
+	link:/bin/busybox bin/tee \
+	link:/bin/busybox bin/uniq \
+	link:/bin/busybox bin/printf \
+	link:/bin/busybox usr/bin/env \
+	link:/bin/busybox usr/bin/awk \
+	link:/bin/busybox usr/bin/realpath \
+	link:/bin/busybox usr/bin/getopt \
+	link:/bin/busybox usr/bin/flock \
+	link:/bin/busybox usr/bin/run-parts \
+	link:/bin/busybox usr/bin/sha1sum \
+	link:/bin/busybox usr/bin/sha256sum \
 	link:/bin/busybox usr/bin/id \
 	link:/bin/busybox usr/bin/logname \
 	link:/bin/busybox usr/bin/groups \
@@ -519,6 +544,7 @@ kernel/user/livemenu.elf: kernel/user/livemenu.c kernel/user/mke2.c
 	gcc -static-pie -O2 -o $@ $< -lcrypt
 
 LIVE_DEPS := kernel/user/livemenu.elf kernel/user/busybox kernel/user/bash \
+	kernel/user/dash \
 	$(addprefix kernel/user/etc/,passwd shadow group securetty) \
 	kernel/user/htop kernel/user/libncursesw.so.6 kernel/user/libm.so.6 \
 	kernel/user/libnl-3.so.200 kernel/user/libnl-genl-3.so.200 \
@@ -627,12 +653,20 @@ run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 	ok=0; \
 	for i in $$(seq 1 12); do \
 		sleep 15; \
-		grep -q "/ #" isoph.log && { ok=1; break; }; \
+		python3 tools/sendkey.py isomon.sock ret "str:echo _RXOK" ret; \
+		sleep 3; \
+		grep -q "_RXOK" isoph.log && { ok=1; break; }; \
 		python3 tools/sendkey.py isomon.sock 1 ret; \
 	done; \
-	grep -q "/ #" isoph.log \
+	grep -q "_RXOK" isoph.log \
 		&& echo "installed boot + live shell: PASS" \
 		|| { echo "installed boot: FAIL"; tail -20 isoph.log; kill $$qpid; exit 1; }; \
+	python3 tools/sendkey.py isomon.sock "str:sh -c 'dpkg --version | head -1'" ret; \
+	sleep 15; \
+	grep -q "usr/bin/dpkg exit(0)" isoph.log \
+		&& echo "installed sh-dpkg resolution: PASS" \
+		|| { echo "installed sh-dpkg resolution: FAIL"; grep -i "dpkg\|busybox\|exit(" isoph.log | tail -15; \
+		     echo quit | socat - UNIX-CONNECT:isomon.sock > /dev/null 2>&1 || kill $$qpid; exit 1; }; \
 	python3 tools/sendkey.py isomon.sock "str:apt update" ret; \
 	ok=0; \
 	for i in $$(seq 1 24); do \

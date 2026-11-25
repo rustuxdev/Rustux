@@ -1470,6 +1470,13 @@ pub(crate) fn rustux_main(
         // SAFETY: `arc` names LOADER_DATA pages that are never freed,
         // so a 'static slice over them is sound.
         user::set_initrd(unsafe { core::slice::from_raw_parts(arc.as_ptr(), arc.len()) });
+        // A firmware read can silently drop a sector run (observed:
+        // a 35x2048B hole inside libapt-pkg.so on one boot). Stamp the
+        // archive's crc at load time so a later install-time verify
+        // failure can be told apart from a mid-session RAM scribble.
+        // zlib convention (!seed, !result) — matches mkinitrd's
+        // zlib.crc32 manifest and livemenu's verify.
+        kprintln!(con, "rustux: initrd crc32 = {:#x}", !klib::crc::crc32_le(!0, arc));
     }
     let root_exe = unsafe { *core::ptr::addr_of!(ROOT_EXE) };
     if let Some((p, n)) = root_exe {
