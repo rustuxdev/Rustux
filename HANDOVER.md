@@ -6818,3 +6818,49 @@ needs_validation: tcp_retx slot-reuse mid-drain (defense added;
 cve-now checked this run: CVE-2026-23127 (perf mmap refcount UAF —
 class-match only, perf subsystem n/a); FIN_WAIT/socket-exhaustion
 class query returned no Linux CVE match.
+
+## run-264 — syscall-exit signal delivery restored (9c167cc regression), installed-boot auth + initrd robustness, run-iso 5/5 green
+
+Found while chasing the POC's noisy failures: pgtest had been failing
+6-10 checks nondeterministically for an unknown number of runs — the
+suite only gates on qemu exit 33 so it never blocked anything. Blame
+bisect (boots at a3721f4, f71544b, 73a2582 all red) + -L on the
+dispatch tail pinned it: ia32-pipe2 commit 9c167cc dropped
+`user::deliver_current(ctx)` from the x86_64 `handle_syscall` exit,
+so self-directed kill() signals pended until the next scheduler pick
+instead of delivering on the syscall's return — a race between the
+user-mode check read and tick-driven delivery. The i386 handle_int80
+path kept its call the whole time. Restored the one line; pgtest
+went 9-failures -> 0, and the wild #PF reports turned out to be
+pgtest's own intentional PROT_NONE guard-page SIGSEGV check working.
+
+termtest's `FIONBIO -> EINVAL` check was stale: run-262 made FIONBIO a
+generic OFD ioctl (Linux semantics — works on any fd). Check now
+asserts set+clear succeed on the tty fd.
+
+Installed-boot chain (landed with f955791, proven by run-iso 5/5):
+pid 1 is `livemenu` (absent hd.img -> run_login -> passwd/shadow auth
+-> bash), not a bare busybox sh — that was the auth regression;
+copy_root_dir mints real vdirs for ext2 dirs via new
+user::root_copy_dir (chmod/mkdir EROFS warnings gone);
+load_initrd logs each failure stage (initrd_fail polling-UART note)
+and retries open+read once — the warm-reboot "initrd: none found"
+that silently killed livemenu->login (root cause of the whole sh-
+fallback chain) now self-heals or at least names its stage. Makefile
+run-iso: login gate sends root/rustux correctly, apt install -y,
+install gate waits on `Setting up nano` not the stale apt-update
+exit(0) line (was false-PASSing).
+
+Verified: make run exit 33, 75 tasks, frames 211791 -> 211791 zero
+leak, every test 0 failures (was pgtest 9 + termtest 1). run-iso 5/5:
+iso install PASS, installed boot+live shell PASS (livemenu -> login ->
+bash), dpkg 1.22.6 PASS, apt update PASS, apt install -y nano PASS
+(`Setting up nano`, apt-get exit(0)); initrd verified vs initrd.crc
+on the warm reboot. Remaining flake: first-attempt apt install still
+once exit(127)'d before the gate retry — unroot-caused, recorded.
+
+Audit: scoped quick, security-audit skill, run-23 — diff is a
+restoration of the audited call site + test check; cve-now
+sigreturn/frame class checked (CVE-2017-1000255, CVE-2026-80560,
+CVE-2019-13648, CVE-2026-46063 — privileged-frame-state classes,
+inapplicable: UCtx carries user GPRs only). 0 findings.
