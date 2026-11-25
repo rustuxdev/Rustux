@@ -5067,3 +5067,17 @@ guards, so the remaining difference is shell-internal.
 
 Verified: 2 boots PASS exit 33, 75 tasks, frames X -> X zero leak,
 ia32test exit 0.
+
+## run-202 — ia32 rt_sigprocmask: accept both sigset sizes
+
+The shell-syscall trace (every negative return) showed the i386
+busybox shell calling rt_sigprocmask (175) with SIG_SETMASK and
+getting EINVAL: our compat shim required sigsetsize == 4, while this
+build passes 8. Only the low 32 bits are meaningful here, so the shim
+now accepts 4 or 8 instead of rejecting a legitimate caller.
+
+Also visible in the same trace (not fixed, known): the pipeline's
+wait4(-1) returning ECHILD, and prctl PR_GET_NAME (172) returning
+EINVAL — the latter is unimplemented and tolerated.
+
+Verified: PASS exit 33, 75 tasks, frames 213333 -> 213333 zero leak.

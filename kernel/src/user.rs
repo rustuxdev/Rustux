@@ -1155,7 +1155,11 @@ pub fn sigaction32(sig: u64, act: u64, oldact: u64) -> u64 {
 
 /// rt_sigprocmask for i386: a 4-byte sigset.
 pub fn rt_sigprocmask32(how: u64, set: u64, old: u64, sigsetsize: u64) -> u64 {
-    if sigsetsize != 4 {
+    // i386 glibc passes 4 (32 signals / 8); some builds pass 8. Only
+    // the low 32 bits are meaningful here, so accept both rather than
+    // EINVAL a legitimate caller (observed: the i386 busybox shell
+    // calling rt_sigprocmask(SIG_SETMASK) and getting EINVAL).
+    if sigsetsize != 4 && sigsetsize != 8 {
         return EINVAL;
     }
     let Some(t) = cur_mut() else { return ENOENT };
