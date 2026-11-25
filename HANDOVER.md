@@ -5041,3 +5041,29 @@ their own pipe-capacity assumptions. That is where the next session
 should look — ideally by tracing the shell's syscalls again with the
 correlation-safe user_out method and watching for an unexpected
 error return right after the dup2/exec pair.
+
+## run-201 — ia32 ugetrlimit: wrong argument (real bug, fixed)
+
+Traced EVERY failing syscall the i386 shell makes during a pipeline
+(flag any negative return, printed via user_out so nothing is
+dropped). It surfaced:
+
+    F: nr=191 a1=0x3 a2=0x7ffefe64 ret=-14
+
+nr 191 is ugetrlimit and the i386 form is
+`ugetrlimit(resource, rlim)` — two arguments. The arm passed only a1
+(the RESOURCE number) to the writer, so the destination pointer was
+literally 3 and range_ok_w rejected it: every getrlimit probe
+returned EFAULT. Fixed to `user::sys_ugetrlimit(a2)`; the writer is
+unchanged and still gates range_ok_w(rlim, 8).
+
+Also seen in the same trace and benign: nr 172 (prctl) with a1=0x10
+(PR_GET_NAME) returns EINVAL — unimplemented, ash tolerates it.
+
+The two-external shell pipeline still fails 4/5 after the fix, so
+this was a real ABI bug but not the pipeline blocker. Every kernel
+primitive a pipeline needs is now covered by the run-198/199/200
+guards, so the remaining difference is shell-internal.
+
+Verified: 2 boots PASS exit 33, 75 tasks, frames X -> X zero leak,
+ia32test exit 0.
