@@ -229,10 +229,20 @@ fn main() -> Status {
     // legal — \initrd.cpio sits next to BOOTX64.EFI. The pages come
     // back as LOADER_DATA, which our buddy deliberately does not
     // claim, so the buffer survives EBS under the identity map.
-    let initrd = load_initrd();
+    let (initrd, initrd_verify) = load_initrd();
     match initrd {
         Some((a, l)) => kprintln!(con, "rustux: initrd: {l}B at {a:#x}"),
         None => kprintln!(con, "rustux: initrd: none found"),
+    }
+    match initrd_verify {
+        InitrdVerify::NoSidecar => {}
+        InitrdVerify::Ok(c) => {
+            kprintln!(con, "rustux: initrd crc32 = {c:#x} (verified vs initrd.crc)")
+        }
+        InitrdVerify::Bad { want, got } => kprintln!(
+            con,
+            "rustux: initrd CORRUPT — crc {got:#x} != initrd.crc {want:#x} (still bad after re-read)"
+        ),
     }
 
     // The loaded image keeps its identity PTEs under every cr3 —
@@ -1554,7 +1564,18 @@ pub(crate) fn rustux_main(
 /// ignores that type, so the buffer survives EBS identity-mapped) and
 /// read the file into them. Returns (phys_addr, len) or None.
 #[cfg(target_os = "uefi")]
-fn load_initrd() -> Option<(u64, usize)> {
+/// Outcome of the initrd crc32 sidecar check — lets the caller log
+/// whether the archive verified, had no sidecar, or stayed corrupt
+/// after a re-read (a transient firmware drop once zeroed 35 CD
+/// sectors inside libapt-pkg.so, silently bricking apt).
+#[derive(Clone, Copy)]
+enum InitrdVerify {
+    NoSidecar,
+    Ok(u32),
+    Bad { want: u32, got: u32 },
+}
+
+fn load_initrd() -> (Option<(u64, usize)>, InitrdVerify) {
     use uefi::proto::media::file::{File, FileAttribute, FileMode, RegularFile};
 
     /// Largest initrd we accept — a guard against a corrupt ESP
@@ -1565,8 +1586,14 @@ fn load_initrd() -> Option<(u64, usize)> {
     const MAX_INITRD: usize = 128 << 20;
 
     let mut sfs =
-        uefi::boot::get_image_file_system(uefi::boot::image_handle()).ok()?;
-    let mut root = sfs.open_volume().ok()?;
+        match uefi::boot::get_image_file_system(uefi::boot::image_handle()) {
+            Ok(s) => s,
+            Err(_) => return (None, InitrdVerify::NoSidecar),
+        };
+    let mut root = match sfs.open_volume() {
+        Ok(r) => r,
+        Err(_) => return (None, InitrdVerify::NoSidecar),
+    };
     // The initrd sits next to the loaded image on whatever filesystem
     // firmware mounted: a FAT ESP keeps `initrd.cpio` verbatim, but a
     // bare ISO9660 view truncates to the 8.3 `INITRD.CPI`.
@@ -1576,35 +1603,84 @@ fn load_initrd() -> Option<(u64, usize)> {
         uefi::cstr16!("initrd.cpi"),
         uefi::cstr16!("INITRD.CPI"),
     ];
-    let mut f = None;
-    for n in &names {
-        if let Ok(h) = root.open(n, FileMode::Read, FileAttribute::empty()) {
-            // SAFETY: we just opened it as a plain file.
-            f = Some(unsafe { RegularFile::new(h) });
-            break;
+    let crc_names = [
+        uefi::cstr16!("initrd.crc"),
+        uefi::cstr16!("INITRD.CRC"),
+    ];
+    let mut open_named = |names: &[&uefi::CStr16]| -> Option<RegularFile> {
+        for n in names {
+            if let Ok(h) = root.open(n, FileMode::Read, FileAttribute::empty()) {
+                // SAFETY: we just opened it as a plain file.
+                return Some(unsafe { RegularFile::new(h) });
+            }
         }
-    }
-    let mut f = f?;
+        None
+    };
+    let mut f = match open_named(&names) {
+        Some(f) => f,
+        None => return (None, InitrdVerify::NoSidecar),
+    };
     let pages = MAX_INITRD / 4096;
-    let base = uefi::boot::allocate_pages(
+    let base = match uefi::boot::allocate_pages(
         uefi::boot::AllocateType::AnyPages,
         MemoryType::LOADER_DATA,
         pages,
-    )
-    .ok()?;
+    ) {
+        Ok(b) => b,
+        Err(_) => return (None, InitrdVerify::NoSidecar),
+    };
     // SAFETY: base names `pages` freshly allocated pages.
     let buf =
         unsafe { core::slice::from_raw_parts_mut(base.as_ptr(), MAX_INITRD) };
-    let mut off = 0usize;
-    loop {
-        let n = f.read(&mut buf[off..]).ok()?;
-        if n == 0 {
-            break;
+    let read_all = |f: &mut RegularFile, buf: &mut [u8]| -> Option<usize> {
+        let mut off = 0usize;
+        loop {
+            let n = f.read(&mut buf[off..]).ok()?;
+            if n == 0 {
+                break;
+            }
+            off += n;
+            if off == MAX_INITRD {
+                return None;
+            }
         }
-        off += n;
-        if off == MAX_INITRD {
-            return None;
+        Some(off)
+    };
+    let mut off = match read_all(&mut f, buf) {
+        Some(o) => o,
+        None => return (None, InitrdVerify::NoSidecar),
+    };
+    // The sidecar holds the archive's zlib crc32, written next to
+    // initrd.cpio at image-build time. A transient firmware read can
+    // drop a sector run and still report success — the bytes simply
+    // never arrive — so re-read the file once before believing a
+    // mismatch.
+    let want = open_named(&crc_names).and_then(|mut cf| {
+        let mut b = [0u8; 32];
+        let n = cf.read(&mut b).ok()?;
+        let s = core::str::from_utf8(&b[..n]).ok()?;
+        u32::from_str_radix(s.trim(), 16).ok()
+    });
+    let verify = match want {
+        None => InitrdVerify::NoSidecar,
+        Some(w) => {
+            let mut got = !klib::crc::crc32_le(!0, &buf[..off]);
+            if got != w {
+                // Retry: firmware drops are transient; a second full
+                // read into the same buffer usually lands clean.
+                if let Some(mut f2) = open_named(&names) {
+                    if let Some(o2) = read_all(&mut f2, buf) {
+                        off = o2;
+                        got = !klib::crc::crc32_le(!0, &buf[..off]);
+                    }
+                }
+            }
+            if got == w {
+                InitrdVerify::Ok(got)
+            } else {
+                InitrdVerify::Bad { want: w, got }
+            }
         }
-    }
-    Some((base.as_ptr() as u64, off))
+    };
+    (Some((base.as_ptr() as u64, off)), verify)
 }

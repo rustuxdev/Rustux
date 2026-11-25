@@ -580,6 +580,8 @@ $(HD_IMG): $(KERNEL) $(INITRD_LIVE)
 	mmd -i $@@@$$((2048 * 512)) ::/EFI/BOOT
 	mcopy -i $@@@$$((2048 * 512)) $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@@@$$((2048 * 512)) $(INITRD_LIVE) ::/initrd.cpio
+	python3 -c 'import zlib; print("%08x" % zlib.crc32(open("$(INITRD_LIVE)","rb").read()))' > hd-initrd.crc
+	mcopy -i $@@@$$((2048 * 512)) hd-initrd.crc ::/initrd.crc
 
 $(ESP_ISO): $(KERNEL) $(INITRD_ISO)
 	dd if=/dev/zero of=$@ bs=1M count=96
@@ -588,6 +590,8 @@ $(ESP_ISO): $(KERNEL) $(INITRD_ISO)
 	mmd -i $@ ::/EFI/BOOT
 	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@ $(INITRD_ISO) ::/initrd.cpio
+	python3 -c 'import zlib; print("%08x" % zlib.crc32(open("$(INITRD_ISO)","rb").read()))' > iso-initrd.crc
+	mcopy -i $@ iso-initrd.crc ::/initrd.crc
 
 $(ISO): $(ESP_ISO) $(KERNEL) $(INITRD_ISO)
 	rm -rf $(ISOROOT) && mkdir -p $(ISOROOT)/EFI/BOOT
