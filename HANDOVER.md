@@ -5081,3 +5081,28 @@ wait4(-1) returning ECHILD, and prctl PR_GET_NAME (172) returning
 EINVAL — the latter is unimplemented and tolerated.
 
 Verified: PASS exit 33, 75 tasks, frames 213333 -> 213333 zero leak.
+
+## run-203 — pipeline: reaper-disabled experiment (negative, no code change)
+
+Temporarily disabling pick_next's zombie reap made the run hang
+instead of fixing the pipeline: with no reaper, Exited slots
+accumulate until fork() starts failing, so the experiment cannot
+answer the question that way. Recorded so it is not repeated.
+
+Where the pipeline investigation stands after runs 189-203:
+* every kernel primitive a pipeline uses is verified by the
+  run-198/199/200 guards (fork, pipe, dup2, exec, wait4);
+* the shells' own syscalls were traced for failures: ugetrlimit was
+  passing the resource as the pointer (FIXED, run-201) and
+  rt_sigprocmask rejected sigsetsize 8 (FIXED, run-202);
+* the remaining symptom is the shell's wait4(-1) answering ECHILD
+  with no children visible, and prctl PR_GET_NAME answering EINVAL
+  (benign, unimplemented);
+* the shells' children are reaped by pick_next's pass after being
+  orphaned, which is correct for ppid == 0 but means a shell whose
+  pipeline children end up as grandchildren cannot collect them.
+
+A better next experiment than disabling the reaper: keep the reaper
+but log (user_out) every reap with the zombie's pid/ppid and the
+reaping rule that fired, then run the pipeline once. That names the
+path without changing behaviour.
