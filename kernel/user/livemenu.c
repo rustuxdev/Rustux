@@ -510,12 +510,19 @@ static void install(const char *path)
                 // read, not just a formatted empty partition.
                 static const char marker[] =
                     "Rustux ext2 root\n";
-                struct mke2_file files[1];
-                files[0].name = "README";
+                struct mke2_file files[2];
+                files[0].path = "README";
                 files[0].data = marker;
                 files[0].len = sizeof marker - 1;
+                // A file inside a directory, so the installed root has a
+                // real tree rather than a flat listing.
+                static const char motd[] =
+                    "Welcome to Rustux.\n";
+                files[1].path = "etc/motd";
+                files[1].data = motd;
+                files[1].len = sizeof motd - 1;
                 int fr = mke2_format(mke2_sink, &sd, (uint64_t)root_lba * 512,
-                                     blocks, files, 1);
+                                     blocks, files, 2);
                 if (fr == 0) {
                     printf("install: ext2 root formatted\n");
                 } else {

@@ -29,7 +29,7 @@ typedef int (*mke2_write_fn)(void *ctx, uint64_t off, const void *buf,
 /// the same pass that lays out the metadata allocates the blocks and
 /// inodes, so the bitmaps never disagree with the content.
 struct mke2_file {
-    const char *name;
+    const char *path; // "README" or "etc/motd" — one directory level
     const void *data;
     uint32_t len;
 };
@@ -146,8 +146,54 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         uint32_t ino;
         uint32_t blk;
         uint32_t len;
+        uint32_t dir; // index into dirs[], or 0xffffffff for the root
+        const char *name;
     } placed[16];
     uint32_t nplaced = 0;
+
+    // Directories come from the file paths: "etc/motd" creates "etc" and
+    // puts the file inside it. One level is enough for /etc, /bin, /lib.
+    struct mke2_dir {
+        char name[16];
+        uint32_t ino;
+        uint32_t blk;
+    } subdirs[8];
+    uint32_t ndirs = 0;
+    for (uint32_t f = 0; f < nfiles && f < 16; f++) {
+        const char *p = files[f].path;
+        const char *slash = 0;
+        for (const char *q = p; *q; q++) {
+            if (*q == '/') {
+                slash = q;
+            }
+        }
+        uint32_t d = 0xffffffffu;
+        const char *base = p;
+        if (slash) {
+            uint32_t n = (uint32_t)(slash - p);
+            if (n > 0 && n < sizeof subdirs[0].name) {
+                for (uint32_t i = 0; i < ndirs; i++) {
+                    if (strncmp(subdirs[i].name, p, n) == 0 && subdirs[i].name[n] == 0) {
+                        d = i;
+                        break;
+                    }
+                }
+                if (d == 0xffffffffu && ndirs < 8) {
+                    memcpy(subdirs[ndirs].name, p, n);
+                    subdirs[ndirs].name[n] = 0;
+                    d = ndirs++;
+                }
+            }
+            base = slash + 1;
+        }
+        placed[nplaced].len = files[f].len;
+        placed[nplaced].dir = d;
+        placed[nplaced].name = base;
+        placed[nplaced].ino = 0;
+        placed[nplaced].blk = 0;
+        nplaced++;
+    }
+    used_inodes += ndirs;    // one inode per created directory
     uint32_t next_data_blk = first_data + 2;
     uint32_t next_ino = FIRST_INO + 1;
     for (uint32_t g = 0; g < groups && g < 64; g++) {
@@ -188,19 +234,22 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         if (g == 0) {
             setbit(bm, root_blk - gs);
             setbit(bm, lf_blk - gs);
-            for (uint32_t f = 0; f < nfiles && nplaced < 16; f++) {
-                uint32_t nb = (files[f].len + BLOCK - 1) / BLOCK;
+            for (uint32_t i = 0; i < ndirs; i++) {
+                subdirs[i].ino = next_ino++;
+                subdirs[i].blk = next_data_blk++;
+                setbit(bm, subdirs[i].blk - gs);
+            }
+            for (uint32_t f = 0; f < nplaced; f++) {
+                uint32_t nb = (placed[f].len + BLOCK - 1) / BLOCK;
                 if (nb == 0) {
                     nb = 1;
                 }
-                placed[nplaced].ino = next_ino++;
-                placed[nplaced].blk = next_data_blk;
-                placed[nplaced].len = files[f].len;
+                placed[f].ino = next_ino++;
+                placed[f].blk = next_data_blk;
                 for (uint32_t b = 0; b < nb; b++) {
-                    setbit(bm, next_data_blk + b - gs);
+                    setbit(bm, placed[f].blk + b - gs);
                 }
                 next_data_blk += nb;
-                nplaced++;
             }
         }
         // Padding: bits with no block behind them (the final bit of the
@@ -228,7 +277,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         uint8_t im[BLOCK];
         memset(im, 0, sizeof im);
         if (g == 0) {
-            uint32_t upto = FIRST_INO + nplaced;
+            uint32_t upto = FIRST_INO + ndirs + nplaced;
             if (upto > INODES_PER_GROUP) {
                 upto = INODES_PER_GROUP;
             }
@@ -242,7 +291,8 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         if (wr(ctx, base + ibitmap * BLOCK, im, BLOCK)) {
             return -13;
         }
-        uint32_t ifree = INODES_PER_GROUP - (g == 0 ? FIRST_INO + nplaced : 0);
+        uint32_t ifree =
+            INODES_PER_GROUP - (g == 0 ? FIRST_INO + ndirs + nplaced : 0);
 
         uint8_t *e = gdt + g * 32;
         put32(e + 0, bbitmap);
@@ -251,7 +301,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         put16(e + 12, (uint16_t)gfree);
         total_free += gfree;
         put16(e + 14, (uint16_t)ifree);
-        put16(e + 16, (uint16_t)(g == 0 ? dirs : 0));
+        put16(e + 16, (uint16_t)(g == 0 ? dirs + ndirs : 0));
 
         if (g > 0) {
             // Backup superblock (same bytes, s_block_group_nr set) and a
@@ -279,7 +329,9 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             uint8_t ino[INODE_SIZE];
             memset(ino, 0, sizeof ino);
             put16(ino + 0, 0x41ed);
-            put16(ino + 26, 3);
+            // links: ".", "..", lost+found, plus one per subdirectory
+            // (each subdir's ".." points back here).
+            put16(ino + 26, (uint16_t)(3 + ndirs));
             put32(ino + 4, BLOCK);
             put32(ino + 28, 2);
             put32(ino + 40, root_blk);
@@ -308,6 +360,58 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
     put32(sb + 16, inodes - used_inodes);
     if (wr(ctx, base + BLOCK, sb, BLOCK)) {
         return -20;
+    }
+
+    // ---- directories: inode + block with ".", "..", and their files ----
+    for (uint32_t i = 0; i < ndirs; i++) {
+        uint8_t ino[INODE_SIZE];
+        memset(ino, 0, sizeof ino);
+        put16(ino + 0, 0x41ed);              // S_IFDIR|0755
+        put16(ino + 26, 2);                  // links: "." and parent's entry
+        put32(ino + 4, BLOCK);               // size
+        put32(ino + 28, BLOCK / 512);        // i_blocks
+        put32(ino + 40, subdirs[i].blk);
+        if (wr(ctx, base + (2 + gdt_blocks + 2) * BLOCK
+               + (subdirs[i].ino - 1) * INODE_SIZE, ino, INODE_SIZE)) {
+            return -24;
+        }
+        // Entries: ".", "..", then the files that live here.
+        struct {
+            const char *name;
+            uint32_t ino;
+            uint8_t type;
+        } ents[2 + 16];
+        uint32_t ne = 0;
+        ents[ne].name = ".";  ents[ne].ino = subdirs[i].ino; ents[ne].type = 2; ne++;
+        ents[ne].name = ".."; ents[ne].ino = 2;           ents[ne].type = 2; ne++;
+        for (uint32_t f = 0; f < nplaced; f++) {
+            if (placed[f].dir == i) {
+                ents[ne].name = placed[f].name;
+                ents[ne].ino = placed[f].ino;
+                ents[ne].type = 1;
+                ne++;
+            }
+        }
+        uint8_t db[BLOCK];
+        memset(db, 0, sizeof db);
+        uint32_t off2 = 0;
+        for (uint32_t e = 0; e < ne; e++) {
+            uint32_t nl = 0;
+            while (ents[e].name[nl]) {
+                nl++;
+            }
+            uint32_t need = (8 + nl + 3) & ~3u;
+            uint32_t rec = (e + 1 == ne) ? (BLOCK - off2) : need;
+            put32(db + off2, ents[e].ino);
+            put16(db + off2 + 4, (uint16_t)rec);
+            db[off2 + 6] = (uint8_t)nl;
+            db[off2 + 7] = ents[e].type;
+            memcpy(db + off2 + 8, ents[e].name, nl);
+            off2 += rec;
+        }
+        if (wr(ctx, base + subdirs[i].blk * BLOCK, db, BLOCK)) {
+            return -25;
+        }
     }
 
     // ---- file inodes and data ----
@@ -369,8 +473,17 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         ents[ne].name = ".";          ents[ne].ino = 2;         ents[ne].type = 2; ne++;
         ents[ne].name = "..";         ents[ne].ino = 2;         ents[ne].type = 2; ne++;
         ents[ne].name = "lost+found"; ents[ne].ino = FIRST_INO; ents[ne].type = 2; ne++;
+        for (uint32_t i = 0; i < ndirs; i++) {
+            ents[ne].name = subdirs[i].name;
+            ents[ne].ino = subdirs[i].ino;
+            ents[ne].type = 2;
+            ne++;
+        }
         for (uint32_t f = 0; f < nplaced; f++) {
-            ents[ne].name = files[f].name;
+            if (placed[f].dir != 0xffffffffu) {
+                continue; // lives inside its directory
+            }
+            ents[ne].name = placed[f].name;
             ents[ne].ino = placed[f].ino;
             ents[ne].type = 1; // regular file
             ne++;

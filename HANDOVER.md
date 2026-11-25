@@ -5990,3 +5990,25 @@ Verified: choosing 64 produced a root entry of 131072 sectors
 
 Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
 NEXT: a directory tree in the root (so /bin, /etc exist), then pivot.
+
+## run-240 — the installed root is a real TREE, not a flat listing
+
+mke2 places files by PATH now ("etc/motd"): the directory is created,
+the file goes inside it, and the entries are built per directory.
+Root link count grows per subdirectory (each ".." points back), and the
+free-inode / used-dir counters include them — all three were caught by
+fsck before the installer used it.
+
+The installer seeds README (root) and etc/motd; booting the installed
+disk:
+
+    rustux: ext2: disk0p1 type=0x83 MOUNTED lba=98304 block=1024
+            entries=5 walked=true etc/motd=19B
+
+entries went 4 -> 5 and the kernel followed the two-level path
+/ -> etc -> motd and read the file. So the root is a directory tree the
+kernel can navigate, not a flat set of files.
+
+Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.
+NEXT: pivot into the root (mount it AS /), then populate a real tree
+from the initrd, then the partition editor.
