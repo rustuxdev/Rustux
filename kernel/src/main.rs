@@ -1143,6 +1143,29 @@ pub(crate) fn rustux_main(
         let refused_disk = ext2::parse_super(&dio).is_none();
         kprintln!(con, "rustux: ext2: disk adapter len>0 {} refuses non-ext2 {refused_disk}",
                   ext2::BlockIo::len(&dio) > 0);
+        // Try to mount partition 1 (the conventional 1 MiB offset) on
+        // every disk and, if it is ext2, walk its root. A FAT disk
+        // simply reports no ext2 — the same code path a root mount uses.
+        for d in 0..4usize {
+            let io = ext2::DiskIo { disk: d };
+            let total = ext2::BlockIo::len(&io);
+            if total < 2 * 1024 * 1024 {
+                continue;
+            }
+            let base = 1024 * 1024;
+            if let Some(m) = ext2::mount(&io, base, total - base) {
+                let part = ext2::PartIo { dev: &io, base, size: total - base };
+                let mut n = 0u32;
+                let walked = ext2::dir_walk(&part, &m.sb, 2, |_e| {
+                    n += 1;
+                    true
+                })
+                .is_some();
+                kprintln!(con,
+                    "rustux: ext2: disk{d} mounted at 1MiB block={} entries={n} walked={walked}",
+                    m.sb.block_size());
+            }
+        }
     }
     let e1000_dev = e1000::probe(bar_is_mmio);
     if let Some((e_base, e_mac)) = e1000_dev {

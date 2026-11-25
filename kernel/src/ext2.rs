@@ -375,3 +375,45 @@ impl BlockIo for DiskIo {
         true
     }
 }
+
+/// A mounted filesystem: the superblock plus the byte offset of the
+/// partition it lives in (0 for a whole-device filesystem).
+pub struct Mount {
+    pub sb: Super,
+    pub base: u64,
+}
+
+/// An offset view of a device — a partition.
+pub struct PartIo<'a> {
+    pub dev: &'a dyn BlockIo,
+    pub base: u64,
+    pub size: u64,
+}
+
+impl BlockIo for PartIo<'_> {
+    fn len(&self) -> u64 {
+        self.size
+    }
+    fn read(&self, off: u64, buf: &mut [u8]) -> bool {
+        if off + buf.len() as u64 > self.size {
+            return false;
+        }
+        self.dev.read(self.base + off, buf)
+    }
+}
+
+/// Mount the ext2/3 filesystem at `base` on `dev`. Returns None when
+/// there is no ext2 there (wrong magic), when the geometry does not fit
+/// the device, or when the filesystem uses ext4 extent trees — a reader
+/// must refuse rather than misread them.
+pub fn mount(dev: &dyn BlockIo, base: u64, size: u64) -> Option<Mount> {
+    let part = PartIo { dev, base, size };
+    let sb = parse_super(&part)?;
+    if !validate(&sb, size) {
+        return None;
+    }
+    if sb.uses_extents() {
+        return None;
+    }
+    Some(Mount { sb, base })
+}

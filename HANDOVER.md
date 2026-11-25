@@ -5825,3 +5825,23 @@ instead of misparsing it. Suite PASS exit 33, 75 tasks, zero leak.
 So the whole ext2 read path now works over a device. NEXT: mount
 partition 2 at boot (DiskIo{d}] + parse/validate + walk), then the root
 switch, then mkfs.ext4 + population in userspace, then the layout UI.
+
+## run-233 — ext2: mount() + PartIo (partition view)
+
+* PartIo: an offset view of a device; read() rejects any range past the
+  partition size BEFORE delegating, and len() reports the partition size
+  so validate() checks the filesystem against the PARTITION, not the
+  whole disk.
+* mount(dev, base, size): parse + validate + refuse ext4 extent trees.
+
+The boot path now tries mount() at the conventional 1 MiB offset on
+every disk each boot. On the FAT boot disk it finds nothing and does not
+crash, so the negative case is exercised continuously.
+
+PENDING: the positive device case. mke2fs -E offset needs an explicit
+size argument and mtools cannot populate ext2, so the test image needs
+debugfs (or a loopback mount) to hold a known file. Then the same mount
+call should report the block size and a walked root.
+
+NEXT: build that image, prove mount+walk on a real partition, then the
+root switch.
