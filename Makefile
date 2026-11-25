@@ -692,6 +692,22 @@ $(ISO_BIOS): $(KERNEL_BIOS) $(INITRD)
 
 # BIOS boot proof: SeaBIOS (QEMU's default firmware — no -bios flag)
 # -> GRUB i386-pc -> multiboot2 -> trampoline -> long mode -> the same
+# Windowed BIOS variant: same ISO and suite, visible framebuffer.
+run-bios-gui: $(ISO_BIOS)
+	$(QEMU) \
+		-machine pc \
+		-m 1G \
+		-cpu qemu64,+rdrand \
+		-drive file=$(ISO_BIOS),format=raw,if=none,id=cd0,media=cdrom \
+		-device ide-cd,drive=cd0,bus=ide.1,unit=0 \
+		-netdev user,id=n0 -device e1000e,netdev=n0 \
+		-serial stdio -display $(DISPLAY_MODE) \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		-no-reboot; \
+	status=$$?; \
+	if [ $$status -eq 33 ]; then echo "bios boot test: PASS (qemu exit 33)"; \
+	else echo "bios boot test: FAIL (qemu exit $$status)"; exit 1; fi
+
 # suite, gated on the same isa-debug-exit 33 contract as `make run`.
 run-bios: $(ISO_BIOS)
 	$(QEMU) \
