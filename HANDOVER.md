@@ -5194,3 +5194,24 @@ virtual mappings.
 
 Verified: BIOS PASS exit 33, 75 tasks, frames 244605 -> 244605 zero
 leak; UEFI PASS exit 33, 75 tasks, frames 213332 -> 213332 zero leak.
+
+## run-208 — pipeline: only the ECHILD symptom remains (no code change)
+
+Re-traced every negative syscall return from the i386 shell during
+two pipeline runs, with all the recent startup fixes in place
+(ugetrlimit 201, rt_sigprocmask 202, prctl PR_GET_NAME 205). The only
+records are:
+
+    F: pid=157 nr=114 a1=0xffffffff a2=0x7ffef984 ret=-10
+    F: pid=164 nr=114 a1=0xffffffff a2=0x7ffef984 ret=-10
+
+i.e. wait4(-1) answering ECHILD and nothing else. So every other
+shell syscall now succeeds; the pipeline's residual failure rate
+(measured 2 of 5, down from 4-5 of 5 before those fixes) is entirely
+the orphan/reap mechanism documented in runs 194-204: the pipeline's
+children are spawned by an intermediate that exits, are orphaned to
+ppid 0, and are then correctly reaped before the shell can wait.
+
+Next: a true ia32 vfork (so the shell's children stay its own) is
+the remaining principled fix; every kernel primitive is covered by
+the run-198/199/200 guards.
