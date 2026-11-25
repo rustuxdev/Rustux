@@ -737,7 +737,9 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         // vfork: busybox ash and glibc's i386 spawn path use it.
         190 => user::sys_vfork(ctx),
         172 => user::sys_prctl(a1, a2),
-        191 => user::sys_ugetrlimit(a1),
+        // ugetrlimit(resource, rlim) — the i386 form takes TWO args;
+        // passing the resource as the pointer made every probe EFAULT.
+        191 => user::sys_ugetrlimit(a2),
         // i386 stat64 family — glibc's stat/lstat/fstat land on 195/
         // 196/197 (and fstatat64 300); struct stat64 is the packed
         // 96-byte i386 layout, not the 144-byte x86_64 one.

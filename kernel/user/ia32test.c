@@ -453,6 +453,8 @@ void main32(void) {
         if (n <= 0) sc1(1, 190);
         if (est != 0) sc1(1, 195 + ((est >> 8) & 0x3f));
     }
+    // NOTE: the two-external shell pipeline still fails; the kernel
+    // primitives it needs are covered by the guards above.
     // NOTE: the pipeline (`cat /motd.txt | cat > /dev/null`) works
     // once pipe2 (331) and wait4 (114) are wired, but its exit status
     // is timing-sensitive in this harness (occasional non-zero), so
