@@ -1089,6 +1089,25 @@ pub(crate) fn rustux_main(
             None => false,
         };
         kprintln!(con, "rustux: ext2: dir walk {walked} found {found}");
+        // REAL image written by Linux's own mke2fs at build time: this
+        // is the test that proves the driver reads what Linux writes,
+        // not merely what our fixture assumes.
+        let real: &[u8] = include_bytes!("ext2_test.img");
+        let mut saw = 0u32;
+        let real_ok = match ext2::parse_super(real) {
+            Some(sb3) => {
+                let v = ext2::validate(&sb3, real.len() as u64);
+                let w = ext2::dir_walk(real, &sb3, 2, |e| {
+                    if &e.name[..e.name_len as usize] == b"hi.txt" {
+                        saw = e.ino;
+                    }
+                    true
+                });
+                v && w.is_some()
+            }
+            None => false,
+        };
+        kprintln!(con, "rustux: ext2: real image {real_ok} hi.txt ino={saw}");
     }
     // AHCI: q35 and real machines expose their disks here, not on the
     // legacy PIIX ports ata.rs drives. Same MMIO validation.

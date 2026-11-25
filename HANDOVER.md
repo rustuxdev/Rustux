@@ -5749,3 +5749,23 @@ inode offset math must use it, not a hardcoded 128 — it already does.
 NEXT: wire this into the kernel as a real-image test (generate the
 image in the Makefile before cargo build, include_bytes! it, walk it at
 boot). Then the root switch.
+
+## run-229 — ext2 reads a REAL mke2fs image
+
+The kernel now include_bytes!s an ext2 image that Linux's own mke2fs
+generated at build time (Makefile EXT2_TEST: dd + printf hi.txt +
+mke2fs -t ext2 -b 1024 -I 256 -d). The path is gitignored, so no
+binary fixture can drift into the repo.
+
+Boot log:
+  rustux: ext2: dir walk true found 12          (synthetic fixture)
+  rustux: ext2: real image true hi.txt ino=12  (mke2fs image)
+
+So the driver reads what Linux writes — superblock, group descriptor,
+root inode, directory entries and the file lookup all agree with a
+real image, not merely with our own assumptions. Suite PASS exit 33,
+75 tasks, frames 212300 -> 212300 zero leak.
+
+NEXT: file content read (walk the block map for an inode's data, so a
+root filesystem's files can actually be read), then the root switch
+(mount partition 2, pivot).

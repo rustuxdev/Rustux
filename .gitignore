@@ -18,3 +18,4 @@ initrd.cpio
 kernel/user/doom.wad
 initrd-doom.cpio
 esp-doom.img
+kernel/src/ext2_test.img
