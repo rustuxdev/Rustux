@@ -530,13 +530,18 @@ $(INITRD_LIVE): $(LIVE_DEPS)
 $(INITRD_ISO): $(LIVE_DEPS) $(HD_IMG)
 	python3 tools/mkinitrd.py $(LIVE_PAIRS) $(HD_IMG) hd.img > $@
 
+# The installed image is a PARTITIONED disk: an ESP at LBA 2048
+# carrying the kernel + initrd, with room after it for the ext2
+# root the installer formats. mkfs.fat --offset places the
+# filesystem inside the partition and -h records the hidden
+# sectors so the firmware finds /EFI/BOOT/BOOTX64.EFI there.
 $(HD_IMG): $(KERNEL) $(INITRD_LIVE)
 	dd if=/dev/zero of=$@ bs=1M count=48
-	mformat -i $@ ::
-	mmd -i $@ ::/EFI
-	mmd -i $@ ::/EFI/BOOT
-	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
-	mcopy -i $@ $(INITRD_LIVE) ::/initrd.cpio
+	mkfs.fat -F 16 --offset=2048 -h 2048 -n RUSTUX $@
+	mmd -i $@@@$$((2048 * 512)) ::/EFI
+	mmd -i $@@@$$((2048 * 512)) ::/EFI/BOOT
+	mcopy -i $@@@$$((2048 * 512)) $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@@@$$((2048 * 512)) $(INITRD_LIVE) ::/initrd.cpio
 
 $(ESP_ISO): $(KERNEL) $(INITRD_ISO)
 	dd if=/dev/zero of=$@ bs=1M count=96

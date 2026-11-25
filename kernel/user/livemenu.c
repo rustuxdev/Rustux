@@ -286,7 +286,14 @@ static int write_mbr(int sd, unsigned int start_lba, unsigned long long sectors,
     memset(mbr, 0, sizeof mbr);
     unsigned char *e = mbr + 446;
     e[0] = 0x80;              // bootable
-    e[1] = 0x00; e[2] = 0x01; e[3] = 0x00;   // CHS start (unused)
+    // CHS start must agree with the LBA start: some firmware validates
+    // the pair. 255 heads / 63 sectors per track.
+    unsigned int c = start_lba / (255 * 63);
+    unsigned int h = (start_lba / 63) % 255;
+    unsigned int sec = (start_lba % 63) + 1;
+    e[1] = (unsigned char)h;
+    e[2] = (unsigned char)(((c >> 2) & 0xc0) | (sec & 0x3f));
+    e[3] = (unsigned char)(c & 0xff);
     e[4] = type;              // 0x06 FAT16, 0x0c FAT32 LBA, 0xef EFI
     e[5] = 0xfe; e[6] = 0xff; e[7] = 0xff;   // CHS end: LBA-only marker
     unsigned int start = start_lba;
@@ -329,8 +336,12 @@ static void install(const char *path)
     // boot (the firmware found no BOOTX64.EFI), so the copy stays at
     // LBA 0 and the table describes that. A partitioned layout needs
     // an image built for a partition offset first — see HANDOVER.
-    const unsigned int PART_LBA = 0;
-    if (lseek(sd, (off_t)PART_LBA * 512, SEEK_SET) < 0
+    // hd.img is now a whole DISK image: its ESP lives at LBA 2048
+    // (mkfs.fat --offset, hidden-sectors 2048). Copy the image at LBA 0
+    // and have the MBR describe the partition at 2048.
+    const unsigned int COPY_LBA = 0;
+    const unsigned int PART_LBA = 2048;
+    if (lseek(sd, (off_t)COPY_LBA * 512, SEEK_SET) < 0
         || copy_image(img, sd, st.st_size) < 0) {
         close(img);
         close(sd);
@@ -340,7 +351,7 @@ static void install(const char *path)
     char a[512], b[512];
     memset(a, 0xaa, sizeof a);
     memset(b, 0xbb, sizeof b);
-    long l1 = lseek(sd, (off_t)PART_LBA * 512, SEEK_SET);
+    long l1 = lseek(sd, (off_t)COPY_LBA * 512, SEEK_SET);
     long r1 = read(sd, a, 512);
     long l2 = lseek(img, 0, SEEK_SET);
     long r2 = read(img, b, 512);
@@ -357,7 +368,9 @@ static void install(const char *path)
     printf("install: verify first sector: %s\n", same ? "ok" : "MISMATCH");
     fflush(stdout);
     if (same) {
-        unsigned long long secs = (unsigned long long)(st.st_size / 512);
+        // The partition starts at PART_LBA, so it spans the image minus
+        // the blocks before it.
+        unsigned long long secs = (unsigned long long)(st.st_size / 512) - PART_LBA;
         if (write_mbr(sd, PART_LBA, secs, 0xef) == 0)
             printf("install: partition table written (ESP type 0xef at LBA %u, %llu sectors)\n",
                    PART_LBA, secs);

@@ -5866,3 +5866,27 @@ content.
 
 NEXT: the root switch (pivot into the mounted fs), then mkfs.ext4 +
 population in userspace, then the layout UI.
+
+## run-235 — the installer produces a PARTITIONED disk that BOOTS
+
+* Makefile: hd.img is now a whole-disk image with a real ESP — the FAT
+  is built INSIDE partition 1 with `mkfs.fat --offset=2048 -h 2048`, so
+  the firmware finds /EFI/BOOT/BOOTX64.EFI inside a partition instead
+  of on a superfloppy.
+* livemenu: the image is copied at LBA 0 (COPY_LBA) and the MBR entry
+  points at 2048 (PART_LBA) with the count bounded by image_size/512 -
+  PART_LBA. Copying the image AT 2048 double-offsets it — that was the
+  bug behind the earlier "does not boot" result.
+* write_mbr now derives CHS from the LBA start (255/63 geometry) so the
+  pair agrees; some firmware validates it.
+
+VERIFIED: the installer's own output boots — the installed disk runs
+the kernel (`sched: launch livemenu (pid 1)`, 219 serial lines). It
+differs from a host-written equivalent in only 9 timestamp bytes.
+
+NOTE for future tests: booting the target image while the install VM is
+still running gives a false "does not boot" (the file is held).
+
+Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
+NEXT: add the ext2 root partition (mke2 validated fsck-clean) beside
+the ESP, then mount it at boot.
