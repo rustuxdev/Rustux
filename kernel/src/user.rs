@@ -2825,6 +2825,25 @@ pub fn set_initrd(img: &'static [u8]) {
 /// Resolve a flat name to archive bytes — the filesystem lookup used
 /// by open and execve alike.
 pub fn fs_lookup(name: &[u8]) -> Option<&'static [u8]> {
+    // The RAM fs first: copy-up places the installed root's files there
+    // (e.g. /etc/rcS), and exec has to be able to see them. This is
+    // why a copied-up script reported ENOENT even though it existed.
+    {
+        // vfile names are canonical (no leading slash); callers may
+        // pass either form, so compare against both.
+        let want = if name.first() == Some(&b'/') { &name[1..] } else { name };
+        let vs = unsafe { &*core::ptr::addr_of!(VFILES) };
+        for v in vs.iter().flatten() {
+            if v.nlen == want.len() && &v.name[..v.nlen] == want && !v.data.is_null() && v.len > 0 {
+                // SAFETY: a vfile's data is kernel-lifetime storage
+                // (kmalloc'd by copy-up or by the fs layer) and is not
+                // freed while the file exists.
+                return Some(unsafe {
+                    core::slice::from_raw_parts(v.data as *const u8, v.len)
+                });
+            }
+        }
+    }
     let arc = unsafe { *core::ptr::addr_of!(INITRD) }?;
     // /proc/<pid-or-self>/exe resolves to that task's executable
     // image — busybox's FEATURE_PREFER_APPLETS re-exec path and

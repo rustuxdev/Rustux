@@ -6250,3 +6250,21 @@ State of the installed boot: `sh` from the ext2 root as pid 1 (works),
 with its /etc copied up so it can read its own config. busybox `init`
 gets as far as reading /etc/inittab (copy-up proven) but cannot run the
 sysinit script.
+
+## run-252 — exec's lookup never consulted the RAM fs (fixed); init still blocked
+
+Root cause found for one part of the /etc/rcS mystery: `fs_lookup`
+searched ONLY the initrd archive (`cpio::find`), so a copy-up file was
+invisible to exec no matter how many times copy-up reported success.
+It now checks the RAM fs vfiles first (canonical name, with a leading
+'/' tolerated) before falling back to the archive.
+
+That fix is correct in its own right and the suite is green
+(pgtest exit(0), PASS exit 33) — but it did NOT unblock the installed
+init: busybox still reports "can't run '/etc/rcS': No such file or
+directory", and the execve trace showed the call arriving with
+path=/etc/rcS. So at least one more defect sits between "execve is
+called" and "the script runs"; it is NOT identified.
+
+State: the pivot stays on `sh` from the ext2 root (works, with /etc
+copied up). Do not assume the fs_lookup fix resolved the init path.
