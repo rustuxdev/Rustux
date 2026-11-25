@@ -5215,3 +5215,30 @@ ppid 0, and are then correctly reaped before the shell can wait.
 Next: a true ia32 vfork (so the shell's children stay its own) is
 the remaining principled fix; every kernel primitive is covered by
 the run-198/199/200 guards.
+
+## run-209 — pipeline: children ARE direct (refutes the intermediate theory)
+
+Creation trace (C<child>/<parent> straight to the UART) for one
+pipeline run:
+
+    C155/150
+    C157/150
+
+Both pipeline children are created by task 150 — the shell itself.
+So the run-195/204 "intermediate that exits and orphans them" theory
+is WRONG: the cats are the shell's direct children, exactly as on
+Linux.
+
+That leaves the real puzzle precisely stated: the shell forks 155
+and 157, and by the time it calls wait4(-1) neither is visible, yet
+the reap trace (run-204) showed every reap using the ppid == 0 rule.
+So the children must be getting ppid = 0 from somewhere OTHER than
+their parent exiting — the orphan sweep is the only writer, and it
+runs on a dying task whose pid equals their ppid, i.e. on task 150
+itself. Which means either the shell's slot is being reaped/cleared
+while it still runs, or a second task with pid 150 exists.
+
+Next: instrument the orphan sweep to print the DYING task's pid and
+the child's pid (O<dying>><child>) again — run-195 did this and saw
+O221>222, which is consistent with 221 being a *different* shell
+invocation; correlating both traces in ONE run is what is missing.
