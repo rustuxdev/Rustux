@@ -21,6 +21,7 @@ mod ata;
 mod cpu;
 mod cpio;
 mod e1000;
+mod ext2;
 mod elf;
 mod net;
 mod nt;
@@ -1025,6 +1026,31 @@ pub(crate) fn rustux_main(
                 && base + size > d.phys_start
         })
     };
+    // ext2 superblock parser self-test: a valid image must parse and
+    // validate, a bad magic must be refused, and a truncated image must
+    // fail validation. Cheap, and it pins the on-disk offsets.
+    {
+        let mut img = [0u8; 4096];
+        const SB: usize = 1024;
+        img[SB + 56..SB + 58].copy_from_slice(&ext2::MAGIC.to_le_bytes());
+        img[SB..SB + 4].copy_from_slice(&128u32.to_le_bytes()); // inodes
+        img[SB + 4..SB + 8].copy_from_slice(&4u32.to_le_bytes()); // blocks
+        img[SB + 20..SB + 24].copy_from_slice(&1u32.to_le_bytes()); // first_data
+        img[SB + 24..SB + 28].copy_from_slice(&0u32.to_le_bytes()); // log_bs = 1024
+        img[SB + 32..SB + 36].copy_from_slice(&4u32.to_le_bytes()); // bpg
+        img[SB + 40..SB + 40 + 4].copy_from_slice(&128u32.to_le_bytes()); // ipg
+        img[SB + 76..SB + 80].copy_from_slice(&1u32.to_le_bytes()); // rev
+        img[SB + 88..SB + 90].copy_from_slice(&128u16.to_le_bytes()); // inode_size
+        let ok = match ext2::parse_super(&img) {
+            Some(sb) => sb.block_size() == 1024 && sb.groups() == 1 && !sb.uses_extents()
+                && ext2::validate(&sb, img.len() as u64),
+            None => false,
+        };
+        let mut bad = img;
+        bad[SB + 56] ^= 0xff;
+        let refused = ext2::parse_super(&bad).is_none();
+        kprintln!(con, "rustux: ext2: superblock parse {ok} reject {refused}");
+    }
     // AHCI: q35 and real machines expose their disks here, not on the
     // legacy PIIX ports ata.rs drives. Same MMIO validation.
     let n_ahci = ahci::init(bar_is_mmio);

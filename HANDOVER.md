@@ -5679,3 +5679,31 @@ THE REAL PREREQUISITE, in order (this is not an installer change):
 
 Do NOT build a partitioned FAT install: it would look professional and
 still be unable to host a Linux system.
+
+## run-226 — ext2 driver: superblock parser (first increment)
+
+New kernel/src/ext2.rs. ext2 is the right first rung because ext4
+shares its superblock, group descriptors, inode table and directory
+format — only extent trees and the journal differ, and both layer on
+top.
+
+Done now: parse_super() (magic 0xEF53 at byte 1024, inodes, blocks,
+first_data_block, log_block_size, blocks_per_group, inodes_per_group,
+rev, inode_size, compat/incompat/ro_compat, first_ino) and validate()
+(geometry must fit the image we actually hold). Every read is
+bounds-checked via slice.get() so untrusted on-disk data can only
+yield None, never a panic. uses_extents() lets a reader refuse ext4
+extent trees rather than misread them as block maps.
+
+Boot self-test in main.rs: a valid synthetic superblock parses and
+validates, a flipped magic is refused —
+  rustux: ext2: superblock parse true reject true
+
+NEXT increments, in order:
+1. Group descriptors + inode read (block map, size, mode, direct and
+   indirect pointers).
+2. Directory walk (linear entries; htree later) so `/` can be listed.
+3. Real-image test: mke2fs -t ext2 a small image, put it in the
+   initrd, mount and walk it at boot — the headless proof.
+4. Root switch: mount partition 2 and pivot.
+Audit: run-21 extended (5 coverage units). cve-now unreachable.
