@@ -6125,3 +6125,28 @@ it is a system the kernel can run programs from.
 Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
 NEXT: make it pid 1 (pivot), place the rest of the payload, then the
 partition editor.
+
+## run-247 — THE PIVOT: the installed system boots as pid 1
+
+When the partition scan finds an ext2 root carrying /bin/busybox, the
+kernel now boots THAT as pid 1 instead of the initrd payload:
+
+    rustux: root: booting the installed system (pid 1 = sh from ext2)
+    rustux: sched: launch sh (pid 1) rip=0x555500020b70
+
+The initrd task loop is gated on `queued == 0`, so:
+  - installed disk -> the root's binary is pid 1 (the initrd is skipped);
+  - normal boot     -> unchanged (75 tasks, PASS, zero leak);
+  - spawn failure   -> "falling back to the initrd" and the payload runs,
+                       so a bad root can never leave the machine with no
+                       init.
+
+The binary is only remembered after the read returned the inode's exact
+size, so a short read can't be booted.
+
+That completes the arc: partition -> format ext2 -> place files -> mount
+-> execute -> BOOT FROM IT.
+
+Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
+NEXT: place the fuller payload (29 MiB in the live initrd), give the
+root an /etc and an init script, then the partition editor.

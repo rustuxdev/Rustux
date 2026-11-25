@@ -16,6 +16,11 @@ use uefi::prelude::*;
 
 mod acpi;
 mod ahci;
+
+/// The installed root's boot binary, when a disk carries one. Set while
+/// scanning partitions; consumed by the task-spawn step, which boots it
+/// INSTEAD of the initrd payload (the pivot).
+static mut ROOT_EXE: Option<(*const u8, usize)> = None;
 mod apic;
 mod ata;
 mod cpu;
@@ -1214,9 +1219,13 @@ pub(crate) fn rustux_main(
                                         ext2::read_file(&part, &m.sb, exe, dst)
                                     {
                                         if got2 == sz {
-                                            let ok = user::spawn(&dst[..sz], "uname");
-                                            kprintln!(con,
-                                                "rustux: ext2: ran /bin/busybox from the root {ok}");
+                                            // Keep it for the pivot: the
+                                            // spawn step boots this as pid 1
+                                            // instead of the initrd payload.
+                                            unsafe {
+                                                *core::ptr::addr_of_mut!(ROOT_EXE) =
+                                                    Some((buf as *const u8, sz));
+                                            }
                                         }
                                     }
                                 }
@@ -1342,7 +1351,21 @@ pub(crate) fn rustux_main(
     // Capture the fninit FPU image tasks start from — must run
     // before the first spawn copies INIT_FX into its Task.
     user::fpu_init();
-    if let Some(arc) = arc {
+    let root_exe = unsafe { *core::ptr::addr_of!(ROOT_EXE) };
+    if let Some((p, n)) = root_exe {
+        // PIVOT: an installed root with a boot binary wins over the
+        // initrd payload — this is what makes the disk a system rather
+        // than a filesystem the kernel reads.
+        let img = unsafe { core::slice::from_raw_parts(p, n) };
+        if user::spawn(img, "sh") {
+            kprintln!(con, "rustux: root: booting the installed system (pid 1 = sh from ext2)");
+            queued += 1;
+        } else {
+            kprintln!(con, "rustux: root: spawn FAILED, falling back to the initrd");
+        }
+    }
+    if queued == 0 {
+        if let Some(arc) = arc {
         // The archive doubles as the read-only root filesystem — fd
         // ops resolve paths against it for the kernel's lifetime.
         // SAFETY: `arc` names LOADER_DATA pages that are never freed,
@@ -1366,6 +1389,7 @@ pub(crate) fn rustux_main(
             } else {
                 kprintln!(con, "rustux: task {nm}: spawn FAILED");
             }
+        }
         }
     }
     if queued == 0 {
