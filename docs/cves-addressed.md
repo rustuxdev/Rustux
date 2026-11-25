@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**161 unique CVEs recorded.**
+**164 unique CVEs recorded.**
 
 ## klib ports
 
@@ -85,6 +85,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2017-1000410 | statx(2) syscall NR 332: sys_statx (flags EINVAL on unknown AT_* bits incl AT_SYMLINK_FOL… | audit run-101 quick scoped: 1 confirmed LOW finding fixed in-diff — AT_SYMLINK_FOLLOW (0x400) EINVAL'd though Linux accepts it (== default follow semantics); added to KNOWN mask +… |
 | CVE-2017-14489 | real CRT-linked MinGW .exe: STUB_DATA_VA writable thunk-state page (argv/envp/fake FILE[]… | audit run-83 quick scoped: 1 confirmed fixed pre-commit - nt_free_pages walked [base,base+size) per page with user-controlled size bounded only by USER_VA_HI: NtFreeVirtualMemory(… |
 | CVE-2017-7558 | real GNU bash 5.2 (dynamic, +libtinfo second DT_NEEDED — ld.so's first multi-library reso… | sockaddr-leak class structurally absent: sock_name copies min(*addrlen,16) bytes of a sockaddr_in built by sockaddr_in() which zero-fills all 16 before writing fields — every copi… |
+| CVE-2018-1263 | sh-resolves-dash + initrd-integrity rung: /bin/sh is now real Debian dash on live AND ins… | audit run-261 scoped quick (security-audit skill): verify_payload bounds and fail-closed abort verified; manifest unverified-by-construction recorded; applet surface widening inte… |
 | CVE-2018-14634 | brk/mmap/munmap/mprotect: per-task VMA table + eager zeroed pages | VMA == ranges[] entry: gate, first-fit, and teardown share one truth, so a mapped page can never escape the syscall pointer gate; first-fit scans holes between entries (freed VA i… |
 | CVE-2018-18281 | NT process objects + CreateProcessA: NT_PROCS ledger (tgid/refs/state/exit), NTH_PROCESS… | audit run-98 quick scoped: 2 confirmed findings fixed in-diff — sys_brk grow-rollback missing flush_tlb (the 10th live-mm unmap site, now flushes at user.rs:6722) and NtWaitProc r… |
 | CVE-2018-3665 | FPU resume fix: resume_ctx lacked fxrstor | the tick/IRQ resume path set CUR_I/cr3/ctx but never restored the incoming task's fx image -- a timer switch left the PREVIOUS task's live xmm registers in the FPU, so a resuming… |
@@ -128,6 +129,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2023-3161 | fbcon VT100/xterm-subset terminal emulator (cell grid, CSI cursor/ED/EL/ICH/DCH, SGR pale… | audit run-102 quick scoped: 6 confirmed findings fixed in-diff — alt-screen restore clobbered saved cursor (saved_alt slot); DECSTBM post-check clamp could set scr_top>scr_bot and… |
 | CVE-2023-3161 | fbcon param/bold/stime/echo + livemenu auth rung: CSI digit accumulation fixed (params no… | audit run-115 quick scoped: param writes bounded to params[15], REP bounded, bold is pure render state, stime gate only narrows billing, stdin_echo writes a single validated byte… |
 | CVE-2023-3161 | live-payload rung: cpio S_IFLNK following in resolve_links (link: records — every busybox… | audit run-114 quick scoped: verified resolve_links cpio arm only reads the validated archive slice (entries_m mode masked S_IFMT==S_IFLNK before data is treated as a target), no p… |
+| CVE-2023-52138 | sh-resolves-dash + initrd-integrity rung: /bin/sh is now real Debian dash on live AND ins… | audit run-261 scoped quick (security-audit skill): verify_payload bounds and fail-closed abort verified; manifest unverified-by-construction recorded; applet surface widening inte… |
 | CVE-2023-52705 | install prompt/eject + read-cap split + ATA recovery: demomenu verifies, ATAPI-ejects /de… | audit run-113 manual scoped + cve.now over HTTP JSON-RPC (entities.search — analogs above; no mapped sr/cdrom-ioctl CVE): verified every fd_read arm bounds n by source availabilit… |
 | CVE-2023-52791 | preemptive round-robin scheduler | every switch is a UCtx resume (15 GPRs + iret frame) — launch/preemption/exit share one path; dedicated 0xf0 stub saves the FULL register file; cs&3==0 ticks never switch (58090 c… |
 | CVE-2023-53035 | ia32 compat foundation: ELFCLASS32/EM_386 static ELF32 loading + IA-32e compat-mode execu… | audit run-121 quick scoped + cve.now MCP (entities.search on ia32/compat classes — analogs above): verified int80 mask covers nr+a1..a6 (a REX-literate compat task can't smuggle h… |
@@ -195,6 +197,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-64371 | procfs breadth: generated /proc — global uptime/meminfo/loadavg/version/stat + per-pid di… | 64371 n/a by construction: single-CPU IF-masked syscall context means a task cannot exec while its stat is read, and the seq_file snapshot freezes content at open — reads never sa… |
 | CVE-2026-64400 | hierarchical VFS: per-task cwd in FsTab, canon_path resolution (. .. rel/abs, root-clampe… | 64400 structurally absent: canon clamps .. AT root with no retry/reconstruct path, and there are no mount/share boundaries to escape through (cwd is the only base). getdents-leak… |
 | CVE-2026-64496 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
+| CVE-2026-66484 | sh-resolves-dash + initrd-integrity rung: /bin/sh is now real Debian dash on live AND ins… | audit run-261 scoped quick (security-audit skill): verify_payload bounds and fail-closed abort verified; manifest unverified-by-construction recorded; applet surface widening inte… |
 | CVE-2026-68120 | ipv6/ndp/icmpv6 | no direct CVEs; frag-header CVEs reinforce the no-extension-headers/no-fragments design; hop==255 + solicited-dst + target==us enforced; pseudo-header csum validated (neg-zero res… |
 | CVE-2026-68124 | terminal ABI: ioctl(16) dispatch — TCGETS/TCSETS-family on the console pair, TIOCGWINSZ r… | every ioctl arg extent is range_ok(_w)-gated with the exact struct size BEFORE any copy (36/8/4B) — the run-68 translate bound already confines arg to the user window; termios is… |
 | CVE-2026-68124 | tty stdin: IRQ1->scancode ring->line discipline->read(0)/poll(0)/FIONREAD, WaitOn::Stdin,… | bounded queues throughout: 256B canonical edit buffer + 4KiB ready queue, drop-on-full = Linux input discard; feed runs from the timer tick (printk is irq_save-safe, kill marks pe… |

@@ -6585,3 +6585,95 @@ Known gaps: apt-key/keyrings absent -> Ign:1 tolerated by
 persists (retried around in run-iso) — unresolved, logged twice;
 htop runs under TERM=linux now but console fidelity unverified;
 enosys nr 435 (clone3) and nr 28 (madvise) logged during dpkg.
+
+## run-261 — sh -> dash (dpkg applet shadow killed), perl-base installs, initrd integrity net
+
+Bug the user hit: `apt install perl-base` (any package whose maintainer
+scripts shell out to `dpkg` — nginx chain too) died with
+`dpkg: unrecognized option '--validate-version'` printed in busybox
+usage format. Root cause is BusyBox 1.36.1 SH_STANDALONE semantics in
+ash.c: find_command/shellexec check find_applet_by_name BEFORE the
+PATH search and run the applet via execve("/proc/self/exe",
+["dpkg",...]); the PATH fallback only happens when that exec FAILS.
+At the interactive prompt pid 1's /proc/self/exe -> "/sh" is a broken
+link (non-canonical exec name) so the self-exec fails and the real
+/usr/bin/dpkg wins — but every busybox CHILD (exec'd as bin/busybox)
+has a valid /proc/self/exe, so inside maintainer scripts the busybox
+dpkg applet shadows the real binary. Reproduced live: `sh -c 'dpkg
+--version'` -> applet usage; `bash -c 'dpkg --version'` -> real
+1.22.6; absolute path works everywhere. Debian never sees this
+because it never points /bin/sh at busybox.
+
+Fix mirrors Debian exactly: /bin/sh is now REAL dash on both live and
+installed boots — livemenu ALIASES maps bin/sh -> bin/dash, LIVE_PAIRS
+ships kernel/user/dash as bin/sh + bin/dash (previously dash only
+existed in the test-suite initrd), LIVE_DEPS tracks it. dash needs
+only libc + ld-linux (both shipped). run-iso gate "installed sh-dpkg
+resolution" sends `sh -c 'dpkg --version | head -1'` and greps the
+exec log for `usr/bin/dpkg exit(0)` (an applet run would print
+proc/self/exe or bin/busybox). The phase-2 prompt gate moved from the
+`/ #` grep to an `_RXOK` sentinel echo — dash's root prompt differs
+from busybox's.
+
+Second-order fallout: perl-base's preinst calls
+dpkg-maintscript-helper (now REALLY running under usr/bin/dpkg) whose
+line 594 calls `basename` — not shipped. Added the maintainer-script
+applet set as busybox links on both live and installed trees:
+basename dirname mktemp readlink cmp cut stat seq true false zcat tee
+uniq printf (bin/) + env awk realpath getopt flock run-parts sha1sum
+sha256sum (usr/bin/, matching Debian's canonical locations for things
+scripts hardcode — /usr/bin/env being the famous one). gzip/gunzip
+aliases were only in the installed table; now in LIVE_PAIRS too.
+
+Verified in the GTK demo on a fresh install: apt update -> exit(0);
+apt install -y perl-base -> Unpacking -> "Setting up perl-base" ->
+dpkg exit(0) -> apt-get exit(0); `perl -e 'print 1+1'` -> 2. Kernel
+exec log shows bin/basename exit(0) inside the maintainer script and
+every dpkg call as usr/bin/dpkg. run-iso: all five phases PASS (92
+files copied up).
+
+Initrd integrity net (separate latent bug found mid-verification):
+one GTK install produced a libapt-pkg.so.6.0 with a 71,680-byte zero
+hole at file offset ~1.71 MB — exactly 35 x 2048-byte CD sectors,
+2048-aligned in archive space — wiping apt's error-string table so
+`E:` printed empty and everything exited 100. ISO on host is clean
+(all 4 embedded copies), target.img install byte-perfect, initrd
+file byte-perfect — the hole appeared only in that guest's RAM copy
+of the archive, i.e. a transient firmware/El Torito read gap during
+load_initrd (fresh QEMU RAM is zeros; a claimed-but-undelivered read
+range stays zero). Detection, not root-cause: mkinitrd.py now emits a
+rustux.manifest member ("name zlib-crc32" per regular file); livemenu
+verify_payload() re-reads every member before touching the disk AND
+again after mke2_format before writing the MBR — a mismatch aborts
+the install loudly instead of writing a bricked disk; the kernel
+prints `initrd crc32 = <zlib value>` at load (klib crc32_le is the
+raw convention — !crc32_le(!0, arc) yields zlib, verified numeric
+match against host zlib on "123456789" and on the full archive) so a
+boot-time corruption is distinguishable from a mid-session RAM
+scribble. Observed on this run's gates: pre+post verify "80 files, 0
+bad" every cycle.
+
+sendkey.py: QEMU sendkey has no uppercase names — str: now maps A-Z
+to shift-<key> (was silently dropping capitals into the guest).
+
+Audit run-261 scoped quick (security-audit skill): verify_payload
+bounds reviewed (16KiB static manifest buf + NUL, name snprintf into
+512B path, strtoul on hex, per-file 64KiB streamed reads, fds
+opened/closed per entry under MAX_FDS, fail-closed !=0 abort);
+manifest >16KiB would silently truncate coverage — ~6KiB today,
+count printed makes truncation visible; manifest itself is
+unverified (chicken-and-egg — trusted build artifact). klib crc print
+is read-only over the bounded initrd slice. New applet links widen
+the busybox surface — intentional, matches the Debian toolset
+maintainer scripts expect. cve-now checked the cpio-extraction class
+(CVE-2023-52138, CVE-2026-66484, CVE-2018-1263 et al — all
+extract-time traversal bugs; n/a: our archive is build-trusted, never
+extracted to disk, and the manifest is integrity detection not
+signature verification). No confirmed findings. needs_validation:
+the sector-drop root cause inside the firmware read path is still
+unproven (detection shipped instead); run a few dozen ISO boots to
+see whether `initrd crc32` ever disagrees with the manifest.
+Known gaps: the manifest is unsigned — it catches read corruption,
+not malicious media; methods/http still #PFs at the 1MiB stack guard
+when run manually (cr2=0x5555ffffff70); pid 1's /proc/self/exe -> /sh
+broken link persists (only affects applet self-exec, now moot).
