@@ -5411,3 +5411,21 @@ Next, in order:
 2. Debug the AHCI write: print at the top of ahci_write and after
    issue() returns, with the poll iteration count reached.
 3. Then partitioning (MBR/GPT), mkfs, ESP boot entry.
+
+## run-216 — installer disk picker (allow-list, not /dev/sda hardcoded)
+
+livemenu now probes /dev/sda..sdd and installs to the first node that
+passes access(R_OK|W_OK), naming it in the menu. The target comes
+from a const allow-list, never from user input, so the raw-sector
+write cannot be aimed at an arbitrary path.
+
+Verified on -machine pc with the only disk on if=ide,index=1:
+`ata: sda=0MiB sdb=128MiB` and the menu now reads
+`[1] install Rustux to /dev/sdb` — previously it said "no writable
+disk detected" because SD_PATH was hardcoded to sda.
+
+Still open: with several disks it silently takes the first and only
+annotates "(first of several disks)"; a real chooser prompt is next.
+And the AHCI write hang (run-213/214) still blocks an actual install
+on q35/SATA.
+Audit: scoped quick run-20. cve-now MCP unreachable (recorded).

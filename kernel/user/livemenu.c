@@ -271,7 +271,7 @@ static int copy_image(int img, int sd, off_t n)
     return 0;
 }
 
-static void install(void)
+static void install(const char *path)
 {
     int img = open(IMG_PATH, O_RDONLY);
     if (img < 0) {
@@ -284,14 +284,14 @@ static void install(void)
         close(img);
         return;
     }
-    int sd = open(SD_PATH, O_RDWR);
+    int sd = open(path, O_RDWR);
     if (sd < 0) {
-        printf("install: open %s: %s\n", SD_PATH, strerror(errno));
+        printf("install: open %s: %s\n", path, strerror(errno));
         close(img);
         return;
     }
     printf("install: writing %lld MiB image to %s ...\n",
-           (long long)(st.st_size >> 20), SD_PATH);
+           (long long)(st.st_size >> 20), path);
     if (lseek(sd, 0, SEEK_SET) < 0 || copy_image(img, sd, st.st_size) < 0) {
         close(img);
         close(sd);
@@ -351,16 +351,33 @@ int main(void)
     // so skip straight to the init -> login -> shell chain.
     if (access(IMG_PATH, R_OK) != 0)
         run_login();
+    // Disk picker: every /dev/sd* that exists and is writable is a
+    // candidate. Hardcoding /dev/sda meant a machine whose only disk
+    // enumerated as sdb reported "no writable disk".
+    static const char *const CAND[] = { "/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd" };
     for (;;) {
-        int can_install = access(SD_PATH, R_OK | W_OK) == 0;
+        const char *target = 0;
+        int ndisk = 0;
+        for (size_t i = 0; i < sizeof CAND / sizeof CAND[0]; i++) {
+            if (access(CAND[i], R_OK | W_OK) == 0) {
+                if (!target)
+                    target = CAND[i];
+                ndisk++;
+            }
+        }
+        int can_install = target != 0;
         // Install is the primary action and the default (bare Enter):
         // this is installation media, the live session is the rescue
         // path. The option is always shown — hiding it behind the
         // access() probe made the installer look absent on machines
         // where the node or its mode was unexpected; selecting it now
         // reports the real reason instead.
-        printf("[1] install Rustux to disk%s\n",
-               can_install ? "" : "  (no writable disk detected)");
+        if (can_install) {
+            printf("[1] install Rustux to %s%s\n", target,
+                   ndisk > 1 ? "  (first of several disks)" : "");
+        } else {
+            printf("[1] install Rustux to disk  (no writable disk detected)\n");
+        }
         printf("[2] live session\n");
         printf("> ");
         fflush(stdout);
@@ -374,9 +391,9 @@ int main(void)
         case '\r':
         case '1':
             if (can_install) {
-                install();
+                install(target);
             } else {
-                printf("install: no writable disk at %s\n", SD_PATH);
+                printf("install: no writable disk at /dev/sd[abcd]\n");
             }
             break;
         case '2':
