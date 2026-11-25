@@ -5727,3 +5727,25 @@ Suite PASS exit 33, 75 tasks, zero leak.
 
 NEXT: the real-image test (mke2fs -t ext2, in the initrd, mount+walk at
 boot), then the root switch.
+
+## run-228 — ext2 offsets validated against a real mke2fs image
+
+Host-side cross-check: mke2fs -t ext2 -b 1024 -I 256 -d <dir> on an
+8 MiB image, then parsed with the SAME offsets ext2.rs uses:
+
+    magic=0xef53 inodes=2048 blocks=8192 first=1 bs=1024
+    bpg=8192 ipg=2048 inode_size=256
+    GDT@(first+1)*bs = 2048: block_bitmap=34 inode_bitmap=35
+                             inode_table=36
+    root inode 2 @ inode_table*bs + isz*1: mode=0o40755 size=1024
+                             block0=548
+    first dirent: ino=2 rec_len=12 name=b'.'
+
+Every formula in ext2.rs matches what Linux wrote, with 256-byte inodes
+(the modern default; 128 is deprecated and mke2fs refuses it on a new
+fs). Note for the driver: inode_size comes from the superblock, so the
+inode offset math must use it, not a hardcoded 128 — it already does.
+
+NEXT: wire this into the kernel as a real-image test (generate the
+image in the Makefile before cargo build, include_bytes! it, walk it at
+boot). Then the root switch.
