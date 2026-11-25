@@ -6316,3 +6316,29 @@ state. Candidates for the next session, in order:
 
 Next probe: print copy_user_path's n and the raw bytes, plus fst(t)
 cwd/cwdlen, at execve entry. That separates 1 and 2 in one boot.
+
+## run-255 — init ENOENT: canonicalisation and resolution are both fine
+
+The probe from run-254 ran. Results:
+
+    dbg: canon=etc/rcS        <- canon_path is CORRECT
+    (no "dbg: resolve FAILED" line)  <- resolve_links returned Ok
+
+So the ENOENT cannot come from canonicalisation or link resolution.
+Combined with the earlier table (copy-up true, fs_lookup true,
+resolve_links Ok), the only remaining producer is the INTERPRETER
+lookup inside the shebang handling: rcS starts "#!/bin/sh", so exec
+looks for "/bin/sh", which in the archive is a LINK record to
+/bin/busybox.
+
+Tried: routing the interpreter through canon_path before resolve_links
+(so the leading slash is stripped). Did NOT work — still "can't run
+'/etc/rcS': No such file or directory" — so it was reverted rather than
+left unverified.
+
+NEXT PROBE (one boot): inside the shebang loop, print (a) the raw
+interp bytes, (b) what canon_path returns for it, (c) what
+resolve_links returns for that, (d) whether fs_lookup finds the final
+name. One of those four is empty/wrong; the printout will say which.
+Do not guess further before that trace — four hypotheses have already
+been eliminated by measurement.
