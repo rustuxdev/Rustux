@@ -5356,3 +5356,33 @@ values and the AHCI issue() poll (which of the two wedges), and check
 whether PxIS reports a task-file error on the first write. Note the
 ISO's hd.img read path is the RAM fs, so the suspect is the AHCI
 write command, not the read.
+
+## run-214 — install hang: no AHCI error, no timeout print (OPEN)
+
+Instrumented both sides (issue() prints tfd/PxIS/PxCI on ERR and on
+poll timeout; copy_image prints the first chunk's got/written). A
+full ISO install run produced the menu, accepted `1` (`> 1`), and then
+NOTHING — no `install: chunk1`, no `dbg: ahci ... ERR`, no
+`dbg: ahci ... TIMEOUT`.
+
+So the first write neither completes nor reaches the driver's error
+or timeout branch. Candidates, in order:
+1. The command IS issued and PxCI bit 0 never clears while PxTFD.ERR
+   stays clear — the loop then exits only after 2M spin iterations,
+   which in TCG can take a very long time (it may simply not have
+   finished within the 35 s window).
+2. Something blocks before issue(): sd_write -> ahci_write ->
+   mem_for (alloc_frame) or the range checks.
+3. The write never reaches the AHCI path at all (e.g. the fd's vfile
+   rdev maps to a different driver branch).
+
+Cheapest next probe: print once at the TOP of ahci_write (before any
+work) with drv/lba/count and once right after issue() returns. That
+separates "never reached the driver" from "stuck inside the command"
+in one boot. Also worth lowering the poll bound and printing the
+iteration count reached.
+
+Note: the same install path over PIIX (ata.rs) also showed no
+progress in earlier runs, so this may not be AHCI-specific — test the
+PIIX install on -machine pc with a target disk before blaming the
+AHCI command path.
