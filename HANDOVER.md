@@ -6101,3 +6101,27 @@ reads back at its full path; the etc case, the 1 MiB file and the base
 format stay clean. Suite PASS exit 33, 75 tasks, zero leak.
 NEXT: place the real payload (libs need the nested paths this enables),
 then pivot into the root.
+
+## run-246 — THE KERNEL RUNS A PROGRAM FROM THE INSTALLED ROOT
+
+The loop is complete in the way that matters: booting the installed
+disk, the kernel mounts its ext2 root, reads /bin/busybox (2,858,424
+bytes) out of it, and EXECUTES it —
+
+    rustux: ext2: disk0p1 type=0x83 MOUNTED lba=98304 block=1024
+            entries=6 walked=true etc/motd=19B
+    rustux: ext2: ran /bin/busybox from the root true
+    Rustux                      <- busybox's uname applet, run from the root
+
+Two things had to be added: ext2.rs gained DOUBLE-INDIRECT reads (the
+reader stopped at single-indirect, so a 2.8 MiB binary returned None),
+and main.rs reads the inode's exact size into a kmalloc buffer and only
+spawns when the read returned that many bytes (a short read would hand
+the ELF loader a partial image).
+
+So the installed system is not just a filesystem the kernel can read —
+it is a system the kernel can run programs from.
+
+Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
+NEXT: make it pid 1 (pivot), place the rest of the payload, then the
+partition editor.

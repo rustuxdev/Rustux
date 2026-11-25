@@ -237,6 +237,25 @@ pub fn block_map(io: &dyn BlockIo, sb: &Super, node: &Inode, lblock: u32) -> Opt
             .then_some(())?;
         return rd32(&b, 0);
     }
+    // Double indirect: the block's index splits into a level-1 slot and a
+    // level-2 slot. busybox is ~2.8 MiB, well past single-indirect.
+    let d = l - per;
+    if d < per.saturating_mul(per) {
+        let dind = node.block[13];
+        if dind == 0 {
+            return Some(0);
+        }
+        let mut b = [0u8; 4];
+        let l1_off = dind as u64 * bs as u64 + (d / per) as u64 * 4;
+        io.read(l1_off, &mut b).then_some(())?;
+        let l1 = rd32(&b, 0)?;
+        if l1 == 0 {
+            return Some(0);
+        }
+        let l2_off = l1 as u64 * bs as u64 + (d % per) as u64 * 4;
+        io.read(l2_off, &mut b).then_some(())?;
+        return rd32(&b, 0);
+    }
     None
 }
 

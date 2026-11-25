@@ -1195,6 +1195,34 @@ pub(crate) fn rustux_main(
                     kprintln!(con,
                         "rustux: ext2: disk{d}p{slot} type={:#x} MOUNTED lba={start} block={} entries={n} walked={walked} etc/motd={got}B",
                         ptype, m.sb.block_size());
+                    // Run a program FROM the installed root: read
+                    // /bin/busybox out of ext2 and spawn it as "uname",
+                    // so the multicall binary prints our sysname. This is
+                    // the difference between reading the root and booting
+                    // a program out of it.
+                    if let Some(bin) = ext2::lookup(&part, &m.sb, 2, b"bin") {
+                        if let Some(exe) = ext2::lookup(&part, &m.sb, bin, b"busybox") {
+                            if let Some(node) = ext2::inode(&part, &m.sb, exe) {
+                                let sz = node.size as usize;
+                                if sz > 4096 && sz < 16 * 1024 * 1024 {
+                                    let buf = crate::kalloc::kmalloc(sz);
+                                    // SAFETY: kmalloc returned sz bytes.
+                                    let dst = unsafe {
+                                        core::slice::from_raw_parts_mut(buf, sz)
+                                    };
+                                    if let Some(got2) =
+                                        ext2::read_file(&part, &m.sb, exe, dst)
+                                    {
+                                        if got2 == sz {
+                                            let ok = user::spawn(&dst[..sz], "uname");
+                                            kprintln!(con,
+                                                "rustux: ext2: ran /bin/busybox from the root {ok}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
