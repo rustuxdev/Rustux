@@ -110,6 +110,27 @@ run: build
 	if [ $$status -eq 33 ]; then echo "boot test: PASS (qemu exit 33)"; \
 	else echo "boot test: FAIL (qemu exit $$status)"; exit 1; fi
 
+# Visible-display variant: opens a QEMU window so the boot can be
+# watched on the emulated framebuffer (the kernel paints its console
+# there via fbcon). Serial still goes to the terminal, so the PASS
+# line and the per-task exits stay visible. DISPLAY is honored by
+# QEMU's gtk backend; override with `make run-gui DISPLAY_MODE=sdl`.
+DISPLAY_MODE ?= gtk
+run-gui: build
+	$(QEMU) \
+		-machine q35 \
+		-m 1G \
+		-cpu qemu64,+rdrand \
+		-bios $(OVMF) \
+		-drive file=$(ESP_IMG),format=raw,if=ide \
+		-snapshot \
+		-serial stdio -display $(DISPLAY_MODE) \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		-no-reboot; \
+	status=$$?; \
+	if [ $$status -eq 33 ]; then echo "boot test: PASS (qemu exit 33)"; \
+	else echo "boot test: FAIL (qemu exit $$status)"; exit 1; fi
+
 INITRD_BASH := initrd-bash.cpio
 
 # Same suite with QEMU user networking (slirp) + an e1000e NIC: the
