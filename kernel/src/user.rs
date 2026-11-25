@@ -23071,8 +23071,13 @@ pub fn tick(img: &mut UCtx) -> *const UCtx {
     // Heartbeat every 5s: a frozen boot screen still tells us which
     // IRQs fire and which task was current — distinguishes "CPU dead"
     // from "IRQ storm starves userspace" without a serial port.
+    // Off by default: it writes to the same console the demo's
+    // full-screen menu owns, so the diagnostic painted over the UI.
+    // Flip DEBUG_BEAT to true to bring it back when diagnosing a
+    // stall.
+    const DEBUG_BEAT: bool = false;
     let tks = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-    if tks % 500 == 499 {
+    if DEBUG_BEAT && tks % 500 == 499 {
         crate::log::printk(format_args!(
             "rustux: beat t={} cur={} pit={} kbd={} net={}",
             tks + 1,
