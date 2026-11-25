@@ -520,7 +520,7 @@ static void install(const char *path)
                 // read, not just a formatted empty partition.
                 static const char marker[] =
                     "Rustux ext2 root\n";
-                struct mke2_file files[4];
+                struct mke2_file files[8];
                 files[0].path = "README";
                 files[0].data = marker;
                 files[0].len = sizeof marker - 1;
@@ -535,13 +535,19 @@ static void install(const char *path)
                 // Only one directory level is supported, so the paths are
                 // kept flat inside bin/ for now.
                 uint32_t nf = 2;
-                static const char *const PAYLOAD[] = {
-                    "/bin/busybox", "/bin/dash",
+                // Source path -> path in the installed root. The libs
+                // exercise the nested directories a real system needs.
+                static const char *const PAYLOAD[][2] = {
+                    { "/bin/busybox", "bin/busybox" },
+                    { "/lib/x86_64-linux-gnu/libapt-pkg.so.6.0",
+                      "lib/x86_64-linux-gnu/libapt-pkg.so.6.0" },
+                    { "/lib/x86_64-linux-gnu/libapt-private.so.0.0",
+                      "lib/x86_64-linux-gnu/libapt-private.so.0.0" },
                 };
-                static int pfds[4];
-                static struct stat pst[4];
-                for (uint32_t i = 0; i < sizeof PAYLOAD / sizeof PAYLOAD[0] && nf < 4; i++) {
-                    int fd = open(PAYLOAD[i], O_RDONLY);
+                static int pfds[8];
+                static struct stat pst[8];
+                for (uint32_t i = 0; i < sizeof PAYLOAD / sizeof PAYLOAD[0] && nf < 8; i++) {
+                    int fd = open(PAYLOAD[i][0], O_RDONLY);
                     if (fd < 0 || fstat(fd, &pst[i]) != 0 || pst[i].st_size <= 0) {
                         if (fd >= 0)
                             close(fd);
@@ -550,7 +556,7 @@ static void install(const char *path)
                     if ((unsigned long long)pst[i].st_size >= (unsigned long long)blocks * 1024)
                         continue; // would not fit
                     pfds[i] = fd;
-                    files[nf].path = i == 0 ? "bin/busybox" : "bin/dash";
+                    files[nf].path = PAYLOAD[i][1];
                     files[nf].data = 0;
                     files[nf].len = (uint32_t)pst[i].st_size;
                     files[nf].read = file_reader;
@@ -559,7 +565,7 @@ static void install(const char *path)
                 }
                 int fr = mke2_format(mke2_sink, &sd, (uint64_t)root_lba * 512,
                                      blocks, files, nf);
-                for (uint32_t i = 0; i < 4; i++) {
+                for (uint32_t i = 0; i < 8; i++) {
                     if (pfds[i] > 0)
                         close(pfds[i]);
                 }

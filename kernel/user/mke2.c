@@ -159,7 +159,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
     uint32_t lf_blk = first_data + 1;
 
     // ---- superblock ----
-    uint8_t sb[BLOCK];
+    static uint8_t sb[BLOCK];
     memset(sb, 0, sizeof sb);
     // Count used blocks: metadata per group + root + lost+found.
     for (uint32_t g = 0; g < groups && g < 64; g++) {
@@ -206,7 +206,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
     // padding (the bug that made e2fsck reject the first two versions).
 
     // ---- bitmaps, inode tables and descriptors, per group ----
-    uint8_t gdt[BLOCK * 4];
+    static uint8_t gdt[BLOCK * 4];
     memset(gdt, 0, sizeof gdt);
     uint32_t total_free = 0;
 
@@ -285,7 +285,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         }
         uint32_t bitmap_bits = in_group;
 
-        uint8_t bm[BLOCK];
+        static uint8_t bm[BLOCK];
         memset(bm, 0, sizeof bm);
         // Metadata bit indices 0..meta_end-1: the super (and GDT for
         // group 0, backups for the rest), both bitmaps, the inode table,
@@ -362,7 +362,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         uint32_t gfree = in_group - set;
 
 
-        uint8_t im[BLOCK];
+        static uint8_t im[BLOCK];
         memset(im, 0, sizeof im);
         if (g == 0) {
             uint32_t upto = FIRST_INO + ndirs + nplaced;
@@ -394,7 +394,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         if (g > 0) {
             // Backup superblock (same bytes, s_block_group_nr set) and a
             // copy of the group descriptor table.
-            uint8_t bsb[BLOCK];
+            static uint8_t bsb[BLOCK];
             memcpy(bsb, sb, BLOCK);
             bsb[104] = (uint8_t)g;
             if (wr(ctx, base + gs * BLOCK, bsb, BLOCK)) {
@@ -407,14 +407,14 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         // Inode table: zero it, then write the two real inodes at their
         // exact offsets (inode 11 is at byte 1280 — the second block).
         for (uint32_t b = 0; b < ITABLE_BLOCKS; b++) {
-            uint8_t it[BLOCK];
+            static uint8_t it[BLOCK];
             memset(it, 0, sizeof it);
             if (wr(ctx, base + (itable + b) * BLOCK, it, BLOCK)) {
                 return -16;
             }
         }
         if (g == 0) {
-            uint8_t ino[INODE_SIZE];
+            static uint8_t ino[INODE_SIZE];
             memset(ino, 0, sizeof ino);
             put16(ino + 0, 0x41ed);
             // links: ".", "..", lost+found, plus one per subdirectory
@@ -462,7 +462,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
 
     // ---- directories: inode + block with ".", "..", and their files ----
     for (uint32_t i = 0; i < ndirs; i++) {
-        uint8_t ino[INODE_SIZE];
+        static uint8_t ino[INODE_SIZE];
         memset(ino, 0, sizeof ino);
         put16(ino + 0, 0x41ed);              // S_IFDIR|0755
         {
@@ -520,7 +520,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
                 ne++;
             }
         }
-        uint8_t db[BLOCK];
+        static uint8_t db[BLOCK];
         memset(db, 0, sizeof db);
         uint32_t off2 = 0;
         for (uint32_t e = 0; e < ne; e++) {
@@ -544,7 +544,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
 
     // ---- file inodes and data ----
     for (uint32_t f = 0; f < nplaced; f++) {
-        uint8_t ino[INODE_SIZE];
+        static uint8_t ino[INODE_SIZE];
         memset(ino, 0, sizeof ino);
         put16(ino + 0, 0x81a4);                 // S_IFREG|0644
         put16(ino + 26, 1);                     // links
@@ -595,7 +595,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             return -20;
         }
         // Data: the source buffer may be shorter than a block, so pad.
-        uint8_t db[BLOCK];
+        static uint8_t db[BLOCK];
         uint32_t left = placed[f].len;
         uint32_t consumed = 0; // explicit offset for the streaming reader
         const uint8_t *src = (const uint8_t *)files[f].data;
@@ -621,7 +621,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             b++;
         } while (left > 0);
         if (placed[f].ind != 0) {
-            uint8_t ib[BLOCK];
+            static uint8_t ib[BLOCK];
             memset(ib, 0, sizeof ib);
             uint32_t nb2 = (placed[f].len + BLOCK - 1) / BLOCK;
             for (uint32_t k = 12; k < nb2 && k - 12 < BLOCK / 4; k++) {
@@ -638,10 +638,10 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             uint32_t first = 12 + per; // first block handled here
             uint32_t rest = nb2 > first ? nb2 - first : 0;
             uint32_t l2count = (rest + per - 1) / per;
-            uint8_t l1[BLOCK];
+            static uint8_t l1[BLOCK];
             memset(l1, 0, sizeof l1);
             for (uint32_t i = 0; i < l2count && i < per; i++) {
-                uint8_t l2[BLOCK];
+                static uint8_t l2[BLOCK];
                 memset(l2, 0, sizeof l2);
                 for (uint32_t k = 0; k < per; k++) {
                     uint32_t idx = i * per + k;
@@ -666,7 +666,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
     // ---- root directory ----
     // Built entry by entry so the last one can absorb the slack; the
     // final rec_len must reach the end of the block.
-    uint8_t dir[BLOCK];
+    static uint8_t dir[BLOCK];
     memset(dir, 0, sizeof dir);
     uint32_t off = 0;
     {

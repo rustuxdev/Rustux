@@ -6150,3 +6150,26 @@ That completes the arc: partition -> format ext2 -> place files -> mount
 Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
 NEXT: place the fuller payload (29 MiB in the live initrd), give the
 root an /etc and an init script, then the partition editor.
+
+## run-248 — the payload grows, and a stack bug it exposed
+
+Placing more files crashed the installer: `user fault #PF
+task=livemenu rip=0x2` — a jump through a corrupted return address.
+Cause: mke2_format held several 1 KiB scratch buffers on the stack
+simultaneously across a recursive path helper, and each extra file
+pushed the frame over the edge. The formatter is single-threaded, so
+every scratch buffer is now `static` and stack use is constant.
+
+With that fixed the payload list carries nested paths:
+
+    bin/busybox
+    lib/x86_64-linux-gnu/libapt-pkg.so.6.0      (2007496 bytes)
+    lib/x86_64-linux-gnu/libapt-private.so.0.0  (424336 bytes)
+
+VERIFIED: the install completes without a fault, e2fsck on the
+installed root reports 0 issues, and debugfs lists both libraries at
+their real paths.
+
+Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.
+NEXT: extend the list to the rest of the 29 MiB payload, add an init
+script, then the partition editor.
