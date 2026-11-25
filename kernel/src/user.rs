@@ -1043,21 +1043,21 @@ fn i386_sigframe_write(t: &mut Task, ctx: &UCtx, sig: u64, saved_mask: u32) -> O
         let off = sc + 16 + i * 4;
         b[off..off + 4].copy_from_slice(&(*v as u32).to_le_bytes());
     }
-    let f = |off: usize, v: u32| {
+    let f = |v: u32| {
         let mut o = [0u8; 4];
         o.copy_from_slice(&v.to_le_bytes());
         o
     };
-    b[sc + 48..sc + 52].copy_from_slice(&f(0, 0)); // trapno
-    b[sc + 52..sc + 56].copy_from_slice(&f(0, 0)); // err
+    b[sc + 48..sc + 52].copy_from_slice(&f(0)); // trapno
+    b[sc + 52..sc + 56].copy_from_slice(&f(0)); // err
     b[sc + 56..sc + 60].copy_from_slice(&(ctx.rip as u32).to_le_bytes()); // ip
     b[sc + 60..sc + 64].copy_from_slice(&(ctx.cs as u32).to_le_bytes()); // cs
     b[sc + 64..sc + 68].copy_from_slice(&(ctx.rflags as u32).to_le_bytes()); // flags
     b[sc + 68..sc + 72].copy_from_slice(&(ctx.rsp as u32).to_le_bytes()); // sp_at_signal
     b[sc + 72..sc + 76].copy_from_slice(&(ctx.ss as u32).to_le_bytes()); // ss
-    b[sc + 76..sc + 80].copy_from_slice(&f(0, 0)); // fpstate = NULL
+    b[sc + 76..sc + 80].copy_from_slice(&f(0)); // fpstate = NULL
     b[sc + 80..sc + 84].copy_from_slice(&saved_mask.to_le_bytes()); // oldmask
-    b[sc + 84..sc + 88].copy_from_slice(&f(0, 0)); // cr2
+    b[sc + 84..sc + 88].copy_from_slice(&f(0)); // cr2
     // The 8 bytes after the sigcontext are reserved (Linux keeps a
     // retcode there for restorer-less actions; ours lives on the
     // trampoline page because the stack is NX).
@@ -13501,6 +13501,80 @@ pub fn sleep_ms(ctx: &mut UCtx, ms: u64) {
 /// 512-byte granular, so unaligned edges bounce through a kernel
 /// sector buffer. Reads clip at the device end — Linux's short
 /// read, not an error.
+/// AHCI-backed read: same 512-byte-granular bounce and clipping
+/// contract as the PIIX path, just a different transport.
+fn ahci_read(o: &mut OpenFile, drv: usize, buf: u64, len: u64) -> u64 {
+    let cap = crate::ahci::disk_capacity(drv);
+    if o.pos as u64 >= cap {
+        return 0;
+    }
+    let n = len.min(cap - o.pos as u64) as usize;
+    if !range_ok_w(buf, n as u64) {
+        return EFAULT;
+    }
+    let mut done = 0usize;
+    let mut bounce = [0u8; 512];
+    while done < n {
+        let off = o.pos as u64 + done as u64;
+        let lba = off / 512;
+        let in_sector = (off % 512) as usize;
+        if !crate::ahci::read_sector(drv, lba, &mut bounce) {
+            return if done > 0 { done as u64 } else { (-5i64) as u64 };
+        }
+        let take = (512 - in_sector).min(n - done);
+        // SAFETY: buf validated writable for n bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bounce.as_ptr().add(in_sector),
+                (buf + done as u64) as *mut u8,
+                take,
+            );
+        }
+        done += take;
+    }
+    o.pos += done;
+    done as u64
+}
+
+fn ahci_write(o: &mut OpenFile, drv: usize, buf: u64, len: u64) -> u64 {
+    let cap = crate::ahci::disk_capacity(drv);
+    if o.pos as u64 >= cap {
+        return (-28i64) as u64; // ENOSPC
+    }
+    let n = len.min(cap - o.pos as u64) as usize;
+    if !range_ok(buf, n as u64) {
+        return EFAULT;
+    }
+    let mut done = 0usize;
+    let mut bounce = [0u8; 512];
+    while done < n {
+        let off = o.pos as u64 + done as u64;
+        let lba = off / 512;
+        let in_sector = (off % 512) as usize;
+        if in_sector != 0 || n - done < 512 {
+            // Partial sector: read-modify-write.
+            if !crate::ahci::read_sector(drv, lba, &mut bounce) {
+                return if done > 0 { done as u64 } else { (-5i64) as u64 };
+            }
+        }
+        let take = (512 - in_sector).min(n - done);
+        // SAFETY: buf validated readable for n bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (buf + done as u64) as *const u8,
+                bounce.as_mut_ptr().add(in_sector),
+                take,
+            );
+        }
+        if !crate::ahci::write_sector(drv, lba, &bounce) {
+            return if done > 0 { done as u64 } else { (-5i64) as u64 };
+        }
+        done += take;
+    }
+    o.pos += done;
+    done as u64
+}
+
 /// Which ATA drive backs this OFD: Linux's /dev/sda is minor 0,
 /// /dev/sdb minor 16 on major 8.
 fn sd_drive(o: &OpenFile) -> usize {
@@ -13518,6 +13592,9 @@ fn sd_drive(o: &OpenFile) -> usize {
 
 fn sd_read(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
     let drv = sd_drive(o);
+    if crate::ata::sectors() == 0 {
+        return ahci_read(o, drv, buf, len);
+    }
     let cap = crate::ata::capacity_d(drv);
     if o.pos as u64 >= cap {
         return 0;
@@ -13556,6 +13633,9 @@ fn sd_read(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
 /// ENOSPC.
 fn sd_write(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
     let drv = sd_drive(o);
+    if crate::ata::sectors() == 0 {
+        return ahci_write(o, drv, buf, len);
+    }
     let cap = crate::ata::capacity_d(drv);
     if o.pos as u64 >= cap {
         return (-28i64) as u64; // ENOSPC
@@ -15037,6 +15117,31 @@ pub fn dev_init() {
                 vfile_stamp(v, 0o660, 0);
                 v.fmt = 0o60000; // S_IFBLK
                 v.rdev = 8 << 8; // major 8, minor 0
+            }
+        }
+    }
+    // AHCI disks (q35 / real SATA): the PIIX probe above finds nothing
+    // on those machines, so mint the nodes from the AHCI table instead.
+    // Minor = 16*i keeps Linux's sda/sdb numbering.
+    if crate::ata::sectors() == 0 {
+        let nd = crate::ahci::disks() as usize;
+        for i in 0..nd.min(4) {
+            if crate::ahci::disk_sectors(i) == 0 {
+                continue;
+            }
+            let name: &[u8] = match i {
+                0 => b"dev/sda",
+                1 => b"dev/sdb",
+                2 => b"dev/sdc",
+                _ => b"dev/sdd",
+            };
+            let r = vfile_create(name);
+            if (r as i64) >= 0 {
+                if let Some(v) = vfile(r as usize) {
+                    vfile_stamp(v, 0o660, 0);
+                    v.fmt = 0o60000; // S_IFBLK
+                    v.rdev = (8 << 8) | ((i as u32) * 16);
+                }
             }
         }
     }

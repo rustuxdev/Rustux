@@ -15,6 +15,7 @@ use uefi::mem::memory_map::{MemoryMap, MemoryType};
 use uefi::prelude::*;
 
 mod acpi;
+mod ahci;
 mod apic;
 mod ata;
 mod cpu;
@@ -1024,6 +1025,12 @@ pub(crate) fn rustux_main(
                 && base + size > d.phys_start
         })
     };
+    // AHCI: q35 and real machines expose their disks here, not on the
+    // legacy PIIX ports ata.rs drives. Same MMIO validation.
+    let n_ahci = ahci::init(bar_is_mmio);
+    if n_ahci > 0 {
+        kprintln!(con, "rustux: ahci: {n_ahci} disk(s)");
+    }
     let e1000_dev = e1000::probe(bar_is_mmio);
     if let Some((e_base, e_mac)) = e1000_dev {
         let tx_ok = e1000::tx_selftest(e_base, e_mac);
