@@ -264,9 +264,14 @@ static int copy_image(int img, int sd, off_t n)
             w += (size_t)k;
         }
         done += got;
-        if ((done & (4 * 1024 * 1024 - 1)) == 0 || done == n)
+        if ((done & (4 * 1024 * 1024 - 1)) == 0 || done == n) {
             printf("install: %lld / %lld MiB\n",
                    (long long)(done >> 20), (long long)(n >> 20));
+            // stdout is block-buffered when it is not a tty: without
+            // this the progress sits in the buffer and the install
+            // looks hung.
+            fflush(stdout);
+        }
     }
     return 0;
 }
@@ -292,6 +297,7 @@ static void install(const char *path)
     }
     printf("install: writing %lld MiB image to %s ...\n",
            (long long)(st.st_size >> 20), path);
+    fflush(stdout);
     if (lseek(sd, 0, SEEK_SET) < 0 || copy_image(img, sd, st.st_size) < 0) {
         close(img);
         close(sd);
@@ -381,8 +387,12 @@ int main(void)
         printf("[2] live session\n");
         printf("> ");
         fflush(stdout);
-        char line[64];
-        if (!fgets(line, sizeof line, stdin)) {
+        // Single-key input: fgets() is line-based and blocks until
+        // Enter, so pressing "1" at the prompt echoed the key and then
+        // did nothing at all — which reads as a dead menu.
+        char line[2];
+        ssize_t got = read(0, line, 1);
+        if (got <= 0) {
             sleep(1);
             continue;
         }

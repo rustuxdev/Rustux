@@ -16178,7 +16178,19 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                 // can be crafted by mknod even without hardware, so
                 // answer ENXIO (the driver has no such device).
                 0o60000 => match v.rdev >> 8 {
-                    8 if crate::ata::sectors() > 0 => i,
+                    // Major 8 is the sd family. Either transport may
+                    // back it: the legacy PIIX driver or AHCI (q35 and
+                    // real SATA). Checking only ata::sectors() made
+                    // every AHCI-backed node open with ENXIO, which is
+                    // why the installer could see /dev/sda (access()
+                    // passes on the node) but never open it.
+                    8 if crate::ata::sectors() > 0
+                        || crate::ahci::disk_sectors(
+                            ((v.rdev & 0xff) / 16) as usize,
+                        ) > 0 =>
+                    {
+                        i
+                    }
                     8 => return ENXIO,
                     // /dev/sr0 — the ATAPI CD drive. No sector I/O
                     // (read/write are ENXIO below); it exists for

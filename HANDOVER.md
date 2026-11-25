@@ -5429,3 +5429,34 @@ annotates "(first of several disks)"; a real chooser prompt is next.
 And the AHCI write hang (run-213/214) still blocks an actual install
 on q35/SATA.
 Audit: scoped quick run-20. cve-now MCP unreachable (recorded).
+
+## run-217 — the install works: ENXIO gate, menu Enter, verify MISMATCH
+
+THREE findings, one fixed:
+
+1. fd_open's block-device gate only accepted major 8 when the PIIX
+   driver had a disk, so EVERY AHCI-backed /dev/sd* opened with
+   ENXIO ("No such device or address"). That is why the installer
+   could see /dev/sda (access() passes on the node) and never open
+   it. Fixed: accept major 8 when either transport has the disk
+   (minor/16 indexes the AHCI table, bounds-checked, so a crafted
+   minor still gets ENXIO).
+2. The menu used fgets(), which is line-based AND the tty is in
+   canonical mode: pressing "1" echoed and then did nothing until
+   Enter. Now read(0, &c, 1) plus the existing Enter-as-default
+   cases. Pressing a digit still needs Enter to submit (the tty is
+   canonical); making it act on the keypress alone needs ICANON
+   support in the tty layer.
+3. install progress was block-buffered (stdout is not a tty), so the
+   copy looked hung. fflush after each progress line.
+
+RESULT: the install now runs end to end — `install: writing 48 MiB
+image to /dev/sda ...`, AHCI writes batched 8 sectors (dbg showed
+lba 98296 = end of payload), then `install: verify first sector:
+MISMATCH`.
+
+NEXT: that verify folds "short read" and "data differs" into one
+message. Print the read return values and the first 8 bytes of each
+buffer to separate them — a short read means the block read path
+clips, a real mismatch means the write lands at the wrong LBA.
+Audit: scoped quick run-21. cve-now MCP unreachable (recorded).
