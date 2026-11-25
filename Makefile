@@ -568,19 +568,22 @@ $(ISO): $(ESP_ISO) $(KERNEL) $(INITRD_ISO)
 		-isohybrid-gpt-basdat $(ISOROOT)
 
 $(INSTALLDISK):
-	dd if=/dev/zero of=$@ bs=1M count=64
+	# 256 MiB: the root must hold the whole payload (~35 MiB of
+	# binaries + libs); the previous 64 left 16 MiB and mke2 ran
+	# out of blocks mid-format (install FAILED -21).
+	dd if=/dev/zero of=$@ bs=1M count=256
 
 # End-to-end install proof in one guest session: `-boot order=dc`
 # prefers the CD while it's inserted and falls back to the disk
 # after the monitor eject — the real installer flow (once= proved
 # unreliable: OVMF picked a stale boot entry over it). monitor-
-# sendkey presses "2" at
-# the menu (the PS/2 path — QEMU does not deliver piped stdio to
-# the guest UART), the installer streams hd.img to /dev/sda,
-# reports status, and waits for ENTER; sendkey answers it, the
-# guest resets into the installed system, and "1" lands in the
-# live shell. The ATA driver binds the i440fx IDE controller —
-# hence -machine pc.
+# sendkey drives the menu: "1" picks install, Enter takes the
+# default root size, "yes" confirms (the PS/2 path — QEMU does not
+# deliver piped stdio to the guest UART). The installer streams
+# hd.img to /dev/sda, reports status, and waits for ENTER; sendkey
+# answers it, the guest resets into the installed system, and "1"
+# lands in the shell. The ATA driver binds the i440fx IDE
+# controller — hence -machine pc.
 run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 	rm -f isomon.sock isoph.log
 	$(QEMU) \
@@ -599,10 +602,10 @@ run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 & \
 	qpid=$$!; \
 	ok=0; \
-	for i in $$(seq 1 16); do \
+	for i in $$(seq 1 40); do \
 		sleep 15; \
 		grep -q "ENTER to reboot" isoph.log && { ok=1; break; }; \
-		python3 tools/sendkey.py isomon.sock 2 ret; \
+		python3 tools/sendkey.py isomon.sock 1 ret str:yes ret; \
 	done; \
 	[ $$ok -eq 1 ] \
 		&& echo "iso install: PASS" \

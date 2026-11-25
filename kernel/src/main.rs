@@ -107,6 +107,84 @@ pub(crate) fn boot_map() -> &'static [mm::MapEnt] {
     }
 }
 
+/// Recursively copy a mounted ext2 directory into the RAM fs — the
+/// namespace pivot: after this, fs_lookup resolves the installed
+/// files through the normal vfile path, so a pid 1 spawned from this
+/// root sees /bin, /etc and the rest of the installed filesystem
+/// rather than the initrd's. `path`/`plen` carry the accumulated
+/// prefix ("etc", "etc/apt"); `depth`, `budget` and `copied` bound
+/// the walk, so a hostile or damaged root cannot exhaust the kernel
+/// stack, the vfile table, or the heap.
+fn copy_root_dir(
+    io: &dyn ext2::BlockIo,
+    sb: &ext2::Super,
+    dir_ino: u32,
+    path: &mut [u8; 128],
+    plen: usize,
+    depth: u32,
+    copied: &mut u32,
+    budget: &mut u64,
+) {
+    const MAX_COPIED: u32 = 512;
+    const MAX_FILE: u64 = 32 << 20;
+    const MAX_DEPTH: u32 = 8;
+    if *copied >= MAX_COPIED || depth >= MAX_DEPTH {
+        return;
+    }
+    // dir_walk reads each block into its own stack buffer before the
+    // callback runs and hands over a Dirent copy — recursing inside
+    // the callback does not re-enter a live read, and the sequential
+    // PIO reads cannot interleave.
+    let _ = ext2::dir_walk(io, sb, dir_ino, |e| {
+        if *copied >= MAX_COPIED {
+            return false;
+        }
+        let n = e.name_len as usize;
+        let dot = n == 1 && e.name[0] == b'.';
+        let ddot = n == 2 && e.name[0] == b'.' && e.name[1] == b'.';
+        let sep = usize::from(plen > 0);
+        if dot || ddot || n > 96 || plen + sep + n > path.len() {
+            return true;
+        }
+        let mut end = plen;
+        if sep == 1 {
+            path[end] = b'/';
+            end += 1;
+        }
+        path[end..end + n].copy_from_slice(&e.name[..n]);
+        end += n;
+        let Some(node) = ext2::inode(io, sb, e.ino) else {
+            return true;
+        };
+        if node.is_dir() {
+            copy_root_dir(io, sb, e.ino, path, end, depth + 1, copied,
+                          budget);
+        } else if node.is_file() {
+            let sz = node.size as u64;
+            if sz != 0 && sz <= *budget && sz <= MAX_FILE {
+                let buf = crate::kalloc::kmalloc(sz as usize);
+                if !buf.is_null() {
+                    // SAFETY: kmalloc returned sz bytes.
+                    let dst = unsafe {
+                        core::slice::from_raw_parts_mut(buf, sz as usize)
+                    };
+                    let ok = ext2::read_file(io, sb, e.ino, dst)
+                        .is_some_and(|got| got == sz as usize)
+                        && user::root_copy_up(&path[..end], dst);
+                    // SAFETY: root_copy_up keeps its own copy; the
+                    // staging buffer is ours to release.
+                    unsafe { crate::kalloc::kfree(buf) };
+                    if ok {
+                        *copied += 1;
+                        *budget -= sz;
+                    }
+                }
+            }
+        }
+        *copied < MAX_COPIED
+    });
+}
+
 #[cfg(target_os = "uefi")]
 #[entry]
 fn main() -> Status {
@@ -1133,6 +1211,20 @@ pub(crate) fn rustux_main(
         };
         kprintln!(con, "rustux: ext2: content {content_ok} bytes {got}");
     }
+    // Driver binding step 2: the primary-channel ATA disk, when the
+    // machine has one (-drive if=ide). Pure PIO — the probe only
+    // costs an IDENTIFY round-trip, so run it whether or not PCI
+    // found the controller (QEMU's PIIX3 is always port-fixed).
+    // Moved ahead of the partition scan: the ext2 mount below gates
+    // on ata::sectors(), and probing ATA only here meant the scan
+    // never ran on -machine pc (IDE only, no AHCI).
+    let ata_secs = ata::init();
+    if ata_secs > 0 {
+        kprintln!(con, "rustux: ata: primary master {ata_secs} sectors ({} MiB)",
+            ata_secs / 2048);
+    } else {
+        kprintln!(con, "rustux: ata: no disk on the primary channel");
+    }
     // AHCI: q35 and real machines expose their disks here, not on the
     // legacy PIIX ports ata.rs drives. Same MMIO validation.
     let n_ahci = ahci::init(bar_is_mmio);
@@ -1148,6 +1240,19 @@ pub(crate) fn rustux_main(
         let refused_disk = ext2::parse_super(&dio).is_none();
         kprintln!(con, "rustux: ext2: disk adapter len>0 {} refuses non-ext2 {refused_disk}",
                   ext2::BlockIo::len(&dio) > 0);
+        // Live-media check: the installer ISO's initrd carries the
+        // hd.img payload (the disk image the installer streams); the
+        // installed disk's initrd is the same archive minus hd.img.
+        // When live, an attached installed disk's ext2 root is still
+        // detected but NOT copied into the namespace — the live
+        // environment must stay pristine, and the installer stays
+        // reachable.
+        let live_media = initrd.is_some_and(|(a, l)| {
+            let a2 = unsafe {
+                core::slice::from_raw_parts(mm::pmap(a) as *const u8, l)
+            };
+            cpio::find(a2, b"hd.img").is_some()
+        });
         // Read each disk's partition table and try to mount every
         // partition as ext2 — the same path a root mount takes. The
         // ESP is FAT, so it is refused; the root partition is mounted
@@ -1206,66 +1311,34 @@ pub(crate) fn rustux_main(
                     kprintln!(con,
                         "rustux: ext2: disk{d}p{slot} type={:#x} MOUNTED lba={start} block={} entries={n} walked={walked} etc/motd={got}B",
                         ptype, m.sb.block_size());
-                    // Copy the root's config files into the RAM fs so a
-                    // program spawned from it can read its own /etc —
-                    // initramfs "copy-up". Without this busybox init
-                    // cannot see /etc/inittab and opens /dev/tty2..4.
-                    for (dir, name) in [
-                        (&b"etc"[..], &b"inittab"[..]),
-                        (&b"etc"[..], &b"motd"[..]),
-                        (&b"etc"[..], &b"rcS"[..]),
-                    ] {
-                        if let Some(d) = ext2::lookup(&part, &m.sb, 2, dir) {
-                            if let Some(f) = ext2::lookup(&part, &m.sb, d, name) {
-                                let mut b = [0u8; 512];
-                                if let Some(n) =
-                                    ext2::read_file(&part, &m.sb, f, &mut b)
-                                {
-                                    let mut path = [0u8; 40];
-                                    let mut o = 0usize;
-                                    for c in dir.iter().chain(b"/".iter()).chain(name.iter()) {
-                                        if o < path.len() {
-                                            path[o] = *c;
-                                            o += 1;
-                                        }
-                                    }
-                                    let ok = user::root_copy_up(&path[..o], &b[..n]);
-                                    kprintln!(con,
-                                        "rustux: root: copy-up {} {ok}",
-                                        core::str::from_utf8(&path[..o]).unwrap_or("?"));
-                                }
-                            }
-                        }
+                    // The namespace pivot: copy the whole installed
+                    // root into the RAM fs. fs_lookup/open/stat/getdents
+                    // all resolve vfiles first, so after this a pid 1
+                    // spawned from this root sees /bin, /etc and the
+                    // rest of its own filesystem — not the initrd's.
+                    // Skipped on live media: the installer ISO keeps a
+                    // pristine namespace and stays reachable.
+                    let mut copied = 0u32;
+                    if !live_media {
+                        let mut path = [0u8; 128];
+                        let mut budget = 256u64 << 20;
+                        copy_root_dir(
+                            &part, &m.sb, 2, &mut path, 0, 0, &mut copied,
+                            &mut budget,
+                        );
                     }
-                    // Run a program FROM the installed root: read
-                    // /bin/busybox out of ext2 and spawn it as "uname",
-                    // so the multicall binary prints our sysname. This is
-                    // the difference between reading the root and booting
-                    // a program out of it.
-                    if let Some(bin) = ext2::lookup(&part, &m.sb, 2, b"bin") {
-                        if let Some(exe) = ext2::lookup(&part, &m.sb, bin, b"busybox") {
-                            if let Some(node) = ext2::inode(&part, &m.sb, exe) {
-                                let sz = node.size as usize;
-                                if sz > 4096 && sz < 16 * 1024 * 1024 {
-                                    let buf = crate::kalloc::kmalloc(sz);
-                                    // SAFETY: kmalloc returned sz bytes.
-                                    let dst = unsafe {
-                                        core::slice::from_raw_parts_mut(buf, sz)
-                                    };
-                                    if let Some(got2) =
-                                        ext2::read_file(&part, &m.sb, exe, dst)
-                                    {
-                                        if got2 == sz {
-                                            // Keep it for the pivot: the
-                                            // spawn step boots this as pid 1
-                                            // instead of the initrd payload.
-                                            unsafe {
-                                                *core::ptr::addr_of_mut!(ROOT_EXE) =
-                                                    Some((buf as *const u8, sz));
-                                            }
-                                        }
-                                    }
-                                }
+                    kprintln!(con,
+                        "rustux: root: {copied} files copied up from ext2");
+                    // Remember a boot binary for the spawn step: the
+                    // pivot only fires when an installed root actually
+                    // supplied one — a live boot has no ext2 root and
+                    // must not mistake the archive's busybox for it.
+                    if copied > 0 {
+                        if let Some(img) = user::fs_lookup(b"bin/busybox")
+                        {
+                            unsafe {
+                                *core::ptr::addr_of_mut!(ROOT_EXE) =
+                                    Some((img.as_ptr(), img.len()));
                             }
                         }
                     }
@@ -1297,18 +1370,6 @@ pub(crate) fn rustux_main(
         }
     } else {
         kprintln!(con, "rustux: e1000: no 82574L on the bus");
-    }
-
-    // Driver binding step 2: the primary-channel ATA disk, when the
-    // machine has one (-drive if=ide). Pure PIO — the probe only
-    // costs an IDENTIFY round-trip, so run it whether or not PCI
-    // found the controller (QEMU's PIIX3 is always port-fixed).
-    let ata_secs = ata::init();
-    if ata_secs > 0 {
-        kprintln!(con, "rustux: ata: primary master {ata_secs} sectors ({} MiB)",
-            ata_secs / 2048);
-    } else {
-        kprintln!(con, "rustux: ata: no disk on the primary channel");
     }
 
     if lapic {
@@ -1388,20 +1449,23 @@ pub(crate) fn rustux_main(
     // Capture the fninit FPU image tasks start from — must run
     // before the first spawn copies INIT_FX into its Task.
     user::fpu_init();
+    if let Some(arc) = arc {
+        // The archive is the read-only underlay of the root fs —
+        // installed files copied into the RAM fs resolve first (the
+        // pivot), anything not installed falls back to the initrd. Set
+        // unconditionally so a pivoted pid 1 gets the union view too.
+        // SAFETY: `arc` names LOADER_DATA pages that are never freed,
+        // so a 'static slice over them is sound.
+        user::set_initrd(unsafe { core::slice::from_raw_parts(arc.as_ptr(), arc.len()) });
+    }
     let root_exe = unsafe { *core::ptr::addr_of!(ROOT_EXE) };
     if let Some((p, n)) = root_exe {
         // PIVOT: an installed root with a boot binary wins over the
         // initrd payload — this is what makes the disk a system rather
-        // than a filesystem the kernel reads.
+        // than a filesystem the kernel reads. Its whole tree was copied
+        // into the RAM fs above, so pid 1's namespace IS the installed
+        // root (with the initrd as read-only underlay).
         let img = unsafe { core::slice::from_raw_parts(p, n) };
-        // "sh": a shell from the installed root. busybox's init applet
-        // cannot be used yet — it opens /etc/inittab through the fs
-        // layer, which still resolves against the initrd, so the binary
-        // runs but cannot see its own root's files (HANDOVER run-249).
-        // "sh": a shell from the installed root, with its /etc copied
-        // up so it can read its own config. busybox `init` gets as far as
-        // reading /etc/inittab (copy-up works) but cannot run the sysinit
-        // script: exec has no #! handling yet (HANDOVER run-250).
         if user::spawn(img, "sh") {
             kprintln!(con, "rustux: root: booting the installed system (pid 1 = sh from ext2)");
             queued += 1;
@@ -1411,11 +1475,6 @@ pub(crate) fn rustux_main(
     }
     if queued == 0 {
         if let Some(arc) = arc {
-        // The archive doubles as the read-only root filesystem — fd
-        // ops resolve paths against it for the kernel's lifetime.
-        // SAFETY: `arc` names LOADER_DATA pages that are never freed,
-        // so a 'static slice over them is sound.
-        user::set_initrd(unsafe { core::slice::from_raw_parts(arc.as_ptr(), arc.len()) });
         for (name, img) in cpio::entries(arc) {
             let nm = core::str::from_utf8(name).unwrap_or("?");
             // '/' names are support files (lib64/ld-linux...,

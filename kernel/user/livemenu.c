@@ -436,6 +436,9 @@ static void install(const char *path)
             root_secs = want_secs;
         }
         chosen_root_secs = root_secs;
+        // The size prompt has no trailing newline, so the confirmation
+        // used to land on the same line and swallow the typed size.
+        printf("\n  root partition: %llu MiB\n", root_secs >> 11);
         printf("  type 'yes' to continue: ");
         fflush(stdout);
         char line[16];
@@ -520,7 +523,11 @@ static void install(const char *path)
                 // read, not just a formatted empty partition.
                 static const char marker[] =
                     "Rustux ext2 root\n";
-                struct mke2_file files[8];
+                struct mke2_file files[24];
+                // Entries without .read stream .data; an uninitialized
+                // fn pointer on the stack crashed the formatter with
+                // a near-null call (cr2=0xfffffffffffff8).
+                memset(files, 0, sizeof files);
                 files[0].path = "README";
                 files[0].data = marker;
                 files[0].len = sizeof marker - 1;
@@ -557,16 +564,33 @@ static void install(const char *path)
                 uint32_t nf = 4;
                 // Source path -> path in the installed root. The libs
                 // exercise the nested directories a real system needs.
+                // The live initrd carries 130 entries; the installed
+                // root must carry the same binaries or the shell has
+                // nothing to run. Missing entries are skipped silently.
                 static const char *const PAYLOAD[][2] = {
                     { "/bin/busybox", "bin/busybox" },
+                    { "/bin/sh", "bin/sh" },
+                    { "/bin/ash", "bin/ash" },
+                    { "/bin/ls", "bin/ls" },
+                    { "/bin/cat", "bin/cat" },
+                    { "/bin/cp", "bin/cp" },
+                    { "/bin/bash", "bin/bash" },
+                    { "/bin/dash", "bin/dash" },
+                    { "/bin/apt", "bin/apt" },
+                    { "/bin/dpkg", "bin/dpkg" },
+                    { "/bin/htop", "bin/htop" },
+                    { "/lib64/ld-linux-x86-64.so.2",
+                      "lib64/ld-linux-x86-64.so.2" },
+                    { "/lib/x86_64-linux-gnu/libc.so.6",
+                      "lib/x86_64-linux-gnu/libc.so.6" },
                     { "/lib/x86_64-linux-gnu/libapt-pkg.so.6.0",
                       "lib/x86_64-linux-gnu/libapt-pkg.so.6.0" },
                     { "/lib/x86_64-linux-gnu/libapt-private.so.0.0",
                       "lib/x86_64-linux-gnu/libapt-private.so.0.0" },
                 };
-                static int pfds[8];
-                static struct stat pst[8];
-                for (uint32_t i = 0; i < sizeof PAYLOAD / sizeof PAYLOAD[0] && nf < 8; i++) {
+                static int pfds[24];
+                static struct stat pst[24];
+                for (uint32_t i = 0; i < sizeof PAYLOAD / sizeof PAYLOAD[0] && nf < 24; i++) {
                     int fd = open(PAYLOAD[i][0], O_RDONLY);
                     if (fd < 0 || fstat(fd, &pst[i]) != 0 || pst[i].st_size <= 0) {
                         if (fd >= 0)
@@ -585,7 +609,7 @@ static void install(const char *path)
                 }
                 int fr = mke2_format(mke2_sink, &sd, (uint64_t)root_lba * 512,
                                      blocks, files, nf);
-                for (uint32_t i = 0; i < 8; i++) {
+                for (uint32_t i = 0; i < 24; i++) {
                     if (pfds[i] > 0)
                         close(pfds[i]);
                 }

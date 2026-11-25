@@ -22827,6 +22827,28 @@ fn spawn_idx(img: &[u8], name: &str, hold: bool) -> Option<usize> {
     let n = name.len().min(EXEC_STR_CAP - 1);
     args.argv[0][..n].copy_from_slice(&name.as_bytes()[..n]);
     args.argv_len[0] = n + 1;
+    // A spawned task needs a usable environment. Without PATH every
+    // bare command reports "not found" even when the binary exists —
+    // that is what made an installed shell look empty.
+    {
+        let envs: [&[u8]; 4] = [
+            b"PATH=/bin:/usr/bin:/sbin:/usr/sbin",
+            b"HOME=/root",
+            b"TERM=linux",
+            b"USER=root",
+        ];
+        let mut e = 0usize;
+        for v in envs.iter() {
+            if e >= MAX_EXEC_ENVS {
+                break;
+            }
+            let k = v.len().min(EXEC_STR_CAP - 1);
+            args.envp[e][..k].copy_from_slice(&v[..k]);
+            args.envp_len[e] = k + 1;
+            e += 1;
+        }
+        args.envc = e;
+    }
     args.argc = 1;
     let nl = name.len().min(15);
     t.name[..nl].copy_from_slice(&name.as_bytes()[..nl]);
