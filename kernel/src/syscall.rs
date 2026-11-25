@@ -962,6 +962,57 @@ fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
             return (-13i64) as u64; // EACCES
         }
     }
+    // #! scripts: exec the interpreter and hand it the script path as
+    // its first argument. Without this an installed init cannot run
+    // /etc/rcS (busybox reports "can't run ... No such file").
+    let mut had_shebang = false;
+    let mut script = [0u8; 128];
+    let mut script_len = 0usize;
+    let mut interp = [0u8; 128];
+    let mut interp_len = 0usize;
+    let mut lname = [0u8; 128];
+    let mut lname_len = name.len().min(127);
+    lname[..lname_len].copy_from_slice(&name[..lname_len]);
+    {
+        let mut cur = &lname[..lname_len];
+        for _ in 0..4 {
+            let Some(body) = user::fs_lookup(cur) else {
+                return ENOENT;
+            };
+            if body.starts_with(b"#!") {
+                // Interpreter path: everything after "#!" up to space or
+                // newline.
+                let mut i = 2usize;
+                while i < body.len() && (body[i] == b' ') {
+                    i += 1;
+                }
+                let start = i;
+                while i < body.len() && body[i] != b' ' && body[i] != b'\n' && i - start < 127 {
+                    i += 1;
+                }
+                if i == start {
+                    return ENOEXEC;
+                }
+                interp[..i - start].copy_from_slice(&body[start..i]);
+                interp_len = i - start;
+                had_shebang = true;
+                if script_len == 0 {
+                    let n2 = cur.len().min(127);
+                    script[..n2].copy_from_slice(&cur[..n2]);
+                    script_len = n2;
+                }
+                lname_len = interp_len.min(127);
+                lname[..lname_len].copy_from_slice(&interp[..lname_len]);
+                cur = &lname[..lname_len];
+                continue;
+            }
+            break;
+        }
+        if elf::parse(user::fs_lookup(&lname[..lname_len]).unwrap_or(&[])).is_none() {
+            return ENOEXEC;
+        }
+    }
+    let name = &lname[..lname_len];
     let Some(img) = user::fs_lookup(name) else {
         return ENOENT;
     };
@@ -982,6 +1033,30 @@ fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
         args.argv[0][..n].copy_from_slice(&name[..n]);
         args.argv_len[0] = n + 1;
         args.argc = 1;
+    }
+    if had_shebang && script_len > 0 {
+        // Linux rewrites argv to [interp, script, original argv[1..]]:
+        // the interpreter is argv[0] (busybox picks its applet from it)
+        // and the script is argv[1].
+        let max = user::MAX_EXEC_ARGS.min(args.argc + 1);
+        let mut i = max;
+        while i > 1 {
+            i -= 1;
+            args.argv[i] = args.argv[i - 1];
+            args.argv_len[i] = args.argv_len[i - 1];
+        }
+        let base = name
+            .iter()
+            .rposition(|&c| c == b'/')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let bn = (name.len() - base).min(user::EXEC_STR_CAP - 1);
+        args.argv[0][..bn].copy_from_slice(&name[base..base + bn]);
+        args.argv_len[0] = bn + 1;
+        let sn = script_len.min(user::EXEC_STR_CAP - 1);
+        args.argv[1][..sn].copy_from_slice(&script[..sn]);
+        args.argv_len[1] = sn + 1;
+        args.argc = max;
     }
     if !user::exec(img, ctx, args, name) {
         // The address space is already torn down; the task cannot

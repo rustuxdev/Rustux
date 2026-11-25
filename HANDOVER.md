@@ -6224,3 +6224,29 @@ Also fixed: root_copy_up stamped 0644, so a copied-up script was not
 executable (EACCES); it now stamps 0755.
 
 Suite PASS exit 33 twice, pgtest exit(0) both runs.
+
+## run-251 — shebang support in exec (landed, but not the init blocker)
+
+sys_execve now follows #! scripts: it parses the interpreter path
+(capped at 127 bytes, stops at space/newline), re-resolves up to four
+levels (so a script naming itself cannot recurse), and rewrites argv
+Linux-style to [interp-basename, script, original argv[1..]] bounded by
+MAX_EXEC_ARGS.
+
+HONEST RESULT: this did NOT fix the installed init. busybox init still
+reports
+
+    can't run '/etc/rcS': No such file or directory
+
+even though copy-up reported `copy-up etc/rcS true`, so the file is in
+the RAM fs and executable (0755). The remaining cause is elsewhere in
+exec's path resolution and is NOT identified — do not assume shebang
+was the whole story.
+
+Safe to keep: three consecutive suite runs PASS exit 33 with pgtest
+exit(0), so the change does not regress anything.
+
+State of the installed boot: `sh` from the ext2 root as pid 1 (works),
+with its /etc copied up so it can read its own config. busybox `init`
+gets as far as reading /etc/inittab (copy-up proven) but cannot run the
+sysinit script.
