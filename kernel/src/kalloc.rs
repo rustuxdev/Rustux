@@ -152,6 +152,34 @@ pub fn alloc_frame() -> Option<u64> {
     b
 }
 
+/// `2^order` zeroed contiguous frames as a physical address — DMA
+/// rings and device structures that must not straddle a page
+/// boundary (virtqueue, AHCI tables). Pair with free_frames_ord.
+pub fn alloc_frames(order: usize) -> Option<u64> {
+    let f = irq_save();
+    let alloc = unsafe { &mut *core::ptr::addr_of_mut!(ALLOC) };
+    let b = alloc.buddy.alloc(order);
+    // SAFETY: f was produced by the matching irq_save above.
+    unsafe { irq_restore(f) };
+    if let Some(p) = b {
+        // SAFETY: p is an owned block, physmap-reachable.
+        unsafe { core::ptr::write_bytes(pmap(p) as *mut u8, 0, (PAGE << order) as usize) };
+    }
+    b
+}
+
+/// Free a block previously returned by alloc_frames with the same
+/// order — same exactly-once contract as kfree.
+pub fn free_frames_ord(p: u64, order: usize) {
+    if p == 0 {
+        return;
+    }
+    let f = irq_save();
+    let alloc = unsafe { &mut *core::ptr::addr_of_mut!(ALLOC) };
+    alloc.buddy.free_pages(p, order);
+    unsafe { irq_restore(f) };
+}
+
 /// Free a frame previously returned by alloc_frame. Same contract as
 /// kfree: exactly once per allocation.
 pub fn free_frame(p: u64) {

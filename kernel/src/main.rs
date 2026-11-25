@@ -27,6 +27,7 @@ mod cpu;
 mod cpio;
 mod e1000;
 mod ext2;
+mod virtio;
 mod elf;
 mod net;
 mod nt;
@@ -1235,6 +1236,46 @@ pub(crate) fn rustux_main(
             None => (false, 0),
         };
         kprintln!(con, "rustux: ext2: content {content_ok} bytes {got}");
+        // ext3: same image contract through Linux's mke2fs -t ext3 —
+        // the journaled sibling must mount and read identically.
+        let e3: &[u8] = include_bytes!("ext3_test.img");
+        let e3io = ext2::MemIo { data: e3 };
+        let e3_ok = match ext2::parse_super(&e3io) {
+            Some(sb3) => {
+                sb3.readable()
+                    && ext2::validate(&sb3, e3.len() as u64)
+                    && ext2::lookup(&e3io, &sb3, 2, b"hi.txt").is_some()
+            }
+            None => false,
+        };
+        kprintln!(con, "rustux: ext3: real image {e3_ok}");
+        // ext4: extents + 64bit descriptors + flex_bg + 256-byte
+        // inodes. big.bin is sparse-with-8-holes — enough extents to
+        // push the tree to depth 1, so the index->leaf walk is proven
+        // on a real Linux-written image, not a fixture.
+        let e4: &[u8] = include_bytes!("ext4_test.img");
+        let e4io = ext2::MemIo { data: e4 };
+        let mut e4_body = [0u8; 64];
+        let e4_ok = match ext2::parse_super(&e4io) {
+            Some(sb4) => {
+                let v = sb4.readable()
+                    && sb4.uses_extents()
+                    && ext2::validate(&sb4, e4.len() as u64);
+                let small = ext2::lookup(&e4io, &sb4, 2, b"hi.txt")
+                    .and_then(|i| ext2::read_file(&e4io, &sb4, i, &mut e4_body))
+                    .is_some_and(|n| n >= 10 && &e4_body[..9] == b"hello ext");
+                let deep = ext2::lookup(&e4io, &sb4, 2, b"big.bin")
+                    .map(|i| {
+                        let n = ext2::read_file(&e4io, &sb4, i, &mut e4_body)
+                            .unwrap_or(0);
+                        n >= 6 && &e4_body[..6] == b"chunk0"
+                    })
+                    .unwrap_or(false);
+                v && small && deep
+            }
+            None => false,
+        };
+        kprintln!(con, "rustux: ext4: real image {e4_ok} (extents incl. depth>0)");
     }
     // Driver binding step 2: the primary-channel ATA disk, when the
     // machine has one (-drive if=ide). Pure PIO — the probe only
@@ -1256,11 +1297,17 @@ pub(crate) fn rustux_main(
     if n_ahci > 0 {
         kprintln!(con, "rustux: ahci: {n_ahci} disk(s)");
     }
+    // virtio-blk: QEMU's modern disk transport (-drive if=virtio).
+    // The driver logs its own probe line; only the count matters here.
+    let n_virtio = virtio::init();
+    if n_virtio > 0 {
+        kprintln!(con, "rustux: virtio: {n_virtio} disk(s)");
+    }
     // DiskIo: the adapter that reads REAL sectors (placed after the
     // disk probes so a disk is known). The boot disk is FAT, so ext2
     // must refuse it cleanly — proving the adapter reads and that the
     // parser rejects non-ext2 data instead of misparsing it.
-    if ata::sectors() > 0 || ahci::disks() > 0 {
+    if ata::sectors() > 0 || ahci::disks() > 0 || virtio::disks() > 0 {
         let dio = ext2::DiskIo { disk: 0 };
         let refused_disk = ext2::parse_super(&dio).is_none();
         kprintln!(con, "rustux: ext2: disk adapter len>0 {} refuses non-ext2 {refused_disk}",
@@ -1282,7 +1329,7 @@ pub(crate) fn rustux_main(
         // partition as ext2 — the same path a root mount takes. The
         // ESP is FAT, so it is refused; the root partition is mounted
         // and its directory walked.
-        for d in 0..4usize {
+        for d in 0..ext2::disk_count().max(4) {
             let io = ext2::DiskIo { disk: d };
             let total = ext2::BlockIo::len(&io);
             if total < 1024 * 1024 {
@@ -1333,8 +1380,15 @@ pub(crate) fn rustux_main(
                         },
                         None => 0,
                     };
+                    let fam = if m.sb.uses_extents() {
+                        "ext4"
+                    } else if m.sb.has_journal() {
+                        "ext3"
+                    } else {
+                        "ext2"
+                    };
                     kprintln!(con,
-                        "rustux: ext2: disk{d}p{slot} type={:#x} MOUNTED lba={start} block={} entries={n} walked={walked} etc/motd={got}B",
+                        "rustux: {fam}: disk{d}p{slot} type={:#x} MOUNTED lba={start} block={} entries={n} walked={walked} etc/motd={got}B",
                         ptype, m.sb.block_size());
                     // The namespace pivot: copy the whole installed
                     // root into the RAM fs. fs_lookup/open/stat/getdents

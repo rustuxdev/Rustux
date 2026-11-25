@@ -95,24 +95,61 @@ $(EXT2_TEST): FORCE
 	printf 'hello ext2\n' > /tmp/ext2src/hi.txt
 	mke2fs -q -t ext2 -b 1024 -I 256 -d /tmp/ext2src $@
 
-$(KERNEL): kernel/src/*.rs kernel/Cargo.toml klib/src/*.rs klib/Cargo.toml Cargo.toml kernel/user/hello.elf $(EXT2_TEST) FORCE
+# ext3/ext4 proofs: same mke2fs -d contract. ext4's big.bin is sparse
+# with 8 holes — enough extents to force a depth-1 extent tree, so the
+# index->leaf walk runs on a real Linux-written image.
+EXT3_TEST := kernel/src/ext3_test.img
+$(EXT3_TEST): FORCE
+	rm -f $@
+	dd if=/dev/zero of=$@ bs=1M count=4 2>/dev/null
+	mkdir -p /tmp/ext3src
+	printf 'hello ext3\n' > /tmp/ext3src/hi.txt
+	mke2fs -q -t ext3 -b 1024 -I 256 -d /tmp/ext3src $@
+
+EXT4_TEST := kernel/src/ext4_test.img
+$(EXT4_TEST): FORCE
+	rm -f $@
+	dd if=/dev/zero of=$@ bs=1M count=8 2>/dev/null
+	rm -rf /tmp/ext4src && mkdir -p /tmp/ext4src
+	printf 'hello ext4\n' > /tmp/ext4src/hi.txt
+	python3 -c "f=open('/tmp/ext4src/big.bin','wb'); \
+	    [ (f.seek(i*2*4096), f.write((b'chunk%d-'%i)*512)) for i in range(8) ]; \
+	    f.truncate(16*4096); f.close()"
+	mke2fs -q -t ext4 -b 1024 -I 256 -d /tmp/ext4src $@
+
+# virtio-blk proof for `make run`: a whole-disk image with a real MBR
+# partition holding the ext4 test filesystem — the boot scan mounts it
+# over the virtqueue datapath, end-to-end.
+VIRTIO_DISK := kernel/src/virtio_test.img
+$(VIRTIO_DISK): $(EXT4_TEST)
+	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
+	dd if=$(EXT4_TEST) of=$@ bs=512 seek=2048 conv=notrunc 2>/dev/null
+	python3 -c "import struct; \
+	    d=bytearray(512); \
+	    d[446+4]=0x83; \
+	    struct.pack_into('<II', d, 446+8, 2048, 32768-2048); \
+	    d[510]=0x55; d[511]=0xaa; \
+	    open('$@','r+b').write(d)"
+
+$(KERNEL): kernel/src/*.rs kernel/Cargo.toml klib/src/*.rs klib/Cargo.toml Cargo.toml kernel/user/hello.elf $(EXT2_TEST) $(EXT3_TEST) $(EXT4_TEST) FORCE
 	cargo build --release --target $(TARGET) -p kernel
 
 $(ESP_IMG): $(KERNEL) $(INITRD)
-	dd if=/dev/zero of=$@ bs=1M count=64
+	dd if=/dev/zero of=$@ bs=1M count=96
 	mformat -i $@ ::
 	mmd -i $@ ::/EFI
 	mmd -i $@ ::/EFI/BOOT
 	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@ $(INITRD) ::/initrd.cpio
 
-run: build
+run: build $(VIRTIO_DISK)
 	$(QEMU) \
 		-machine q35 \
 		-m 1G \
 		-cpu qemu64,+rdrand \
 		-bios $(OVMF) \
 		-drive file=$(ESP_IMG),format=raw,if=ide \
+		-drive file=$(VIRTIO_DISK),format=raw,if=virtio \
 		-snapshot \
 		-serial stdio -display none \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \

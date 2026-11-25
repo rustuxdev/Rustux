@@ -17,6 +17,20 @@ pub unsafe fn inb(port: u16) -> u8 {
 }
 
 #[inline]
+/// One 16-bit port read.
+///
+/// # Safety
+/// Same contract as [`inb`]: caller guarantees `port` is a real device
+/// register and that the read is side-effect-safe there.
+pub unsafe fn inw(port: u16) -> u16 {
+    let v: u16;
+    unsafe {
+        core::arch::asm!("in ax, dx", out("ax") v, in("dx") port,
+            options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
 pub unsafe fn outw(port: u16, v: u16) {
     unsafe {
         core::arch::asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack));
