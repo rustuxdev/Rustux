@@ -6705,3 +6705,116 @@ buffer via the same read_all closure; a corrupt .crc read degrades
 to NoSidecar, never a false Bad. The sidecar is a build-time
 integrity tag, not a signature — it defends against read errors, not
 malicious media. No findings.
+
+## run-262 — apt install nginx end-to-end: TCP-orphan sweep (ENFILE), vtable capacity (ENOSPC), base-passwd, service stubs, getent, FIONBIO, faccessat2
+
+nginx was a random apt test that kept surfacing real bugs; each got
+fixed as it appeared. The chain now completes: `apt update` +
+`apt install -y nginx` → `Setting up nginx` → `dpkg exit(0)` →
+`nginx -v` prints nginx/1.22.1 on the installed system.
+
+- ENFILE root cause was TCP slots, not OFDs. `fd_socket` returns
+  ENFILE only when TCPSOCKS (MAX_TCPS=8) is full — OFD exhaustion is
+  EMFILE. Orphaned FinWait/LastAck sockets (last fd closed before the
+  peer's FIN+ACK) could only be freed by arriving peer segments; a
+  lost FIN/ACK or a keep-alive server holding its side pinned a slot
+  forever. apt's fetch loop opens+closes one socket per file → 8
+  fetches = ENFILE. Fix: `tcp_retx` (the per-tick sweep) now also
+  retransmits unacked FINs for FinWait/LastAck on the same doubling
+  schedule (syn_at/syn_tries renamed ctl_at/ctl_tries, armed at every
+  close transition in fd_shutdown + tcp_sock_close) and RST+frees
+  orphans after a 12s deadline.
+- ENOSPC mid-unpack was MAX_VFILES=1024/MAX_VDIRS=512 — perl-base
+  alone is ~2700 files. Bumped to 8192/2048; the table-full paths now
+  printk instead of failing silently.
+- `chown: unknown user/group root:adm` — shipped the full Debian
+  base-passwd set in kernel/user/etc/{passwd,group,shadow} (adm,
+  www-data, _apt, etc.).
+- `update-rc.d: not found` → stub script `stubs/noinit` (`exit 0`)
+  installed as usr/sbin/update-rc.d and hardlinked to invoke-rc.d,
+  deb-systemd-helper, deb-systemd-invoke; `stubs/locale` silences
+  Debconf::Encoding.
+- `getent: not found` broke passwd.postinst:7 (`getent group shadow`
+  gid-42 check) → `stubs/getent`, a real flat-file lookup over
+  /etc/{passwd,group,shadow,gshadow,hosts} (name → field 1, numeric
+  → field 3, exit 2 on miss). Also satisfies nginx-common's
+  `getent passwd www-data` guard so adduser is never invoked.
+- Two install-path bugs surfaced by the stubs: MKE2_MAX_FILES=160
+  truncated the ALIASES pass mid-table (awk/perl/deb-systemd-* never
+  reached the ext2 — bumped to 320) and the stub sources needed +x.
+- `nginx: [emerg] ioctl(FIONBIO) :80 failed (EINVAL)` — the ioctl arm
+  predated OpenFile.nonblock; FIONBIO now toggles o.nonblock like
+  fcntl(F_SETFL).
+- faccessat2 (nr 439) routed to sys_access (the a4 flags are inert in
+  the single-user model); kills the recurring `enosys: nr 439` spam.
+- Exit telemetry kept: `pid N exe exit(code) ofds X tabs Y slots Z
+  refs W tcps T` — it split the ENFILE misdiagnosis (clean OFDs) from
+  the real TCP leak and costs one printk per exit.
+
+Verified: GTK QEMU -machine pc, fresh ISO install (pre+post verify
+83 files 0 bad), installed boot, `apt update` exit(0) then
+`apt install -y nginx` exit(0) — tcps never exceeded 1; make run
+exit 33, 75 tasks, frames X -> X zero leak.
+
+Audit: scoped quick, security-audit skill — two in-diff findings
+fixed (FIN retransmit advertised ack=0 instead of rcv_nxt;
+tcp_sock_close's state write-back could resurrect a Closed state a
+loopback-drained RST just set — now guarded by !k.dead). Verified
+clean: stale bound, RTO0<<ctl_tries shift bound, FIN seq snd_nxt-1,
+orphan gating (no fd/waiter can dangle), tick serialization vs IRQ.
+needs_validation: post-loop tcp_free vs a future rx path that
+enqueues mid-drain — unreachable with today's LO_Q semantics.
+cve-now MCP unreachable this run (deviation recorded).
+## run-263 — MAP_SHARED|MAP_ANONYMOUS shared memory: SHMSEGS segments, per-task VMA ledger, fork verbatim-share, phys-verified ownership
+
+nginx's unconditional 1280B shm alloc at init forced the rung: mmap
+deliberately ENODEV'd MAP_SHARED. Now implemented for the anonymous
+case (file-backed shared stays honest ENODEV — no writeback exists).
+
+- SHMSEGS: 16 global segments {frames[512], nframes, refs}. Task
+  gains shms[(lo,hi,seg)] ×8 + nshms. shm_mmap allocates zeroed
+  frames, maps via map_frame (caller-supplied-phys twin of
+  map_page), adds range+VMA.
+- fork_address_space aliases shm leaves verbatim (same frame) after
+  shm_pin_all; fork failure path's shm_drop_all unwinds the pins.
+  CLONE_VM children pin per copied VMA too; shm_mmap itself refuses
+  under a shared mm (per-task ledger can't track two writers —
+  ENODEV like file-backed, documented gap).
+- The ownership test is shm_owns(t,va,phys) — phys ∈ ANY covering
+  segment's frame list (OR over covers: MAP_FIXED can stack shm
+  VMAs), never VMA coverage alone — after the audit found a
+  range-based test lets a stale VMA (private MAP_FIXED remap,
+  partial munmap) both shield private frames from freeing and alias
+  them cross-task at fork.
+- Unmap/exit paths: unmap_page and free_user_mappings skip only
+  phys-verified seg frames; shm_unmap_range drops refs on fully
+  covered VMAs at munmap, private/shm MAP_FIXED, brk shrink,
+  nt_decommit/free_pages. shm_drop_all runs at task teardown AND
+  unconditionally in reap (CLONE_VM non-last users leak refs
+  otherwise — audit finding).
+- tcp_retx hardened while in there: orphan deadline marks k.dead
+  BEFORE the RST so a drain-side realloc can't resurrect the slot;
+  the deferred free re-verifies dead+orphan; SynSent/FIN re-borrows
+  check port-pair identity (slot reuse inside a loopback drain would
+  otherwise bump a stranger's ctl_tries).
+
+Verified: make run exit 33, 75 tasks, frames 211793 -> 211793 zero
+leak; shmtest static-pie injected via initrd on the installed system
+— 0 failures (maps, zeroed, child-write-visible-parent, private
+stays private, munmap, multi-map); nginx gets past shm init
+(FIONBIO + MAP_SHARED) — next blocker was /run/nginx.pid ENOENT
+(mkdir fixes; not a kernel bug).
+
+Audit: scoped quick, security-audit skill, run-22 — three confirmed
+findings fixed in-diff (rollback double-free; stale-VMA private-
+frame aliasing via phys-verified shm_owns + shm_unmap_range at every
+user-VA unmap; CLONE_VM non-last-exit ref leak via unconditional
+reap shm_drop_all). Also fixed: aliased &mut SHMSEGS borrow in
+shm_mmap; non-atomic MAP_FIXED nranges check moved pre-destroy.
+needs_validation: tcp_retx slot-reuse mid-drain (defense added;
+  a live realloc path unproven — residual: re-borrow checks lack
+  peer_ip/state, schedule-corruption only); nt_view_unmap shm-ref
+  coverage marginal (NT-only task issuing Linux mmap).
+cve-now checked this run: CVE-2026-23127 (perf mmap refcount UAF —
+class-match only, perf subsystem n/a); FIN_WAIT/socket-exhaustion
+class query returned no Linux CVE match.

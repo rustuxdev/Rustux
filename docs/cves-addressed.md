@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**164 unique CVEs recorded.**
+**165 unique CVEs recorded.**
 
 ## klib ports
 
@@ -180,6 +180,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-13216 | legacy BIOS boot rung: Multiboot2 front end — kernel also builds for x86_64-unknown-none… | audit run-120 quick scoped via safe-anything MCP (kernel/ 119 files clean; security-audit skill still absent on disk — limitation recorded) + cve.now entities.search (parsing clas… |
 | CVE-2026-13478 | installed-root pivot rung: the mounted ext2 root is copied whole into the RAM fs at boot… | audit run-258 scoped quick (security-audit skill): verified the walk bounds, the callback re-entrancy claim, the exact-name gate, and the underlay ordering. No findings. needs_val… |
 | CVE-2026-23115 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
+| CVE-2026-23127 | shm-anon rung: MAP_SHARED\ | refcount-lifecycle class (double-free in shm_mmap rollback — unmap_page freed mapped frames then s.frames freed again; fixed by single-free-path); ownership-attribution class (ran… |
 | CVE-2026-23374 | preemptive round-robin scheduler | every switch is a UCtx resume (15 GPRs + iret frame) — launch/preemption/exit share one path; dedicated 0xf0 stub saves the FULL register file; cs&3==0 ticks never switch (58090 c… |
 | CVE-2026-31433 | NT directory enumeration: NtQueryDirectoryFile (FileDirectoryInformation records, wildcar… | audit run-85 quick scoped: no confirmed findings; 1 correctness fix applied - stale wildcard cell cleared on handle-slot reuse. Verified: [info,info+ilen) probed writable + <=1MiB… |
 | CVE-2026-31495 | tcp/ipv4 (mini) | exact seq+ack required on every transition (no blind RST/state jumps — 63913 class out); option walk bounded, wscale never shifted (31495); seq state fully initialized (72020); do… |

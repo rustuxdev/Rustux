@@ -59,6 +59,20 @@ before.
 - `translate`/`translate_r` are bounded to [USER_VA_LO, USER_VA_HI) —
   never call raw `translate` for user memory.
 
+## The QEMU hdd is a test artifact — fix the media, not the disk
+
+- `target.img` / the installed ext2 root is a **test medium only**.
+  Experiments on the live hdd are allowed to validate a theory, but
+  every real fix lands in the files that BUILD the medium:
+  `mkinitrd`/`tools/` payload lists, `kernel/user/livemenu.c`
+  (installer's PAYLOAD table + `apt_dirs`), `kernel/user/mke2.c`, the
+  initrd cpio contents, and the kernel copy-up path
+  (`copy_root_dir`/`root_copy_up`). Never hand-patch the installed
+  disk and call it a fix — it vanishes on the next `make run-iso`.
+- Same rule for the live session: anything `apt`/login/dpkg needs at
+  runtime must be baked in at build time (payload file present in the
+  cpio/ext2, or a vdir/vfile the boot path mints).
+
 ## Session-specific caveat
 
 The injected `global_rules` rule content in this session has shown a
