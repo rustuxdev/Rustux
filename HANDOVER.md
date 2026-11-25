@@ -6045,3 +6045,27 @@ Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
 NEXT: read the initrd's files from userspace and place them into the
 root (the installer already reads /hd.img, so the mechanism exists),
 then pivot into it.
+
+## run-243 — a real binary lands in the installed root
+
+mke2 takes a streaming source per file (read callback + explicit
+offset), so the installer places a 1 MiB+ binary from the initrd
+without holding it in memory. The installer now streams /bin/busybox
+(2.8 MiB) into the root alongside README and etc/motd.
+
+VERIFIED end to end:
+  - e2fsck on the installed root: 0 issues, 16 files, /bin/busybox
+    2858424 bytes (debugfs).
+  - booting that disk: `ext2: disk0p1 type=0x83 MOUNTED lba=98304
+    block=1024 entries=6 walked=true etc/motd=19B` — entries went 5->6
+    with /bin present.
+
+So the installer produces a root that holds a real executable, and the
+kernel mounts and walks it. Suite PASS exit 33, 75 tasks, zero leak.
+
+TESTING NOTE (cost me several false failures): booting the target
+image while the install VM still runs reads a half-written disk and
+looks like "does not boot". Always wait for the installer VM to exit,
+or copy the image, before booting it.
+NEXT: stream the rest of the payload (libs, dash, /etc files), then
+pivot into the root.

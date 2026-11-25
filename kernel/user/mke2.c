@@ -30,8 +30,13 @@ typedef int (*mke2_write_fn)(void *ctx, uint64_t off, const void *buf,
 /// inodes, so the bitmaps never disagree with the content.
 struct mke2_file {
     const char *path; // "README" or "etc/motd" — one directory level
-    const void *data;
+    const void *data; // inline content, or NULL when streaming
     uint32_t len;
+    // Streaming source: called with an offset inside the file. Lets the
+    // installer place a 1 MiB binary from the initrd without holding it
+    // in memory alongside everything else.
+    int (*read)(void *ctx, uint32_t off, void *buf, uint32_t len);
+    void *rctx;
 };
 
 #define BLOCK 1024u
@@ -497,14 +502,22 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         // Data: the source buffer may be shorter than a block, so pad.
         uint8_t db[BLOCK];
         uint32_t left = placed[f].len;
+        uint32_t consumed = 0; // explicit offset for the streaming reader
         const uint8_t *src = (const uint8_t *)files[f].data;
         uint32_t b = 0;
         do {
             uint32_t take = left < BLOCK ? left : BLOCK;
             memset(db, 0, sizeof db);
             if (take > 0) {
-                memcpy(db, src, take);
-                src += take;
+                if (files[f].read) {
+                    if (files[f].read(files[f].rctx, consumed, db, take) != 0) {
+                        return -29;
+                    }
+                    consumed += take;
+                } else {
+                    memcpy(db, src, take);
+                    src += take;
+                }
                 left -= take;
             }
             if (wr(ctx, base + (placed[f].blk + b) * BLOCK, db, BLOCK)) {

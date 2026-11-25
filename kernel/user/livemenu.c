@@ -300,6 +300,16 @@ static void mbr_entry(unsigned char *e, unsigned int start_lba,
         e[12 + i] = (unsigned char)((sectors >> (8 * i)) & 0xff);
 }
 
+// mke2's source: absolute byte reads from an open file — lets the
+// installer place a 1 MiB binary from the initrd without holding it.
+static int file_reader(void *ctx, uint32_t off, void *buf, uint32_t len)
+{
+    int fd = *(int *)ctx;
+    if (lseek(fd, (off_t)off, SEEK_SET) < 0)
+        return 1;
+    return read(fd, buf, len) == (ssize_t)len ? 0 : 1;
+}
+
 // mke2's sink: absolute byte writes to the target fd.
 static int mke2_sink(void *ctx, uint64_t off, const void *buf, uint32_t len)
 {
@@ -510,7 +520,7 @@ static void install(const char *path)
                 // read, not just a formatted empty partition.
                 static const char marker[] =
                     "Rustux ext2 root\n";
-                struct mke2_file files[2];
+                struct mke2_file files[3];
                 files[0].path = "README";
                 files[0].data = marker;
                 files[0].len = sizeof marker - 1;
@@ -521,8 +531,23 @@ static void install(const char *path)
                 files[1].path = "etc/motd";
                 files[1].data = motd;
                 files[1].len = sizeof motd - 1;
+                // A real binary, streamed straight from the initrd.
+                uint32_t nf = 2;
+                int bb = open("/bin/busybox", O_RDONLY);
+                struct stat bs;
+                if (bb >= 0 && fstat(bb, &bs) == 0 && bs.st_size > 0
+                    && (unsigned long long)bs.st_size < (unsigned long long)blocks * 1024) {
+                    files[2].path = "bin/busybox";
+                    files[2].data = 0;
+                    files[2].len = (uint32_t)bs.st_size;
+                    files[2].read = file_reader;
+                    files[2].rctx = &bb;
+                    nf = 3;
+                }
                 int fr = mke2_format(mke2_sink, &sd, (uint64_t)root_lba * 512,
-                                     blocks, files, 2);
+                                     blocks, files, nf);
+                if (bb >= 0)
+                    close(bb);
                 if (fr == 0) {
                     printf("install: ext2 root formatted\n");
                 } else {
