@@ -5845,3 +5845,24 @@ call should report the block size and a walked root.
 
 NEXT: build that image, prove mount+walk on a real partition, then the
 root switch.
+
+## run-234 — PROVEN: the kernel mounts a real ext2 partition
+
+Fixture (host): mke2fs -t ext2 -b 1024 -I 256 -F root.img (16 MiB),
+debugfs writes motd.txt (inode 12), then dd into a 64 MiB disk at
+LBA 2048 (1 MiB). Booted with that disk attached:
+
+  rustux: ext2: disk adapter len>0 true refuses non-ext2 true
+  rustux: ext2: disk1 mounted at 1MiB block=1024 entries=4 walked=true
+
+disk1 is the ext2 disk; the walk found 4 entries (., .., lost+found,
+motd.txt). The boot disk (disk0, FAT) was correctly REFUSED by the same
+code path.
+
+So the ext2 read path is complete and proven against real hardware:
+mount a partition, validate geometry against the PARTITION, refuse
+non-ext2 and ext4-extent filesystems, walk directories, read file
+content.
+
+NEXT: the root switch (pivot into the mounted fs), then mkfs.ext4 +
+population in userspace, then the layout UI.
