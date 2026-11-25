@@ -5973,3 +5973,20 @@ returns before a byte is touched. Verified in a live boot.
 Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
 NEXT: a real layout choice (ESP/root sizes), then the directory tree,
 then pivoting into the root.
+
+## run-239 — the installer offers a real layout choice
+
+After the plan is printed the installer asks for the root size:
+bare Enter takes everything that is left, a number leaves the rest
+unpartitioned (what a dual-boot or shared data disk needs). The value
+is bounded twice — below 4 MiB and above the available space are both
+refused before any write — and clamped again at the use site.
+
+Verified: choosing 64 produced a root entry of 131072 sectors
+(0x20000) in the MBR; bare Enter still takes the whole remainder.
+
+    root size in MiB (Enter = all 208): 64
+    partition table written (ESP at 2048 +96256, root at 98304 +131072)
+
+Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
+NEXT: a directory tree in the root (so /bin, /etc exist), then pivot.

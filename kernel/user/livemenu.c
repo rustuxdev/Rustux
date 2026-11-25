@@ -373,6 +373,7 @@ static void install(const char *path)
     }
     // State exactly what will be destroyed and require an explicit
     // yes. This is the last point before the disk is written.
+    unsigned long long chosen_root_secs = 0;
     {
         off_t cap0 = lseek(sd, 0, SEEK_END);
         unsigned long long esp_secs =
@@ -395,6 +396,36 @@ static void install(const char *path)
         } else {
             printf("  partition 2  root  (not enough space left)\n");
         }
+        // A real choice: the root size. Bare Enter uses everything
+        // left; a number leaves the remainder unpartitioned, which is
+        // what a dual-boot or a shared data disk needs.
+        printf("  root size in MiB (Enter = all %llu): ",
+               root_secs >> 11);
+        fflush(stdout);
+        char sz[32];
+        if (fgets(sz, sizeof sz, stdin) && sz[0] >= '1' && sz[0] <= '9') {
+            unsigned long long want = 0;
+            for (int i = 0; sz[i] >= '0' && sz[i] <= '9'; i++)
+                want = want * 10 + (unsigned long long)(sz[i] - '0');
+            unsigned long long want_secs = want * 2048;
+            if (want_secs < 8192) {
+                printf("  install: root must be at least 4 MiB\n");
+                fflush(stdout);
+                close(img);
+                close(sd);
+                return;
+            }
+            if (want_secs > root_secs) {
+                printf("  install: only %llu MiB is available\n",
+                       root_secs >> 11);
+                fflush(stdout);
+                close(img);
+                close(sd);
+                return;
+            }
+            root_secs = want_secs;
+        }
+        chosen_root_secs = root_secs;
         printf("  type 'yes' to continue: ");
         fflush(stdout);
         char line[16];
@@ -465,6 +496,11 @@ static void install(const char *path)
             unsigned int root_lba = PART_LBA + (unsigned int)esp_secs;
             if (total > root_lba + 2048) {
                 root_secs = total - root_lba;
+                // Honour a size the user chose at the prompt; bare
+                // Enter keeps everything that is left.
+                if (chosen_root_secs > 0 && chosen_root_secs < root_secs) {
+                    root_secs = chosen_root_secs;
+                }
                 unsigned int blocks = (unsigned int)(root_secs / 2); // 1 KiB blocks
                 printf("install: formatting ext2 root at LBA %u (%u blocks)...\n",
                        root_lba, blocks);
