@@ -1050,6 +1050,45 @@ pub(crate) fn rustux_main(
         bad[SB + 56] ^= 0xff;
         let refused = ext2::parse_super(&bad).is_none();
         kprintln!(con, "rustux: ext2: superblock parse {ok} reject {refused}");
+        // Walk a minimal in-memory ext2: 1 KiB blocks, GDT at block 2,
+        // inode table at block 3, inode 2 = / whose first block is 4
+        // holding one entry "hi.txt" -> inode 12.
+        let mut fs = [0u8; 8192];
+        fs[SB + 56..SB + 58].copy_from_slice(&ext2::MAGIC.to_le_bytes());
+        fs[SB..SB + 4].copy_from_slice(&16u32.to_le_bytes()); // inodes
+        fs[SB + 4..SB + 8].copy_from_slice(&8u32.to_le_bytes()); // blocks
+        fs[SB + 20..SB + 24].copy_from_slice(&1u32.to_le_bytes());
+        fs[SB + 32..SB + 36].copy_from_slice(&8u32.to_le_bytes()); // bpg
+        fs[SB + 40..SB + 40 + 4].copy_from_slice(&16u32.to_le_bytes()); // ipg
+        fs[SB + 76..SB + 80].copy_from_slice(&1u32.to_le_bytes());
+        fs[SB + 88..SB + 90].copy_from_slice(&128u16.to_le_bytes());
+        // group 0 descriptor at block 2 (first_data_block=1 -> gdt=2)
+        fs[2048 + 8..2048 + 12].copy_from_slice(&3u32.to_le_bytes()); // inode_table
+        // inode 2 (root): mode dir, size 1024, block[0]=4
+        let i2 = 3 * 1024 + 128;
+        fs[i2..i2 + 2].copy_from_slice(&0x4000u16.to_le_bytes());
+        fs[i2 + 4..i2 + 8].copy_from_slice(&1024u32.to_le_bytes());
+        fs[i2 + 40..i2 + 44].copy_from_slice(&4u32.to_le_bytes());
+        // block 4: one dir entry, ino 12, rec_len 1024, name "hi.txt"
+        let d = 4096;
+        fs[d..d + 4].copy_from_slice(&12u32.to_le_bytes());
+        fs[d + 4..d + 6].copy_from_slice(&1024u16.to_le_bytes());
+        fs[d + 6] = 6;
+        fs[d + 8..d + 14].copy_from_slice(b"hi.txt");
+        let mut found = 0u32;
+        let walked = match ext2::parse_super(&fs) {
+            Some(sb2) => {
+                let r = ext2::dir_walk(&fs, &sb2, 2, |e| {
+                    if &e.name[..e.name_len as usize] == b"hi.txt" {
+                        found = e.ino;
+                    }
+                    true
+                });
+                r.is_some()
+            }
+            None => false,
+        };
+        kprintln!(con, "rustux: ext2: dir walk {walked} found {found}");
     }
     // AHCI: q35 and real machines expose their disks here, not on the
     // legacy PIIX ports ata.rs drives. Same MMIO validation.

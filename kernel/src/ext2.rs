@@ -127,3 +127,141 @@ pub fn validate(sb: &Super, img_len: u64) -> bool {
     }
     sb.groups() <= 1024
 }
+
+/// One group descriptor — the fields a reader needs.
+#[derive(Clone, Copy)]
+pub struct Group {
+    pub block_bitmap: u32,
+    pub inode_bitmap: u32,
+    pub inode_table: u32,
+}
+
+/// Read group descriptor `g` from the image.
+pub fn group(img: &[u8], sb: &Super, g: u32) -> Option<Group> {
+    let bs = sb.block_size() as usize;
+    let base = sb.gdt_block() as usize * bs + (g as usize) * 32;
+    Some(Group {
+        block_bitmap: rd32(img, base)?,
+        inode_bitmap: rd32(img, base + 4)?,
+        inode_table: rd32(img, base + 8)?,
+    })
+}
+
+/// A parsed inode — block map only (ext2); extents are refused.
+#[derive(Clone, Copy)]
+pub struct Inode {
+    pub mode: u16,
+    pub size: u32,
+    pub block: [u32; 15],
+}
+
+impl Inode {
+    pub fn is_dir(&self) -> bool {
+        self.mode & 0xf000 == 0x4000
+    }
+    pub fn is_file(&self) -> bool {
+        self.mode & 0xf000 == 0x8000
+    }
+}
+
+/// Read inode number `ino` (1-based, as on disk).
+pub fn inode(img: &[u8], sb: &Super, ino: u32) -> Option<Inode> {
+    if ino == 0 || ino > sb.inodes {
+        return None;
+    }
+    let bs = sb.block_size() as usize;
+    let per = sb.inodes_per_group;
+    if per == 0 {
+        return None;
+    }
+    let g = (ino - 1) / per;
+    let idx = (ino - 1) % per;
+    let grp = group(img, sb, g)?;
+    let off = grp.inode_table as usize * bs + idx as usize * sb.inode_size as usize;
+    let raw = img.get(off..off + 128)?;
+    let mut block = [0u32; 15];
+    for (i, b) in block.iter_mut().enumerate() {
+        *b = rd32(raw, 40 + i * 4)?;
+    }
+    Some(Inode {
+        mode: rd16(raw, 0)?,
+        size: rd32(raw, 4)?,
+        block,
+    })
+}
+
+/// One directory entry.
+pub struct Dirent {
+    pub ino: u32,
+    pub name: [u8; 256],
+    pub name_len: u8,
+}
+
+/// Walk a directory's linear entries, calling `f` for each. ext2/3/4
+/// all use this format; htree adds an index but leaves the leaves in
+/// this shape.
+pub fn dir_walk(
+    img: &[u8],
+    sb: &Super,
+    ino: u32,
+    mut f: impl FnMut(&Dirent) -> bool,
+) -> Option<()> {
+    let bs = sb.block_size() as usize;
+    let inode = inode(img, sb, ino)?;
+    if !inode.is_dir() {
+        return None;
+    }
+    let mut pos = 0u32;
+    while pos < inode.size {
+        let blk = block_map(img, sb, &inode, pos / bs as u32)?;
+        if blk == 0 {
+            pos += bs as u32;
+            continue;
+        }
+        let base = blk as usize * bs;
+        let mut off = 0usize;
+        while off + 8 <= bs {
+            let e = img.get(base + off..base + off + 8)?;
+            let e_ino = rd32(e, 0)?;
+            let rec_len = rd16(e, 4)? as usize;
+            let name_len = e[6] as usize;
+            if rec_len < 8 || off + rec_len > bs {
+                break;
+            }
+            if e_ino != 0 && name_len > 0 && name_len <= 255 {
+                let mut name = [0u8; 256];
+                name[..name_len].copy_from_slice(img.get(base + off + 8..base + off + 8 + name_len)?);
+                let d = Dirent {
+                    ino: e_ino,
+                    name,
+                    name_len: name_len as u8,
+                };
+                if !f(&d) {
+                    return Some(());
+                }
+            }
+            off += rec_len;
+        }
+        pos += bs as u32;
+    }
+    Some(())
+}
+
+/// Logical file block -> physical block, via direct + single indirect.
+pub fn block_map(img: &[u8], sb: &Super, inode: &Inode, lblock: u32) -> Option<u32> {
+    let bs = sb.block_size();
+    let per = (bs / 4) as u32;
+    if lblock < 12 {
+        return Some(inode.block[lblock as usize]);
+    }
+    let l = lblock - 12;
+    if l < per {
+        let ind = inode.block[12];
+        if ind == 0 {
+            return Some(0);
+        }
+        let off = ind as usize * bs as usize + (l as usize) * 4;
+        return rd32(img, off);
+    }
+    None // double/triple indirect: not needed for a root walk
+}

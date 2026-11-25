@@ -5707,3 +5707,23 @@ NEXT increments, in order:
    initrd, mount and walk it at boot — the headless proof.
 4. Root switch: mount partition 2 and pivot.
 Audit: run-21 extended (5 coverage units). cve-now unreachable.
+
+## run-227 — ext2: group descriptors, inodes, directory walk
+
+* group(): reads a 32-byte group descriptor (block/inode bitmap,
+  inode table) at gdt_block + g*32.
+* inode(): 1-based, refuses ino == 0 or ino > sb.inodes, computes the
+  group from inodes_per_group, reads mode/size/15 block pointers.
+* dir_walk(): linear ext2/3/4 entries; rec_len validated (>= 8 and
+  inside the block), name_len capped at 255 with a checked copy, and
+  off advances by rec_len so the walk always terminates.
+* block_map(): direct + single indirect (double/triple refused — a
+  root walk does not need them).
+
+Verified with an in-memory ext2 fixture (1 KiB blocks, GDT at block 2,
+inode table at 3, root inode 2 with block 4 holding "hi.txt"):
+  rustux: ext2: dir walk true found 12
+Suite PASS exit 33, 75 tasks, zero leak.
+
+NEXT: the real-image test (mke2fs -t ext2, in the initrd, mount+walk at
+boot), then the root switch.
