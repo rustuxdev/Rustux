@@ -5169,3 +5169,28 @@ Next: run HEAD's run-bios with the serial fault log enabled (the
 crash produced no fault record, so it is likely a triple fault);
 check whether a compat task's free_user_mappings/exec touches the
 kernel image's 2M region under the 1 MiB load address.
+
+## run-207 — BIOS regression FIXED: restore slot 0 before freeing
+
+Root cause of the run-206 BIOS regression, confirmed by QEMU's
+interrupt log: an instruction fetch fault at cpl=0 in the KERNEL
+IMAGE (IP=CR2=0x1487f8, i.e. inside the 1 MiB image the legacy BIOS
+loader produces), repeating until a triple fault.
+
+Mechanism: under BIOS the kernel image sits at 1 MiB — inside GiB 0,
+which is exactly the GiB a compat task privatizes to map its image at
+0x08048000. free_user_mappings freed the task's private PD (whose
+2M leaves are the kernel image's own identity mapping) and only THEN
+restored the shared kernel PDPT. In the window between the free and
+the restore the kernel's own code was unmapped — fatal for the very
+next instruction fetch, and fatal again in the fault handler, hence
+the silent triple fault. UEFI never saw it because its image lives
+at 5 GiB (PML4 slot 5), untouched by the private hierarchy.
+
+Fix: restore the shared kernel PDPT into slot 0 FIRST, then free the
+private hierarchy. The walk keeps working because every table access
+goes through mm::pmap (phys + physmap), not through the task's
+virtual mappings.
+
+Verified: BIOS PASS exit 33, 75 tasks, frames 244605 -> 244605 zero
+leak; UEFI PASS exit 33, 75 tasks, frames 213332 -> 213332 zero leak.

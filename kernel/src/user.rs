@@ -2553,6 +2553,16 @@ impl Task {
             let e0 = rd64(self.pml4);
             if e0 & USER != 0 {
                 let pdpt = e0 & PHYS_MASK;
+                // Restore the shared kernel PDPT FIRST. Under the
+                // legacy BIOS the kernel image sits at 1 MiB — inside
+                // GiB 0, the very GiB a compat task privatizes — so
+                // while the private PD below is being freed the
+                // kernel's own code would be unmapped and the next
+                // instruction fetch faults (a triple fault, since the
+                // fault handler lives there too). The walk below uses
+                // physmap addresses, so it keeps working after the
+                // slot is restored.
+                wr64(self.pml4, rd64(crate::mm::kernel_pml4()));
                 for j in 0..512u64 {
                     let de = rd64(pdpt + 8 * j);
                     if de & USER == 0 {
@@ -2579,12 +2589,6 @@ impl Task {
                     kalloc::free_frame(pd);
                 }
                 kalloc::free_frame(pdpt);
-                // Restore the shared kernel PDPT — do NOT zero the
-                // slot. When UEFI loads the image below 4 GiB the
-                // kernel's own code/statics live in slot 0, and exec
-                // and exit keep running on this cr3 until the next
-                // switch: zeroing it unmaps the kernel under itself.
-                wr64(self.pml4, rd64(crate::mm::kernel_pml4()));
             }
         }
         for i in 128..256u64 {
