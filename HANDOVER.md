@@ -6285,3 +6285,34 @@ execve entry and script execution, and it is NOT identified.
 
 Verified state: pivot stays on `sh` from the ext2 root (works, /etc
 copied up); suite PASS exit 33 with pgtest exit(0).
+
+## run-254 — init-script ENOENT: the key clue (no code change)
+
+Every candidate was MEASURED, not guessed, and they all pass:
+
+  copy-up etc/rcS           -> true
+  fs_lookup("etc/rcS")      -> true
+  resolve_links("etc/rcS")  -> Ok (resolve=0)
+  canon_path("/etc/rcS")    -> correct (empty base for an absolute path)
+  execve entry              -> traced, path=/etc/rcS
+  probe inside the shebang block -> NEVER FIRES
+
+THE CLUE: those same functions succeed when called from the KERNEL at
+boot (the measurements above were taken there) but the task's execve
+returns ENOENT and never reaches the shebang block. So the difference
+is contextual, not algorithmic — something about the calling TASK's
+state. Candidates for the next session, in order:
+
+1. The task's fst()/cwd: canon_path reads fst(t) for a relative path.
+   busybox passes an ABSOLUTE path, so this should not matter — unless
+   copy_user_path truncated or mangled it.
+2. copy_user_path's bounds: it copies from the task's address space;
+   a short copy would produce a different string than the one traced.
+   Log the LENGTH and the exact bytes copy_user_path returns, not just
+   the rendered string.
+3. The child that execs is a FORK of init — check that fork copies the
+   fs state (cwd) and that the child's task slot is fully initialised
+   before its first syscall.
+
+Next probe: print copy_user_path's n and the raw bytes, plus fst(t)
+cwd/cwdlen, at execve entry. That separates 1 and 2 in one boot.
