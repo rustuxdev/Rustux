@@ -124,6 +124,8 @@ fn copy_root_dir(
     depth: u32,
     copied: &mut u32,
     budget: &mut u64,
+    seen: &mut [u32; 1024],
+    nseen: &mut u32,
 ) {
     const MAX_COPIED: u32 = 512;
     const MAX_FILE: u64 = 32 << 20;
@@ -158,8 +160,13 @@ fn copy_root_dir(
         };
         if node.is_dir() {
             copy_root_dir(io, sb, e.ino, path, end, depth + 1, copied,
-                          budget);
+                          budget, seen, nseen);
         } else if node.is_file() {
+            // Hardlinked dirents (busybox applets) share one inode —
+            // copy it once; the archive underlay resolves the rest.
+            if seen[..*nseen as usize].contains(&e.ino) {
+                return true;
+            }
             let sz = node.size as u64;
             if sz != 0 && sz <= *budget && sz <= MAX_FILE {
                 let buf = crate::kalloc::kmalloc(sz as usize);
@@ -177,6 +184,10 @@ fn copy_root_dir(
                     if ok {
                         *copied += 1;
                         *budget -= sz;
+                        if (*nseen as usize) < seen.len() {
+                            seen[*nseen as usize] = e.ino;
+                            *nseen += 1;
+                        }
                     }
                 }
             }
@@ -1322,9 +1333,11 @@ pub(crate) fn rustux_main(
                     if !live_media {
                         let mut path = [0u8; 128];
                         let mut budget = 256u64 << 20;
+                        let mut seen = [0u32; 1024];
+                        let mut nseen = 0u32;
                         copy_root_dir(
                             &part, &m.sb, 2, &mut path, 0, 0, &mut copied,
-                            &mut budget,
+                            &mut budget, &mut seen, &mut nseen,
                         );
                     }
                     kprintln!(con,

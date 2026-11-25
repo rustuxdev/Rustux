@@ -29,7 +29,7 @@ typedef int (*mke2_write_fn)(void *ctx, uint64_t off, const void *buf,
 /// the same pass that lays out the metadata allocates the blocks and
 /// inodes, so the bitmaps never disagree with the content.
 struct mke2_file {
-    const char *path; // "README" or "etc/motd" — one directory level
+    const char *path; // "README" or "etc/motd" — nested directories ok
     const void *data; // inline content, or NULL when streaming
     uint32_t len;
     // Streaming source: called with an offset inside the file. Lets the
@@ -37,6 +37,10 @@ struct mke2_file {
     // in memory alongside everything else.
     int (*read)(void *ctx, uint32_t off, void *buf, uint32_t len);
     void *rctx;
+    // Hardlink: when set this entry carries no data — its dirent points
+    // at the inode of the earlier file whose path matches. This is how
+    // busybox applets land without one copy of the binary per name.
+    const char *alias;
 };
 
 #define BLOCK 1024u
@@ -60,11 +64,31 @@ static void setbit(uint8_t *bm, uint32_t i) {
     bm[i / 8] |= (uint8_t)(1u << (i % 8));
 }
 
-#define MKE2_MAX_DIRS 24
+/// Mark `n` consecutive blocks starting at `blk` inside one group's
+/// bitmap. Bit i covers absolute block gs+i; blocks outside this
+/// group's range are skipped, so a caller can offer every allocated
+/// block to every group and only the owning group claims it. Keeping
+/// this check here matters: the payload allocates during group 0's
+/// pass but a ~45 MiB payload spans far past block 8192 — indexing
+/// this bitmap with `blk - gs` unconditionally would write past its
+/// 1 KiB buffer and leave later groups' used blocks marked free.
+static void mark_used(uint8_t *bm, uint32_t gs, uint32_t bits,
+                      uint32_t blk, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t b = blk + i;
+        if (b >= gs && b - gs < bits) {
+            setbit(bm, b - gs);
+        }
+    }
+}
+
+#define MKE2_MAX_DIRS 64
+#define MKE2_MAX_FILES 160
 struct mke2_dirrec {
     char path[56]; // full prefix: "lib", "lib/x86_64-linux-gnu"
     uint32_t ino;
     uint32_t blk;
+    uint32_t nblk; // blocks this directory's entries need
 };
 
 static int mke2_dir_find(struct mke2_dirrec *d, uint32_t n, const char *p,
@@ -127,6 +151,116 @@ static int mke2_dir_parent(struct mke2_dirrec *d, uint32_t n, uint32_t idx) {
     return -1;
 }
 
+/// Data region of the group `cur` falls in: [return, *end). A group
+/// loses its first meta_end blocks to its own backup super, GDT,
+/// bitmaps and inode table — group 0 also loses the boot block and
+/// primary super — so payload blocks must never land inside it.
+static uint32_t data_range(uint32_t cur, uint32_t blocks,
+                           uint32_t gdt_blocks, uint32_t *end) {
+    uint32_t g = (cur - 1) / BLOCKS_PER_GROUP;
+    uint32_t gs = 1 + g * BLOCKS_PER_GROUP;
+    uint32_t meta_end = 2 + ITABLE_BLOCKS +
+        (g == 0 ? 2 + gdt_blocks : 1 + gdt_blocks);
+    uint32_t dstart = gs + meta_end;
+    uint32_t dend = gs + BLOCKS_PER_GROUP;
+    if (dend > blocks) {
+        dend = blocks;
+    }
+    *end = dend;
+    return cur < dstart ? dstart : cur;
+}
+
+/// Allocate `n` contiguous blocks from data regions only, skipping
+/// every group's metadata span. Returns the first block, or 0 when
+/// the filesystem has no room — block 0 is unreachable because it
+/// always lies inside group 0's metadata.
+static uint32_t alloc_contig(uint32_t *cur, uint32_t n, uint32_t blocks,
+                             uint32_t gdt_blocks) {
+    for (;;) {
+        uint32_t dend;
+        uint32_t start = data_range(*cur, blocks, gdt_blocks, &dend);
+        if (start + n > dend) {
+            if (dend >= blocks) {
+                return 0;
+            }
+            *cur = dend; // lands on the next group's metadata start
+            continue;
+        }
+        *cur = start + n;
+        return start;
+    }
+}
+
+/// One directory entry as it is emitted into a dir block.
+struct mke2_ent {
+    const char *name;
+    uint32_t ino;
+    uint8_t type;
+};
+
+/// How many BLOCK-sized blocks a packed entry list spans. Must mirror
+/// mke2_dir_write's packing: an entry is flushed to a new block when it
+/// would cross the boundary; the previous entry's rec_len absorbs the
+/// slack, so an entry never straddles blocks.
+static uint32_t mke2_dir_nblk(const struct mke2_ent *ents, uint32_t ne) {
+    uint32_t off = 0, nblk = 1;
+    for (uint32_t e = 0; e < ne; e++) {
+        uint32_t nl = 0;
+        while (ents[e].name[nl]) {
+            nl++;
+        }
+        uint32_t need = (8 + nl + 3) & ~3u;
+        if (off + need > BLOCK) {
+            nblk++;
+            off = 0;
+        }
+        off += need;
+    }
+    return nblk;
+}
+
+/// Write a packed directory: entries laid out in order, each block's
+/// last rec_len extended to the block end. Returns 0 or -30/-31 on
+/// overflow/write failure — never silently truncates or spills.
+static int mke2_dir_write(mke2_write_fn wr, void *ctx, uint64_t base,
+                          uint32_t blk0, const struct mke2_ent *ents,
+                          uint32_t ne) {
+    static uint8_t db[BLOCK];
+    uint32_t off = 0, last = 0, b = 0;
+    memset(db, 0, sizeof db);
+    for (uint32_t e = 0; e < ne; e++) {
+        uint32_t nl = 0;
+        while (ents[e].name[nl]) {
+            nl++;
+        }
+        uint32_t need = (8 + nl + 3) & ~3u;
+        if (off + need > BLOCK) {
+            if (off == 0) {
+                return -30; // a single entry can never exceed a block
+            }
+            put16(db + last + 4, (uint16_t)(BLOCK - last));
+            if (wr(ctx, base + (blk0 + b) * BLOCK, db, BLOCK)) {
+                return -31;
+            }
+            b++;
+            memset(db, 0, sizeof db);
+            off = 0;
+        }
+        put32(db + off, ents[e].ino);
+        put16(db + off + 4, (uint16_t)need);
+        db[off + 6] = (uint8_t)nl;
+        db[off + 7] = ents[e].type;
+        memcpy(db + off + 8, ents[e].name, nl);
+        last = off;
+        off += need;
+    }
+    put16(db + last + 4, (uint16_t)(BLOCK - last));
+    if (wr(ctx, base + (blk0 + b) * BLOCK, db, BLOCK)) {
+        return -31;
+    }
+    return 0;
+}
+
 /// Format `blocks` 1024-byte blocks starting at byte `base`.
 static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
                        uint32_t blocks, const struct mke2_file *files,
@@ -153,9 +287,11 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         g_start[g] = 1 + g * BLOCKS_PER_GROUP;
     }
 
-    // Root (2) and lost+found (11) each own one block, placed after the
-    // metadata of group 0.
+    // Root (2) and lost+found (11) each own blocks right after the
+    // metadata of group 0; the root's span depends on its entry count,
+    // so lf_blk is fixed once the payload is known.
     uint32_t root_blk = first_data;
+    uint32_t root_nblk = 1;
     uint32_t lf_blk = first_data + 1;
 
     // ---- superblock ----
@@ -169,9 +305,14 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         }
         used_blocks += m;
     }
-    used_blocks += 2; // root + lost+found
+    used_blocks += 2; // root + lost+found (patched once root_nblk is known)
     used_inodes = FIRST_INO; // inodes 1..11 reserved (1 is bad-blocks)
-    used_inodes += nfiles;   // one inode per placed file
+    // One inode per real file; hardlink entries share their target's.
+    for (uint32_t f = 0; f < nfiles && f < MKE2_MAX_FILES; f++) {
+        if (!files[f].alias) {
+            used_inodes++;
+        }
+    }
     dirs = 2;                // root + lost+found
 
     put32(sb + 0, inodes);
@@ -221,16 +362,22 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         uint32_t dir; // index into dirs[], or 0xffffffff for the root
         uint32_t ind; // single-indirect block, 0 when the file is small
         uint32_t dind; // double-indirect block, 0 when not needed
+        uint32_t alias; // placed[] index this hardlinks, or 0xffffffff
+        uint32_t nb;  // data blocks this file owns
+        uint32_t l2n; // level-2 pointer blocks behind dind
         const char *name;
-    } placed[16];
+    } placed[MKE2_MAX_FILES];
     uint32_t nplaced = 0;
+    if (nfiles > MKE2_MAX_FILES) {
+        return -32;
+    }
 
     // Directories come from the file paths, at any depth:
     // "lib/x86_64-linux-gnu/libc.so.6" creates lib, lib/x86_64-linux-gnu
     // and puts the file in the innermost one.
     struct mke2_dirrec subdirs[MKE2_MAX_DIRS];
     uint32_t ndirs = 0;
-    for (uint32_t f = 0; f < nfiles && f < 16; f++) {
+    for (uint32_t f = 0; f < nfiles; f++) {
         const char *p = files[f].path;
         const char *slash = 0;
         for (const char *q = p; *q; q++) {
@@ -248,6 +395,20 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             }
             base = slash + 1;
         }
+        // Hardlink entries must name an earlier non-alias file — a
+        // dangling or chained alias has no inode to share.
+        uint32_t alias = 0xffffffffu;
+        if (files[f].alias) {
+            for (uint32_t g = 0; g < f; g++) {
+                if (!files[g].alias && strcmp(files[g].path, files[f].alias) == 0) {
+                    alias = g;
+                    break;
+                }
+            }
+            if (alias == 0xffffffffu) {
+                return -33;
+            }
+        }
         placed[nplaced].len = files[f].len;
         placed[nplaced].dir = d;
         placed[nplaced].name = base;
@@ -255,10 +416,82 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         placed[nplaced].blk = 0;
         placed[nplaced].ind = 0;
         placed[nplaced].dind = 0;
+        placed[nplaced].alias = alias;
+        placed[nplaced].nb = 0;
+        placed[nplaced].l2n = 0;
         nplaced++;
     }
     used_inodes += ndirs;    // one inode per created directory
-    uint32_t next_data_blk = first_data + 2;
+
+    // Size every directory's span before the bitmap pass so block
+    // allocation can reserve the whole range at once. Entries are
+    // packed in the order the emit pass uses: ".", "..", child dirs,
+    // then files — so the count here must see the same names.
+    {
+        struct mke2_ent probe[3 + MKE2_MAX_DIRS + MKE2_MAX_FILES];
+        for (uint32_t i = 0; i < ndirs; i++) {
+            uint32_t ne = 0;
+            probe[ne].name = ".";   probe[ne].ino = 2; probe[ne].type = 2; ne++;
+            probe[ne].name = "..";  probe[ne].ino = 2; probe[ne].type = 2; ne++;
+            for (uint32_t k = 0; k < ndirs; k++) {
+                if (mke2_dir_parent(subdirs, ndirs, k) != (int)i) {
+                    continue;
+                }
+                const char *nm = subdirs[k].path;
+                for (const char *q = subdirs[k].path; *q; q++) {
+                    if (*q == '/') {
+                        nm = q + 1;
+                    }
+                }
+                probe[ne].name = nm;
+                probe[ne].ino = 2;
+                probe[ne].type = 2;
+                ne++;
+            }
+            for (uint32_t f = 0; f < nplaced; f++) {
+                if (placed[f].dir == i) {
+                    probe[ne].name = placed[f].name;
+                    probe[ne].ino = 2;
+                    probe[ne].type = 1;
+                    ne++;
+                }
+            }
+            subdirs[i].nblk = mke2_dir_nblk(probe, ne);
+        }
+        // The root directory: ".", "..", "lost+found", top-level dirs,
+        // files with no parent directory.
+        uint32_t ne = 0;
+        probe[ne].name = ".";          probe[ne].ino = 2; probe[ne].type = 2; ne++;
+        probe[ne].name = "..";         probe[ne].ino = 2; probe[ne].type = 2; ne++;
+        probe[ne].name = "lost+found"; probe[ne].ino = 2; probe[ne].type = 2; ne++;
+        for (uint32_t i = 0; i < ndirs; i++) {
+            if (mke2_dir_parent(subdirs, ndirs, i) != -1) {
+                continue;
+            }
+            const char *nm = subdirs[i].path;
+            for (const char *q = subdirs[i].path; *q; q++) {
+                if (*q == '/') {
+                    nm = q + 1;
+                }
+            }
+            probe[ne].name = nm;
+            probe[ne].ino = 2;
+            probe[ne].type = 2;
+            ne++;
+        }
+        for (uint32_t f = 0; f < nplaced; f++) {
+            if (placed[f].dir == 0xffffffffu) {
+                probe[ne].name = placed[f].name;
+                probe[ne].ino = 2;
+                probe[ne].type = 1;
+                ne++;
+            }
+        }
+        root_nblk = mke2_dir_nblk(probe, ne);
+    }
+    lf_blk = root_blk + root_nblk;
+    used_blocks += root_nblk - 1; // root grew past its first block
+    uint32_t next_data_blk = lf_blk + 1;
     uint32_t next_ino = FIRST_INO + 1;
     for (uint32_t g = 0; g < groups && g < 64; g++) {
         uint32_t gs = g_start[g];
@@ -296,48 +529,90 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             setbit(bm, i);
         }
         if (g == 0) {
-            setbit(bm, root_blk - gs);
-            setbit(bm, lf_blk - gs);
+            // Allocation only: assign inos and block ranges. Bitmap
+            // marking is the per-group pass below — a data block past
+            // 8192 belongs to a later group's bitmap, and writing
+            // `blk - gs` into group 0's 1 KiB map anyway would scribble
+            // past the buffer.
             for (uint32_t i = 0; i < ndirs; i++) {
                 subdirs[i].ino = next_ino++;
-                subdirs[i].blk = next_data_blk++;
-                setbit(bm, subdirs[i].blk - gs);
+                subdirs[i].blk = alloc_contig(&next_data_blk,
+                                              subdirs[i].nblk, blocks,
+                                              gdt_blocks);
+                if (subdirs[i].blk == 0) {
+                    return -34;
+                }
             }
             for (uint32_t f = 0; f < nplaced; f++) {
+                if (placed[f].alias != 0xffffffffu) {
+                    continue; // hardlink: shares its target's inode
+                }
                 uint32_t nb = (placed[f].len + BLOCK - 1) / BLOCK;
                 if (nb == 0) {
                     nb = 1;
                 }
                 placed[f].ino = next_ino++;
-                placed[f].blk = next_data_blk;
+                placed[f].nb = nb;
+                placed[f].blk = alloc_contig(&next_data_blk, nb, blocks,
+                                             gdt_blocks);
+                if (placed[f].blk == 0) {
+                    return -34; // payload larger than the partition
+                }
                 // Data blocks are contiguous; a file over 12 blocks also
                 // needs one indirect block (256 more pointers at 1 KiB
                 // blocks, so up to 268 KiB per file here).
-                uint32_t ndata = nb <= 12 ? nb : nb;
-                for (uint32_t b = 0; b < ndata; b++) {
-                    setbit(bm, placed[f].blk + b - gs);
-                }
-                next_data_blk += ndata;
                 if (nb > 12) {
-                    placed[f].ind = next_data_blk++;
-                    setbit(bm, placed[f].ind - gs);
+                    placed[f].ind = alloc_contig(&next_data_blk, 1,
+                                                 blocks, gdt_blocks);
+                    if (placed[f].ind == 0) {
+                        return -34;
+                    }
                 }
                 // Past 12 direct + 256 indirect entries, a second level
                 // of indirection is needed (12 + 256 + 256*256 blocks).
                 if (nb > 12 + BLOCK / 4) {
-                    placed[f].dind = next_data_blk++;
-                    setbit(bm, placed[f].dind - gs);
                     // The level-2 pointer blocks live right after the
-                    // double-indirect block and must be reserved too,
-                    // or they are marked free while in use.
+                    // double-indirect block — one contiguous run so the
+                    // emit pass finds them at dind + 1 + i.
                     uint32_t per2 = BLOCK / 4;
                     uint32_t rest2 = nb - (12 + per2);
-                    uint32_t l2n = (rest2 + per2 - 1) / per2;
-                    for (uint32_t i = 0; i < l2n; i++) {
-                        setbit(bm, placed[f].dind + 1 + i - gs);
+                    placed[f].l2n = (rest2 + per2 - 1) / per2;
+                    placed[f].dind = alloc_contig(&next_data_blk,
+                                                  1 + placed[f].l2n,
+                                                  blocks, gdt_blocks);
+                    if (placed[f].dind == 0) {
+                        return -34;
                     }
-                    next_data_blk += l2n;
                 }
+            }
+            // Alias entries resolve now that every real file owns an
+            // inode — the dirent written later carries the target's ino.
+            for (uint32_t f = 0; f < nplaced; f++) {
+                if (placed[f].alias != 0xffffffffu) {
+                    placed[f].ino = placed[placed[f].alias].ino;
+                }
+            }
+        }
+        // Per-group marking: claim the payload blocks inside this
+        // group's range. Runs for every group, not just 0 — allocation
+        // above spans the whole filesystem.
+        mark_used(bm, gs, bitmap_bits, root_blk, root_nblk);
+        mark_used(bm, gs, bitmap_bits, lf_blk, 1);
+        for (uint32_t i = 0; i < ndirs; i++) {
+            mark_used(bm, gs, bitmap_bits, subdirs[i].blk,
+                      subdirs[i].nblk);
+        }
+        for (uint32_t f = 0; f < nplaced; f++) {
+            if (placed[f].alias != 0xffffffffu) {
+                continue;
+            }
+            mark_used(bm, gs, bitmap_bits, placed[f].blk, placed[f].nb);
+            if (placed[f].ind) {
+                mark_used(bm, gs, bitmap_bits, placed[f].ind, 1);
+            }
+            if (placed[f].dind) {
+                mark_used(bm, gs, bitmap_bits, placed[f].dind,
+                          1 + placed[f].l2n);
             }
         }
         // Padding: bits with no block behind them (the final bit of the
@@ -364,8 +639,16 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
 
         static uint8_t im[BLOCK];
         memset(im, 0, sizeof im);
+        // Hardlink entries share an inode, so only non-alias files take
+        // an ino — the bitmap must mark exactly what was consumed.
+        uint32_t nreal = 0;
+        for (uint32_t f = 0; f < nplaced; f++) {
+            if (placed[f].alias == 0xffffffffu) {
+                nreal++;
+            }
+        }
         if (g == 0) {
-            uint32_t upto = FIRST_INO + ndirs + nplaced;
+            uint32_t upto = FIRST_INO + ndirs + nreal;
             if (upto > INODES_PER_GROUP) {
                 upto = INODES_PER_GROUP;
             }
@@ -380,7 +663,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             return -13;
         }
         uint32_t ifree =
-            INODES_PER_GROUP - (g == 0 ? FIRST_INO + ndirs + nplaced : 0);
+            INODES_PER_GROUP - (g == 0 ? FIRST_INO + ndirs + nreal : 0);
 
         uint8_t *e = gdt + g * 32;
         put32(e + 0, bbitmap);
@@ -430,9 +713,11 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
                 }
                 put16(ino + 26, (uint16_t)(3 + top));
             }
-            put32(ino + 4, BLOCK);
-            put32(ino + 28, 2);
-            put32(ino + 40, root_blk);
+            put32(ino + 4, root_nblk * BLOCK);
+            put32(ino + 28, root_nblk * (BLOCK / 512));
+            for (uint32_t i = 0; i < root_nblk && i < 12; i++) {
+                put32(ino + 40 + i * 4, root_blk + i);
+            }
             if (wr(ctx, base + itable * BLOCK + 1 * INODE_SIZE, ino, INODE_SIZE)) {
                 return -17;
             }
@@ -475,19 +760,17 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             }
             put16(ino + 26, (uint16_t)(2 + kids));
         }
-        put32(ino + 4, BLOCK);               // size
-        put32(ino + 28, BLOCK / 512);        // i_blocks
-        put32(ino + 40, subdirs[i].blk);
+        put32(ino + 4, subdirs[i].nblk * BLOCK);
+        put32(ino + 28, subdirs[i].nblk * (BLOCK / 512));
+        for (uint32_t b = 0; b < subdirs[i].nblk && b < 12; b++) {
+            put32(ino + 40 + b * 4, subdirs[i].blk + b);
+        }
         if (wr(ctx, base + (2 + gdt_blocks + 2) * BLOCK
                + (subdirs[i].ino - 1) * INODE_SIZE, ino, INODE_SIZE)) {
             return -24;
         }
         // Entries: ".", "..", then the files that live here.
-        struct {
-            const char *name;
-            uint32_t ino;
-            uint8_t type;
-        } ents[2 + 16];
+        struct mke2_ent ents[2 + MKE2_MAX_DIRS + MKE2_MAX_FILES];
         uint32_t ne = 0;
         ents[ne].name = ".";  ents[ne].ino = subdirs[i].ino; ents[ne].type = 2; ne++;
         // ".." is the PARENT, not always the root — nested directories
@@ -520,34 +803,30 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
                 ne++;
             }
         }
-        static uint8_t db[BLOCK];
-        memset(db, 0, sizeof db);
-        uint32_t off2 = 0;
-        for (uint32_t e = 0; e < ne; e++) {
-            uint32_t nl = 0;
-            while (ents[e].name[nl]) {
-                nl++;
-            }
-            uint32_t need = (8 + nl + 3) & ~3u;
-            uint32_t rec = (e + 1 == ne) ? (BLOCK - off2) : need;
-            put32(db + off2, ents[e].ino);
-            put16(db + off2 + 4, (uint16_t)rec);
-            db[off2 + 6] = (uint8_t)nl;
-            db[off2 + 7] = ents[e].type;
-            memcpy(db + off2 + 8, ents[e].name, nl);
-            off2 += rec;
-        }
-        if (wr(ctx, base + subdirs[i].blk * BLOCK, db, BLOCK)) {
-            return -25;
+        int dr = mke2_dir_write(wr, ctx, base, subdirs[i].blk, ents, ne);
+        if (dr != 0) {
+            return dr;
         }
     }
 
     // ---- file inodes and data ----
     for (uint32_t f = 0; f < nplaced; f++) {
+        if (placed[f].alias != 0xffffffffu) {
+            continue; // hardlink: no inode or data of its own
+        }
         static uint8_t ino[INODE_SIZE];
         memset(ino, 0, sizeof ino);
         put16(ino + 0, 0x81a4);                 // S_IFREG|0644
-        put16(ino + 26, 1);                     // links
+        // links: 1 for its own name plus every alias dirent pointing
+        // at this inode — e2fsck reconciles i_links_count with the
+        // dirents it sees.
+        uint32_t refs = 1;
+        for (uint32_t g = 0; g < nplaced; g++) {
+            if (placed[g].alias == f) {
+                refs++;
+            }
+        }
+        put16(ino + 26, (uint16_t)refs);        // links
         put32(ino + 4, placed[f].len);          // size
         {
             uint32_t nb = (placed[f].len + BLOCK - 1) / BLOCK;
@@ -664,18 +943,9 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
     }
 
     // ---- root directory ----
-    // Built entry by entry so the last one can absorb the slack; the
-    // final rec_len must reach the end of the block.
-    static uint8_t dir[BLOCK];
-    memset(dir, 0, sizeof dir);
-    uint32_t off = 0;
     {
         // ".", "..", "lost+found", then the files.
-        struct {
-            const char *name;
-            uint32_t ino;
-            uint8_t type;
-        } ents[3 + 16];
+        struct mke2_ent ents[3 + MKE2_MAX_DIRS + MKE2_MAX_FILES];
         uint32_t ne = 0;
         ents[ne].name = ".";          ents[ne].ino = 2;         ents[ne].type = 2; ne++;
         ents[ne].name = "..";         ents[ne].ino = 2;         ents[ne].type = 2; ne++;
@@ -706,26 +976,14 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             ents[ne].type = 1; // regular file
             ne++;
         }
-        for (uint32_t i = 0; i < ne; i++) {
-            uint32_t nl = 0;
-            while (ents[i].name[nl]) {
-                nl++;
-            }
-            uint32_t need = (8 + nl + 3) & ~3u;
-            uint32_t rec = (i + 1 == ne) ? (BLOCK - off) : need;
-            put32(dir + off, ents[i].ino);
-            put16(dir + off + 4, (uint16_t)rec);
-            dir[off + 6] = (uint8_t)nl;
-            dir[off + 7] = ents[i].type;
-            memcpy(dir + off + 8, ents[i].name, nl);
-            off += rec;
+        int dr = mke2_dir_write(wr, ctx, base, root_blk, ents, ne);
+        if (dr != 0) {
+            return dr;
         }
-    }
-    if (wr(ctx, base + root_blk * BLOCK, dir, BLOCK)) {
-        return -22;
     }
 
     // ---- lost+found ----
+    static uint8_t dir[BLOCK];
     memset(dir, 0, sizeof dir);
     put32(dir + 0, FIRST_INO);
     put16(dir + 4, 12);

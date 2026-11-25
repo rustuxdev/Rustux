@@ -493,10 +493,15 @@ LIVE_PAIRS := \
 	kernel/user/aptetc/sources.list etc/apt/sources.list \
 	kernel/user/aptetc/99rustux etc/apt/apt.conf.d/99rustux \
 	kernel/user/resolv.conf etc/resolv.conf \
+	kernel/user/etc/nsswitch.conf etc/nsswitch.conf \
+	kernel/user/etc/hosts etc/hosts \
 	kernel/user/etc/passwd etc/passwd \
 	kernel/user/etc/shadow etc/shadow \
 	kernel/user/etc/group etc/group \
 	kernel/user/etc/securetty etc/securetty \
+	/lib/x86_64-linux-gnu/libnss_dns.so.2 lib/x86_64-linux-gnu/libnss_dns.so.2 \
+	/lib/x86_64-linux-gnu/libnss_files.so.2 lib/x86_64-linux-gnu/libnss_files.so.2 \
+	/lib/x86_64-linux-gnu/libresolv.so.2 lib/x86_64-linux-gnu/libresolv.so.2 \
 	kernel/user/libncursesw.so.6 lib/x86_64-linux-gnu/libncursesw.so.6 \
 	kernel/user/libm.so.6 lib/x86_64-linux-gnu/libm.so.6 \
 	kernel/user/libnl-3.so.200 lib/x86_64-linux-gnu/libnl-3.so.200 \
@@ -522,7 +527,10 @@ LIVE_DEPS := kernel/user/livemenu.elf kernel/user/busybox kernel/user/bash \
 	$(APTROOT)/apt-get $(APTROOT)/apt-helper $(APTROOT)/gpgv \
 	$(wildcard $(APTROOT)/methods/*) $(wildcard $(APTROOT)/dpkgtables/*) \
 	$(wildcard $(APTROOT)/lib*.so*) $(wildcard kernel/user/libdpkg/lib*.so*) \
-	tools/mkinitrd.py /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6
+	tools/mkinitrd.py /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6 \
+	/lib/x86_64-linux-gnu/libnss_dns.so.2 /lib/x86_64-linux-gnu/libnss_files.so.2 \
+	/lib/x86_64-linux-gnu/libresolv.so.2 \
+	kernel/user/etc/nsswitch.conf kernel/user/etc/hosts
 
 $(INITRD_LIVE): $(LIVE_DEPS)
 	python3 tools/mkinitrd.py $(LIVE_PAIRS) > $@
@@ -621,6 +629,17 @@ run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 	grep -q "/ #" isoph.log \
 		&& echo "installed boot + live shell: PASS" \
 		|| { echo "installed boot: FAIL"; tail -20 isoph.log; kill $$qpid; exit 1; }; \
+	python3 tools/sendkey.py isomon.sock "str:apt update" ret; \
+	ok=0; \
+	for i in $$(seq 1 24); do \
+		sleep 15; \
+		grep -q "apt-get exit(0)" isoph.log && { ok=1; break; }; \
+		grep -q "apt-get exit(100)" isoph.log && break; \
+	done; \
+	[ $$ok -eq 1 ] \
+		&& echo "installed apt update: PASS" \
+		|| { echo "installed apt update: FAIL"; grep -i "err:\|ign:\|get:\|exit(" isoph.log | tail -15; \
+		     echo quit | socat - UNIX-CONNECT:isomon.sock > /dev/null 2>&1 || kill $$qpid; exit 1; }; \
 	echo quit | socat - UNIX-CONNECT:isomon.sock > /dev/null 2>&1 || kill $$qpid
 
 # DOOM proof-of-concept: doomgeneric (the GPL'd original id source)

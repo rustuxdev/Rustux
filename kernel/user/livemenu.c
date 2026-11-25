@@ -38,6 +38,47 @@ static void banner(void)
     printf("\n");
 }
 
+// Every lib the payload ships is staged as an installed package in
+// /var/lib/dpkg/status — `apt install <pkg>` then resolves to just
+// the leaf instead of trying to overwrite an initrd file.
+static const char *const BASE_PKGS[][2] = {
+    {"libc6", "2.36-9+deb12u14"},
+    {"libgcc-s1", "12.2.0-14+deb12u1"},
+    {"gcc-12-base", "12.2.0-14+deb12u1"},
+    {"libidn2-0", "2.3.3-1+b1"},
+    {"libunistring2", "1.0-2"},
+    {"libncursesw6", "6.4-4"},
+    {"libtinfo6", "6.4-4"},
+    {"libnl-3-200", "3.7.0-0.2+b1"},
+    {"libnl-genl-3-200", "3.7.0-0.2+b1"},
+    {"libselinux1", "3.4-1+b6"},
+    {"libpcre2-8-0", "10.42-1"},
+    {"libacl1", "2.3.1-3"},
+    {"zlib1g", "1:1.2.13.dfsg-1"},
+    {"liblzma5", "5.4.1-0.2"},
+    {"libzstd1", "1.5.4+dfsg2-5"},
+    {"libbz2-1.0", "1.0.8-5+b1"},
+    {"libmd0", "1.0.4-2"},
+    {"liblz4-1", "1.9.4-1"},
+    {"libxxhash0", "0.8.1-1"},
+    {"libstdc++6", "12.2.0-14+deb12u1"},
+    {"libsystemd0", "252.30-1~deb12u2"},
+    {"libudev1", "252.30-1~deb12u2"},
+    {"libcap2", "1:2.66-4"},
+    {"libgcrypt20", "1.10.1-3"},
+    {"libgpg-error0", "1.46-1"},
+    {"libgnutls30", "3.7.9-2+deb12u3"},
+    {"libnettle8", "3.8.1-2"},
+    {"libhogweed6", "3.8.1-2"},
+    {"libgmp10", "2:6.2.1+dfsg1-1.1"},
+    {"libp11-kit0", "0.24.1-2"},
+    {"libtasn1-6", "4.19.0-2"},
+    {"libffi8", "3.4.4-1"},
+    {"libseccomp2", "2.5.4-1+deb12u1"},
+    {"libassuan0", "2.5.5-5"},
+    {"libnpth0", "1.6-3"},
+};
+
 // The directories apt/dpkg expect (mirrors aptprobe's setup) — made
 // once per live session so `apt update` works out of the box.
 static void apt_dirs(void)
@@ -66,44 +107,7 @@ static void apt_dirs(void)
     FILE *f = fopen("/var/lib/dpkg/status", "w");
     if (!f)
         return;
-    static const char *pkgs[][2] = {
-        {"libc6", "2.36-9+deb12u14"},
-        {"libgcc-s1", "12.2.0-14+deb12u1"},
-        {"gcc-12-base", "12.2.0-14+deb12u1"},
-        {"libidn2-0", "2.3.3-1+b1"},
-        {"libunistring2", "1.0-2"},
-        {"libncursesw6", "6.4-4"},
-        {"libtinfo6", "6.4-4"},
-        {"libnl-3-200", "3.7.0-0.2+b1"},
-        {"libnl-genl-3-200", "3.7.0-0.2+b1"},
-        {"libselinux1", "3.4-1+b6"},
-        {"libpcre2-8-0", "10.42-1"},
-        {"libacl1", "2.3.1-3"},
-        {"zlib1g", "1:1.2.13.dfsg-1"},
-        {"liblzma5", "5.4.1-0.2"},
-        {"libzstd1", "1.5.4+dfsg2-5"},
-        {"libbz2-1.0", "1.0.8-5+b1"},
-        {"libmd0", "1.0.4-2"},
-        {"liblz4-1", "1.9.4-1"},
-        {"libxxhash0", "0.8.1-1"},
-        {"libstdc++6", "12.2.0-14+deb12u1"},
-        {"libsystemd0", "252.30-1~deb12u2"},
-        {"libudev1", "252.30-1~deb12u2"},
-        {"libcap2", "1:2.66-4"},
-        {"libgcrypt20", "1.10.1-3"},
-        {"libgpg-error0", "1.46-1"},
-        {"libgnutls30", "3.7.9-2+deb12u3"},
-        {"libnettle8", "3.8.1-2"},
-        {"libhogweed6", "3.8.1-2"},
-        {"libgmp10", "2:6.2.1+dfsg1-1.1"},
-        {"libp11-kit0", "0.24.1-2"},
-        {"libtasn1-6", "4.19.0-2"},
-        {"libffi8", "3.4.4-1"},
-        {"libseccomp2", "2.5.4-1+deb12u1"},
-        {"libassuan0", "2.5.5-5"},
-        {"libnpth0", "1.6-3"},
-    };
-    for (size_t i = 0; i < sizeof(pkgs) / sizeof(pkgs[0]); i++)
+    for (size_t i = 0; i < sizeof BASE_PKGS / sizeof BASE_PKGS[0]; i++)
         fprintf(f,
                 "Package: %s\n"
                 "Status: install ok installed\n"
@@ -116,7 +120,7 @@ static void apt_dirs(void)
                 "Version: %s\n"
                 "Description: staged on the demo media\n"
                 "\n",
-                pkgs[i][0], pkgs[i][1]);
+                BASE_PKGS[i][0], BASE_PKGS[i][1]);
     fclose(f);
 }
 
@@ -304,10 +308,19 @@ static void mbr_entry(unsigned char *e, unsigned int start_lba,
 // installer place a 1 MiB binary from the initrd without holding it.
 static int file_reader(void *ctx, uint32_t off, void *buf, uint32_t len)
 {
-    int fd = *(int *)ctx;
-    if (lseek(fd, (off_t)off, SEEK_SET) < 0)
+    // ctx is the initrd source path — open per call so a large payload
+    // never holds more than one fd at a time (MAX_FDS is 16 and the
+    // std/img/sd fds already hold five).
+    int fd = open((const char *)ctx, O_RDONLY);
+    if (fd < 0)
         return 1;
-    return read(fd, buf, len) == (ssize_t)len ? 0 : 1;
+    if (lseek(fd, (off_t)off, SEEK_SET) < 0) {
+        close(fd);
+        return 1;
+    }
+    ssize_t r = read(fd, buf, len);
+    close(fd);
+    return r == (ssize_t)len ? 0 : 1;
 }
 
 // mke2's sink: absolute byte writes to the target fd.
@@ -523,7 +536,7 @@ static void install(const char *path)
                 // read, not just a formatted empty partition.
                 static const char marker[] =
                     "Rustux ext2 root\n";
-                struct mke2_file files[24];
+                struct mke2_file files[MKE2_MAX_FILES];
                 // Entries without .read stream .data; an uninitialized
                 // fn pointer on the stack crashed the formatter with
                 // a near-null call (cr2=0xfffffffffffff8).
@@ -558,61 +571,316 @@ static void install(const char *path)
                 files[3].path = "etc/inittab";
                 files[3].data = inittab;
                 files[3].len = sizeof inittab - 1;
-                // Real binaries, streamed straight from the initrd.
-                // Only one directory level is supported, so the paths are
-                // kept flat inside bin/ for now.
                 uint32_t nf = 4;
-                // Source path -> path in the installed root. The libs
-                // exercise the nested directories a real system needs.
-                // The live initrd carries 130 entries; the installed
-                // root must carry the same binaries or the shell has
-                // nothing to run. Missing entries are skipped silently.
+                // Small text seeds: resolver config and the state dirs
+                // apt/dpkg expect. A .keep file materializes an
+                // otherwise-empty directory (the RAM-fs copy-up only
+                // carries files, so these must be non-empty to arrive).
+                static const char *const SEEDS[][2] = {
+                    { "etc/resolv.conf",
+                      "nameserver 10.0.2.3\n" },
+                    { "etc/nsswitch.conf",
+                      "passwd: files\ngroup: files\nshadow: files\n"
+                      "hosts: files dns\nnetworks: files\n" },
+                    { "etc/hosts",
+                      "127.0.0.1 localhost\n::1 localhost\n" },
+                    { "etc/apt/sources.list",
+                      "deb [trusted=yes] http://deb.debian.org/debian"
+                      " bookworm main\n" },
+                    { "etc/apt/apt.conf.d/99rustux",
+                      "APT::Get::AllowUnauthenticated \"true\";\n"
+                      "Acquire::AllowInsecureRepositories \"true\";\n"
+                      "Acquire::Languages \"none\";\n"
+                      "Acquire::GzipIndexes \"true\";\n"
+                      "APT::Cache-Start \"100000000\";\n"
+                      "APT::Sandbox::User \"root\";\n"
+                      "Dpkg::Use-Pty \"true\";\n"
+                      "Dir::Cache::pkgcache \"\";\n"
+                      "Dir::Cache::srcpkgcache \"\";\n" },
+                    { "tmp/.keep", "\n" },
+                    { "root/.keep", "\n" },
+                    { "var/lib/apt/lists/partial/.keep", "\n" },
+                    { "var/cache/apt/archives/partial/.keep", "\n" },
+                    { "var/lib/dpkg/info/.keep", "\n" },
+                    { "var/lib/dpkg/updates/.keep", "\n" },
+                    { "var/lib/dpkg/triggers/.keep", "\n" },
+                    { "var/log/apt/.keep", "\n" },
+                    { "etc/apt/sources.list.d/.keep", "\n" },
+                    { "etc/apt/preferences.d/.keep", "\n" },
+                    { "etc/apt/trusted.gpg.d/.keep", "\n" },
+                };
+                for (uint32_t i = 0;
+                     i < sizeof SEEDS / sizeof SEEDS[0]; i++) {
+                    files[nf].path = SEEDS[i][0];
+                    files[nf].data = SEEDS[i][1];
+                    files[nf].len = strlen(SEEDS[i][1]);
+                    nf++;
+                }
+                // /var/lib/dpkg/status must be a real dpkg database —
+                // a blank file fails MergeList with "no Package:
+                // header". Stage every shipped lib as installed.
+                static char statusbuf[96 * 1024];
+                {
+                    size_t so = 0;
+                    for (uint32_t i = 0;
+                         i < sizeof BASE_PKGS / sizeof BASE_PKGS[0]
+                             && so + 512 < sizeof statusbuf;
+                         i++) {
+                        int n = snprintf(statusbuf + so,
+                                sizeof statusbuf - so,
+                                "Package: %s\n"
+                                "Status: install ok installed\n"
+                                "Priority: optional\n"
+                                "Section: libs\n"
+                                "Installed-Size: 1\n"
+                                "Maintainer: Rustux demo <root@localhost>\n"
+                                "Architecture: amd64\n"
+                                "Multi-Arch: same\n"
+                                "Version: %s\n"
+                                "Description: staged on the demo media\n"
+                                "\n",
+                                BASE_PKGS[i][0], BASE_PKGS[i][1]);
+                        if (n < 0)
+                            break;
+                        so += (size_t)n;
+                    }
+                    files[nf].path = "var/lib/dpkg/status";
+                    files[nf].data = statusbuf;
+                    files[nf].len = (uint32_t)so;
+                    nf++;
+                }
+                // Real binaries, streamed straight from the initrd.
+                // Source path -> path in the installed root. Missing
+                // entries are skipped silently.
                 static const char *const PAYLOAD[][2] = {
                     { "/bin/busybox", "bin/busybox" },
-                    { "/bin/sh", "bin/sh" },
-                    { "/bin/ash", "bin/ash" },
-                    { "/bin/ls", "bin/ls" },
-                    { "/bin/cat", "bin/cat" },
-                    { "/bin/cp", "bin/cp" },
                     { "/bin/bash", "bin/bash" },
                     { "/bin/dash", "bin/dash" },
-                    { "/bin/apt", "bin/apt" },
-                    { "/bin/dpkg", "bin/dpkg" },
                     { "/bin/htop", "bin/htop" },
+                    { "/bin/tar", "bin/tar" },
+                    { "/sbin/ldconfig", "sbin/ldconfig" },
+                    { "/usr/bin/apt-get", "usr/bin/apt-get" },
+                    { "/usr/lib/apt/apt-helper",
+                      "usr/lib/apt/apt-helper" },
+                    { "/usr/lib/apt/methods/http",
+                      "usr/lib/apt/methods/http" },
+                    { "/usr/lib/apt/methods/gpgv",
+                      "usr/lib/apt/methods/gpgv" },
+                    { "/usr/lib/apt/methods/store",
+                      "usr/lib/apt/methods/store" },
+                    { "/usr/lib/apt/methods/copy",
+                      "usr/lib/apt/methods/copy" },
+                    { "/usr/lib/apt/methods/file",
+                      "usr/lib/apt/methods/file" },
+                    { "/usr/bin/gpgv", "usr/bin/gpgv" },
+                    { "/usr/bin/dpkg", "usr/bin/dpkg" },
+                    { "/usr/bin/dpkg-deb", "usr/bin/dpkg-deb" },
+                    { "/usr/bin/dpkg-split", "usr/bin/dpkg-split" },
+                    { "/usr/bin/dpkg-query", "usr/bin/dpkg-query" },
+                    { "/usr/share/dpkg/cputable",
+                      "usr/share/dpkg/cputable" },
+                    { "/usr/share/dpkg/ostable",
+                      "usr/share/dpkg/ostable" },
+                    { "/usr/share/dpkg/tupletable",
+                      "usr/share/dpkg/tupletable" },
+                    { "/usr/share/dpkg/abitable",
+                      "usr/share/dpkg/abitable" },
+                    { "/usr/share/terminfo/x/xterm",
+                      "usr/share/terminfo/x/xterm" },
+                    { "/etc/passwd", "etc/passwd" },
+                    { "/etc/shadow", "etc/shadow" },
+                    { "/etc/group", "etc/group" },
+                    { "/etc/securetty", "etc/securetty" },
                     { "/lib64/ld-linux-x86-64.so.2",
                       "lib64/ld-linux-x86-64.so.2" },
                     { "/lib/x86_64-linux-gnu/libc.so.6",
                       "lib/x86_64-linux-gnu/libc.so.6" },
+                    { "/lib/x86_64-linux-gnu/libnss_dns.so.2",
+                      "lib/x86_64-linux-gnu/libnss_dns.so.2" },
+                    { "/lib/x86_64-linux-gnu/libnss_files.so.2",
+                      "lib/x86_64-linux-gnu/libnss_files.so.2" },
+                    { "/lib/x86_64-linux-gnu/libresolv.so.2",
+                      "lib/x86_64-linux-gnu/libresolv.so.2" },
                     { "/lib/x86_64-linux-gnu/libapt-pkg.so.6.0",
                       "lib/x86_64-linux-gnu/libapt-pkg.so.6.0" },
                     { "/lib/x86_64-linux-gnu/libapt-private.so.0.0",
                       "lib/x86_64-linux-gnu/libapt-private.so.0.0" },
+                    { "/lib/x86_64-linux-gnu/libstdc++.so.6",
+                      "lib/x86_64-linux-gnu/libstdc++.so.6" },
+                    { "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+                      "lib/x86_64-linux-gnu/libgcc_s.so.1" },
+                    { "/lib/x86_64-linux-gnu/libz.so.1",
+                      "lib/x86_64-linux-gnu/libz.so.1" },
+                    { "/lib/x86_64-linux-gnu/libzstd.so.1",
+                      "lib/x86_64-linux-gnu/libzstd.so.1" },
+                    { "/lib/x86_64-linux-gnu/liblzma.so.5",
+                      "lib/x86_64-linux-gnu/liblzma.so.5" },
+                    { "/lib/x86_64-linux-gnu/libbz2.so.1.0",
+                      "lib/x86_64-linux-gnu/libbz2.so.1.0" },
+                    { "/lib/x86_64-linux-gnu/liblz4.so.1",
+                      "lib/x86_64-linux-gnu/liblz4.so.1" },
+                    { "/lib/x86_64-linux-gnu/libxxhash.so.0",
+                      "lib/x86_64-linux-gnu/libxxhash.so.0" },
+                    { "/lib/x86_64-linux-gnu/libudev.so.1",
+                      "lib/x86_64-linux-gnu/libudev.so.1" },
+                    { "/lib/x86_64-linux-gnu/libsystemd.so.0",
+                      "lib/x86_64-linux-gnu/libsystemd.so.0" },
+                    { "/lib/x86_64-linux-gnu/libgcrypt.so.20",
+                      "lib/x86_64-linux-gnu/libgcrypt.so.20" },
+                    { "/lib/x86_64-linux-gnu/libseccomp.so.2",
+                      "lib/x86_64-linux-gnu/libseccomp.so.2" },
+                    { "/lib/x86_64-linux-gnu/libassuan.so.0",
+                      "lib/x86_64-linux-gnu/libassuan.so.0" },
+                    { "/lib/x86_64-linux-gnu/libnpth.so.0",
+                      "lib/x86_64-linux-gnu/libnpth.so.0" },
+                    { "/lib/x86_64-linux-gnu/libgpg-error.so.0",
+                      "lib/x86_64-linux-gnu/libgpg-error.so.0" },
+                    { "/lib/x86_64-linux-gnu/libgnutls.so.30",
+                      "lib/x86_64-linux-gnu/libgnutls.so.30" },
+                    { "/lib/x86_64-linux-gnu/libgmp.so.10",
+                      "lib/x86_64-linux-gnu/libgmp.so.10" },
+                    { "/lib/x86_64-linux-gnu/libhogweed.so.6",
+                      "lib/x86_64-linux-gnu/libhogweed.so.6" },
+                    { "/lib/x86_64-linux-gnu/libnettle.so.8",
+                      "lib/x86_64-linux-gnu/libnettle.so.8" },
+                    { "/lib/x86_64-linux-gnu/libtasn1.so.6",
+                      "lib/x86_64-linux-gnu/libtasn1.so.6" },
+                    { "/lib/x86_64-linux-gnu/libp11-kit.so.0",
+                      "lib/x86_64-linux-gnu/libp11-kit.so.0" },
+                    { "/lib/x86_64-linux-gnu/libunistring.so.5",
+                      "lib/x86_64-linux-gnu/libunistring.so.5" },
+                    { "/lib/x86_64-linux-gnu/libidn2.so.0",
+                      "lib/x86_64-linux-gnu/libidn2.so.0" },
+                    { "/lib/x86_64-linux-gnu/libffi.so.8",
+                      "lib/x86_64-linux-gnu/libffi.so.8" },
+                    { "/lib/x86_64-linux-gnu/libselinux.so.1",
+                      "lib/x86_64-linux-gnu/libselinux.so.1" },
+                    { "/lib/x86_64-linux-gnu/libpcre2-8.so.0",
+                      "lib/x86_64-linux-gnu/libpcre2-8.so.0" },
+                    { "/lib/x86_64-linux-gnu/libacl.so.1",
+                      "lib/x86_64-linux-gnu/libacl.so.1" },
+                    { "/lib/x86_64-linux-gnu/libmd.so.0",
+                      "lib/x86_64-linux-gnu/libmd.so.0" },
+                    { "/lib/x86_64-linux-gnu/libcap.so.2",
+                      "lib/x86_64-linux-gnu/libcap.so.2" },
+                    { "/lib/x86_64-linux-gnu/libncursesw.so.6",
+                      "lib/x86_64-linux-gnu/libncursesw.so.6" },
+                    { "/lib/x86_64-linux-gnu/libtinfo.so.6",
+                      "lib/x86_64-linux-gnu/libtinfo.so.6" },
+                    { "/lib/x86_64-linux-gnu/libm.so.6",
+                      "lib/x86_64-linux-gnu/libm.so.6" },
+                    { "/lib/x86_64-linux-gnu/libnl-3.so.200",
+                      "lib/x86_64-linux-gnu/libnl-3.so.200" },
+                    { "/lib/x86_64-linux-gnu/libnl-genl-3.so.200",
+                      "lib/x86_64-linux-gnu/libnl-genl-3.so.200" },
                 };
-                static int pfds[24];
-                static struct stat pst[24];
-                for (uint32_t i = 0; i < sizeof PAYLOAD / sizeof PAYLOAD[0] && nf < 24; i++) {
+                // busybox applets and duplicated binaries land as
+                // hardlinks — a dirent pointing at an existing inode
+                // instead of another copy of the file. Target must be
+                // an earlier PAYLOAD entry.
+                static const char *const ALIASES[][2] = {
+                    { "bin/sh", "bin/busybox" },
+                    { "bin/ash", "bin/busybox" },
+                    { "bin/ls", "bin/busybox" },
+                    { "bin/cat", "bin/busybox" },
+                    { "bin/cp", "bin/busybox" },
+                    { "bin/mv", "bin/busybox" },
+                    { "bin/rm", "bin/busybox" },
+                    { "bin/mkdir", "bin/busybox" },
+                    { "bin/touch", "bin/busybox" },
+                    { "bin/echo", "bin/busybox" },
+                    { "bin/pwd", "bin/busybox" },
+                    { "bin/df", "bin/busybox" },
+                    { "bin/du", "bin/busybox" },
+                    { "bin/free", "bin/busybox" },
+                    { "bin/ps", "bin/busybox" },
+                    { "bin/top", "bin/busybox" },
+                    { "bin/uname", "bin/busybox" },
+                    { "bin/hostname", "bin/busybox" },
+                    { "bin/date", "bin/busybox" },
+                    { "bin/mount", "bin/busybox" },
+                    { "bin/umount", "bin/busybox" },
+                    { "bin/dd", "bin/busybox" },
+                    { "bin/sync", "bin/busybox" },
+                    { "bin/grep", "bin/busybox" },
+                    { "bin/sed", "bin/busybox" },
+                    { "bin/diff", "bin/busybox" },
+                    { "bin/find", "bin/busybox" },
+                    { "bin/xargs", "bin/busybox" },
+                    { "bin/sort", "bin/busybox" },
+                    { "bin/tr", "bin/busybox" },
+                    { "bin/md5sum", "bin/busybox" },
+                    { "bin/chown", "bin/busybox" },
+                    { "bin/chmod", "bin/busybox" },
+                    { "bin/ln", "bin/busybox" },
+                    { "bin/rmdir", "bin/busybox" },
+                    { "bin/test", "bin/busybox" },
+                    { "bin/install", "bin/busybox" },
+                    { "bin/mkfifo", "bin/busybox" },
+                    { "bin/sleep", "bin/busybox" },
+                    { "bin/expr", "bin/busybox" },
+                    { "bin/head", "bin/busybox" },
+                    { "bin/tail", "bin/busybox" },
+                    { "bin/wc", "bin/busybox" },
+                    { "bin/more", "bin/busybox" },
+                    { "bin/less", "bin/busybox" },
+                    { "bin/vi", "bin/busybox" },
+                    { "bin/clear", "bin/busybox" },
+                    { "bin/which", "bin/busybox" },
+                    { "bin/dmesg", "bin/busybox" },
+                    { "bin/whoami", "bin/busybox" },
+                    { "bin/gzip", "bin/busybox" },
+                    { "bin/gunzip", "bin/busybox" },
+                    { "usr/bin/id", "bin/busybox" },
+                    { "usr/bin/logname", "bin/busybox" },
+                    { "usr/bin/groups", "bin/busybox" },
+                    { "sbin/reboot", "bin/busybox" },
+                    { "sbin/poweroff", "bin/busybox" },
+                    { "sbin/halt", "bin/busybox" },
+                    { "sbin/start-stop-daemon", "bin/busybox" },
+                    { "usr/sbin/start-stop-daemon", "bin/busybox" },
+                    { "usr/bin/apt", "usr/bin/apt-get" },
+                    { "usr/sbin/ldconfig", "sbin/ldconfig" },
+                };
+                static struct stat pst[MKE2_MAX_FILES];
+                for (uint32_t i = 0; i < sizeof PAYLOAD / sizeof PAYLOAD[0] && nf < MKE2_MAX_FILES; i++) {
                     int fd = open(PAYLOAD[i][0], O_RDONLY);
                     if (fd < 0 || fstat(fd, &pst[i]) != 0 || pst[i].st_size <= 0) {
                         if (fd >= 0)
                             close(fd);
                         continue;
                     }
+                    close(fd); // file_reader re-opens per block — no
+                    // payload fd survives the loop (MAX_FDS is 16)
                     if ((unsigned long long)pst[i].st_size >= (unsigned long long)blocks * 1024)
                         continue; // would not fit
-                    pfds[i] = fd;
                     files[nf].path = PAYLOAD[i][1];
                     files[nf].data = 0;
                     files[nf].len = (uint32_t)pst[i].st_size;
                     files[nf].read = file_reader;
-                    files[nf].rctx = &pfds[i];
+                    files[nf].rctx = (void *)PAYLOAD[i][0];
+                    nf++;
+                }
+                for (uint32_t i = 0; i < sizeof ALIASES / sizeof ALIASES[0] && nf < MKE2_MAX_FILES; i++) {
+                    // Skip an alias whose target never landed — the
+                    // formatter would fail the whole image on a
+                    // dangling hardlink.
+                    int found = 0;
+                    for (uint32_t j = 0; j < nf; j++) {
+                        if (files[j].path &&
+                            strcmp(files[j].path, ALIASES[i][1]) == 0) {
+                            found = 1;
+                            break;
+                        }
+                    }
+                    if (!found)
+                        continue;
+                    files[nf].path = ALIASES[i][0];
+                    files[nf].alias = ALIASES[i][1];
                     nf++;
                 }
                 int fr = mke2_format(mke2_sink, &sd, (uint64_t)root_lba * 512,
                                      blocks, files, nf);
-                for (uint32_t i = 0; i < 24; i++) {
-                    if (pfds[i] > 0)
-                        close(pfds[i]);
-                }
                 if (fr == 0) {
                     printf("install: ext2 root formatted\n");
                 } else {
