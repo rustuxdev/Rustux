@@ -6444,3 +6444,84 @@ UNAUTHENTICATED root sh — busybox `login` still #GPs after its prompt
 (/tmp/auth-work.patch holds the passwd/shadow payload + login pivot);
 login-as-pid1 is the follow-up. Also open: two-external shell pipelines;
 archive symlink records stat ENOENT in ls /bin output (cosmetic).
+
+## run-259 — apt on the installed system: NSS/DNS, mke2 hardlinks + multi-block dirs, the multi-group allocator fix
+
+Two reported defects: "apt missing folders" and "apt update cannot resolve
+deb.debian.org". Both were data/layout problems, not kernel network code —
+the UDP resolver surface (connect, sendto/recvfrom, sendmmsg, poll,
+SO_ACCEPTCONN drop) was already complete.
+
+DNS: glibc getaddrinfo needs the NSS chain — libnss_dns.so.2,
+libnss_files.so.2, libresolv.so.2 were absent from the initrd. Added to
+LIVE_PAIRS/LIVE_DEPS plus new etc/nsswitch.conf and etc/hosts. After that
+`Get:1 http://deb.debian.org` resolves and fetches.
+
+Missing folders: apt_dirs() only ran in live sessions; the installed boot
+(busybox sh as pid 1) never seeded the apt/dpkg state tree. mke2 `.keep`
+seeds now materialize var/lib/apt/lists{,/partial},
+var/lib/dpkg/{info,updates,alternatives,parts,triggers},
+var/cache/apt/archives{,/partial}, var/log/apt,
+etc/apt/{sources.list.d,preferences.d,trusted.gpg.d}, tmp, root —
+plus resolv.conf, nsswitch.conf, hosts, sources.list, 99rustux, and a
+GENERATED var/lib/dpkg/status: the shipped-lib package table moved to file
+scope and is shared between apt_dirs() and the seed, emitting real
+Package:/Status: stanzas (the earlier "\n" seed parsed as an empty section —
+"no Package: header" -> MergeList -> exit(100)).
+
+mke2 upgrades: `alias` field = ext2 hardlink (dirent points at the target's
+inode; no inode/blocks of its own) — ~54 busybox applet names plus
+usr/bin/apt and the sbin applets now cost a dirent each, not a 2.8 MiB copy.
+MKE2_MAX_DIRS 24->64, placed[16] -> MKE2_MAX_FILES(160). Multi-block
+directories: mke2_dir_nblk() probes the packed span, root/subdir inodes get
+nblk*BLOCK i_size and one direct pointer per block; the shared mke2_ent +
+mke2_dir_write() emitter replaces the unbounded ents[2+16] into a 1 KiB
+block (latent overflow — ~16 long names in one dir would have scribbled a
+static buffer). i_links_count counts aliases; the inode bitmap marks only
+non-alias files.
+
+MAX_FDS exhaustion — why "32 files copied up" was really ~11: PAYLOAD opened
+every streamed source before mke2_format and closed after, so open #12 hit
+the 16-fd ceiling and every later entry silently skipped. file_reader now
+takes the source PATH and opens+closes per block call; a payload of 150
+streams never holds more than one fd.
+
+copy_root_dir: dedup by inode — the ~55 dirents that share busybox's inode
+copy once; the skipped names resolve through the initrd underlay's applet
+symlinks, so /bin/rm still works without ~170 MiB of RAM copies.
+
+Allocator correctness (found by audit, fixed same run): next_data_blk grew
+contiguously THROUGH later groups' metadata — a ~45 MiB payload wrote file
+data over group 1+'s backup super, GDT, bitmaps and inode tables (e2fsck:
+"conflicts with critical metadata", garbage inodes 2049+, debugfs refused
+the image outright). New data_range()/alloc_contig() hand out only blocks
+inside each group's data span; dind+l2n allocate as one contiguous run so
+the emit pass still finds level-2 blocks at dind+1+i. And the bitmap marking
+itself was an OOB write: setbit(bm, blk-gs) on a 1 KiB group bitmap for
+blk>=8192 scribbled neighbouring statics — mark_used() now offers every
+allocated block to every group and only the owning group sets the bit, so
+later groups' used blocks are claimed too.
+
+Makefile run-iso third phase: after install+boot PASS it sends `apt update`
+and gates on `apt-get exit(0)` (24x15s window; the 8.8 MB Packages fetch
+takes ~3 min at ~57 kB/s).
+
+Verified: iso install PASS; installed boot PASS (88 files copied up, pid 1
+= sh from ext2); installed apt update PASS (Get:1 InRelease, Get:2 Packages
+8790 kB, Reading package lists... Done, apt-get exit(0)); e2fsck -fn on the
+extracted root: all 5 passes CLEAN (previously: metadata conflicts, garbage
+inode tables, debugfs refused). make run: exit 33, 75 tasks, zero leak
+(pgtest SA_SIGINFO FAILs = recorded open gap).
+
+Audit run-259 scoped quick (security-audit skill): cve-now e2fsprogs parser
+class (CVE-2022-1304, CVE-2019-5188, CVE-2019-5094, CVE-2015-0247,
+CVE-2015-1572, CVE-2007-5497) — all crafted-image READER bugs; mke2 writes
+a fixed installer table and the kernel reader bounds are audited (run-258).
+Two findings inside the diff, both FIXED above: the setbit OOB write and
+the metadata-overwriting allocator. needs_validation: none.
+Known gaps: apt-key/keyrings absent -> Ign:1 tolerated by [trusted=yes];
+copy-up is RAM-only (no persistence, ext2 stays read-only); installed boot
+is still an unauthenticated root sh (/tmp/auth-work.patch); one transient
+`sh: apt: not found` seen at t=0.5s post-boot, unreproduced on the same
+image at t=11s — likely a tty-input race in the test loop, not the fs
+(e2fsck clean, apt 2.8.4 runs from the identical disk).
