@@ -6856,8 +6856,13 @@ leak, every test 0 failures (was pgtest 9 + termtest 1). run-iso 5/5:
 iso install PASS, installed boot+live shell PASS (livemenu -> login ->
 bash), dpkg 1.22.6 PASS, apt update PASS, apt install -y nano PASS
 (`Setting up nano`, apt-get exit(0)); initrd verified vs initrd.crc
-on the warm reboot. Remaining flake: first-attempt apt install still
-once exit(127)'d before the gate retry — unroot-caused, recorded.
+on the warm reboot. Remaining noise, root-caused by execve ENOENT tracing: apt forks
+children that exit(127) for missing helpers — usr/bin/apt-key is
+absent from the payload (apt's own W: names it; AllowUnauthenticated
+covers it); the per-acquire http method exit(100) is the documented
+non-fatal pending-error convention (Makefile INITRD_APT comment);
+dpkg/tar PATH-probe ENOENTs are normal. None of it is a kernel bug —
+every parent apt-get exits 0.
 
 Audit: scoped quick, security-audit skill, run-23 — diff is a
 restoration of the audited call site + test check; cve-now
