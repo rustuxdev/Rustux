@@ -159,6 +159,10 @@ fn copy_root_dir(
             return true;
         };
         if node.is_dir() {
+            // Mint a real dir, not just a name prefix — an implicit
+            // dir rejects chmod/mkdir with EROFS, which is what made
+            // apt's partial-dir setup warn on the installed system.
+            user::root_copy_dir(&path[..end], node.mode);
             copy_root_dir(io, sb, e.ino, path, end, depth + 1, copied,
                           budget, seen, nseen);
         } else if node.is_file() {
@@ -1495,8 +1499,27 @@ pub(crate) fn rustux_main(
         // than a filesystem the kernel reads. Its whole tree was copied
         // into the RAM fs above, so pid 1's namespace IS the installed
         // root (with the initrd as read-only underlay).
+        // pid 1 is livemenu, not a bare shell: on the installed ESP
+        // /hd.img is absent so it skips the menu and runs login —
+        // passwd/shadow auth, then the account shell. Without this
+        // the installed system booted straight into an unauthenticated
+        // root sh and never ran apt_dirs() either. A bare busybox sh
+        // stays the fallback if the image somehow lacks livemenu.
         let img = unsafe { core::slice::from_raw_parts(p, n) };
-        if user::spawn(img, "sh") {
+        let mut spawned = false;
+        match user::fs_lookup(b"livemenu") {
+            None => kprintln!(con, "rustux: root: livemenu lookup miss"),
+            Some(limg) => {
+                spawned = user::spawn(limg, "livemenu");
+                if !spawned {
+                    kprintln!(con, "rustux: root: livemenu spawn refused len={}", limg.len());
+                }
+            }
+        }
+        if spawned {
+            kprintln!(con, "rustux: root: booting the installed system (pid 1 = livemenu -> login)");
+            queued += 1;
+        } else if user::spawn(img, "sh") {
             kprintln!(con, "rustux: root: booting the installed system (pid 1 = sh from ext2)");
             queued += 1;
         } else {
@@ -1575,6 +1598,18 @@ enum InitrdVerify {
     Bad { want: u32, got: u32 },
 }
 
+/// Early-boot note before the named failure stage: load_initrd runs
+/// after the console exists but takes no handle — a fresh polling
+/// UART on COM1 mirrors the panic path and is safe pre-scheduler.
+fn initrd_fail(stage: &str) {
+    use core::fmt::Write;
+    unsafe {
+        let mut u = uart::Uart16550::new(uart::COM1);
+        u.init();
+        let _ = writeln!(u, "rustux: initrd: load failed at {stage}");
+    }
+}
+
 fn load_initrd() -> (Option<(u64, usize)>, InitrdVerify) {
     use uefi::proto::media::file::{File, FileAttribute, FileMode, RegularFile};
 
@@ -1588,11 +1623,17 @@ fn load_initrd() -> (Option<(u64, usize)>, InitrdVerify) {
     let mut sfs =
         match uefi::boot::get_image_file_system(uefi::boot::image_handle()) {
             Ok(s) => s,
-            Err(_) => return (None, InitrdVerify::NoSidecar),
+            Err(_) => {
+                initrd_fail("get_image_file_system");
+                return (None, InitrdVerify::NoSidecar);
+            }
         };
     let mut root = match sfs.open_volume() {
         Ok(r) => r,
-        Err(_) => return (None, InitrdVerify::NoSidecar),
+        Err(_) => {
+            initrd_fail("open_volume");
+            return (None, InitrdVerify::NoSidecar);
+        }
     };
     // The initrd sits next to the loaded image on whatever filesystem
     // firmware mounted: a FAT ESP keeps `initrd.cpio` verbatim, but a
@@ -1616,10 +1657,6 @@ fn load_initrd() -> (Option<(u64, usize)>, InitrdVerify) {
         }
         None
     };
-    let mut f = match open_named(&names) {
-        Some(f) => f,
-        None => return (None, InitrdVerify::NoSidecar),
-    };
     let pages = MAX_INITRD / 4096;
     let base = match uefi::boot::allocate_pages(
         uefi::boot::AllocateType::AnyPages,
@@ -1627,7 +1664,10 @@ fn load_initrd() -> (Option<(u64, usize)>, InitrdVerify) {
         pages,
     ) {
         Ok(b) => b,
-        Err(_) => return (None, InitrdVerify::NoSidecar),
+        Err(_) => {
+            initrd_fail("allocate_pages");
+            return (None, InitrdVerify::NoSidecar);
+        }
     };
     // SAFETY: base names `pages` freshly allocated pages.
     let buf =
@@ -1646,10 +1686,26 @@ fn load_initrd() -> (Option<(u64, usize)>, InitrdVerify) {
         }
         Some(off)
     };
-    let mut off = match read_all(&mut f, buf) {
-        Some(o) => o,
-        None => return (None, InitrdVerify::NoSidecar),
-    };
+    // Firmware file I/O on a warm reboot is flaky — a read can error
+    // out or an open can miss outright; both are transient, so open
+    // and read live in one two-attempt loop. The crc sidecar check
+    // below still guards silent short reads.
+    let mut off = 0usize;
+    let mut loaded = false;
+    for _ in 0..2 {
+        let Some(mut f) = open_named(&names) else {
+            continue;
+        };
+        if let Some(o) = read_all(&mut f, buf) {
+            off = o;
+            loaded = true;
+            break;
+        }
+    }
+    if !loaded {
+        initrd_fail("open/read");
+        return (None, InitrdVerify::NoSidecar);
+    }
     // The sidecar holds the archive's zlib crc32, written next to
     // initrd.cpio at image-build time. A transient firmware read can
     // drop a sector run and still report success — the bytes simply

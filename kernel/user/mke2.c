@@ -83,7 +83,7 @@ static void mark_used(uint8_t *bm, uint32_t gs, uint32_t bits,
 }
 
 #define MKE2_MAX_DIRS 64
-#define MKE2_MAX_FILES 160
+#define MKE2_MAX_FILES 320
 struct mke2_dirrec {
     char path[56]; // full prefix: "lib", "lib/x86_64-linux-gnu"
     uint32_t ino;

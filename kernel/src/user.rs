@@ -158,6 +158,82 @@ fn user_window(t: &Task) -> (u64, u64) {
 // Sized for the NT module ledger's own ceiling: NT_MAX_MODS=16
 // images of ~11 mapped sections each + the exe's + system VMAs.
 const MAX_RANGES: usize = 128;
+/// MAP_SHARED|MAP_ANONYMOUS segments: kernel-owned frame sets shared
+/// by inheritance through fork. 16 segments × up to 2 MiB each —
+/// nginx's init slab is 1280 B, real programs' posix shm goes through
+/// files later.
+const MAX_SHM_VMAS: usize = 8;
+const MAX_SHM_SEGS: usize = 16;
+const SHM_MAX_PAGES: usize = 512;
+
+/// One shared-anon segment: the physical frames every mapper aliases.
+/// refs counts VMAs (one per task mapping); frames are owned by the
+/// segment and freed only when the last VMA drops.
+struct ShmSeg {
+    frames: [u64; SHM_MAX_PAGES],
+    nframes: u32,
+    refs: u32,
+}
+
+static mut SHMSEGS: [Option<ShmSeg>; MAX_SHM_SEGS] =
+    [None, None, None, None, None, None, None, None,
+     None, None, None, None, None, None, None, None];
+
+/// Does `va` lie in one of `t`'s shared-anon VMAs? Pages that do are
+/// owned by the segment — never the task's private copy/free set.
+/// Is the frame mapped at `va` under `t` actually segment-owned?
+/// Verified against the segment's frame list, not just VMA coverage —
+/// a stale VMA (private remap, partial munmap) must never make a
+/// task-private frame exempt from freeing or fork-copy.
+fn shm_owns(t: &Task, va: u64, phys: u64) -> bool {
+    let segs = unsafe { &*core::ptr::addr_of!(SHMSEGS) };
+    // OR over EVERY covering VMA — MAP_FIXED can stack shm VMAs
+    // (partial containment keeps the old entry), so the first hit
+    // may name a different segment than the frame's owner.
+    for &(lo, hi, seg) in t.shms[..t.nshms].iter() {
+        if va >= lo && va < hi {
+            if let Some(s) = &segs[seg as usize] {
+                if s.frames[..s.nframes as usize].contains(&phys) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Drop every shared-anon VMA's segment ref, freeing frames at zero —
+/// called once at task teardown (after unmaps have already dropped
+/// their coverage). Mapping teardown itself skips shm frames, so the
+/// segment can only die here or at munmap-of-the-whole-VMA.
+fn shm_drop_all(t: &mut Task) {
+    for i in 0..t.nshms {
+        let (_, _, seg) = t.shms[i];
+        let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
+        if let Some(s) = &mut segs[seg as usize] {
+            s.refs = s.refs.saturating_sub(1);
+            if s.refs == 0 {
+                for f in 0..s.nframes as usize {
+                    kalloc::free_frame(s.frames[f]);
+                }
+                segs[seg as usize] = None;
+            }
+        }
+    }
+    t.nshms = 0;
+}
+
+/// Pin every segment named by `t`'s VMA list once more — fork/clone
+/// children copy the list, so each copy owes its own ref (balanced
+/// by shm_drop_all at teardown, or the fork failure path's).
+fn shm_pin_all(t: &Task) {
+    let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
+    for i in 0..t.nshms {
+        if let Some(s) = &mut segs[t.shms[i].2 as usize] {
+            s.refs += 1;
+        }
+    }
+}
 
 /// Max resident tasks — a hard bound so spawn can't exhaust the
 /// kernel heap by enqueueing forever. 48 was fork-EAGAIN-tight
@@ -1875,6 +1951,12 @@ pub struct Task {
     /// (page granularity underneath, like Linux VMAs).
     brk_base: u64,
     brk_cur: u64,
+    /// Shared-anon VMAs: (lo, hi, SHMSEGS index). Each entry pins one
+    /// segment ref; fork clones the list and maps the SAME frames
+    /// rather than deep-copying them — that's what makes the pages
+    /// shared. Bounded like ranges; a full table is ENOMEM.
+    shms: [(u64, u64, u8); MAX_SHM_VMAS],
+    nshms: usize,
     /// Index into FDTABS — this task fd table. CLONE_FILES
     /// children share the parent index; fork duplicates it.
     fdi: u8,
@@ -2145,6 +2227,26 @@ fn fdtab_release(i: u8) {
     tb.cloexec = 0;
 }
 
+/// Debug telemetry: (ofds in use, fd tables in use, fd slots in use,
+/// ofd refs total, tcp slots in use). The slot/ref split catches the
+/// two leak shapes — slots held by a live table vs refs no slot
+/// still names; tcps watches the connection pool itself (orphan
+/// FinWait/LastAck linger shows here while ofds stay clean).
+pub fn fd_telemetry() -> (usize, usize, usize, usize, usize) {
+    let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
+    let ts = unsafe { &*core::ptr::addr_of!(FDTABS) };
+    let socks = unsafe { &*core::ptr::addr_of!(TCPSOCKS) };
+    let ou = ofds.iter().flatten().count();
+    let refs: usize = ofds.iter().flatten().map(|o| o.refs).sum();
+    let (tu, slots) = ts
+        .iter()
+        .filter(|t| t.users > 0)
+        .fold((0, 0), |(tu, s), t| {
+            (tu + 1, s + t.fds.iter().flatten().count())
+        });
+    (ou, tu, slots, refs, socks.iter().flatten().count())
+}
+
 /// A task signal-disposition table — the sighand_struct analogue.
 /// CLONE_SIGHAND shares the index (users++); fork duplicates it.
 /// sigaction on one thread is visible to every sharer.
@@ -2273,12 +2375,12 @@ const MAX_OFDS: usize = 256;
 /// cpio names are read-only, VFILES names are created, written,
 /// truncated, renamed and unlinked. Bounded so untrusted fd churn
 /// can't exhaust frames.
-/// dpkg-deb -x on a real .deb walks ~50 files + ~95 dirs (locale
-/// trees are deep); a real `apt install libc6` extracts several
-/// hundred names across its six-package dep set — headroom for
+/// A real `apt install nginx` unpacks its whole dep set into this
+/// namespace — perl-base alone is ~2.7k names (unicore tables are
+/// deep) and the full chain runs ~5k files + ~600 dirs. Sized for
 /// that plus the suite's own scratch files.
-const MAX_VFILES: usize = 1024;
-const MAX_VDIRS: usize = 512;
+const MAX_VFILES: usize = 8192;
+const MAX_VDIRS: usize = 2048;
 /// Per-file ceiling — an honest ENOSPC, not an unbounded grow.
 const VFILE_MAX: usize = 32 << 20;
 
@@ -2392,6 +2494,10 @@ fn vfile_create(path: &[u8]) -> u64 {
     }
     let vs = unsafe { &mut *core::ptr::addr_of_mut!(VFILES) };
     let Some(i) = vs.iter().position(Option::is_none) else {
+        crate::log::printk(format_args!(
+            "rustux: vfile ENOSPC: table full creating {}",
+            core::str::from_utf8(path).unwrap_or("?")
+        ));
         return ENOSPC_;
     };
     let mut v = VFile {
@@ -2419,6 +2525,47 @@ fn vfile_create(path: &[u8]) -> u64 {
     v.name[..path.len()].copy_from_slice(path);
     vs[i] = Some(v);
     i as u64
+}
+
+/// Copy-up twin of root_copy_up for directories: mints a VDir for an
+/// ext2 dir the installed-root walk finds. Without this an installed
+/// dir exists only implicitly (as a name prefix), which reads fine
+/// but rejects chmod/chown/mkdir-touching ops with EROFS — apt's
+/// SetupAPTPartialDirectory chmod is exactly that case. Existing
+/// vdirs are kept (a later mkdir -p may have set real metadata).
+/// `mode` is the ext2 inode's mode; the low 12 bits are the perms.
+pub fn root_copy_dir(path: &[u8], mode: u16) -> bool {
+    if path.is_empty() || path.len() > 128 {
+        return false;
+    }
+    if vdir_find(path).is_some() {
+        return true;
+    }
+    let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
+    let Some(i) = ds.iter().position(Option::is_none) else {
+        crate::log::printk(format_args!(
+            "rustux: vdir ENOSPC: table full copying {}",
+            core::str::from_utf8(path).unwrap_or("?")
+        ));
+        return false;
+    };
+    let (s, ns) = now();
+    let mut d = VDir {
+        path: [0; 128],
+        nlen: path.len(),
+        mode: mode & 0o7777,
+        uid: 0,
+        gid: 0,
+        atime: s,
+        atime_ns: ns,
+        mtime: s,
+        mtime_ns: ns,
+        ctime: s,
+        ctime_ns: ns,
+    };
+    d.path[..path.len()].copy_from_slice(path);
+    ds[i] = Some(d);
+    true
 }
 
 /// Current wall time as (sec, nsec): TICKS is 100 Hz so subsecond
@@ -2640,7 +2787,14 @@ impl Task {
                     for l in 0..512u64 {
                         let leaf = rd64(pt + 8 * l);
                         if leaf & PRESENT != 0 {
-                            kalloc::free_frame(leaf & PHYS_MASK);
+                            let va = (i << 39) | (j << 30)
+                                | (k << 21) | (l << 12);
+                            // Segment frames stay — SHMSEGS frees
+                            // them on the last VMA ref (phys-verified:
+                            // stale VMAs can't shield private frames).
+                            if !shm_owns(self, va, leaf & PHYS_MASK) {
+                                kalloc::free_frame(leaf & PHYS_MASK);
+                            }
                         }
                     }
                     kalloc::free_frame(pt);
@@ -2650,6 +2804,7 @@ impl Task {
             kalloc::free_frame(pdpt);
             wr64(self.pml4 + 8 * i, 0);
         }
+        shm_drop_all(self);
     }
 
     /// Drop every fd's reference on its (global) OFD — Linux's
@@ -2702,6 +2857,11 @@ impl Task {
             self.free_user_mappings();
             kalloc::free_frame(self.pml4);
         }
+        // The shm VMA ledger is per-TASK, not per-mm: every exiting
+        // user drops its segment refs even when siblings keep the mm
+        // alive (free_user_mappings already ran it for the last user
+        // — nshms==0 makes the second call a no-op).
+        shm_drop_all(self);
         if self.kstack_base != 0 {
             // SAFETY: kstack_base came from kmalloc, freed once here.
             unsafe { kalloc::kfree(self.kstack_base as *mut u8) };
@@ -7502,6 +7662,8 @@ fn load(img: &[u8]) -> Option<Task> {
         kstack_top: 0,
         ranges: [(0, 0, 0); MAX_RANGES],
         nranges: 0,
+        shms: [(0, 0, 0); MAX_SHM_VMAS],
+        nshms: 0,
         brk_base: 0,
         brk_cur: 0,
 
@@ -7687,7 +7849,12 @@ fn unmap_page(t: &mut Task, va: u64) {
         return;
     }
     if e & PRESENT != 0 {
-        kalloc::free_frame(e & PHYS_MASK);
+        // Segment frames are owned by SHMSEGS, not the task — clear
+        // the translation but never free them. Phys-verified: a
+        // stale VMA can't shield a private frame from freeing.
+        if !shm_owns(t, va, e & PHYS_MASK) {
+            kalloc::free_frame(e & PHYS_MASK);
+        }
         wr64(ent, 0);
     }
 }
@@ -7989,6 +8156,7 @@ pub fn sys_brk(addr: u64) -> u64 {
             unmap_page(t, v);
             v += PAGE;
         }
+        shm_unmap_range(t, new_end, old_end);
         for r in t.ranges[..t.nranges].iter_mut() {
             if r.0 == t.brk_base {
                 r.1 = new_end;
@@ -8021,10 +8189,16 @@ pub fn sys_mmap(
     const MAP_ANON: u64 = 0x20;
     const MAP_SHARED: u64 = 0x01;
     let Some(t) = cur_mut() else { return ENOMEM };
-    // MAP_SHARED is honest ENODEV even without MAP_PRIVATE — shared
-    // writable mappings would need writeback we do not have.
     if flags & MAP_SHARED != 0 {
-        return ENODEV;
+        // Shared anonymous: real support via SHMSEGS — the frames are
+        // segment-owned, so every fork aliases the same pages. Still
+        // ENODEV under a CLONE_VM-shared mm (a second thread's
+        // mapping would corrupt the per-task VMA ledger) and always
+        // ENODEV file-backed (no writeback exists to write against).
+        if flags & MAP_ANON == 0 || mm_is_shared(t.pml4) {
+            return ENODEV;
+        }
+        return shm_mmap(t, addr, len, prot, flags);
     }
     if len == 0 || prot > 7 || flags & MAP_PRIVATE == 0 {
         return EINVAL;
@@ -8074,6 +8248,7 @@ pub fn sys_mmap(
                 unmap_page(t, v);
                 v += PAGE;
             }
+            shm_unmap_range(t, addr, addr + len);
             range_clip(t, addr, addr + len);
             // Freed frames' stale translations must go before user
             // code can run — else they alias whatever the buddy hands
@@ -8126,6 +8301,164 @@ pub fn sys_mmap(
     va
 }
 
+/// Map `phys` into `t`'s user space at `va` — map_page's twin for a
+/// caller-supplied frame (shm segments own the frames, the task only
+/// references them). Intermediates allocate like map_page.
+fn map_frame(t: &mut Task, va: u64, phys: u64, flags: u64) -> bool {
+    if t.is_compat {
+        return false;
+    }
+    let mut tab = t.pml4;
+    for shift in [39u64, 30, 21] {
+        let idx = ((va >> shift) & 0x1ff) as usize;
+        let e = rd64(tab + 8 * idx as u64);
+        if e & PRESENT != 0 {
+            if e & (1 << 7) != 0 {
+                return false;
+            }
+            tab = e & PHYS_MASK;
+        } else {
+            let Some(f) = kalloc::alloc_frame() else { return false };
+            wr64(tab + 8 * idx as u64, f | PRESENT | WRITE | USER);
+            tab = f;
+        }
+    }
+    let idx = ((va >> 12) & 0x1ff) as usize;
+    let ent = tab + 8 * idx as u64;
+    if rd64(ent) & PRESENT != 0 {
+        return false; // caller guarantees a hole
+    }
+    wr64(ent, phys | flags | PRESENT);
+    true
+}
+
+/// MAP_SHARED|MAP_ANONYMOUS: allocate a zeroed frame set into
+/// SHMSEGS and alias it at `va`. The segment owns the frames for the
+/// union of all VMA lifetimes — fork shares them verbatim instead of
+/// deep-copying, munmap/exit drop refs, the last ref frees.
+fn shm_mmap(t: &mut Task, addr: u64, len: u64, prot: u64, flags: u64) -> u64 {
+    const ENOMEM: u64 = (-12i64) as u64;
+    const ENODEV: u64 = (-19i64) as u64;
+    const MAP_FIXED: u64 = 0x10;
+    if len == 0 || prot > 7 || t.is_compat {
+        return if len == 0 || prot > 7 { EINVAL } else { ENODEV };
+    }
+    let Some(len) = len.checked_add(PAGE - 1).map(|v| v & !(PAGE - 1))
+    else {
+        return ENOMEM;
+    };
+    let npages = (len / PAGE) as usize;
+    if npages > SHM_MAX_PAGES
+        || t.nshms >= MAX_SHM_VMAS
+        || t.nranges >= MAX_RANGES
+    {
+        return ENOMEM;
+    }
+    // Slot INDEX only — holding a &mut into the table across
+    // shm_unmap_range's own borrow would alias the same static.
+    let seg = {
+        let segs = unsafe { &*core::ptr::addr_of!(SHMSEGS) };
+        let Some(i) = segs.iter().position(Option::is_none) else {
+            return ENOMEM;
+        };
+        i
+    };
+    let (ulo, uhi) = user_window(t);
+    let va = if addr != 0 {
+        if addr & (PAGE - 1) != 0
+            || addr < ulo
+            || addr.checked_add(len).is_none_or(|e| e > uhi)
+        {
+            return if flags & MAP_FIXED != 0 { EINVAL } else { ENOMEM };
+        }
+        if flags & MAP_FIXED != 0 {
+            if clip_entry_count(t, addr, addr + len) >= MAX_RANGES {
+                return ENOMEM;
+            }
+            let mut v = addr;
+            while v < addr + len {
+                unmap_page(t, v);
+                v += PAGE;
+            }
+            shm_unmap_range(t, addr, addr + len);
+            range_clip(t, addr, addr + len);
+            flush_tlb();
+            addr
+        } else if t.ranges[..t.nranges]
+            .iter()
+            .any(|&(lo, hi, _)| lo < addr + len && hi > addr)
+        {
+            let Some(v) = mmap_find(t, len) else { return ENOMEM };
+            v
+        } else {
+            addr
+        }
+    } else {
+        let Some(v) = mmap_find(t, len) else { return ENOMEM };
+        v
+    };
+    let mut s = ShmSeg { frames: [0; SHM_MAX_PAGES], nframes: 0, refs: 1 };
+    let leaf = prot_leaf(prot);
+    let mut mapped = 0usize;
+    for i in 0..npages {
+        let Some(f) = kalloc::alloc_frame() else {
+            break;
+        };
+        if !map_frame(t, va + (i as u64) * PAGE, f, leaf) {
+            kalloc::free_frame(f);
+            break;
+        }
+        s.frames[i] = f;
+        mapped = i + 1;
+    }
+    if mapped < npages {
+        // Roll back: unmap_page frees each mapped frame — the VMA
+        // isn't registered yet, so shm_owns correctly treats them as
+        // task-owned. Freeing s.frames here too would double-free.
+        let mut v = va;
+        while v < va + (mapped as u64) * PAGE {
+            unmap_page(t, v);
+            v += PAGE;
+        }
+        flush_tlb();
+        return ENOMEM;
+    }
+    s.nframes = npages as u32;
+    let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
+    segs[seg] = Some(s);
+    t.shms[t.nshms] = (va, va + len, seg as u8);
+    t.nshms += 1;
+    range_add(t, va, va + len, prot_rng(prot));
+    va
+}
+
+/// Drop the segment refs of every shm VMA fully covered by [lo,hi) —
+/// munmap and the MAP_FIXED replace path use it. Partial overlaps
+/// keep their VMA (the pages are already leaf-cleared; the frames
+/// still belong to the segment).
+fn shm_unmap_range(t: &mut Task, lo: u64, hi: u64) {
+    let mut w = 0usize;
+    for i in 0..t.nshms {
+        let (vlo, vhi, seg) = t.shms[i];
+        if vlo >= lo && vhi <= hi {
+            let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
+            if let Some(s) = &mut segs[seg as usize] {
+                s.refs = s.refs.saturating_sub(1);
+                if s.refs == 0 {
+                    for f in 0..s.nframes as usize {
+                        kalloc::free_frame(s.frames[f]);
+                    }
+                    segs[seg as usize] = None;
+                }
+            }
+            continue;
+        }
+        t.shms[w] = t.shms[i];
+        w += 1;
+    }
+    t.nshms = w;
+}
+
 /// munmap(addr, len): Linux never fails on an aligned range — holes
 /// and foreign areas are silent no-ops. Pages are freed, range
 /// entries clipped/split, one TLB flush at the end.
@@ -8155,6 +8488,7 @@ pub fn sys_munmap(addr: u64, len: u64) -> u64 {
         unmap_page(t, v);
         v += PAGE;
     }
+    shm_unmap_range(t, lo, hi);
     range_clip(t, lo, hi);
     flush_tlb();
     0
@@ -9579,9 +9913,19 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             };
             0
         }
-        // No nonblocking mode exists to toggle — EINVAL, not a
-        // silently-dropped flag a caller would trust.
-        FIONBIO => EINVAL,
+        // ioctl FIONBIO — the same O_NONBLOCK flag fcntl(F_SETFL)
+        // toggles, presented in the BSD ioctl form. nginx sets its
+        // listener nonblocking this way; the flag lives on the OFD
+        // so dup'd fds share it like Linux.
+        FIONBIO => {
+            if !range_ok(arg, 4) {
+                return EFAULT;
+            }
+            // SAFETY: arg validated readable for 4 bytes.
+            let v = unsafe { (arg as *const u32).read_unaligned() };
+            o.nonblock = v != 0;
+            0
+        }
         _ => ENOTTY_,
     }
 }
@@ -10410,6 +10754,10 @@ pub fn fs_mkdir(dfd: u64, path: &[u8], mode: u64) -> u64 {
     }
     let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
     let Some(i) = ds.iter().position(Option::is_none) else {
+        crate::log::printk(format_args!(
+            "rustux: vdir ENOSPC: table full creating {}",
+            core::str::from_utf8(p).unwrap_or("?")
+        ));
         return ENOSPC_;
     };
     let umask = cur_mut().map_or(0, |t| fst(t).umask);
@@ -12442,6 +12790,8 @@ pub fn nt_thread_create(
         kstack_top: ks + KSTACK_SIZE as u64,
         ranges: p.ranges,
         nranges: p.nranges,
+        shms: p.shms,
+        nshms: p.nshms,
         brk_base: p.brk_base,
         brk_cur: p.brk_cur,
         fdi: cfdi,
@@ -12584,6 +12934,9 @@ pub fn nt_thread_create(
         return None;
     };
     c.stack_top = c.ctx.rsp;
+    // Shared-mm child: own a ref per copied shm VMA so the parent's
+    // exit can't free frames this mm still maps.
+    shm_pin_all(&c);
     tasks[slot] = Some(c);
     PROCS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Some((idx, tid))
@@ -13037,6 +13390,7 @@ pub fn nt_decommit_window(t: &mut Task, base: u64, size: u64) -> bool {
         unmap_page(t, va);
         va += PAGE;
     }
+    shm_unmap_range(t, base, end);
     // unmap_page doesn't invlpg — the mm stays live across sibling
     // threads and the caller's own VA window, so one flush here.
     flush_tlb();
@@ -13121,12 +13475,14 @@ fn nt_free_pages_t(t: &mut Task, base: u64, size: u64) {
             i += 1;
             continue;
         }
-        let mut va = lo.max(base);
+        let vsta = lo.max(base);
         let vend = hi.min(end);
+        let mut va = vsta;
         while va < vend {
             unmap_page(t, va);
             va += PAGE;
         }
+        shm_unmap_range(t, vsta, vend);
         // Adjust the entry to cover only the still-mapped
         // remainder: left remnant [lo,base), right remnant
         // [end,hi). A middle free splits the entry when the table
@@ -20805,8 +21161,8 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
             blen: 0,
             parent: usize::MAX,
             orphan: false,
-            syn_at: 0,
-            syn_tries: 0,
+            ctl_at: 0,
+            ctl_tries: 0,
             dead: false,
             rxl: 0,
         });
@@ -21321,10 +21677,11 @@ struct TcpSock {
     parent: usize,
     /// All fds gone — teardown completes asynchronously.
     orphan: bool,
-    /// Tick of the last SYN transmit — retransmit backoff clock.
-    syn_at: u64,
-    /// SYN retries sent so far (Linux initial-RTO doubling).
-    syn_tries: u8,
+    /// Tick this control phase was armed — the retransmit backoff
+    /// clock for SYN first, then FIN once the close handshake begins.
+    ctl_at: u64,
+    /// Control-segment retries sent this phase (initial-RTO doubling).
+    ctl_tries: u8,
     /// RST seen — reads fail ECONNRESET, writes EPIPE.
     dead: bool,
     rxl: usize,
@@ -21767,8 +22124,8 @@ pub fn tcp_rx(
             blen: 0,
             parent: li,
             orphan: false,
-            syn_at: 0,
-            syn_tries: 0,
+            ctl_at: 0,
+            ctl_tries: 0,
             dead: false,
             rxl: 0,
         });
@@ -21866,9 +22223,9 @@ pub fn fd_connect(ctx: &mut UCtx, fd: u64, sa: u64, len: u64) -> u64 {
         k.peer_mac = mac;
         k.snd_nxt = tcp_isn(peer, k.port, dport).wrapping_add(1);
         k.state = TcpState::SynSent;
-        k.syn_at = crate::apic::TICKS
+        k.ctl_at = crate::apic::TICKS
             .load(core::sync::atomic::Ordering::Relaxed);
-        k.syn_tries = 0;
+        k.ctl_tries = 0;
         let isn = k.snd_nxt.wrapping_sub(1);
         let _ = crate::e1000::tcp_tx(
             mac, dip, k.port, dport, isn, 0, crate::net::TCP_SYN, &[],
@@ -21895,39 +22252,114 @@ pub fn fd_connect(ctx: &mut UCtx, fd: u64, sa: u64, len: u64) -> u64 {
 }
 
 /// Per-tick SYN retransmit: a SynSent socket re-fires on Linux's
-/// initial-RTO schedule — 1 s, then doubling (syn_tries shifts the
+/// initial-RTO schedule — 1 s, then doubling (ctl_tries shifts the
 /// base), capped at 5 retries. slirp and real networks do drop SYNs
 /// and SYN-ACKs; a single lost frame must not sink connect(). The
 /// task's own TCP_CONN_TICKS deadline still bounds the whole open.
 fn tcp_retx() {
     const RTO0: u64 = 100; // 1 s at 100 Hz
     const MAX_TRIES: u8 = 5;
+    // How long an fd-less closer may wait on the peer's FIN/ACK
+    // before the slot is reclaimed — the pool is 8 slots and a
+    // keep-alive peer holds its half-open side on its own schedule,
+    // so a lost or merely slow segment must not pin one forever.
+    const ORPHAN_DEADLINE: u64 = 1200; // 12 s at 100 Hz
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-    for s in tcp_socks().iter_mut() {
-        let Some(k) = s.as_ref() else { continue };
-        if k.state != TcpState::SynSent
-            || k.dead
-            || k.syn_tries >= MAX_TRIES
-            || now.wrapping_sub(k.syn_at) < RTO0 << k.syn_tries
-        {
+    let mut stale = [usize::MAX; MAX_TCPS];
+    let mut nstale = 0;
+    for (si, s) in tcp_socks().iter_mut().enumerate() {
+        let Some(k) = s.as_mut() else { continue };
+        if k.dead {
+            if k.orphan {
+                stale[nstale] = si;
+                nstale += 1;
+            }
             continue;
         }
-        let (pm, pi, sp, dp, isn) = (
-            k.peer_mac,
-            k.peer_ip,
-            k.port,
-            k.peer_port,
-            k.snd_nxt.wrapping_sub(1),
-        );
-        // tcp_tx may complete (or RST) the handshake on loopback —
-        // re-borrow rather than hold `k` across the call.
-        let _ = crate::e1000::tcp_tx(pm, pi, sp, dp, isn, 0,
-            crate::net::TCP_SYN, &[], 1460);
-        if let Some(k) = s.as_mut() {
-            if k.state == TcpState::SynSent {
-                k.syn_at = now;
-                k.syn_tries += 1;
+        match k.state {
+            TcpState::SynSent => {
+                if k.ctl_tries >= MAX_TRIES
+                    || now.wrapping_sub(k.ctl_at) < RTO0 << k.ctl_tries
+                {
+                    continue;
+                }
+                let (pm, pi, sp, dp, isn) = (
+                    k.peer_mac,
+                    k.peer_ip,
+                    k.port,
+                    k.peer_port,
+                    k.snd_nxt.wrapping_sub(1),
+                );
+                // tcp_tx may complete (or RST) the handshake on
+                // loopback — re-borrow rather than hold `k` across
+                // it, and re-verify slot identity: a drain could have
+                // freed AND reallocated this slot to a different conn.
+                let _ = crate::e1000::tcp_tx(pm, pi, sp, dp, isn, 0,
+                    crate::net::TCP_SYN, &[], 1460);
+                if let Some(k) = s.as_mut() {
+                    if k.state == TcpState::SynSent
+                        && k.port == sp
+                        && k.peer_port == dp
+                    {
+                        k.ctl_at = now;
+                        k.ctl_tries += 1;
+                    }
+                }
             }
+            TcpState::FinWait | TcpState::LastAck => {
+                let elapsed = now.wrapping_sub(k.ctl_at);
+                if k.orphan && elapsed >= ORPHAN_DEADLINE {
+                    // Peer stalled the close — lost segment or a
+                    // half-open held deliberately. Mark dead BEFORE
+                    // the RST: a drain-side realloc can't resurrect
+                    // the slot under the deferred free. RST kills its
+                    // end, then the slot is reclaimed.
+                    k.dead = true;
+                    let (pm, pi, sp, dp, sn, an) = (
+                        k.peer_mac, k.peer_ip, k.port, k.peer_port,
+                        k.snd_nxt, k.rcv_nxt,
+                    );
+                    let _ = crate::e1000::tcp_tx(pm, pi, sp, dp, sn, an,
+                        crate::net::TCP_RST | crate::net::TCP_ACK, &[],
+                        1460);
+                    stale[nstale] = si;
+                    nstale += 1;
+                    continue;
+                }
+                // An unACKed FIN may never have arrived — resend on
+                // the same doubling schedule; the peer's re-ACK is
+                // the only thing that can still free the slot. The
+                // FIN already consumed seq space, so it rides at
+                // snd_nxt-1 like the SYN did.
+                if !k.fin_acked
+                    && k.ctl_tries < MAX_TRIES
+                    && elapsed >= RTO0 << k.ctl_tries
+                {
+                    let (pm, pi, sp, dp, sn, an) = (
+                        k.peer_mac, k.peer_ip, k.port, k.peer_port,
+                        k.snd_nxt.wrapping_sub(1), k.rcv_nxt,
+                    );
+                    let _ = crate::e1000::tcp_tx(pm, pi, sp, dp, sn, an,
+                        crate::net::TCP_FIN | crate::net::TCP_ACK, &[],
+                        1460);
+                    if let Some(k) = s.as_mut() {
+                        // Same slot-identity check as the SYN arm.
+                        if k.port == sp && k.peer_port == dp {
+                            k.ctl_tries += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for i in stale[..nstale].iter().copied() {
+        // Slot identity re-check: a mid-sweep drain may have freed
+        // and reallocated i — only kill a slot that's still a dead
+        // orphan, never a fresh connection holding the same index.
+        if matches!(tcp_socks()[i].as_ref(), Some(k) if k.dead && k.orphan)
+        {
+            tcp_free(i);
         }
     }
 }
@@ -22238,12 +22670,18 @@ pub fn fd_shutdown(fd: u64, how: u64) -> u64 {
                 let k = tcp_socks()[si].as_mut().unwrap();
                 k.snd_nxt = k.snd_nxt.wrapping_add(1);
                 k.state = TcpState::FinWait;
+                k.ctl_at = crate::apic::TICKS
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                k.ctl_tries = 0;
             }
             TcpState::CloseWait => {
                 let _ = tcp_seg(k, crate::net::TCP_FIN | crate::net::TCP_ACK, &[]);
                 let k = tcp_socks()[si].as_mut().unwrap();
                 k.snd_nxt = k.snd_nxt.wrapping_add(1);
                 k.state = TcpState::LastAck;
+                k.ctl_at = crate::apic::TICKS
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                k.ctl_tries = 0;
             }
             _ => return ENOTCONN,
         }
@@ -22300,18 +22738,29 @@ fn tcp_sock_close(si: usize) {
     };
     match act {
         A::Free => socks[si] = None,
-        A::Orphan => {
-            if let Some(k) = socks[si].as_mut() {
-                k.orphan = true;
+        A::Orphan | A::Fin(_) => {
+            // The last fd is gone — arm the close clock so a stalled
+            // handshake can't pin the slot (see tcp_retx).
+            let now = crate::apic::TICKS
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if let A::Fin(next) = act {
+                let Some(k) = socks[si].as_mut() else { return };
+                let _ =
+                    tcp_seg(k, crate::net::TCP_FIN | crate::net::TCP_ACK, &[]);
+                // Loopback may have finished the handshake inside the
+                // send — a freed slot has nothing left to arm, and a
+                // drained RST may have marked the slot dead; don't
+                // resurrect its state past Closed.
+                let Some(k) = socks[si].as_mut() else { return };
+                if !k.dead {
+                    k.snd_nxt = k.snd_nxt.wrapping_add(1);
+                    k.state = next;
+                }
             }
-        }
-        A::Fin(next) => {
             let Some(k) = socks[si].as_mut() else { return };
-            let _ = tcp_seg(k, crate::net::TCP_FIN | crate::net::TCP_ACK, &[]);
-            let k = socks[si].as_mut().unwrap();
-            k.snd_nxt = k.snd_nxt.wrapping_add(1);
-            k.state = next;
             k.orphan = true;
+            k.ctl_at = now;
+            k.ctl_tries = 0;
         }
     }
 }
@@ -22698,6 +23147,10 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     // finishes loading). A later load failure exits the child, but
     // the parent no longer shares its mm so the wake is correct.
     wake_vfork_parent_of(t.pid);
+    // The exec'd mm is gone (freed above or abandoned to siblings) —
+    // every shm VMA dies with it; dropping refs here also covers the
+    // shared-mm detach where free_user_mappings never ran.
+    shm_drop_all(t);
     t.nranges = 0;
     t.stack_top = 0;
     t.fs_base = 0; // TLS dies with the old image — new one SET_FSs
@@ -23486,7 +23939,8 @@ pub fn translate_r(pml4: u64, va: u64) -> Option<u64> {
 /// honest copy is correct and the refcount machinery isn't worth it
 /// at this scale). Kernel slots are shared by reference like every
 /// load. Returns false on allocation failure — caller reaps `c`.
-fn fork_address_space(c: &mut Task, ppml4: u64) -> bool {
+fn fork_address_space(c: &mut Task, p: &Task) -> bool {
+    let ppml4 = p.pml4;
     // Kernel-shared slots copy by reference: the identity map in
     // 0..128 plus the physmap band 256..512 (all supervisor entries,
     // so the USER check below never deep-copies them).
@@ -23589,6 +24043,15 @@ fn fork_address_space(c: &mut Task, ppml4: u64) -> bool {
                     if le & PRESENT == 0 {
                         continue;
                     }
+                    let va = ((i as u64) << 39) | ((j as u64) << 30)
+                        | ((k as u64) << 21) | ((l as u64) << 12);
+                    if shm_owns(p, va, le & PHYS_MASK) {
+                        // Shared-anon leaf: alias the SAME frame — the
+                        // phys check keeps a stale VMA from turning a
+                        // private remap into a cross-task alias.
+                        wr64(cpt + 8 * l as u64, le);
+                        continue;
+                    }
                     let Some(nf) = kalloc::alloc_frame() else { return false };
                     // SAFETY: both frames are owned, identity-mapped,
                     // full 4 KiB each — a verbatim copy.
@@ -23668,6 +24131,8 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         kstack_top: 0,
         ranges: p.ranges,
         nranges: p.nranges,
+        shms: p.shms,
+        nshms: p.nshms,
         brk_base: p.brk_base,
         brk_cur: p.brk_cur,
         fdi: cfdi,
@@ -23737,7 +24202,10 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
     // Either failure frees the (possibly partial) user page-table
     // tree + pml4 — NOT reap(): child's fd slots name OFDs whose refs
     // were never bumped, so release_fds would corrupt the count.
-    if !fork_address_space(&mut c, p.pml4) {
+    // Pin the shm segments first: the child aliases their frames
+    // verbatim, and the failure path's shm_drop_all undoes the pins.
+    shm_pin_all(&c);
+    if !fork_address_space(&mut c, p) {
         c.free_user_mappings();
         kalloc::free_frame(c.pml4);
         fstab_release(cfsi);
@@ -23846,6 +24314,8 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         // the page tables themselves stay shared).
         ranges: p.ranges,
         nranges: p.nranges,
+        shms: p.shms,
+        nshms: p.nshms,
         brk_base: p.brk_base,
         brk_cur: p.brk_cur,
         fdi: cfdi,
@@ -23944,6 +24414,9 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         }
     }
     let cpid = c.pid;
+    // Shared-mm child: one segment ref per copied shm VMA — balanced
+    // by shm_drop_all at this task's teardown.
+    shm_pin_all(&c);
     tasks[slot] = Some(c);
     PROCS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     cpid

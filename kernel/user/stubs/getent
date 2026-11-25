@@ -1,0 +1,14 @@
+#!/bin/sh
+# Minimal getent over the flat /etc databases — enough for Debian
+# maintainer scripts: `getent <db>` dumps, `getent <db> <key>` looks
+# up name (field 1) or numeric id (field 3). exit 2 = key absent.
+db=$1 key=$2
+case $db in
+    passwd|group|shadow|gshadow|hosts) f=/etc/$db ;;
+    *) exit 2 ;;
+esac
+[ -f "$f" ] || exit 2
+if [ -z "$key" ]; then cat "$f"; exit 0; fi
+grep "^$key:" "$f" && exit 0
+grep ":$key:" "$f" && exit 0
+exit 2

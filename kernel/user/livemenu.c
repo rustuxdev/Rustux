@@ -785,6 +785,10 @@ static void install(const char *path)
                     { "/etc/shadow", "etc/shadow" },
                     { "/etc/group", "etc/group" },
                     { "/etc/securetty", "etc/securetty" },
+                    { "/usr/sbin/update-rc.d",
+                      "usr/sbin/update-rc.d" },
+                    { "/usr/bin/locale", "usr/bin/locale" },
+                    { "/usr/bin/getent", "usr/bin/getent" },
                     { "/lib64/ld-linux-x86-64.so.2",
                       "lib64/ld-linux-x86-64.so.2" },
                     { "/lib/x86_64-linux-gnu/libc.so.6",
@@ -961,6 +965,12 @@ static void install(const char *path)
                     { "usr/sbin/start-stop-daemon", "bin/busybox" },
                     { "usr/bin/apt", "usr/bin/apt-get" },
                     { "usr/sbin/ldconfig", "sbin/ldconfig" },
+                    { "usr/sbin/invoke-rc.d",
+                      "usr/sbin/update-rc.d" },
+                    { "usr/bin/deb-systemd-helper",
+                      "usr/sbin/update-rc.d" },
+                    { "usr/bin/deb-systemd-invoke",
+                      "usr/sbin/update-rc.d" },
                 };
                 static struct stat pst[MKE2_MAX_FILES];
                 for (uint32_t i = 0; i < sizeof PAYLOAD / sizeof PAYLOAD[0] && nf < MKE2_MAX_FILES; i++) {

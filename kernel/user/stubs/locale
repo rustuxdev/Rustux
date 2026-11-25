@@ -1,0 +1,2 @@
+#!/bin/sh
+if [ "$1" = charmap ]; then echo UTF-8; else echo LANG=C.UTF-8; fi

@@ -481,6 +481,12 @@ LIVE_PAIRS := \
 	kernel/user/ldconfig usr/sbin/ldconfig \
 	link:/bin/busybox sbin/start-stop-daemon \
 	link:/bin/busybox usr/sbin/start-stop-daemon \
+	kernel/user/stubs/noinit usr/sbin/update-rc.d \
+	kernel/user/stubs/locale usr/bin/locale \
+	kernel/user/stubs/getent usr/bin/getent \
+	link:/usr/sbin/update-rc.d usr/sbin/invoke-rc.d \
+	link:/usr/sbin/update-rc.d usr/bin/deb-systemd-helper \
+	link:/usr/sbin/update-rc.d usr/bin/deb-systemd-invoke \
 	$(APTROOT)/dpkgtables/cputable usr/share/dpkg/cputable \
 	$(APTROOT)/dpkgtables/ostable usr/share/dpkg/ostable \
 	$(APTROOT)/dpkgtables/tupletable usr/share/dpkg/tupletable \
@@ -657,10 +663,11 @@ run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 	ok=0; \
 	for i in $$(seq 1 12); do \
 		sleep 15; \
-		python3 tools/sendkey.py isomon.sock ret "str:echo _RXOK" ret; \
+		python3 tools/sendkey.py isomon.sock "str:root" ret "str:rustux" ret; \
+		sleep 5; \
+		python3 tools/sendkey.py isomon.sock "str:echo _RXOK" ret; \
 		sleep 3; \
 		grep -q "_RXOK" isoph.log && { ok=1; break; }; \
-		python3 tools/sendkey.py isomon.sock 1 ret; \
 	done; \
 	grep -q "_RXOK" isoph.log \
 		&& echo "installed boot + live shell: PASS" \
@@ -683,13 +690,13 @@ run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 		&& echo "installed apt update: PASS" \
 		|| { echo "installed apt update: FAIL"; grep -i "err:\|ign:\|get:\|exit(" isoph.log | tail -15; \
 		     echo quit | socat - UNIX-CONNECT:isomon.sock > /dev/null 2>&1 || kill $$qpid; exit 1; }; \
-	python3 tools/sendkey.py isomon.sock "str:apt install nano" ret; \
+	python3 tools/sendkey.py isomon.sock "str:apt install -y nano" ret; \
 	ok=0; \
 	for i in $$(seq 1 24); do \
 		sleep 15; \
-		grep -q "apt-get exit(0)" isoph.log && { ok=1; break; }; \
-		grep -q "apt-get exit(100)\|apt: not found" isoph.log \
-			&& { sleep 5; python3 tools/sendkey.py isomon.sock "str:apt install nano" ret; }; \
+		grep -q "Setting up nano" isoph.log && { ok=1; break; }; \
+		grep -q "apt-get exit(100)\|apt-get exit(127)\|Unable to locate" isoph.log \
+			&& { sleep 5; python3 tools/sendkey.py isomon.sock "str:apt install -y nano" ret; }; \
 	done; \
 	[ $$ok -eq 1 ] \
 		&& echo "installed apt install nano: PASS" \

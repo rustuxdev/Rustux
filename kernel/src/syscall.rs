@@ -559,6 +559,10 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_FSTAT => user::sys_fstat(a1, a2),
         NR_ACCESS => sys_access(u64::MAX, a1, a2),
         NR_FACCESSAT => sys_access(a1, a2, a3),
+        // faccessat2's extra flags arg: AT_EACCESS is inert in a
+        // single-user world; AT_SYMLINK_NOFOLLOW is the same edge
+        // faccessat already documents. Same answer either way.
+        439 => sys_access(a1, a2, a3),
         NR_SYMLINK => sys_symlink(a1, a2),
         NR_SYMLINKAT => sys_symlinkat(a1, a2, a3),
         NR_READLINK => sys_readlink(a1, a2, a3),
@@ -1676,8 +1680,9 @@ fn sys_writev(ctx: &mut user::UCtx, fd: u64, iov: u64, cnt: u64) -> u64 {
 /// exit(code): hand off to the scheduler — resume the next Runnable
 /// task's ctx, or unwind to the saved kernel frame when none remain.
 fn sys_exit(code: u64) -> ! {
+    let (ou, tu, slots, refs, tcps) = user::fd_telemetry();
     log::printk(format_args!(
-        "rustux: user: pid {} {} exit({code})",
+        "rustux: user: pid {} {} exit({code}) ofds {ou} tabs {tu} slots {slots} refs {refs} tcps {tcps}",
         user::getpid(),
         user::cur_exe()
     ));
