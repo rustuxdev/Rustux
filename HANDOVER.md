@@ -6387,3 +6387,60 @@ kernel/src/syscall.rs plus the `cur = &lname[..lname_len]` assignment.
 State: tree clean at ba104c7, pivot on `sh`, suite green, both boot
 paths PASS with zero leak. The fix is a five-line change with a
 one-boot verification (look for "init script running" / "uname:").
+
+## run-258 — the namespace pivot: the installed root copied into the RAM fs, pid 1 from ext2
+
+The structural defect behind "installed system shows dev etc proc": fs_lookup
+resolves vfiles + the initrd archive only — the mounted ext2 was never in a
+process's namespace. The fix is NOT a VFS layer: the installed root (bounded to
+512 files / 256 MiB) is copied whole into the RAM fs at mount time by
+copy_root_dir (kernel/src/main.rs), which recurses INSIDE dir_walk's callback —
+the Dirent is a stack copy and the PIO reads are sequential, so no live read is
+re-entered. After that, fs_lookup/open/stat/getdents resolve the installed
+files natively: ls / shows the installed tree, binaries exec out of it.
+
+The pivot only fires on the installed disk: the installer ISO's initrd carries
+hd.img, the installed ESP's initrd is the same archive minus hd.img, so
+cpio::find(arc,"hd.img") gates both the copy-up and ROOT_EXE. Booting live
+media with an installed disk still attached stays pristine and the installer
+remains reachable. ROOT_EXE is fs_lookup("bin/busybox") taken after copy-up;
+pid 1 = spawn(img,"sh"). set_initrd moved BEFORE the pivot so the initrd is a
+read-only underlay — installed files win (vfiles resolve first), anything not
+installed falls back to the archive.
+
+Ordering fix that was masking everything on -machine pc: ata::init() ran AFTER
+the partition scan, so the gate `ata::sectors()>0 || ahci::disks()>0` was
+always false on i440fx (IDE only, no AHCI) and the scan never ran — neither the
+install boot nor the installed boot ever mounted anything there. ata init is
+now ahead of the scan.
+
+livemenu: memset(files,0) — the uninitialized .read fn pointer was the
+cr2=0xfffffffffffff8 installer crash; payload widened to 15 streamed entries
+(busybox + sh/ash/ls/cat/cp/bash/dash/apt/dpkg/htop + ld-linux + libc + apt
+libs); layout prompt emits its own newline and echoes the chosen root size.
+user.rs: spawn sets PATH/HOME/TERM/USER — without PATH every bare command
+reported "not found" even when the binary was right there.
+
+Makefile run-iso: sendkey updated for the current menu (1 install -> Enter for
+the default root size -> "yes" to confirm); INSTALLDISK 64->256 MiB (a 16 MiB
+root cannot hold the ~35 MiB payload — mke2 FAILED -21 mid-format); install
+wait 16->40 polls (formatting a 208 MiB root is minutes of one-block PIO
+writes, not a hang).
+
+Verified end-to-end: iso install PASS; eject; reboot;
+`ext2: disk0p1 type=0x83 MOUNTED lba=98304`;
+`root: 15 files copied up from ext2`; `pid 1 = sh from ext2`; `/ #` prompt;
+`ls /` shows README bin dev etc lib lib64 livemenu proc sbin usr;
+`uname -a` -> Rustux; `cat /etc/motd` -> the installed file.
+make run: exit 33, 75 tasks, frames X -> X zero leak.
+
+Audit run-258 scoped quick (security-audit skill): copy_root_dir bounds
+(depth 8, 512 files, 256 MiB total, 32 MiB/file, name 96B, path 128B);
+dir_walk already validates rec_len/name_len — CVE-2026-10645 class checked,
+not vulnerable; superblock bounded by validate() — CVE-2026-13478 n/a;
+hd.img gate is an exact cpio name match; spawn env writes are cap-bounded.
+No findings. Recorded gap, not hidden: the installed boot lands on an
+UNAUTHENTICATED root sh — busybox `login` still #GPs after its prompt
+(/tmp/auth-work.patch holds the passwd/shadow payload + login pivot);
+login-as-pid1 is the follow-up. Also open: two-external shell pipelines;
+archive symlink records stat ENOENT in ls /bin output (cosmetic).

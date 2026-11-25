@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**152 unique CVEs recorded.**
+**154 unique CVEs recorded.**
 
 ## klib ports
 
@@ -162,10 +162,12 @@ by hand; append to the matrix and regenerate.
 | CVE-2025-68814 | file-I/O ABI: openat(257)+dirfd int32 semantics, pread64(17), fcntl(72) FD flags, dup(32)… | RUN-TIME BUG CAUGHT BY THE REAL BINARY: glibc passes dirfd as a 32-bit int (mov edi,-100 zero-extends to 0xffffff9c) so a u64 compare vs sign-extended AT_FDCWD never matched -- ev… |
 | CVE-2025-71089 | physmap rung: supervisor mirror of all phys RAM at PML4 slot 256 (0xFFFF_8000_0000_0000)… | PRESENT |
 | CVE-2026-102068 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
+| CVE-2026-10645 | installed-root pivot rung: the mounted ext2 root is copied whole into the RAM fs at boot… | audit run-258 scoped quick (security-audit skill): verified the walk bounds, the callback re-entrancy claim, the exact-name gate, and the underlay ordering. No findings. needs_val… |
 | CVE-2026-12365 | wall clock + NT time/system services: rtc.rs CMOS/RTC reader (BCD/binary, UIP-bounded, ce… | audit run-99 quick scoped: 2 confirmed findings fixed in-diff — tsc_hz unbounded OUT2 poll was lazily reachable from NT userspace (now TSC-deadline bail, uncached failure) and NT… |
 | CVE-2026-12365 | wall clock + NT time/system services: rtc.rs CMOS/RTC reader (BCD/binary, UIP-bounded, ce… | audit run-99 quick scoped: 2 confirmed findings fixed in-diff — tsc_hz unbounded OUT2 poll was lazily reachable from NT userspace (now TSC-deadline bail, uncached failure) and NT… |
 | CVE-2026-12366 | real NT threads + per-thread TLS: NT_THREADS ledger (16, handle-refed, exit-status surviv… | audit run-89 quick scoped: 1 confirmed-class issue found + fixed in-run (stale-ledger probe hazard -> mm_owner routes every NT non-leader ranges/heap access to the leader task), n… |
 | CVE-2026-13216 | legacy BIOS boot rung: Multiboot2 front end — kernel also builds for x86_64-unknown-none… | audit run-120 quick scoped via safe-anything MCP (kernel/ 119 files clean; security-audit skill still absent on disk — limitation recorded) + cve.now entities.search (parsing clas… |
+| CVE-2026-13478 | installed-root pivot rung: the mounted ext2 root is copied whole into the RAM fs at boot… | audit run-258 scoped quick (security-audit skill): verified the walk bounds, the callback re-entrancy claim, the exact-name gate, and the underlay ordering. No findings. needs_val… |
 | CVE-2026-23115 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
 | CVE-2026-23374 | preemptive round-robin scheduler | every switch is a UCtx resume (15 GPRs + iret frame) — launch/preemption/exit share one path; dedicated 0xf0 stub saves the FULL register file; cs&3==0 ticks never switch (58090 c… |
 | CVE-2026-31433 | NT directory enumeration: NtQueryDirectoryFile (FileDirectoryInformation records, wildcar… | audit run-85 quick scoped: no confirmed findings; 1 correctness fix applied - stale wildcard cell cleared on handle-slot reuse. Verified: [info,info+ilen) probed writable + <=1MiB… |
