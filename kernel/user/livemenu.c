@@ -432,7 +432,17 @@ static void install(const char *path)
                 printf("install: formatting ext2 root at LBA %u (%u blocks)...\n",
                        root_lba, blocks);
                 fflush(stdout);
-                int fr = mke2_format(mke2_sink, &sd, (uint64_t)root_lba * 512, blocks);
+                // Seed the root with a marker file: it proves the
+                // installed root is a real filesystem the kernel can
+                // read, not just a formatted empty partition.
+                static const char marker[] =
+                    "Rustux ext2 root\n";
+                struct mke2_file files[1];
+                files[0].name = "README";
+                files[0].data = marker;
+                files[0].len = sizeof marker - 1;
+                int fr = mke2_format(mke2_sink, &sd, (uint64_t)root_lba * 512,
+                                     blocks, files, 1);
                 if (fr == 0) {
                     printf("install: ext2 root formatted\n");
                 } else {

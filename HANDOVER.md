@@ -5932,3 +5932,26 @@ remembering.
 Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
 NEXT: make the ext2 root the actual ROOT (pivot into it), then populate
 it from userspace and add the layout UI.
+
+## run-237 — files land in the root, and the kernel reads them back
+
+mke2 now places files at format time: blocks and inodes are allocated
+in the SAME pass that builds the bitmaps, so the bitmaps and the
+content cannot disagree. Bugs the fsck harness caught: the inode was
+written at root_blk instead of the inode-table start, i_blocks counted
+1024-byte blocks instead of 512-byte units, and the free-inode count
+ignored the placed inodes.
+
+The installer seeds the root with a README; booting the installed disk:
+
+    rustux: ext2: disk0p1 type=0x83 MOUNTED lba=98304 block=1024
+            entries=4 walked=true README=17B
+    rustux: sched: launch livemenu (pid 1)
+
+entries went 3 -> 4 and the kernel read the file the installer wrote.
+That is the whole loop carrying DATA: partition -> format -> write file
+-> mount -> read.
+
+Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.
+NEXT: populate the real tree (a directory walk instead of root-only
+files), then pivot into it as /, then the layout UI.

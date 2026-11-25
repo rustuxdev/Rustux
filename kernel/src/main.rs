@@ -1178,8 +1178,17 @@ pub(crate) fn rustux_main(
                         true
                     })
                     .is_some();
+                    // Read a file back out of the mounted root: the
+                    // end-to-end proof that the installer's filesystem
+                    // is readable by this kernel.
+                    let mut body = [0u8; 64];
+                    let got = match ext2::lookup(&part, &m.sb, 2, b"README") {
+                        Some(ino) => ext2::read_file(&part, &m.sb, ino, &mut body)
+                            .unwrap_or(0),
+                        None => 0,
+                    };
                     kprintln!(con,
-                        "rustux: ext2: disk{d}p{slot} type={:#x} MOUNTED lba={start} block={} entries={n} walked={walked}",
+                        "rustux: ext2: disk{d}p{slot} type={:#x} MOUNTED lba={start} block={} entries={n} walked={walked} README={got}B",
                         ptype, m.sb.block_size());
                 }
             }
