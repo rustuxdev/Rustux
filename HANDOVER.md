@@ -5139,3 +5139,33 @@ PR_SET_NAME (15). Added PR_GET_NAME: writes the task name into a
 
 Verified: 2 boots PASS exit 33, 75 tasks, frames X -> X zero leak,
 ia32test exit 0.
+
+## run-206 — BIOS boot path regression (bisected, OPEN)
+
+IMPORTANT: the legacy BIOS boot path (`make run-bios`) is RED at
+HEAD while the pre-session commit was GREEN. Bisect (each a full
+run-bios):
+
+    bb52a12  pre-session              PASS  73 tasks, zero leak
+    516b52c  physmap rung             PASS  73 tasks, zero leak
+    e08183f  identity-map fixes       PASS  74 tasks, zero leak
+    fcec189  ia32 fork/exec/wait      HANG  (182 exits, no summary)
+    HEAD     everything               FAIL  (~88 exits, dies at ~2.9s,
+                                            no kernel fault, no heartbeat)
+
+So the breakage starts at the ia32 fork/execve/wait4 rung (fcec189)
+or is triggered by it. The BIOS path loads the kernel at 1 MiB —
+BELOW 4 GiB — which is exactly the shared-slot-0 scenario, so this
+is plausibly the same hazard class as runs 173/176 but reached
+through the compat fork/exec path (a compat child's address-space
+teardown or exec under a 1 MiB kernel image).
+
+UEFI (`make run`) is green at HEAD, so the regression is
+BIOS-specific. NOT YET FIXED — this is the top item for the next
+session, and it must be fixed before anything else because it means
+the legacy boot path no longer completes the suite.
+
+Next: run HEAD's run-bios with the serial fault log enabled (the
+crash produced no fault record, so it is likely a triple fault);
+check whether a compat task's free_user_mappings/exec touches the
+kernel image's 2M region under the 1 MiB load address.
