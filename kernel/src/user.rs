@@ -10701,6 +10701,22 @@ pub fn sys_prctl(op: u64, a2: u64) -> u64 {
             }
             0
         }
+        16 => {
+            // PR_GET_NAME — 16 bytes, NUL-padded. The i386 busybox
+            // shell probes this at startup; EINVAL used to make it
+            // take an error path.
+            if !range_ok_w(a2, 16) {
+                return EFAULT;
+            }
+            let mut b = [0u8; 16];
+            let n = t.name.iter().position(|&c| c == 0).unwrap_or(16).min(15);
+            b[..n].copy_from_slice(&t.name[..n]);
+            // SAFETY: validated writable user range (16 bytes).
+            unsafe {
+                core::ptr::copy_nonoverlapping(b.as_ptr(), a2 as *mut u8, 16);
+            }
+            0
+        }
         _ => EINVAL,
     }
 }

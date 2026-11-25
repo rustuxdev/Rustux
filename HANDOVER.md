@@ -5129,3 +5129,13 @@ would exec in place. Implementing a true vfork (child never
 returns; parent stack genuinely shared; any fork inside is the
 caller's bug) is the principled next step, with a dedicated i386
 test that vforks and execs.
+
+## run-205 — prctl PR_GET_NAME: the shell's startup probe answers
+
+The shell-syscall trace showed the i386 busybox shell calling
+prctl(PR_GET_NAME = 16) and getting EINVAL — we only implemented
+PR_SET_NAME (15). Added PR_GET_NAME: writes the task name into a
+16-byte NUL-padded user buffer, gated by range_ok_w(a2, 16).
+
+Verified: 2 boots PASS exit 33, 75 tasks, frames X -> X zero leak,
+ia32test exit 0.
