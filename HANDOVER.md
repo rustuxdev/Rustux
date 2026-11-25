@@ -6029,3 +6029,19 @@ the source. Base format still clean at 16 MiB and 212992 blocks.
 Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.
 NEXT: place real files from the initrd into the root (busybox is ~1 MB,
 so double-indirect is needed for it), then pivot.
+
+## run-242 — double-indirect: files up to ~64 MiB
+
+mke2 now handles files past 12 direct + 256 single-indirect entries by
+allocating a double-indirect block and its level-2 pointer blocks,
+reserving every one in the bitmap and counting them all in i_blocks
+(that count was the last bug fsck found).
+
+VERIFIED: a 1 MiB file (busybox-sized) passes e2fsck with 0 issues and
+dumps back byte-identical; the 100 KiB and base-16 MiB cases stay
+clean. So the formatter can now hold the real initrd payload.
+
+Suite PASS exit 33, 75 tasks, frames 212293 -> 212293 zero leak.
+NEXT: read the initrd's files from userspace and place them into the
+root (the installer already reads /hd.img, so the mechanism exists),
+then pivot into it.

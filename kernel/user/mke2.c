@@ -148,6 +148,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         uint32_t len;
         uint32_t dir; // index into dirs[], or 0xffffffff for the root
         uint32_t ind; // single-indirect block, 0 when the file is small
+        uint32_t dind; // double-indirect block, 0 when not needed
         const char *name;
     } placed[16];
     uint32_t nplaced = 0;
@@ -193,6 +194,7 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
         placed[nplaced].ino = 0;
         placed[nplaced].blk = 0;
         placed[nplaced].ind = 0;
+        placed[nplaced].dind = 0;
         nplaced++;
     }
     used_inodes += ndirs;    // one inode per created directory
@@ -259,6 +261,22 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
                 if (nb > 12) {
                     placed[f].ind = next_data_blk++;
                     setbit(bm, placed[f].ind - gs);
+                }
+                // Past 12 direct + 256 indirect entries, a second level
+                // of indirection is needed (12 + 256 + 256*256 blocks).
+                if (nb > 12 + BLOCK / 4) {
+                    placed[f].dind = next_data_blk++;
+                    setbit(bm, placed[f].dind - gs);
+                    // The level-2 pointer blocks live right after the
+                    // double-indirect block and must be reserved too,
+                    // or they are marked free while in use.
+                    uint32_t per2 = BLOCK / 4;
+                    uint32_t rest2 = nb - (12 + per2);
+                    uint32_t l2n = (rest2 + per2 - 1) / per2;
+                    for (uint32_t i = 0; i < l2n; i++) {
+                        setbit(bm, placed[f].dind + 1 + i - gs);
+                    }
+                    next_data_blk += l2n;
                 }
             }
         }
@@ -437,7 +455,19 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
                 nb = 1;
             }
             // i_blocks counts the indirect block too, in 512-byte units.
-            put32(ino + 28, (nb + (placed[f].ind ? 1 : 0)) * (BLOCK / 512));
+            {
+                // i_blocks counts data + indirect + double-indirect +
+                // every level-2 pointer block, in 512-byte units.
+                uint32_t per3 = BLOCK / 4;
+                uint32_t l2n3 = 0;
+                if (placed[f].dind) {
+                    uint32_t rest3 = nb > 12 + per3 ? nb - (12 + per3) : 0;
+                    l2n3 = (rest3 + per3 - 1) / per3;
+                }
+                uint32_t tot = nb + (placed[f].ind ? 1 : 0)
+                    + (placed[f].dind ? 1 : 0) + l2n3;
+                put32(ino + 28, tot * (BLOCK / 512));
+            }
         }
         {
             // All twelve direct pointers, not just the first: leaving
@@ -452,6 +482,9 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             }
             if (placed[f].ind != 0) {
                 put32(ino + 40 + 12 * 4, placed[f].ind); // block[12]
+            }
+            if (placed[f].dind != 0) {
+                put32(ino + 40 + 13 * 4, placed[f].dind); // block[13]
             }
         }
         // The inode table starts right after group 0's two bitmaps —
@@ -488,6 +521,36 @@ static int mke2_format(mke2_write_fn wr, void *ctx, uint64_t base,
             }
             if (wr(ctx, base + placed[f].ind * BLOCK, ib, BLOCK)) {
                 return -26;
+            }
+        }
+        if (placed[f].dind != 0) {
+            // Level 1: pointers to level-2 blocks; level 2: data blocks.
+            uint32_t nb2 = (placed[f].len + BLOCK - 1) / BLOCK;
+            uint32_t per = BLOCK / 4;
+            uint32_t first = 12 + per; // first block handled here
+            uint32_t rest = nb2 > first ? nb2 - first : 0;
+            uint32_t l2count = (rest + per - 1) / per;
+            uint8_t l1[BLOCK];
+            memset(l1, 0, sizeof l1);
+            for (uint32_t i = 0; i < l2count && i < per; i++) {
+                uint8_t l2[BLOCK];
+                memset(l2, 0, sizeof l2);
+                for (uint32_t k = 0; k < per; k++) {
+                    uint32_t idx = i * per + k;
+                    if (idx >= rest) {
+                        break;
+                    }
+                    put32(l2 + k * 4, placed[f].blk + first + idx);
+                }
+                // Level-2 blocks are allocated contiguously after dind.
+                uint32_t l2blk = placed[f].dind + 1 + i;
+                if (wr(ctx, base + l2blk * BLOCK, l2, BLOCK)) {
+                    return -27;
+                }
+                put32(l1 + i * 4, l2blk);
+            }
+            if (wr(ctx, base + placed[f].dind * BLOCK, l1, BLOCK)) {
+                return -28;
             }
         }
     }
