@@ -6199,3 +6199,28 @@ script, then the partition editor.
    mount, read, execute — so this is a VFS change, not a filesystem one.
 
 Suite PASS exit 33, 75 tasks, frames 212295 -> 212295 zero leak.
+
+## run-250 — copy-up: the installed root's /etc becomes visible
+
+Added user::root_copy_up(path, data): after mounting the ext2 root the
+kernel copies its config files into the RAM fs, which is what an
+initramfs boot does. Programs spawned from the root can now READ their
+own /etc:
+
+    rustux: root: copy-up etc/inittab true
+    rustux: root: copy-up etc/motd true
+    rustux: root: copy-up etc/rcS true
+
+PROOF IT MATTERS: busybox `init` as pid 1 used to open /dev/tty2..4 and
+exit 1 because it could not see /etc/inittab. With copy-up it reads the
+inittab and prints "Please press Enter to activate this console" — i.e.
+the installed system's own configuration is being honoured.
+
+STILL BLOCKED: `can't run '/etc/rcS'` — exec has no #! (shebang)
+support, so an installed init cannot run a shell script. That is the
+next small rung; the pivot stays on `sh` until then.
+
+Also fixed: root_copy_up stamped 0644, so a copied-up script was not
+executable (EACCES); it now stamps 0755.
+
+Suite PASS exit 33 twice, pgtest exit(0) both runs.

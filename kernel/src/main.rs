@@ -1206,6 +1206,37 @@ pub(crate) fn rustux_main(
                     kprintln!(con,
                         "rustux: ext2: disk{d}p{slot} type={:#x} MOUNTED lba={start} block={} entries={n} walked={walked} etc/motd={got}B",
                         ptype, m.sb.block_size());
+                    // Copy the root's config files into the RAM fs so a
+                    // program spawned from it can read its own /etc —
+                    // initramfs "copy-up". Without this busybox init
+                    // cannot see /etc/inittab and opens /dev/tty2..4.
+                    for (dir, name) in [
+                        (&b"etc"[..], &b"inittab"[..]),
+                        (&b"etc"[..], &b"motd"[..]),
+                        (&b"etc"[..], &b"rcS"[..]),
+                    ] {
+                        if let Some(d) = ext2::lookup(&part, &m.sb, 2, dir) {
+                            if let Some(f) = ext2::lookup(&part, &m.sb, d, name) {
+                                let mut b = [0u8; 512];
+                                if let Some(n) =
+                                    ext2::read_file(&part, &m.sb, f, &mut b)
+                                {
+                                    let mut path = [0u8; 40];
+                                    let mut o = 0usize;
+                                    for c in dir.iter().chain(b"/".iter()).chain(name.iter()) {
+                                        if o < path.len() {
+                                            path[o] = *c;
+                                            o += 1;
+                                        }
+                                    }
+                                    let ok = user::root_copy_up(&path[..o], &b[..n]);
+                                    kprintln!(con,
+                                        "rustux: root: copy-up {} {ok}",
+                                        core::str::from_utf8(&path[..o]).unwrap_or("?"));
+                                }
+                            }
+                        }
+                    }
                     // Run a program FROM the installed root: read
                     // /bin/busybox out of ext2 and spawn it as "uname",
                     // so the multicall binary prints our sysname. This is
@@ -1367,6 +1398,10 @@ pub(crate) fn rustux_main(
         // cannot be used yet — it opens /etc/inittab through the fs
         // layer, which still resolves against the initrd, so the binary
         // runs but cannot see its own root's files (HANDOVER run-249).
+        // "sh": a shell from the installed root, with its /etc copied
+        // up so it can read its own config. busybox `init` gets as far as
+        // reading /etc/inittab (copy-up works) but cannot run the sysinit
+        // script: exec has no #! handling yet (HANDOVER run-250).
         if user::spawn(img, "sh") {
             kprintln!(con, "rustux: root: booting the installed system (pid 1 = sh from ext2)");
             queued += 1;

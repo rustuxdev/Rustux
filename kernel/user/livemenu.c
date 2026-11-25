@@ -531,10 +531,30 @@ static void install(const char *path)
                 files[1].path = "etc/motd";
                 files[1].data = motd;
                 files[1].len = sizeof motd - 1;
+                // busybox init runs this when there is no /etc/inittab,
+                // so the installed system boots a real init script
+                // rather than just a shell.
+                static const char rcs[] =
+                    "#!/bin/sh\n"
+                    "echo 'Rustux: init script running from the ext2 root'\n"
+                    "echo 'uname:' `uname -s`\n"
+                    "exec /bin/busybox sh\n";
+                files[2].path = "etc/rcS";
+                files[2].data = rcs;
+                files[2].len = sizeof rcs - 1;
+                // Without an inittab busybox init opens /dev/tty1..4,
+                // which this kernel does not provide, and exits 1. Pin
+                // it to the console only.
+                static const char inittab[] =
+                    "::sysinit:/etc/rcS\n"
+                    "::askfirst:/bin/busybox sh\n";
+                files[3].path = "etc/inittab";
+                files[3].data = inittab;
+                files[3].len = sizeof inittab - 1;
                 // Real binaries, streamed straight from the initrd.
                 // Only one directory level is supported, so the paths are
                 // kept flat inside bin/ for now.
-                uint32_t nf = 2;
+                uint32_t nf = 4;
                 // Source path -> path in the installed root. The libs
                 // exercise the nested directories a real system needs.
                 static const char *const PAYLOAD[][2] = {

@@ -2356,6 +2356,34 @@ fn vfile(i: usize) -> Option<&'static mut VFile> {
 
 /// Create a VFile named `path` — ENOSPC at the table bound,
 /// ENAMETOOLONG past the name slot. Returns the slot index.
+/// Copy a file from the installed root into the RAM fs, so programs
+/// spawned from that root can see their own /etc. This is initramfs
+/// "copy-up": the kernel's path resolution still lives in the RAM fs,
+/// and until a real namespace pivot exists this is what lets an
+/// installed init read /etc/inittab and /etc/init.d/rcS.
+pub fn root_copy_up(path: &[u8], data: &[u8]) -> bool {
+    let r = vfile_create(path);
+    if (r as i64) < 0 {
+        return false;
+    }
+    let Some(v) = vfile(r as usize) else { return false };
+    let n = data.len();
+    let buf = kalloc::kmalloc(n.max(1));
+    if buf.is_null() {
+        return false;
+    }
+    // SAFETY: kmalloc returned at least n bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), buf, n);
+    }
+    v.data = buf;
+    v.len = n;
+    // 0755: a copied-up script has to be executable, and a plain
+    // config file is harmless with +x.
+    vfile_stamp(v, 0o100755, 0);
+    true
+}
+
 fn vfile_create(path: &[u8]) -> u64 {
     const ENOSPC_: u64 = (-28i64) as u64;
     const ENAMETOOLONG_: u64 = (-36i64) as u64;
