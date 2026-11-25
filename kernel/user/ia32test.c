@@ -424,6 +424,35 @@ void main32(void) {
         sc3(7, c, (long)&dst, 0);
         if (dst != 0) sc1(1, 185 + ((dst >> 8) & 0x3f));
     }
+    // The shells' full pattern: dup2 the pipe onto fd 1, then EXEC.
+    {
+        static int ep[2];
+        check(sc1(42, (long)ep) == 0);
+        long c = sc0(2);
+        if (c == 0) {
+            sc3(63, ep[1], 1, 0); // dup2(ep[1], 1)
+            sc1(6, ep[0]);
+            sc1(6, ep[1]);
+            static char e0[] = "cat";
+            static char e1[] = "/motd.txt";
+            unsigned int av[3];
+            av[0] = (unsigned int)e0;
+            av[1] = (unsigned int)e1;
+            av[2] = 0;
+            sc3(11, (long)"/bin/cat", (long)av, 0);
+            sc1(1, 9);
+            for (;;) {}
+        }
+        sc1(6, ep[1]);
+        char buf[64];
+        long n = sc3(3, ep[0], (long)buf, sizeof(buf) - 1);
+        sc1(6, ep[0]);
+        static volatile int est;
+        est = -1;
+        sc3(7, c, (long)&est, 0);
+        if (n <= 0) sc1(1, 190);
+        if (est != 0) sc1(1, 195 + ((est >> 8) & 0x3f));
+    }
     // NOTE: the pipeline (`cat /motd.txt | cat > /dev/null`) works
     // once pipe2 (331) and wait4 (114) are wired, but its exit status
     // is timing-sensitive in this harness (occasional non-zero), so
