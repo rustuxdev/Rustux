@@ -345,9 +345,15 @@ int main(void)
         run_login();
     for (;;) {
         int can_install = access(SD_PATH, R_OK | W_OK) == 0;
-        printf("[1] live session\n");
-        if (can_install)
-            printf("[2] install Rustux to disk\n");
+        // Install is the primary action and the default (bare Enter):
+        // this is installation media, the live session is the rescue
+        // path. The option is always shown — hiding it behind the
+        // access() probe made the installer look absent on machines
+        // where the node or its mode was unexpected; selecting it now
+        // reports the real reason instead.
+        printf("[1] install Rustux to disk%s\n",
+               can_install ? "" : "  (no writable disk detected)");
+        printf("[2] live session\n");
         printf("> ");
         fflush(stdout);
         char line[64];
@@ -356,12 +362,17 @@ int main(void)
             continue;
         }
         switch (line[0]) {
+        case '\n':
+        case '\r':
         case '1':
-            run_login();
+            if (can_install) {
+                install();
+            } else {
+                printf("install: no writable disk at %s\n", SD_PATH);
+            }
             break;
         case '2':
-            if (can_install)
-                install();
+            run_login();
             break;
         default:
             break;

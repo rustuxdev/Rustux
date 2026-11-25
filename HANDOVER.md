@@ -5242,3 +5242,37 @@ Next: instrument the orphan sweep to print the DYING task's pid and
 the child's pid (O<dying>><child>) again — run-195 did this and saw
 O221>222, which is consistent with 221 being a *different* shell
 invocation; correlating both traces in ONE run is what is missing.
+
+## run-210 — installer direction: port a real distro installer
+
+USER DECISION (recorded): the hand-rolled raw-image installer is not
+acceptable long-term — a menu that hides install behind a permission
+probe and offers no partitioning "looks bad". Direction chosen:
+**port a real distro installer** (Debian d-i / subiquity class), with
+the menu kept but install as the DEFAULT action and always visible.
+
+Landed now (first step):
+* livemenu: install is [1] and the default (bare Enter); live session
+  is [2]. The install option is ALWAYS shown — when no writable disk
+  is detected it is annotated "(no writable disk detected)" and
+  selecting it reports the real reason instead of vanishing.
+
+Remaining, in order, for the d-i port:
+1. Kernel: enumerate multiple disks (sda/sdb), read+write MBR and GPT,
+   block-device ioctls (BLKGETSIZE64, BLKRRPART), a mount story.
+2. Filesystems: FAT (busybox mkfs.vfat) for the ESP, ext2 (busybox
+   mkfs.ext2 or an in-kernel formatter) for root.
+3. Bootloader: for UEFI just \EFI\BOOT\BOOTX64.EFI on the ESP plus a
+   boot entry — no GRUB needed on the target.
+4. Installer image: one shared initrd, two boot entries (installer
+   default, live session secondary) so the ISO does not duplicate the
+   ~180 MB payload.
+5. Installed-detection: write a marker (e.g. /etc/rustux-installed)
+   during install and check THAT in main() — the current check
+   (`access("/hd.img")`) is why an installed disk still shows the menu.
+6. Then bring up the real installer's TUI/scripts on the above.
+
+Also open: keyboard IRQ1 never asserts on this firmware (controller
+armed 0x67, GSI1 entry 0xf2 unmasked edge/high, vector classified,
+EOI fine, PIT works). Workaround landed: kbd::poll() reads the
+controller every 100 Hz tick — needs a keypress confirmation.
