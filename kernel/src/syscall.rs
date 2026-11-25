@@ -1004,7 +1004,14 @@ fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
                 // The interpreter may itself be a link ("bin/sh" ->
                 // /bin/busybox), so follow it before looking for an
                 // ELF; reading the link's target text as an image is
-                // what made exec report ENOENT.
+                // what made exec report ENOENT. A shebang names an
+                // absolute path ("/bin/sh"), but the namespace is
+                // canonical slashless — strip it first or every
+                // component lookup misses and the script exec fails.
+                if interp_len > 0 && interp[0] == b'/' {
+                    interp.copy_within(1..interp_len, 0);
+                    interp_len -= 1;
+                }
                 let resolved = match user::resolve_links(&interp[..interp_len], true) {
                     Ok((b2, n2, _)) => {
                         lname_len = n2.min(127);
@@ -1060,16 +1067,22 @@ fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
             args.argv[i] = args.argv[i - 1];
             args.argv_len[i] = args.argv_len[i - 1];
         }
-        let base = name
+        // argv[0] is the shebang's interpreter name, not the resolved
+        // image — busybox picks its applet from it ("sh" here; the
+        // resolved "bin/busybox" would dispatch on the script path).
+        let base = interp[..interp_len]
             .iter()
             .rposition(|&c| c == b'/')
             .map(|p| p + 1)
             .unwrap_or(0);
-        let bn = (name.len() - base).min(user::EXEC_STR_CAP - 1);
-        args.argv[0][..bn].copy_from_slice(&name[base..base + bn]);
+        let bn = (interp_len - base).min(user::EXEC_STR_CAP - 2);
+        args.argv[0][..bn].copy_from_slice(&interp[base..base + bn]);
+        args.argv[0][bn] = 0; // shorter name over a longer old arg —
+                            // the tail byte is not NUL by accident
         args.argv_len[0] = bn + 1;
-        let sn = script_len.min(user::EXEC_STR_CAP - 1);
+        let sn = script_len.min(user::EXEC_STR_CAP - 2);
         args.argv[1][..sn].copy_from_slice(&script[..sn]);
+        args.argv[1][sn] = 0;
         args.argv_len[1] = sn + 1;
         args.argc = max;
     }

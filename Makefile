@@ -450,6 +450,7 @@ LIVE_PAIRS := \
 	kernel/user/dpkg-deb usr/bin/dpkg-deb \
 	kernel/user/dpkg-split usr/bin/dpkg-split \
 	kernel/user/dpkg-query usr/bin/dpkg-query \
+	kernel/user/update-alternatives usr/bin/update-alternatives \
 	kernel/user/tar bin/tar \
 	kernel/user/ldconfig sbin/ldconfig \
 	kernel/user/ldconfig usr/sbin/ldconfig \
@@ -507,6 +508,7 @@ LIVE_PAIRS := \
 	kernel/user/libnl-3.so.200 lib/x86_64-linux-gnu/libnl-3.so.200 \
 	kernel/user/libnl-genl-3.so.200 lib/x86_64-linux-gnu/libnl-genl-3.so.200 \
 	kernel/user/terminfo_x/xterm usr/share/terminfo/x/xterm \
+	kernel/user/terminfo_l/linux usr/share/terminfo/l/linux \
 	/lib64/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2 \
 	/lib/x86_64-linux-gnu/libc.so.6 lib/x86_64-linux-gnu/libc.so.6 \
 	kernel/user/libtinfo.so.6 lib/x86_64-linux-gnu/libtinfo.so.6 \
@@ -520,8 +522,10 @@ LIVE_DEPS := kernel/user/livemenu.elf kernel/user/busybox kernel/user/bash \
 	$(addprefix kernel/user/etc/,passwd shadow group securetty) \
 	kernel/user/htop kernel/user/libncursesw.so.6 kernel/user/libm.so.6 \
 	kernel/user/libnl-3.so.200 kernel/user/libnl-genl-3.so.200 \
-	kernel/user/terminfo_x/xterm kernel/user/libtinfo.so.6 kernel/user/motd.txt \
+	kernel/user/terminfo_x/xterm kernel/user/terminfo_l/linux \
+	kernel/user/libtinfo.so.6 kernel/user/motd.txt \
 	kernel/user/dpkg kernel/user/dpkg-deb kernel/user/dpkg-split kernel/user/dpkg-query \
+	kernel/user/update-alternatives \
 	kernel/user/tar kernel/user/ldconfig kernel/user/resolv.conf \
 	kernel/user/aptetc/sources.list kernel/user/aptetc/99rustux \
 	$(APTROOT)/apt-get $(APTROOT)/apt-helper $(APTROOT)/gpgv \
@@ -634,11 +638,24 @@ run-iso: $(ISO) $(INSTALLDISK) tools/sendkey.py
 	for i in $$(seq 1 24); do \
 		sleep 15; \
 		grep -q "apt-get exit(0)" isoph.log && { ok=1; break; }; \
-		grep -q "apt-get exit(100)" isoph.log && break; \
+		grep -q "apt-get exit(100)\|apt: not found" isoph.log \
+			&& { sleep 5; python3 tools/sendkey.py isomon.sock "str:apt update" ret; }; \
 	done; \
 	[ $$ok -eq 1 ] \
 		&& echo "installed apt update: PASS" \
 		|| { echo "installed apt update: FAIL"; grep -i "err:\|ign:\|get:\|exit(" isoph.log | tail -15; \
+		     echo quit | socat - UNIX-CONNECT:isomon.sock > /dev/null 2>&1 || kill $$qpid; exit 1; }; \
+	python3 tools/sendkey.py isomon.sock "str:apt install nano" ret; \
+	ok=0; \
+	for i in $$(seq 1 24); do \
+		sleep 15; \
+		grep -q "apt-get exit(0)" isoph.log && { ok=1; break; }; \
+		grep -q "apt-get exit(100)\|apt: not found" isoph.log \
+			&& { sleep 5; python3 tools/sendkey.py isomon.sock "str:apt install nano" ret; }; \
+	done; \
+	[ $$ok -eq 1 ] \
+		&& echo "installed apt install nano: PASS" \
+		|| { echo "installed apt install nano: FAIL"; grep -i "err:\|postinst\|exit(" isoph.log | tail -15; \
 		     echo quit | socat - UNIX-CONNECT:isomon.sock > /dev/null 2>&1 || kill $$qpid; exit 1; }; \
 	echo quit | socat - UNIX-CONNECT:isomon.sock > /dev/null 2>&1 || kill $$qpid
 
