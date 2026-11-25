@@ -13501,8 +13501,8 @@ pub fn sleep_ms(ctx: &mut UCtx, ms: u64) {
 /// 512-byte granular, so unaligned edges bounce through a kernel
 /// sector buffer. Reads clip at the device end — Linux's short
 /// read, not an error.
-/// AHCI-backed read: same 512-byte-granular bounce and clipping
-/// contract as the PIIX path, just a different transport.
+/// AHCI-backed read: same clipping contract as the PIIX path, but
+/// batched — up to 8 sectors (4 KiB) per DMA command.
 fn ahci_read(o: &mut OpenFile, drv: usize, buf: u64, len: u64) -> u64 {
     let cap = crate::ahci::disk_capacity(drv);
     if o.pos as u64 >= cap {
@@ -13513,15 +13513,29 @@ fn ahci_read(o: &mut OpenFile, drv: usize, buf: u64, len: u64) -> u64 {
         return EFAULT;
     }
     let mut done = 0usize;
-    let mut bounce = [0u8; 512];
+    let mut bounce = [0u8; 4096];
     while done < n {
         let off = o.pos as u64 + done as u64;
         let lba = off / 512;
         let in_sector = (off % 512) as usize;
-        if !crate::ahci::read_sector(drv, lba, &mut bounce) {
+        let want = n - done;
+        // One command covers a whole 4 KiB run when aligned.
+        let batch = if in_sector == 0 { (want / 4096).min(1) * crate::ahci::BATCH } else { 0 };
+        let take = if batch > 0 {
+            batch * 512
+        } else {
+            (512 - in_sector).min(want)
+        };
+        let secs = take.div_ceil(512).max(1);
+        let ok = if secs == 1 && in_sector != 0 {
+            // Partial sector: read it whole, then copy the slice.
+            crate::ahci::read_range(drv, lba, 1, &mut bounce[..512])
+        } else {
+            crate::ahci::read_range(drv, lba, secs, &mut bounce[..secs * 512])
+        };
+        if !ok {
             return if done > 0 { done as u64 } else { (-5i64) as u64 };
         }
-        let take = (512 - in_sector).min(n - done);
         // SAFETY: buf validated writable for n bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -13546,19 +13560,27 @@ fn ahci_write(o: &mut OpenFile, drv: usize, buf: u64, len: u64) -> u64 {
         return EFAULT;
     }
     let mut done = 0usize;
-    let mut bounce = [0u8; 512];
+    let mut bounce = [0u8; 4096];
     while done < n {
         let off = o.pos as u64 + done as u64;
         let lba = off / 512;
         let in_sector = (off % 512) as usize;
-        if in_sector != 0 || n - done < 512 {
-            // Partial sector: read-modify-write.
-            if !crate::ahci::read_sector(drv, lba, &mut bounce) {
+        let want = n - done;
+        let batch = if in_sector == 0 { (want / 4096).min(1) * crate::ahci::BATCH } else { 0 };
+        let take = if batch > 0 {
+            batch * 512
+        } else {
+            (512 - in_sector).min(want)
+        };
+        let secs = take.div_ceil(512).max(1);
+        let whole = in_sector == 0 && take == secs * 512;
+        if !whole {
+            // Read-modify-write for the partial edges.
+            if !crate::ahci::read_range(drv, lba, secs, &mut bounce[..secs * 512]) {
                 return if done > 0 { done as u64 } else { (-5i64) as u64 };
             }
         }
-        let take = (512 - in_sector).min(n - done);
-        // SAFETY: buf validated readable for n bytes.
+        // SAFETY: buf validated readable for n bytes; bounce holds secs*512.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 (buf + done as u64) as *const u8,
@@ -13566,7 +13588,7 @@ fn ahci_write(o: &mut OpenFile, drv: usize, buf: u64, len: u64) -> u64 {
                 take,
             );
         }
-        if !crate::ahci::write_sector(drv, lba, &bounce) {
+        if !crate::ahci::write_range(drv, lba, secs, &bounce[..secs * 512]) {
             return if done > 0 { done as u64 } else { (-5i64) as u64 };
         }
         done += take;

@@ -5333,3 +5333,26 @@ a 67 MB image is thousands of commands. Batching PRDT entries (up to
 128 sectors/command) is the next optimisation — the PIIX path already
 batches via ata::write(count).
 Audit: scoped quick run-19. cve-now MCP unreachable (recorded).
+
+## run-213 — AHCI batching + scratch-cache fix (install path still hangs)
+
+* ahci.rs: read_range/write_range issue one command for up to 8
+  sectors (BATCH = 8; the data frame is 4 KiB), with count and range
+  validated against the disk before the HBA is touched.
+* FIXED a frame leak I introduced in run-212: port_mem() allocated
+  four frames PER COMMAND and never freed them — a 64 KiB write cost
+  64 frames and starved the allocator mid-install. mem_for() now
+  caches one PortMem per disk in a static array.
+* user.rs: ahci_read/ahci_write use the batched range path with the
+  same clipping and partial-sector RMW contract.
+
+Verified: suite PASS exit 33, 75 tasks, frames 213326 -> 213326 zero
+leak (q35, `ahci: 1 disk(s)`).
+
+STILL BROKEN: the ISO install writes no progress at all — the menu
+accepts `1` (`> 1`) and then nothing, so the first 4 MiB of the copy
+never completes. Next: instrument copy_image's read/write return
+values and the AHCI issue() poll (which of the two wedges), and check
+whether PxIS reports a task-file error on the first write. Note the
+ISO's hd.img read path is the RAM fs, so the suspect is the AHCI
+write command, not the read.

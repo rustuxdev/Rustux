@@ -125,6 +125,25 @@ struct PortMem {
     buf: u64,  // 512-byte data buffer phys
 }
 
+/// Cached scratch per disk. Allocating per command leaked four frames
+/// every 4 KiB (a 64 KiB write cost 64 frames) and starved the
+/// allocator mid-install.
+static mut MEM: [Option<PortMem>; MAX_DISKS] = [
+    None, None, None, None, None, None, None, None,
+];
+
+fn mem_for(i: usize) -> Option<&'static PortMem> {
+    // SAFETY: single-threaded syscall context, like the rest of the
+    // driver's statics.
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(MEM);
+        if slot[i].is_none() {
+            slot[i] = port_mem();
+        }
+        slot[i].as_ref()
+    }
+}
+
 fn port_mem() -> Option<PortMem> {
     Some(PortMem {
         cl: kalloc::alloc_frame()?,
@@ -312,14 +331,58 @@ pub fn disk_capacity(i: usize) -> u64 {
     disk_sectors(i) as u64 * 512
 }
 
+/// Sectors per command: the data frame is 4 KiB, so 8 sectors fit
+/// one PRDT entry. Batching is what makes an image install take
+/// seconds instead of minutes (one polled command per sector would be
+/// ~131k commands for a 67 MB image).
+pub const BATCH: usize = 8;
+
+/// Read `count` sectors (1..=BATCH) starting at `lba` into `buf`,
+/// which must hold count*512 bytes.
+pub fn read_range(i: usize, lba: u64, count: usize, buf: &mut [u8]) -> bool {
+    if i >= MAX_DISKS || count == 0 || count > BATCH || buf.len() < count * 512 {
+        return false;
+    }
+    if disk_sectors(i) == 0 || lba + count as u64 > disk_sectors(i) as u64 {
+        return false;
+    }
+    let p = DISK_PORT[i].load(Ordering::Relaxed) as usize;
+    let Some(m) = mem_for(i) else { return false };
+    if !issue(p, m, ATA_READ_DMA_EXT, lba, count as u16, false) {
+        return false;
+    }
+    // SAFETY: m.buf is our 4 KiB frame, filled by the HBA.
+    unsafe {
+        core::ptr::copy_nonoverlapping(phys_ptr(m.buf), buf.as_mut_ptr(), count * 512);
+    }
+    true
+}
+
+/// Write `count` sectors (1..=BATCH) from `buf`.
+pub fn write_range(i: usize, lba: u64, count: usize, buf: &[u8]) -> bool {
+    if i >= MAX_DISKS || count == 0 || count > BATCH || buf.len() < count * 512 {
+        return false;
+    }
+    if disk_sectors(i) == 0 || lba + count as u64 > disk_sectors(i) as u64 {
+        return false;
+    }
+    let p = DISK_PORT[i].load(Ordering::Relaxed) as usize;
+    let Some(m) = mem_for(i) else { return false };
+    // SAFETY: m.buf is our 4 KiB frame; buf holds count*512 bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), phys_ptr(m.buf), count * 512);
+    }
+    issue(p, m, ATA_WRITE_DMA_EXT, lba, count as u16, true)
+}
+
 /// Read one 512-byte sector from disk `i`.
 pub fn read_sector(i: usize, lba: u64, buf: &mut [u8; 512]) -> bool {
     if i >= MAX_DISKS || disk_sectors(i) == 0 {
         return false;
     }
     let p = DISK_PORT[i].load(Ordering::Relaxed) as usize;
-    let Some(m) = port_mem() else { return false };
-    if !issue(p, &m, ATA_READ_DMA_EXT, lba, 1, false) {
+    let Some(m) = mem_for(i) else { return false };
+    if !issue(p, m, ATA_READ_DMA_EXT, lba, 1, false) {
         return false;
     }
     // SAFETY: m.buf is our frame, filled by the HBA.
@@ -335,10 +398,10 @@ pub fn write_sector(i: usize, lba: u64, buf: &[u8; 512]) -> bool {
         return false;
     }
     let p = DISK_PORT[i].load(Ordering::Relaxed) as usize;
-    let Some(m) = port_mem() else { return false };
+    let Some(m) = mem_for(i) else { return false };
     // SAFETY: m.buf is our frame; the caller's buffer is 512 bytes.
     unsafe {
         core::ptr::copy_nonoverlapping(buf.as_ptr(), phys_ptr(m.buf), 512);
     }
-    issue(p, &m, ATA_WRITE_DMA_EXT, lba, 1, true)
+    issue(p, m, ATA_WRITE_DMA_EXT, lba, 1, true)
 }
