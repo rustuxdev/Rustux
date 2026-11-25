@@ -6342,3 +6342,26 @@ resolve_links returns for that, (d) whether fs_lookup finds the final
 name. One of those four is empty/wrong; the printout will say which.
 Do not guess further before that trace — four hypotheses have already
 been eliminated by measurement.
+
+## run-256 — init ENOENT: it is the INTERPRETER (proven)
+
+Final probe, with every earlier candidate already eliminated:
+
+    dbg: canon=etc/rcS
+    dbg: resolved=etc/rcS len=7 found=true
+
+So the SCRIPT resolves and fs_lookup finds it. The shebang loop therefore
+enters iteration 1 successfully (body starts "#!"), derives the
+interpreter "/bin/sh", and fails on iteration 2 — where fs_lookup of the
+interpreter returns None. That is the ENOENT, and it is the only
+remaining producer.
+
+Why the interpreter lookup fails: "/bin/sh" in the archive is a LINK
+record whose data is the target text, not an ELF. resolve_links does
+find the link, but the resolved target is "/bin/busybox" WITH a leading
+slash, and the archive's names carry none — so the next fs_lookup misses.
+
+NEXT FIX (small, one place): in the shebang loop, strip leading '/'
+from whatever resolve_links returns before the next lookup (or call
+canon_path on the resolved output). My earlier attempts stripped the
+INPUT rather than the OUTPUT, which is why they did not help.
