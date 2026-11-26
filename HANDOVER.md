@@ -8324,3 +8324,21 @@ and clears at reap so a reused pid can't catch a stale
 si_value. lstest floor 79->80, 107 tasks, zero leak. Audit
 run-76: 0 confirmed; CVE-2017-11176 netlink-UAF class absent
 by construction.
+run-318 lands waitid(247) — the siginfo-reporting wait API modern
+glibc uses through posix_spawn. idtype maps P_ALL/P_PID/P_PGID/
+P_PIDFD onto wait4's signed selector (P_PIDFD resolves the fd to a
+pid once; P_PID/P_PGID id<=0 EINVAL like kernel_waitid); options
+must name an event class. The report is a fully-zeroed 128-byte
+siginfo_t via fill_sig_rec — si_signo SIGCHLD, CLD_* code, real
+si_uid, si_status. WNOHANG with live children zeroes si_pid so
+callers can tell "no change" from a report; WNOWAIT peeks without
+consuming (the zombie stays for wait4 to reap). Blocked waits ride
+three new WaitOn::WaitId* arms — exit_bookkeeping delivers the
+siginfo + rax=0 through the sleeper's pml4 (WNOWAIT leaves the
+zombie uncollected), child_change covers stop/continue, and the
+setpgid stranded-group rescan handles WaitIdGroup. Two test bugs
+surfaced (bad-infop + zero children is ECHILD not EFAULT, and a
+WNOHANG-vs-WNOWAIT mask slip in the peek check); the kernel needed
+no fixes after the first green run. lstest floor 80->81, 108
+tasks, zero leak. Audit run-77: 0 confirmed — the waitid info-leak
+family (rusage/uninit-siginfo/io_uring classes) is all n/a.

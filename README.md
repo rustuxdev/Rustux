@@ -133,7 +133,7 @@ RESOLVE_*, `process_mrelease`, `pidfd_*`, `futex_waitv`,
 `process_vm_readv`/`writev`, `copy_file_range`, `splice`/`tee`/
 `vmsplice`, `fallocate`, `preadv`/`pwritev`, `sigaltstack`,
 `execveat` + real credential handover, POSIX per-process
-timers), and socket families beyond TCP — `AF_UNIX`
+timers, `waitid`), and socket families beyond TCP — `AF_UNIX`
 stream/dgram/`socketpair` with `SCM_RIGHTS` fd-passing,
 `SOCK_SEQPACKET`, `AF_PACKET`, `AF_NETLINK` route dumps,
 `/dev/net/tun`, `recvmmsg`.
@@ -150,7 +150,7 @@ non-transitional transport). ext2/ext3/ext4 readers feed a real
 xterm-subset console hosts ncurses.
 The suite boots a real static **BusyBox** (x86-64 *and* i386),
 real Debian **dash**, and dynamically linked **GNU bash 5.2** —
-107 tasks, all passing; `make run-bash` boots an
+108 tasks, all passing; `make run-bash` boots an
 interactive `-bash` login shell on the serial console.
 Beyond the suite, `make run-apt` proves real Debian package
 management end to end — `apt-get update`/`apt install` fetch from
@@ -174,7 +174,7 @@ Every rung is also security-reviewed: a scoped audit of the diff plus a
 check of that subsystem's published kernel CVEs — each gets a written
 verdict in [docs/cve-matrix.md](docs/cve-matrix.md) (structurally
 absent, explicitly mitigated, or a documented divergence), gathered
-into a flat ledger of 366 unique CVEs so far.
+into a flat ledger of 372 unique CVEs so far.
 
 **The pace, and what is still missing.** ~550 commits and 316 audited
 rungs landed in nine days — the git log is the honest measure of that.
@@ -254,8 +254,8 @@ GNU bash and native `.exe` tasks in five days:
 | **Nov 23 (cont.)** | **It runs DOOM.** The GOP framebuffer becomes a real `/dev/fb0` fbdev device (major 29: `FBIOGET_VSCREENINFO`/`FSCREENINFO`, positional write, seekable), and the original id DOOM engine — doomgeneric, built static-pie — plays the E1M1 attract demo full-screen from the original `DOOM.WAD`. Plus the platform-compat rung: distro-structure xorriso ISO (BIOS+UEFI El Torito, hybrid MBR/GPT) and console-mirrored fault reports for serial-less machines. |
 | **Nov 24** | **Two more boot paths and a second ABI.** Legacy BIOS boot via GRUB Multiboot2, then the ia32 compat foundation: ELF32 loader, `int 0x80` syscall ABI, low-4GiB compat address spaces (private PDPT under pml4 slot 0), the physmap supervisor mirror of all RAM, and `set_thread_area` TLS with per-task GDT slots — real i386 BusyBox runs natively. |
 | **Nov 25** | **The install lands, then Debian fights back.** The ia32 ABI completes — compat clone/threads, i386 signal frames + sigreturn, compat struct shims, vfork/fcntl64/pipe2/wait4 — a real i386 shell runs external commands and pipelines. The block layer arrives: ATA multi-drive then a real AHCI/SATA driver. ext2: mke2fs parser → `mount()` + partition views → the installer streams real payloads into a fresh ext2 root on an MBR-partitioned disk that boots. Installed-root pivot: the ext2 tree copies into the RAM fs and pid 1 runs from the installed system. Then the proof — `apt update` + `apt install` on the installed system end-to-end (NSS/DNS, mke2 hardlinks), `/bin/sh` becomes real dash (BusyBox `SH_STANDALONE` was shadowing `/usr/bin/dpkg` inside maintainer scripts), an initrd integrity net (crc32 manifest + load-time sidecar verify), `#!` interpreter resolution, update-alternatives — `apt install nano`, then **`apt install -y nginx` exits 0**: a TCP-orphan socket-table sweep (the ENFILE leak), VFILES/VDIRS capacity, the Debian base-passwd set, service stubs + `getent`, `FIONBIO`. And `MAP_SHARED|MAP_ANONYMOUS` becomes real — refcounted shm segments, fork aliases the same frames (phys-verified ownership), private mappings stay private. |
-| **Nov 26** | **The driver and IPC shelf.** ext3/ext4 reader + virtio-blk; the virtio fleet — net datapath + IRQ-RX + control queue, input → evdev, console `/dev/hvc0`, balloon, rng, modern (non-transitional) transport; NVMe admin+IO queues with write path, MSI-X, multi-namespace, discard/TRIM + flush; GPT partitions + `/dev` minors (`sda1`, `vda`, `nvme0n1pN`); SG_IO, virtio-scsi, `/dev/loopN`, the CDROM ioctl family. Then sockets wide: `AF_PACKET`, `AF_UNIX` (stream/dgram/socketpair + `SCM_RIGHTS` fd-passing), `SOCK_SEQPACKET`, `recvmmsg`, `AF_NETLINK` route dumps, `/dev/net/tun`. And the modern syscall shelf: `memfd_create` + sealing, `pidfd`, `clone3`, `close_range`, `epoll_pwait2`, `openat2` RESOLVE_* + `process_mrelease`, `futex_waitv`, `mremap`/`madvise`/`mincore`/`mlock`/`process_madvise`/`mseal`/`cachestat`, the xattr family + `memfd_secret`, `select`, `sched_setattr`, `msync`, SysV SHM/MSG/SEM, `process_vm_*`, `copy_file_range`, `splice`/`tee`/`vmsplice`, `fallocate`, `preadv`/`pwritev`, `sigaltstack`, `execveat`, POSIX per-process timers, POSIX message queues — over a hundred suite tasks. |
-| **Every rung** | A scoped security audit plus a cve.now sweep of that subsystem's published kernel CVEs — 366 unique CVEs recorded in [docs/cves-addressed.md](docs/cves-addressed.md) so far. |
+| **Nov 26** | **The driver and IPC shelf.** ext3/ext4 reader + virtio-blk; the virtio fleet — net datapath + IRQ-RX + control queue, input → evdev, console `/dev/hvc0`, balloon, rng, modern (non-transitional) transport; NVMe admin+IO queues with write path, MSI-X, multi-namespace, discard/TRIM + flush; GPT partitions + `/dev` minors (`sda1`, `vda`, `nvme0n1pN`); SG_IO, virtio-scsi, `/dev/loopN`, the CDROM ioctl family. Then sockets wide: `AF_PACKET`, `AF_UNIX` (stream/dgram/socketpair + `SCM_RIGHTS` fd-passing), `SOCK_SEQPACKET`, `recvmmsg`, `AF_NETLINK` route dumps, `/dev/net/tun`. And the modern syscall shelf: `memfd_create` + sealing, `pidfd`, `clone3`, `close_range`, `epoll_pwait2`, `openat2` RESOLVE_* + `process_mrelease`, `futex_waitv`, `mremap`/`madvise`/`mincore`/`mlock`/`process_madvise`/`mseal`/`cachestat`, the xattr family + `memfd_secret`, `select`, `sched_setattr`, `msync`, SysV SHM/MSG/SEM, `process_vm_*`, `copy_file_range`, `splice`/`tee`/`vmsplice`, `fallocate`, `preadv`/`pwritev`, `sigaltstack`, `execveat`, POSIX per-process timers, POSIX message queues, `waitid` — over a hundred suite tasks. |
+| **Every rung** | A scoped security audit plus a cve.now sweep of that subsystem's published kernel CVEs — 372 unique CVEs recorded in [docs/cves-addressed.md](docs/cves-addressed.md) so far. |
 
 ## Acknowledgements
 

@@ -34,21 +34,21 @@ before.
    the extractor catches them.
 9. Commit impl and docs separately, push `origin main`.
 10. Verify on native VM-3 (`/home/zorin/rustux`, fetch+reset+`make run`).
-11. Continue to the next rung (rule 2) unless the user says stop.
+    NOTE: the project moved to Ubuntu — THIS machine IS VM-3 now
+    (`/home/zorin/linux-rust`). `make run` here IS the native
+    verification; no remote fetch is needed.
+11. When confirmed working and bug free, commit and push.
+12. Update the README with the new feature/fix and update the milestone chart.
+13. Continue to the next rung (rule 2) unless the user says stop.
 
 ## Environment facts (relearned the hard way — check these first)
 
-- Repo lives on the Windows side. WSL path:
-  `/mnt/c/Users/Davy/Documents/GitHub/linux-rust` — there is NO
-  `/home/zorin/rustux` in WSL (that path is on VM-3).
-- `make`, `qemu`, `gcc`, `cargo` run inside WSL:
-  `wsl -e bash -lc "cd /mnt/c/... && make run"`. `make` is not on the
-  Windows PATH.
-- `git push` works from Windows Git Bash (credential manager), NOT
-  from WSL.
-- Pillow is installed in WSL user site; python3 drives QMP
-  `screendump` capture for the README GIF. Capture scripts live in
-  `%TEMP%` (rxcap.py/rxgif.py) and get recreated as needed.
+- RELOCATED: the project lives natively on this Ubuntu machine at
+  `/home/zorin/linux-rust` — this host IS the machine formerly
+  reached as "VM-3" via MCP. There is no remote dev VM to verify
+  on. The old Windows/WSL layout is gone.
+- `make`, `qemu`, `gcc`, `cargo`, `git` (incl. `git push`) all run
+  natively here.
 - The kernel holds the final framebuffer ~1.5s (rdtsc delay before
   `qemu_exit`) so screendump can catch the end-of-run summary.
 - QEMU success = exit 33 (`isa-debug-exit` 0x10 -> 0x21).
