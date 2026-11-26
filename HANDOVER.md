@@ -7364,3 +7364,33 @@ zero leak.
 Audit run-38: 0 confirmed — device-field/used-ring/config-size
 trust all bounded; teardown CVEs n/a. Ledger at 202 CVEs.
 Commits pushed origin main.
+
+## run-280 — virtio-net control queue
+
+handshake_modern is now handshake_modern_feat(common, accept_lo):
+accepts the subset of requested low-dword features the device
+offers (VERSION_1 still required). net_init_modern negotiates
+F_NET_CTRL_VQ (bit 17) — QEMU's non-transitional virtio-net
+offers it by default. Control queue = sel 2 (queue pairs first,
+ctrl last per spec); binds only when the feature negotiated AND
+C_NQ >= 3.
+
+net_ctrl(class, cmd, data): {class,cmd}+data as an OUT desc
+chained DESC_NEXT to a 1-byte device-writable ack desc — the
+only thing the device may write. poll_once waits the chain;
+ack==VIRTIO_NET_OK(0) is success.
+
+Selftest runs at init (poll-based, pre-sti): CTRL_RX promisc +
+allmulti (class 0, cmd 0/1) and CTRL_MAC_TABLE_SET (class 1,
+cmd 0). BUG the proof caught: MAC table layout is
+{nuni, uni_macs[], nmulti, multi_macs[]} — the first build put
+nmulti before the unicast table and QEMU acked error; fixed by
+ordering the unicast set first.
+
+`net ctrlq promisc true allmulti true mac-table true` —
+three device-acked commands. ARP round-trip and the MSI IRQ
+proof unaffected. Exit 33, 78 tasks, zero leak.
+
+Audit run-39: 0 confirmed — staging bounds, feature-masking,
+queue-count gate all by design; CVE-2022-48864 (vdpa device-side
+validation) n/a. Ledger at 203 CVEs. Commits pushed origin main.

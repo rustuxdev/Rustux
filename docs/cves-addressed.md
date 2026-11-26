@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**202 unique CVEs recorded.**
+**203 unique CVEs recorded.**
 
 ## klib ports
 
@@ -124,6 +124,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-0847 | rseq(334) registration + sendfile(40): per-task rseq_va (not fork-inherited, exec-cleared… | 0847 architecturally absent: Dirty Pipe was uninit flags in pipe_buffer letting partial writes merge into shared page-cache pages; Rustux pipes are private kernel rings and sendfi… |
 | CVE-2022-1304 | installed-apt rung: glibc DNS/NSS chain shipped (libnss_dns/libnss_files/libresolv + etc/… | audit run-259 scoped quick (security-audit skill): cve-now e2fsprogs class — CVE-2022-1304, CVE-2019-5188, CVE-2019-5094, CVE-2015-0247, CVE-2015-1572, CVE-2007-5497 all crafted-i… |
 | CVE-2022-4378 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
+| CVE-2022-48864 | virtio-net-ctrlq rung: handshake_modern generalised to handshake_modern_feat(common, acce… | audit run-39 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2022-48864 — n/a. Verified: make run exit 33, 78 tasks, frames equal; virtio: net ctrlq promisc… |
+| CVE-2022-48864 | virtio-net-ctrlq rung: handshake_modern generalised to handshake_modern_feat(common, acce… | audit run-39 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2022-48864 — n/a. Verified: make run exit 33, 78 tasks, frames equal; virtio: net ctrlq promisc… |
 | CVE-2022-49073 | install prompt/eject + read-cap split + ATA recovery: demomenu verifies, ATAPI-ejects /de… | audit run-113 manual scoped + cve.now over HTTP JSON-RPC (entities.search — analogs above; no mapped sr/cdrom-ioctl CVE): verified every fd_read arm bounds n by source availabilit… |
 | CVE-2022-49100 | virtio-console rung (/dev/hvc0): virtio.rs gains the virtio-serial channel — transitional… | audit run-37 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2025-38064, CVE-2022-49100 — n/a. Verified: make run exit 33, 77 tasks, frames equal; console c… |
 | CVE-2022-49100 | virtio-console rung (/dev/hvc0): virtio.rs gains the virtio-serial channel — transitional… | audit run-37 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2025-38064, CVE-2022-49100 — n/a. Verified: make run exit 33, 77 tasks, frames equal; console c… |
