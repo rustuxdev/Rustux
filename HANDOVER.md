@@ -7905,3 +7905,43 @@ getfd fd-clone proof via a child writing through a pipe the
 parent pulled out of its table. Exit 33, 86 tasks, zero leak.
 
 Audit run-55: 0 confirmed, 2 fixed in-run. Ledger at 258 CVEs.
+
+## run-297 — clone3 (435) + close_range (436) + epoll_pwait2 (441)
+
+sys_clone3 parses the 88-byte clone_args the way Linux does:
+size < 64 EINVALs, > PAGE_SIZE E2BIGs, and bytes past struct v2
+must all be zero (E2BIG — a caller can't smuggle fields through
+the tail). Signal bits may NOT live in flags (EINVAL — they
+belong in exit_signal, which merges into the merged-flags low
+byte; valid-but-undeliverable signals still ENOSYS via clone's
+own gate). ptid/ctid map onto PARENT_SETTID and
+CHILD_SETTID|CHILD_CLEARTID; set_tid/cgroup EINVAL — set_tid
+would let a caller pick pids and break next_pid's monotonicity
+(the invariant that makes FdKind::Pidfd safe). CLONE_PIDFD is
+the headline: it EINVALs with PARENT_SETTID, pre-flights the
+*pidfd pointer and OFD/fd room BEFORE spawn (Linux allocates
+the pidfd file inside copy_process — an EMFILE must not leave a
+zombie without a handle), then mints FdKind::Pidfd(child) —
+composing directly with run-296's machinery, proven by pidfd
+SIGKILL + POLLIN on the clone3'd child.
+
+fd_close_range EINVALs first>last, unknown flags, and the
+UNSHARE|CLOEXEC combo (Linux: meaningless); last clamps to
+MAX_FDS-1, empty slots pass silently. UNSHARE fdtab_dup's a
+private table (every OFD ref bumped) before releasing the old
+index — proven by a CLONE_FILES thread that detaches then
+closes a range while the parent's fd survives. CLOEXEC marks
+the range. fd_epoll_pwait2 takes a timespec: NULL waits
+forever, bad sec/nsec EINVALs, sub-ms rounds up to the next ms.
+
+Three in-run fixes: CLONE_PIDFD leaked into the merged flags
+(tripped clone's ENOSYS on every PIDFD call); the clone_args
+field check was off by one (cgroup was aimed at a[8]=set_tid —
+real indices a[8]/a[9]/a[10]); and stack+stack_size was an
+unchecked u64 add — a user-controlled overflow panic, now
+checked_add -> EINVAL.
+
+Proof: cl3test 41 checks, 0 failures. Exit 33, 87 tasks, zero
+leak — zero FAILs suite-wide this run.
+
+Audit run-56: 0 confirmed, 1 fixed in-run. Ledger at 259 CVEs.

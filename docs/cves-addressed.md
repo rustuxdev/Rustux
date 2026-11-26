@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**258 unique CVEs recorded.**
+**259 unique CVEs recorded.**
 
 ## klib ports
 
@@ -166,6 +166,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-49264 | shebang-exec rung: `#!` scripts all exec'd ENOENT — the shebang's absolute interp path ("… | audit run-260 scoped quick (security-audit skill): bounds verified (interp <=127, bn/sn <= CAP-2, shift <= MAX_EXEC_ARGS); cve-now exec-argv/binfmt classes checked (CVE-2022-49264… |
 | CVE-2022-49264 | shebang-exec rung: `#!` scripts all exec'd ENOENT — the shebang's absolute interp path ("… | audit run-260 scoped quick (security-audit skill): bounds verified (interp <=127, bn/sn <= CAP-2, shift <= MAX_EXEC_ARGS); cve-now exec-argv/binfmt classes checked (CVE-2022-49264… |
 | CVE-2022-49349 | writable file layer: VFile/Ram OFDs (O_CREAT/O_EXCL/O_TRUNC/O_APPEND), write/read/pread/l… | self-review catches FIXED pre-commit: write(fd,buf,0) at pos>len allocated+extended the file (now early-0 like Linux); fd_pread on an empty VFile took null.add(0) (now n==0 early… |
+| CVE-2022-49443 | clone3+close_range+epoll_pwait2 rung (435/436/441): sys_clone3 parses the 88B clone_args… | kernel/src/user.rs (sys_clone3 + fd_close_range + fd_epoll_pwait2), kernel/src/syscall.rs (NR 435/436/441), kernel/user/cl3test.c, Makefile, lstest.S floor 59->60 |
+| CVE-2022-49443 | clone3+close_range+epoll_pwait2 rung (435/436/441): sys_clone3 parses the 88B clone_args… | kernel/src/user.rs (sys_clone3 + fd_close_range + fd_epoll_pwait2), kernel/src/syscall.rs (NR 435/436/441), kernel/user/cl3test.c, Makefile, lstest.S floor 59->60 |
 | CVE-2022-50466 | PT_INTERP dynamic ELF: Elf::interp() (first-PT_INTERP-only, absolute NUL path bounded 4Ki… | RUN-TIME BUG CAUGHT BY REAL ld.so: glibc ld.so dedupes shared objects by (st_dev,st_ino) — sys_fstat reported ino=0 for every cpio member, so libc.so.6 aliased ld.so's own object,… |
 | CVE-2022-50531 | NT filesystem/path services round 2: RUX_PATH 0x100 multiplexed service (subs 0-10: GetCu… | audit run-100 quick scoped: 2 confirmed findings fixed in-diff — UTF-16 path reader loaded a u16 whose second byte could straddle a page end into the next physical frame (per-byte… |
 | CVE-2022-50531 | newfstatat: 144-byte Linux struct stat over the cpio fs | the stat buffer is [0u64;18] zeroed before any field is set -- the uninit-kernel-struct copy_to_user info-leak class (50531/KMSAN family) is structurally absent; copy_user_path ge… |
