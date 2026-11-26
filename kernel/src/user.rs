@@ -363,6 +363,16 @@ enum WaitOn {
     PipeRead(usize),
     /// write() on a full pipe: `wait_ptr/len` is the user buffer.
     PipeWrite(usize),
+    /// msgrcv() on a queue with no matching message: wait_ptr is
+    /// the user msgp, wait_len msgsz, wait_ptr2 the mtype bits,
+    /// wait_ptr3 msgflg. The msgsnd waker re-runs the pick and
+    /// deposits the mtext length.
+    MsgRcv(usize),
+    /// msgsnd() on a full queue: the message was staged to kernel
+    /// memory at arm time — wait_ptr is the kmalloc'd buf,
+    /// wait_len its size, wait_ptr2 the mtype bits. The msgrcv
+    /// waker links it if room freed, EIDRM/interrupt frees it.
+    MsgSnd(usize),
     /// poll(): `wait_ptr` is the user pollfd array, `wait_len` the
     /// fd count. Any pipe-state change re-scans it; wait_deadline
     /// ticks (0 = none) bounds the sleep.
@@ -1784,6 +1794,11 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
                 t.psel_mask = u64::MAX;
             }
             t.frame_mask = u64::MAX;
+        }
+        // A MsgSnd waiter's staged kernel buffer dies with the
+        // wait — the queue never owned it.
+        if let WaitOn::MsgSnd(_) = t.wait_on {
+            unsafe { kalloc::kfree(t.wait_ptr as *mut u8) };
         }
         t.wait_on = WaitOn::None;
         t.wait_ptr = 0;
@@ -9022,6 +9037,468 @@ pub fn sys_shmctl(id: u64, cmd: u64, buf: u64) -> u64 {
             0
         }
         11 | 12 => 0, // SHM_LOCK / SHM_UNLOCK
+        _ => EINVAL,
+    }
+}
+
+// --- SysV message queues (msgget 68 / msgsnd 69 / msgrcv 70 /
+// msgctl 71) ----------------------------------------------------
+// The same shape the SHM API takes: gen<<16|slot ids with an
+// rmid tombstone, and a WaitOn pair for the blocking directions.
+// Message bytes are copied into kernel memory at syscall time —
+// Linux's load_msg discipline: once msgsnd returns (or blocks)
+// the payload is the kernel's, never re-read from a user VA that
+// could be unmapped or mutated underneath.
+
+const MAX_MSGQS: usize = 16;
+/// Queued-message slots per queue — Linux bounds by qbytes +
+/// msgmni; the fixed ceiling keeps the audit surface static.
+const MSG_PER_Q: usize = 32;
+/// Per-queue byte ceiling — Linux's msgmnb default.
+const MSG_QBYTES: usize = 16384;
+/// Single-message ceiling — Linux's msgmax.
+const MSG_SZ_MAX: usize = 8192;
+const MSG_NOERROR: u64 = 0o10000;
+const MSG_EXCEPT: u64 = 0o20000;
+const IPC_NOWAIT: u64 = 0o4000;
+
+struct MsgQMsg {
+    mtype: i64,
+    len: usize,
+    /// kmalloc'd message text — queue-owned while linked.
+    data: *mut u8,
+}
+
+struct MsgQ {
+    key: i64,
+    gen: u16,
+    /// low 9 perm bits from msgget's mode (collapse like shm).
+    mode: u16,
+    /// queued payload bytes — the qbytes ceiling input.
+    used: usize,
+    msgs: [Option<MsgQMsg>; MSG_PER_Q],
+    rmid: bool,
+}
+
+static mut MSGQS: [Option<MsgQ>; MAX_MSGQS] =
+    [None, None, None, None, None, None, None, None,
+     None, None, None, None, None, None, None, None];
+/// Per-slot generation stamped into msqids ((gen << 16) | slot).
+static mut MSGQGEN: [u16; MAX_MSGQS] = [0; MAX_MSGQS];
+
+/// Resolve a user msqid to a live slot — destroyed, rmid'd,
+/// stale-gen or out-of-range ids all answer EINVAL like Linux's
+/// ipc_obtain_object failure.
+fn msg_id_resolve(id: u64) -> Option<usize> {
+    let slot = (id & 0xffff) as usize;
+    let gen = (id >> 16) as u16;
+    if slot >= MAX_MSGQS {
+        return None;
+    }
+    let qs = unsafe { &*core::ptr::addr_of!(MSGQS) };
+    match &qs[slot] {
+        Some(q) if q.gen == gen && !q.rmid => Some(slot),
+        _ => None,
+    }
+}
+
+/// The msgrcv pick: mtype>0 wants the first exact match (or the
+/// first non-match under MSG_EXCEPT), mtype=0 the head, mtype<0
+/// the lowest type <= |mtype| — Linux's convert_mode shapes.
+fn msg_pick_idx(q: &MsgQ, mtype: i64, flags: u64) -> Option<usize> {
+    if mtype == 0 {
+        return q.msgs.iter().position(|m| m.is_some());
+    }
+    if mtype > 0 {
+        return q.msgs.iter().position(|m| {
+            m.as_ref().is_some_and(|m| {
+                (m.mtype == mtype) != (flags & MSG_EXCEPT != 0)
+            })
+        });
+    }
+    let lim = -mtype;
+    let mut best: Option<usize> = None;
+    for (i, m) in q.msgs.iter().enumerate() {
+        if let Some(m) = m {
+            if m.mtype <= lim && best.is_none_or(|b| m.mtype < q.msgs[b].as_ref().unwrap().mtype) {
+                best = Some(i);
+            }
+        }
+    }
+    best
+}
+
+/// msgrcv's dequeue-and-copy into `t`'s address space — writes
+/// the mtype word then the mtext, returns the copied mtext len
+/// or the errno (E2BIG oversize sans MSG_NOERROR, EFAULT).
+fn msg_deliver(t: &mut Task, q: &mut MsgQ, idx: usize, msgp: u64, msgsz: u64, flags: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const E2BIG_: u64 = (-7i64) as u64;
+    let m = q.msgs[idx].take().unwrap();
+    q.used -= m.len;
+    let n = m.len;
+    if n as u64 > msgsz && flags & MSG_NOERROR == 0 {
+        unsafe { kalloc::kfree(m.data) };
+        return E2BIG_;
+    }
+    let n = n.min(msgsz as usize);
+    let mut mt = [0u8; 8];
+    mt[..8].copy_from_slice(&m.mtype.to_le_bytes());
+    let ok = write_task_bytes(t.pml4, msgp, &mt)
+        && (n == 0
+            || write_task_bytes(t.pml4, msgp + 8, unsafe {
+                core::slice::from_raw_parts(m.data, n)
+            }));
+    unsafe { kalloc::kfree(m.data) };
+    if !ok {
+        return EFAULT_;
+    }
+    n as u64
+}
+
+/// Wake MsgRcv waiters on queue `slot` — each re-runs its pick
+/// against the live queue and takes the first match it gets.
+fn msg_wake_rcv(slot: usize) {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let qs = unsafe { &mut *core::ptr::addr_of_mut!(MSGQS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked || t.wait_on != WaitOn::MsgRcv(slot) {
+            continue;
+        }
+        let Some(q) = qs.get_mut(slot).and_then(|x| x.as_mut()) else {
+            break;
+        };
+        let mtype = t.wait_ptr2 as i64;
+        let Some(idx) = msg_pick_idx(q, mtype, t.wait_ptr3) else {
+            continue;
+        };
+        let msgp = t.wait_ptr;
+        let msgsz = t.wait_len;
+        let flags = t.wait_ptr3;
+        let r = msg_deliver(t, q, idx, msgp, msgsz, flags);
+        t.ctx.rax = r;
+        t.wait_on = WaitOn::None;
+        t.wait_deadline = 0;
+        t.state = TaskState::Runnable;
+    }
+}
+
+/// Wake MsgSnd waiters on queue `slot` — each staged kernel
+/// buffer links if room freed; a dequeued queue feeds as many
+/// waiters as it has room for.
+fn msg_wake_snd(slot: usize) {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let qs = unsafe { &mut *core::ptr::addr_of_mut!(MSGQS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked || t.wait_on != WaitOn::MsgSnd(slot) {
+            continue;
+        }
+        let Some(q) = qs.get_mut(slot).and_then(|x| x.as_mut()) else {
+            break;
+        };
+        let len = t.wait_len as usize;
+        if q.used + len > MSG_QBYTES || q.msgs.iter().all(|m| m.is_some()) {
+            continue; // still no room for this waiter
+        }
+        let slot_i = q.msgs.iter().position(|m| m.is_none()).unwrap();
+        q.msgs[slot_i] = Some(MsgQMsg {
+            mtype: t.wait_ptr2 as i64,
+            len,
+            data: t.wait_ptr as *mut u8,
+        });
+        q.used += len;
+        t.ctx.rax = 0;
+        t.wait_on = WaitOn::None;
+        t.wait_deadline = 0;
+        t.state = TaskState::Runnable;
+    }
+}
+
+/// IPC_RMID's wake — every waiter on the dead queue reports
+/// EIDRM; MsgSnd staged buffers are freed with the wait.
+fn msg_wake_dead(slot: usize) {
+    const EIDRM_: u64 = (-43i64) as u64;
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked {
+            continue;
+        }
+        if t.wait_on == WaitOn::MsgSnd(slot) {
+            unsafe { kalloc::kfree(t.wait_ptr as *mut u8) };
+            t.ctx.rax = EIDRM_;
+            t.wait_on = WaitOn::None;
+            t.state = TaskState::Runnable;
+        } else if t.wait_on == WaitOn::MsgRcv(slot) {
+            t.ctx.rax = EIDRM_;
+            t.wait_on = WaitOn::None;
+            t.state = TaskState::Runnable;
+        }
+    }
+}
+
+/// msgget(key, msgflg): key 0 (IPC_PRIVATE) always mints; else
+/// find-by-key or create under IPC_CREAT. ids = (gen<<16)|slot.
+pub fn sys_msgget(key: u64, msgflg: u64) -> u64 {
+    const EEXIST_: u64 = (-17i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const ENOSPC_: u64 = (-28i64) as u64;
+    if msgflg & !(IPC_CREAT | IPC_EXCL | 0o777) != 0 {
+        return EINVAL;
+    }
+    let key = key as i32 as i64;
+    let qs = unsafe { &mut *core::ptr::addr_of_mut!(MSGQS) };
+    let gens = unsafe { &mut *core::ptr::addr_of_mut!(MSGQGEN) };
+    if key != 0 {
+        for (i, q) in qs.iter().enumerate() {
+            let Some(q) = q else { continue };
+            if q.key == key {
+                if msgflg & (IPC_CREAT | IPC_EXCL) == IPC_CREAT | IPC_EXCL {
+                    return EEXIST_;
+                }
+                return (((q.gen as u64) << 16) | i as u64) as u64;
+            }
+        }
+        if msgflg & IPC_CREAT == 0 {
+            return ENOENT_;
+        }
+    }
+    let Some(i) = qs.iter().position(|q| q.is_none()) else {
+        return ENOSPC_;
+    };
+    gens[i] = gens[i].wrapping_add(1);
+    qs[i] = Some(MsgQ {
+        key,
+        gen: gens[i],
+        mode: (msgflg & 0o777) as u16,
+        used: 0,
+        msgs: [const { None }; MSG_PER_Q],
+        rmid: false,
+    });
+    ((gens[i] as u64) << 16) | i as u64
+}
+
+/// msgsnd(msqid, msgp, msgsz, msgflg): mtype>0 and a user buffer
+/// with room for the text are validated, the text is staged into
+/// kernel memory, then the message links — or, on a full queue,
+/// the task blocks on MsgSnd for a dequeue to feed it.
+pub fn sys_msgsnd(ctx: &mut UCtx, id: u64, msgp: u64, msgsz: u64, msgflg: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EINTR_: u64 = (-4i64) as u64;
+    const EIDRM_: u64 = (-43i64) as u64;
+    if msgflg & !IPC_NOWAIT != 0 {
+        return EINVAL;
+    }
+    if msgsz > MSG_SZ_MAX as u64 {
+        return EINVAL;
+    }
+    if !range_ok(msgp, msgsz + 8) {
+        return EFAULT_;
+    }
+    let Some(slot) = msg_id_resolve(id) else {
+        return EINVAL;
+    };
+    let Some(t) = cur_mut() else { return EINVAL };
+    let mut hb = [0u8; 8];
+    if !read_task_bytes(t.pml4, msgp, &mut hb) {
+        return EFAULT_;
+    }
+    let mtype = i64::from_le_bytes(hb);
+    if mtype <= 0 {
+        return EINVAL;
+    }
+    // Stage the payload — the kernel owns these bytes from here.
+    let data = unsafe { kalloc::kmalloc(msgsz.max(1) as usize) };
+    if data.is_null() {
+        return (-12i64) as u64; // ENOMEM
+    }
+    if msgsz > 0 && !read_task_bytes(t.pml4, msgp + 8, unsafe {
+        core::slice::from_raw_parts_mut(data, msgsz as usize)
+    }) {
+        unsafe { kalloc::kfree(data) };
+        return EFAULT_;
+    }
+    let len = msgsz as usize;
+    loop {
+        let qs = unsafe { &mut *core::ptr::addr_of_mut!(MSGQS) };
+        let Some(q) = qs.get_mut(slot).and_then(|x| x.as_mut()) else {
+            unsafe { kalloc::kfree(data) };
+            return EIDRM_;
+        };
+        if q.rmid {
+            unsafe { kalloc::kfree(data) };
+            return EIDRM_;
+        }
+        if q.used + len <= MSG_QBYTES
+            && q.msgs.iter().any(|m| m.is_none())
+        {
+            let i = q.msgs.iter().position(|m| m.is_none()).unwrap();
+            q.msgs[i] = Some(MsgQMsg { mtype, len, data });
+            q.used += len;
+            msg_wake_rcv(slot);
+            return 0;
+        }
+        if msgflg & IPC_NOWAIT != 0 {
+            unsafe { kalloc::kfree(data) };
+            return EAGAIN_;
+        }
+        if deliverable(t) {
+            unsafe { kalloc::kfree(data) };
+            return EINTR_;
+        }
+        // Sleep until a dequeue frees room — the waker links our
+        // staged buffer; a signal's EINTR hook frees it.
+        t.wait_on = WaitOn::MsgSnd(slot);
+        t.wait_ptr = data as u64;
+        t.wait_len = msgsz;
+        t.wait_ptr2 = mtype as u64;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+        if (q.used + len > MSG_QBYTES || q.msgs.iter().all(|m| m.is_some()))
+            && !q.rmid
+        {
+            block_switch();
+        }
+        if t.wait_on == WaitOn::None {
+            return t.ctx.rax; // waker linked us, or EIDRM/EINTR
+        }
+        // The armed recheck found room — fall back to the link.
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
+    }
+}
+
+/// msgrcv(msqid, msgp, msgsz, mtype, msgflg): pick the first
+/// message matching mtype's convert_mode, write mtype+text to
+/// the user buffer — or block on MsgRcv for a send to deliver.
+pub fn sys_msgrcv(ctx: &mut UCtx, id: u64, msgp: u64, msgsz: u64, mtype: u64, msgflg: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const ENOMSG_: u64 = (-42i64) as u64;
+    const E2BIG_: u64 = (-7i64) as u64;
+    const EINTR_: u64 = (-4i64) as u64;
+    const EIDRM_: u64 = (-43i64) as u64;
+    if msgflg & !(IPC_NOWAIT | MSG_NOERROR | MSG_EXCEPT) != 0 {
+        return EINVAL;
+    }
+    if msgflg & MSG_EXCEPT != 0 && (mtype as i64) <= 0 {
+        return EINVAL;
+    }
+    if msgsz > MSG_SZ_MAX as u64 || !range_ok_w(msgp, msgsz + 8) {
+        return EFAULT_;
+    }
+    let mtype = mtype as i64;
+    let Some(slot) = msg_id_resolve(id) else {
+        return EINVAL;
+    };
+    let Some(t) = cur_mut() else { return EINVAL };
+    loop {
+        let qs = unsafe { &mut *core::ptr::addr_of_mut!(MSGQS) };
+        let Some(q) = qs.get_mut(slot).and_then(|x| x.as_mut()) else {
+            return EIDRM_;
+        };
+        if let Some(idx) = msg_pick_idx(q, mtype, msgflg) {
+            let r = msg_deliver(t, q, idx, msgp, msgsz, msgflg);
+            // The dequeue freed room no matter the delivery
+            // outcome (E2BIG consumes the message like Linux).
+            msg_wake_snd(slot);
+            return r;
+        }
+        if q.rmid {
+            return EIDRM_;
+        }
+        if msgflg & IPC_NOWAIT != 0 {
+            return ENOMSG_;
+        }
+        if deliverable(t) {
+            return EINTR_;
+        }
+        // Sleep until a send delivers — the waker writes our msgp.
+        t.wait_on = WaitOn::MsgRcv(slot);
+        t.wait_ptr = msgp;
+        t.wait_len = msgsz;
+        t.wait_ptr2 = mtype as u64;
+        t.wait_ptr3 = msgflg;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+        if msg_pick_idx(q, mtype, msgflg).is_none() && !q.rmid {
+            block_switch();
+        }
+        if t.wait_on == WaitOn::None {
+            return t.ctx.rax; // a waker or signal deposited it
+        }
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
+    }
+}
+
+/// msgctl(msqid, cmd, buf): IPC_STAT fills the msqid_ds shape,
+/// IPC_SET writes mode+qbytes, IPC_RMID tombstones the queue —
+/// waiters wake with EIDRM, queued text frees, the slot dies.
+pub fn sys_msgctl(id: u64, cmd: u64, buf: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    match cmd {
+        // IPC_STAT
+        2 => {
+            let Some(slot) = msg_id_resolve(id) else { return EINVAL };
+            if !range_ok_w(buf, 120) {
+                return EFAULT_;
+            }
+            let Some(t) = cur_mut() else { return EINVAL };
+            let qs = unsafe { &*core::ptr::addr_of!(MSGQS) };
+            let q = qs[slot].as_ref().unwrap();
+            // msqid64_ds: ipc_perm @0 (key@0, mode@20), then
+            // stime@48, rtime@56, ctime@64, cbytes@72, qnum@80,
+            // qbytes@88, lspid@96, lrpid@100.
+            for off in (0..120u64).step_by(4) {
+                write_task_u32(t.pml4, buf + off, 0);
+            }
+            write_task_u32(t.pml4, buf, q.key as u32);
+            write_task_u32(t.pml4, buf + 20, q.mode as u32);
+            write_task_u64(t.pml4, buf + 72, q.used as u64);
+            write_task_u64(
+                t.pml4,
+                buf + 80,
+                q.msgs.iter().filter(|m| m.is_some()).count() as u64,
+            );
+            write_task_u64(t.pml4, buf + 88, MSG_QBYTES as u64);
+            0
+        }
+        // IPC_SET — mode and qbytes are the mutable fields; the
+        // qbytes ceiling is a compile-time bound here, so accept
+        // and drop the request like an inert resource limit.
+        1 => {
+            let Some(slot) = msg_id_resolve(id) else { return EINVAL };
+            if !range_ok(buf, 120) {
+                return EFAULT_;
+            }
+            let Some(t) = cur_mut() else { return EINVAL };
+            let mode = read_task_u64(t.pml4, buf + 16)
+                .map(|v| v as u32 & 0o777)
+                .unwrap_or(0);
+            let qs = unsafe { &mut *core::ptr::addr_of_mut!(MSGQS) };
+            qs[slot].as_mut().unwrap().mode = mode as u16;
+            0
+        }
+        // IPC_RMID
+        0 => {
+            let Some(slot) = msg_id_resolve(id) else { return EINVAL };
+            msg_wake_dead(slot);
+            let qs = unsafe { &mut *core::ptr::addr_of_mut!(MSGQS) };
+            if let Some(q) = qs[slot].as_mut() {
+                q.rmid = true;
+                for m in q.msgs.iter_mut() {
+                    if let Some(m) = m.take() {
+                        unsafe { kalloc::kfree(m.data) };
+                    }
+                }
+                q.used = 0;
+            }
+            qs[slot] = None;
+            0
+        }
         _ => EINVAL,
     }
 }

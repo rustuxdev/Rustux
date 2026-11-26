@@ -689,6 +689,11 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         125 => user::sys_capget(a1, a2),
         126 => user::sys_capset(a1, a2),
         322 => sys_execveat(ctx, a1, a2, a3, a4, a5),
+        // SysV message queues — same gen<<16|slot id model as SHM.
+        68 => user::sys_msgget(a1, a2),
+        69 => user::sys_msgsnd(ctx, a1, a2, a3, a4),
+        70 => user::sys_msgrcv(ctx, a1, a2, a3, a4, a5),
+        71 => user::sys_msgctl(a1, a2, a3),
 
         NR_FUTEX_WAKE => user::sys_futex_wake(a1, a2, a3, a4),
         NR_FUTEX_WAIT => user::sys_futex_wait(ctx, a1, a2, a3, a4, a5, a6),
