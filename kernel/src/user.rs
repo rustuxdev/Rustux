@@ -13939,117 +13939,52 @@ pub fn sleep_ms(ctx: &mut UCtx, ms: u64) {
 /// feed wakes the task; Console and closed slots are EBADF.
 /// The kernel validates that [buf, buf+n) is user-writable before
 /// copying — checked arithmetic, no partial writes past the gate.
-/// /dev/sdN read at the OFD position: the ATA port path is
-/// 512-byte granular, so unaligned edges bounce through a kernel
-/// sector buffer. Reads clip at the device end — Linux's short
-/// read, not an error.
-/// AHCI-backed read: same clipping contract as the PIIX path, but
-/// batched — up to 8 sectors (4 KiB) per DMA command.
-fn ahci_read(o: &mut OpenFile, drv: usize, buf: u64, len: u64) -> u64 {
-    let cap = crate::ahci::disk_capacity(drv);
-    if o.pos as u64 >= cap {
-        return 0;
+/// One MBR partition the disk scan registered: the backing window
+/// for the parent's partition minors (sd/vd 16-per-disk, nvme
+/// 16-per-namespace).
+#[derive(Clone, Copy)]
+struct DevPart {
+    major: u32,
+    drv: u8,
+    part: u8,
+    lba: u32,
+    sectors: u32,
+}
+static mut DEV_PARTS: [Option<DevPart>; 32] = [None; 32];
+
+/// The disk scan registers every partition entry that fits its
+/// parent — the /dev minors resolve against this table. Partition
+/// index is 1-based like the MBR slot order.
+pub fn dev_part_add(major: u32, drv: usize, part: usize, lba: u64, sectors: u64) {
+    if part == 0 || part > 15 || lba > u32::MAX as u64 || sectors > u32::MAX as u64 {
+        return;
     }
-    let n = len.min(cap - o.pos as u64) as usize;
-    if !range_ok_w(buf, n as u64) {
-        return EFAULT;
+    let parts = unsafe { &mut *core::ptr::addr_of_mut!(DEV_PARTS) };
+    if let Some(slot) = parts.iter_mut().find(|s| s.is_none()) {
+        *slot = Some(DevPart {
+            major,
+            drv: drv as u8,
+            part: part as u8,
+            lba: lba as u32,
+            sectors: sectors as u32,
+        });
     }
-    let mut done = 0usize;
-    let mut bounce = [0u8; 4096];
-    while done < n {
-        let off = o.pos as u64 + done as u64;
-        let lba = off / 512;
-        let in_sector = (off % 512) as usize;
-        let want = n - done;
-        // One command covers a whole 4 KiB run when aligned.
-        let batch = if in_sector == 0 { (want / 4096).min(1) * crate::ahci::BATCH } else { 0 };
-        let take = if batch > 0 {
-            batch * 512
-        } else {
-            (512 - in_sector).min(want)
-        };
-        let secs = take.div_ceil(512).max(1);
-        let ok = if secs == 1 && in_sector != 0 {
-            // Partial sector: read it whole, then copy the slice.
-            crate::ahci::read_range(drv, lba, 1, &mut bounce[..512])
-        } else {
-            crate::ahci::read_range(drv, lba, secs, &mut bounce[..secs * 512])
-        };
-        if !ok {
-            return if done > 0 { done as u64 } else { (-5i64) as u64 };
-        }
-        // SAFETY: buf validated writable for n bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bounce.as_ptr().add(in_sector),
-                (buf + done as u64) as *mut u8,
-                take,
-            );
-        }
-        done += take;
-    }
-    o.pos += done;
-    done as u64
 }
 
-fn ahci_write(o: &mut OpenFile, drv: usize, buf: u64, len: u64) -> u64 {
-    let cap = crate::ahci::disk_capacity(drv);
-    if o.pos as u64 >= cap {
-        return (-28i64) as u64; // ENOSPC
-    }
-    let n = len.min(cap - o.pos as u64) as usize;
-    if !range_ok(buf, n as u64) {
-        return EFAULT;
-    }
-    let mut done = 0usize;
-    let mut bounce = [0u8; 4096];
-    while done < n {
-        let off = o.pos as u64 + done as u64;
-        let lba = off / 512;
-        let in_sector = (off % 512) as usize;
-        let want = n - done;
-        let batch = if in_sector == 0 { (want / 4096).min(1) * crate::ahci::BATCH } else { 0 };
-        let take = if batch > 0 {
-            batch * 512
-        } else {
-            (512 - in_sector).min(want)
-        };
-        let secs = take.div_ceil(512).max(1);
-        let whole = in_sector == 0 && take == secs * 512;
-        if !whole {
-            // Read-modify-write for the partial edges.
-            if !crate::ahci::read_range(drv, lba, secs, &mut bounce[..secs * 512]) {
-                return if done > 0 { done as u64 } else { (-5i64) as u64 };
-            }
-        }
-        // SAFETY: buf validated readable for n bytes; bounce holds secs*512.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (buf + done as u64) as *const u8,
-                bounce.as_mut_ptr().add(in_sector),
-                take,
-            );
-        }
-        if !crate::ahci::write_range(drv, lba, secs, &bounce[..secs * 512]) {
-            return if done > 0 { done as u64 } else { (-5i64) as u64 };
-        }
-        done += take;
-    }
-    o.pos += done;
-    done as u64
-}
-
-/// Capacity in bytes of the block device `rdev` names, 0 when no
-/// hardware backs it — the SEEK_END base and open-gate check for
-/// every block transport (sd major 8, vd major 254, nvme major 259).
-fn blk_capacity(rdev: u32) -> u64 {
-    match rdev >> 8 {
+/// The window `rdev` names: (major, drive, base sector, capacity
+/// bytes). The minor's low nibble is the partition — 0 is the whole
+/// disk, 1-15 index the scan's table. None when no hardware (or no
+/// registered partition) backs the node.
+fn blk_window(rdev: u32) -> Option<(u32, usize, u64, u64)> {
+    let major = rdev >> 8;
+    let minor = (rdev & 0xff) as usize;
+    let (drv, part) = (minor / 16, minor % 16);
+    // Whichever transport actually has this disk: the PIIX capacity
+    // is 0 on AHCI machines, which made SEEK_END answer 0 and left
+    // the installer unable to size the space after its first
+    // partition.
+    let disk_cap = match major {
         8 => {
-            // Whichever transport actually has this disk: the PIIX
-            // capacity is 0 on AHCI machines, which made SEEK_END
-            // answer 0 and left the installer unable to size the
-            // space after its first partition.
-            let drv = ((rdev & 0xff) / 16) as usize;
             let c = crate::ata::capacity_d(drv);
             if c > 0 {
                 c
@@ -14057,54 +13992,86 @@ fn blk_capacity(rdev: u32) -> u64 {
                 crate::ahci::disk_capacity(drv)
             }
         }
-        254 => crate::virtio::disk_capacity(((rdev & 0xff) / 16) as usize),
-        259 => crate::nvme::disk_capacity((rdev & 0xff) as usize),
-        _ => 0,
+        254 => crate::virtio::disk_capacity(drv),
+        259 => crate::nvme::disk_capacity(drv),
+        _ => return None,
+    };
+    if disk_cap == 0 {
+        return None;
     }
+    if part == 0 {
+        return Some((major, drv, 0, disk_cap));
+    }
+    let parts = unsafe { &*core::ptr::addr_of!(DEV_PARTS) };
+    parts
+        .iter()
+        .flatten()
+        .find(|p| {
+            p.major == major && p.drv as usize == drv && p.part as usize == part
+        })
+        .and_then(|p| {
+            let cap = p.sectors as u64 * 512;
+            let base = p.lba as u64 * 512;
+            (cap > 0 && base + cap <= disk_cap)
+                .then_some((major, drv, p.lba as u64, cap))
+        })
 }
 
-/// Which transport+drive `rdev` names: (drive, major) when a driver
-/// actually backs the node. vd minors are 16/disk like sd; nvme
-/// minors are one per namespace.
-fn blk_transport(rdev: u32) -> Option<(usize, u32)> {
-    let major = rdev >> 8;
-    let drv = if major == 254 {
-        ((rdev & 0xff) / 16) as usize
-    } else {
-        (rdev & 0xff) as usize
-    };
-    match major {
-        254 if crate::virtio::disk_capacity(drv) > 0 => Some((drv, major)),
-        259 if crate::nvme::disk_capacity(drv) > 0 => Some((drv, major)),
-        _ => None,
-    }
+/// Capacity in bytes of the block device `rdev` names, 0 when no
+/// hardware backs it — the SEEK_END base and open-gate check for
+/// every block transport (sd major 8, vd major 254, nvme major 259).
+fn blk_capacity(rdev: u32) -> u64 {
+    blk_window(rdev).map(|(_, _, _, c)| c).unwrap_or(0)
 }
 
 fn blk_rd(t: u32, d: usize, lba: u64, n: usize, b: &mut [u8]) -> bool {
-    if t == 254 {
-        crate::virtio::read_range(d, lba, n, b)
-    } else {
-        crate::nvme::read_range(d, lba, n, b)
+    match t {
+        8 => {
+            if crate::ata::sectors_d(d) > 0 {
+                // The PIIX path is one sector per command — loop.
+                let mut sec = [0u8; 512];
+                for s in 0..n {
+                    if !crate::ata::read_d(
+                        (lba + s as u64) as u32,
+                        &mut sec,
+                        d,
+                    ) {
+                        return false;
+                    }
+                    b[s * 512..s * 512 + 512].copy_from_slice(&sec);
+                }
+                true
+            } else {
+                crate::ahci::read_range(d, lba, n, b)
+            }
+        }
+        254 => crate::virtio::read_range(d, lba, n, b),
+        _ => crate::nvme::read_range(d, lba, n, b),
     }
 }
 
 fn blk_wr(t: u32, d: usize, lba: u64, n: usize, b: &[u8]) -> bool {
-    if t == 254 {
-        crate::virtio::write_range(d, lba, n, b)
-    } else {
-        crate::nvme::write_range(d, lba, n, b)
+    match t {
+        8 => {
+            if crate::ata::sectors_d(d) > 0 {
+                crate::ata::write_d(lba as u32, n as u32, b.as_ptr(), d)
+            } else {
+                crate::ahci::write_range(d, lba, n, b)
+            }
+        }
+        254 => crate::virtio::write_range(d, lba, n, b),
+        _ => crate::nvme::write_range(d, lba, n, b),
     }
 }
 
-/// /dev/vdN + /dev/nvmeXnY read at the OFD position — the same
-/// bounce-buffered byte contract as the sd path: 512B-granular
-/// drivers, unaligned edges through a kernel sector buffer, reads
-/// clip at the device end.
+/// Block-device read at the OFD position — the bounce-buffered byte
+/// contract every transport shares: 512B-granular drivers,
+/// unaligned edges through a kernel sector buffer, reads clip at
+/// the window (disk or partition) end.
 fn blk_read(o: &mut OpenFile, rdev: u32, buf: u64, len: u64) -> u64 {
-    let Some((d, t)) = blk_transport(rdev) else {
+    let Some((t, d, base, cap)) = blk_window(rdev) else {
         return (-6i64) as u64; // ENXIO — node outlived its driver
     };
-    let cap = blk_capacity(rdev);
     if o.pos as u64 >= cap {
         return 0;
     }
@@ -14125,7 +14092,7 @@ fn blk_read(o: &mut OpenFile, rdev: u32, buf: u64, len: u64) -> u64 {
             (512 - in_sector).min(want)
         };
         let secs = take.div_ceil(512).max(1);
-        if !blk_rd(t, d, lba, secs, &mut bounce[..secs * 512]) {
+        if !blk_rd(t, d, base + lba, secs, &mut bounce[..secs * 512]) {
             return if done > 0 { done as u64 } else { (-5i64) as u64 };
         }
         // SAFETY: buf validated writable for n bytes.
@@ -14143,13 +14110,12 @@ fn blk_read(o: &mut OpenFile, rdev: u32, buf: u64, len: u64) -> u64 {
 }
 
 /// Matching write: partial-sector edges read-modify-write through
-/// the bounce buffer; a write clipped at the device end is Linux's
+/// the bounce buffer; a write clipped at the window end is Linux's
 /// short write, a write starting past it is ENOSPC.
 fn blk_write(o: &mut OpenFile, rdev: u32, buf: u64, len: u64) -> u64 {
-    let Some((d, t)) = blk_transport(rdev) else {
+    let Some((t, d, base, cap)) = blk_window(rdev) else {
         return (-6i64) as u64; // ENXIO
     };
-    let cap = blk_capacity(rdev);
     if o.pos as u64 >= cap {
         return (-28i64) as u64; // ENOSPC
     }
@@ -14171,7 +14137,9 @@ fn blk_write(o: &mut OpenFile, rdev: u32, buf: u64, len: u64) -> u64 {
         };
         let secs = take.div_ceil(512).max(1);
         let whole = in_sector == 0 && take == secs * 512;
-        if !whole && !blk_rd(t, d, lba, secs, &mut bounce[..secs * 512]) {
+        if !whole
+            && !blk_rd(t, d, base + lba, secs, &mut bounce[..secs * 512])
+        {
             return if done > 0 { done as u64 } else { (-5i64) as u64 };
         }
         // SAFETY: buf validated readable for n bytes; bounce holds secs*512.
@@ -14182,7 +14150,7 @@ fn blk_write(o: &mut OpenFile, rdev: u32, buf: u64, len: u64) -> u64 {
                 take,
             );
         }
-        if !blk_wr(t, d, lba, secs, &bounce[..secs * 512]) {
+        if !blk_wr(t, d, base + lba, secs, &bounce[..secs * 512]) {
             return if done > 0 { done as u64 } else { (-5i64) as u64 };
         }
         done += take;
@@ -14191,112 +14159,6 @@ fn blk_write(o: &mut OpenFile, rdev: u32, buf: u64, len: u64) -> u64 {
     done as u64
 }
 
-/// Which ATA drive backs this OFD: Linux's /dev/sda is minor 0,
-/// /dev/sdb minor 16 on major 8.
-fn sd_drive(o: &OpenFile) -> usize {
-    match &o.kind {
-        FdKind::Dev(i) => {
-            let v = unsafe { (*core::ptr::addr_of!(VFILES)).get(*i as usize).and_then(|x| x.as_ref()) };
-            match v {
-                Some(v) if (v.rdev & 0xff) >= 16 => 1,
-                _ => 0,
-            }
-        }
-        _ => 0,
-    }
-}
-
-fn sd_read(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
-    let drv = sd_drive(o);
-    if crate::ata::sectors() == 0 {
-        return ahci_read(o, drv, buf, len);
-    }
-    let cap = crate::ata::capacity_d(drv);
-    if o.pos as u64 >= cap {
-        return 0;
-    }
-    let n = len.min(cap - o.pos as u64) as usize;
-    if !range_ok_w(buf, n as u64) {
-        return EFAULT;
-    }
-    let mut done = 0usize;
-    let mut bounce = [0u8; 512];
-    while done < n {
-        let off = o.pos + done;
-        if !crate::ata::read_d((off / 512) as u32, &mut bounce, drv) {
-            // EIO on hardware failure — bytes already delivered
-            // still count, like Linux.
-            return if done > 0 { done as u64 } else { (-5i64) as u64 };
-        }
-        let take = (512 - off % 512).min(n - done);
-        // SAFETY: `buf..buf+n` passed range_ok_w under cur cr3.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bounce[off % 512..].as_ptr(),
-                (buf + done as u64) as *mut u8,
-                take,
-            )
-        };
-        done += take;
-    }
-    o.pos += done;
-    done as u64
-}
-
-/// /dev/sdN write at the OFD position: partial sectors read-
-/// modify-write through the bounce buffer; a write clipped at the
-/// device end is Linux's short write, a write starting past it is
-/// ENOSPC.
-fn sd_write(o: &mut OpenFile, buf: u64, len: u64) -> u64 {
-    let drv = sd_drive(o);
-    if crate::ata::sectors() == 0 {
-        return ahci_write(o, drv, buf, len);
-    }
-    let cap = crate::ata::capacity_d(drv);
-    if o.pos as u64 >= cap {
-        return (-28i64) as u64; // ENOSPC
-    }
-    let n = len.min(cap - o.pos as u64) as usize;
-    if !range_ok(buf, n as u64) {
-        return EFAULT;
-    }
-    let mut done = 0usize;
-    let mut bounce = [0u8; 512];
-    while done < n {
-        let off = o.pos + done;
-        // Aligned full sectors write straight from the user buffer —
-        // one command carries up to 256. Only unaligned edges pay
-        // the read-modify-write bounce.
-        if off.is_multiple_of(512) && n - done >= 512 {
-            let run = ((n - done) / 512).min(256) as u32;
-            let p = (buf + done as u64) as *const u8;
-            if !crate::ata::write_d((off / 512) as u32, run, p, drv) {
-                return if done > 0 { done as u64 } else { (-5i64) as u64 };
-            }
-            done += run as usize * 512;
-            continue;
-        }
-        let take = (512 - off % 512).min(n - done);
-        // A partial sector keeps its untouched bytes — fetch first.
-        if !crate::ata::read_d((off / 512) as u32, &mut bounce, drv) {
-            return if done > 0 { done as u64 } else { (-5i64) as u64 };
-        }
-        // SAFETY: `buf..buf+n` passed range_ok under cur cr3.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (buf + done as u64) as *const u8,
-                bounce[off % 512..].as_mut_ptr(),
-                take,
-            )
-        };
-        if !crate::ata::write_d((off / 512) as u32, 1, bounce.as_ptr(), drv) {
-            return if done > 0 { done as u64 } else { (-5i64) as u64 };
-        }
-        done += take;
-    }
-    o.pos += done;
-    done as u64
-}
 
 pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     // Drain any decoded keys sitting in the scancode ring before the
@@ -14336,8 +14198,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             // Block devices read at the OFD position — sector I/O
             // through a kernel bounce buffer.
             match v.rdev >> 8 {
-                8 => return sd_read(o, buf, len),
-                254 | 259 => return blk_read(o, v.rdev, buf, len),
+                8 | 254 | 259 => return blk_read(o, v.rdev, buf, len),
                 _ => {}
             }
             match v.rdev {
@@ -14647,8 +14508,7 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         // Block devices write at the OFD position; partial sectors
         // read-modify-write through a kernel bounce buffer.
         match v.rdev >> 8 {
-            8 => return sd_write(o, buf, len),
-            254 | 259 => return blk_write(o, v.rdev, buf, len),
+            8 | 254 | 259 => return blk_write(o, v.rdev, buf, len),
             _ => {}
         }
         const ENOSPC_: u64 = (-28i64) as u64;
@@ -15802,9 +15662,9 @@ pub fn dev_init() {
             }
         }
     }
-    // NVMe namespaces — major 259, minor = namespace index; whole-
-    // disk nodes only (partition minors come with the scan that
-    // names them, like sda1 on real udev).
+    // NVMe namespaces — major 259, minor = ns*16 + part like the
+    // sd/vd window (nvme0n2 lands at minor 16, leaving 1-15 for
+    // partitions of n1).
     for i in 0..(crate::nvme::disks() as usize).min(4) {
         let name: &[u8] = match i {
             0 => b"dev/nvme0n1",
@@ -15817,7 +15677,46 @@ pub fn dev_init() {
             if let Some(v) = vfile(r as usize) {
                 vfile_stamp(v, 0o660, 0);
                 v.fmt = 0o60000; // S_IFBLK
-                v.rdev = (259 << 8) | (i as u32);
+                v.rdev = (259 << 8) | ((i as u32) * 16);
+            }
+        }
+    }
+    // Partition nodes from the scan's table — Linux names them
+    // after the parent (sda1, vda1, nvme0n1p1) at minor drv*16+part.
+    let parts = unsafe { &*core::ptr::addr_of!(DEV_PARTS) };
+    for p in parts.iter().flatten() {
+        let mut nm = [0u8; 24];
+        let mut n = 0usize;
+        let mut put = |s: &[u8], nm: &mut [u8; 24], n: &mut usize| {
+            nm[*n..*n + s.len()].copy_from_slice(s);
+            *n += s.len();
+        };
+        match p.major {
+            8 => {
+                put(b"dev/sd", &mut nm, &mut n);
+                put(&[b'a' + p.drv], &mut nm, &mut n);
+            }
+            254 => {
+                put(b"dev/vd", &mut nm, &mut n);
+                put(&[b'a' + p.drv], &mut nm, &mut n);
+            }
+            _ => {
+                put(b"dev/nvme0n", &mut nm, &mut n);
+                put(&[b'1' + p.drv], &mut nm, &mut n);
+                put(b"p", &mut nm, &mut n);
+            }
+        }
+        if p.part >= 10 {
+            put(&[b'0' + p.part / 10], &mut nm, &mut n);
+        }
+        put(&[b'0' + p.part % 10], &mut nm, &mut n);
+        let r = vfile_create(&nm[..n]);
+        if (r as i64) >= 0 {
+            if let Some(v) = vfile(r as usize) {
+                vfile_stamp(v, 0o660, 0);
+                v.fmt = 0o60000; // S_IFBLK
+                v.rdev = (p.major << 8)
+                    | ((p.drv as u32) * 16 + p.part as u32);
             }
         }
     }
@@ -16813,29 +16712,20 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                 // can be crafted by mknod even without hardware, so
                 // answer ENXIO (the driver has no such device).
                 0o60000 => match v.rdev >> 8 {
-                    // Major 8 is the sd family. Either transport may
-                    // back it: the legacy PIIX driver or AHCI (q35 and
-                    // real SATA). Checking only ata::sectors() made
-                    // every AHCI-backed node open with ENXIO, which is
-                    // why the installer could see /dev/sda (access()
+                    // sd / vd / nvme — one capacity check covers
+                    // every transport plus partition minors: a node
+                    // with no hardware (or no registered partition)
+                    // behind it answers ENXIO, like a driverless sd.
+                    // Checking only ata::sectors() used to make every
+                    // AHCI-backed node open with ENXIO, which is why
+                    // the installer could see /dev/sda (access()
                     // passes on the node) but never open it.
-                    8 if crate::ata::sectors() > 0
-                        || crate::ahci::disk_sectors(
-                            ((v.rdev & 0xff) / 16) as usize,
-                        ) > 0 =>
-                    {
-                        i
-                    }
-                    8 => return ENXIO,
+                    8 | 254 | 259 if blk_capacity(v.rdev) > 0 => i,
+                    8 | 254 | 259 => return ENXIO,
                     // /dev/sr0 — the ATAPI CD drive. No sector I/O
                     // (read/write are ENXIO below); it exists for
                     // the CDROM* ioctl family like eject.
                     11 => i,
-                    // virtio-blk (vd, minor 16/disk) and NVMe
-                    // (namespace per minor) — same no-hardware
-                    // ENXIO answer as sd.
-                    254 | 259 if blk_capacity(v.rdev) > 0 => i,
-                    254 | 259 => return ENXIO,
                     _ => return ENODEV,
                 },
                 // A fifo node exists but no fifo semantics live
@@ -17868,8 +17758,7 @@ pub fn fd_pread(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
             let saved = o.pos;
             o.pos = pos as usize;
             let r = match rdev >> 8 {
-                8 => sd_read(o, buf, len),
-                254 | 259 => blk_read(o, rdev, buf, len),
+                8 | 254 | 259 => blk_read(o, rdev, buf, len),
                 _ => {
                     o.pos = saved;
                     return ESPIPE_;
@@ -17965,8 +17854,7 @@ pub fn fd_pwrite(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
             let saved = o.pos;
             o.pos = pos as usize;
             let r = match rdev >> 8 {
-                8 => sd_write(o, buf, len),
-                254 | 259 => blk_write(o, rdev, buf, len),
+                8 | 254 | 259 => blk_write(o, rdev, buf, len),
                 _ => {
                     o.pos = saved;
                     return ESPIPE_;

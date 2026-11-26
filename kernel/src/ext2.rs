@@ -554,8 +554,9 @@ pub fn disk_count() -> usize {
 
 /// Which transport owns global disk index `i`: ATA occupies the low
 /// indices (its own 0/1 master/slave numbering), then AHCI disks,
-/// then virtio disks, then NVMe namespaces.
-fn transport(i: usize) -> (u8, usize) {
+/// then virtio disks, then NVMe namespaces. Public so the /dev
+/// layer can encode the same index into major/minor.
+pub fn transport(i: usize) -> (u8, usize) {
     let n_ata = (0..2).filter(|&d| crate::ata::sectors_d(d) > 0).count();
     if i < n_ata {
         return (0, i);

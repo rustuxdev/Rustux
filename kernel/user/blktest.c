@@ -83,6 +83,30 @@ int main(void) {
         close(fd);
     }
 
+    // ---- /dev/vda1 — the MBR partition node (254:1) ----
+    fd = open("/dev/vda1", O_RDWR);
+    check(fd >= 0, "open vda1");
+    if (fd >= 0) {
+        check(fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)
+              && major(st.st_rdev) == 254 && minor(st.st_rdev) == 1,
+              "fstat S_IFBLK 254:1");
+        check(ioctl(fd, BLKGETSIZE64, &cap) == 0 && cap > 0
+              && cap < 64 * 1024 * 1024ULL,
+              "part BLKGETSIZE64");
+        // Partition offset 0 is the ext4 superblock page — the
+        // 0xEF53 magic at +1080 (sb+56) proves the window starts
+        // at the partition base, not the disk's.
+        check(pread(fd, sec, 4, 1080) == 4
+              && (unsigned char)sec[0] == 0x53
+              && (unsigned char)sec[1] == 0xef,
+              "pread ext4 magic");
+        // Last sector of the partition — inside the window but
+        // past the filesystem's structures on this test image.
+        check(pread(fd, sec, 512, cap - 512) == 512,
+              "pread last sector");
+        close(fd);
+    }
+
     // ---- /dev/nvme0n1 (NVMe, major 259) ----
     fd = open("/dev/nvme0n1", O_RDWR);
     check(fd >= 0, "open nvme0n1");
@@ -99,6 +123,31 @@ int main(void) {
         check(rw_roundtrip(fd, "nvme-tag"), "pwrite/verify/restore");
         close(fd);
     }
+
+    // ---- /dev/nvme0n1p1 — the NVMe partition node (259:1) ----
+    fd = open("/dev/nvme0n1p1", O_RDWR);
+    check(fd >= 0, "open nvme0n1p1");
+    if (fd >= 0) {
+        check(fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)
+              && major(st.st_rdev) == 259 && minor(st.st_rdev) == 1,
+              "fstat S_IFBLK 259:1");
+        check(ioctl(fd, BLKGETSIZE64, &cap) == 0 && cap > 0,
+              "part BLKGETSIZE64");
+        check(pread(fd, sec, 4, 1080) == 4
+              && (unsigned char)sec[0] == 0x53
+              && (unsigned char)sec[1] == 0xef,
+              "pread ext4 magic");
+        close(fd);
+    }
+
+    // A crafted partition node with no registered partition must
+    // answer ENXIO — vda5 does not exist on the test disk.
+    unlink("vda5.nod");
+    check(mknod("vda5.nod", S_IFBLK | 0600, makedev(254, 5)) == 0,
+          "mknod vda5");
+    check(open("vda5.nod", O_RDONLY) < 0 && errno == ENXIO,
+          "open vda5 -> ENXIO");
+    unlink("vda5.nod");
 
     // ---- gate answers ----
     // A crafted vd node for a disk that doesn't exist must answer

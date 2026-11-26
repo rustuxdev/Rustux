@@ -1371,6 +1371,15 @@ pub(crate) fn rustux_main(
                 if base + size > total {
                     continue;
                 }
+                // Register the partition's /dev minor — every valid
+                // entry gets a node, mounted fs or not, like udev.
+                let (tr, tdrv) = ext2::transport(d);
+                let tmajor = match tr {
+                    0 | 1 => 8,   // PIIX + AHCI are both sd
+                    2 => 254,     // vd
+                    _ => 259,     // nvme
+                };
+                user::dev_part_add(tmajor, tdrv, slot + 1, start, count);
                 if let Some(m) = ext2::mount(&io, base, size) {
                     let part = ext2::PartIo { dev: &io, base, size };
                     let mut n = 0u32;
