@@ -386,7 +386,7 @@ const NR_CREAT: u64 = 85;
 const NR_UNLINK: u64 = 87;
 const NR_UNLINKAT: u64 = 263;
 const NR_RENAMEAT: u64 = 264;
-const NR_RENAMEAT2: u64 = 276;
+const NR_RENAMEAT2: u64 = 316;
 const NR_CHMOD: u64 = 90;
 const NR_FCHMOD: u64 = 91;
 const NR_CHOWN: u64 = 92;
@@ -642,6 +642,12 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         227 => user::sys_clock_settime(a1, a2),
         221 => user::sys_fadvise64(a1, a2, a3, a4),
         203 => user::sys_sched_setaffinity(a1, a2, a3),
+        // small classics III: alt stack + robust-list peer read +
+        // wall clock write + inert fsync-all.
+        131 => user::sys_sigaltstack(a1, a2, ctx),
+        164 => user::sys_settimeofday(a1, a2),
+        274 => user::sys_get_robust_list(a1, a2, a3),
+        306 => user::sys_syncfs(a1),
 
         NR_FUTEX_WAKE => user::sys_futex_wake(a1, a2, a3, a4),
         NR_FUTEX_WAIT => user::sys_futex_wait(ctx, a1, a2, a3, a4, a5, a6),
@@ -1379,7 +1385,10 @@ fn sys_unlinkat(dirfd: u64, path: u64, flags: u64) -> u64 {
 /// renameat2(olddirfd, old, newdirfd, new, flags): each path
 /// canonicalizes against its own dirfd; nonzero flags EINVAL.
 fn sys_renameat2(odfd: u64, old: u64, ndfd: u64, new: u64, flags: u64) -> u64 {
-    if flags != 0 {
+    // RENAME_NOREPLACE(1) is honored; EXCHANGE/WHITEOUT need fs
+    // machinery that doesn't exist — honest EINVAL like Linux's
+    // unsupported-flag answer.
+    if flags & !1 != 0 {
         return EINVAL;
     }
     let mut oname = [0u8; 257];
@@ -1400,7 +1409,7 @@ fn sys_renameat2(odfd: u64, old: u64, ndfd: u64, new: u64, flags: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    user::fs_rename(&ob[..oc], &nb[..nc])
+    user::fs_rename(&ob[..oc], &nb[..nc], flags == 1)
 }
 
 /// truncate(path, len): getname then the shared VFile truncate.

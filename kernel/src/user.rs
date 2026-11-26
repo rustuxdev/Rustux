@@ -1030,6 +1030,12 @@ const CLD_CONTINUED: i32 = 6;
 /// sigaction sa_flags bits we honor.
 const SA_NODEFER: u32 = 0x4000_0000;
 const SA_RESETHAND: u32 = 0x8000_0000;
+const SA_ONSTACK: u32 = 0x0800_0000;
+/// sigaltstack ss_flags + minimum.
+const SS_ONSTACK: u64 = 1;
+const SS_DISABLE: u64 = 2;
+const SS_AUTODISARM: u64 = 0x8000_0000;
+const MINSIGSTKSZ: u64 = 2048;
 /// The si fields attached to a pending bit. Standard signals
 /// coalesce — a second pend while the bit is set drops its info
 /// like Linux's standard-signal merge, so one record per bit is
@@ -1196,8 +1202,35 @@ fn sig_record(t: &mut Task, sig: u64, fd: bool) -> [u8; 128] {
 const I386_SC_LEN: u64 = 88;
 const I386_SIGFRAME: u64 = 104;
 
-fn i386_sigframe_write(t: &mut Task, ctx: &UCtx, sig: u64, saved_mask: u32) -> Option<u64> {
-    let frame = (ctx.rsp.wrapping_sub(I386_SIGFRAME)) & !15;
+/// The signal-frame stack top for a delivery: SA_ONSTACK handlers
+/// with an enabled altstack switch to ss_sp+ss_size when the
+/// interrupted rsp isn't already inside it (Linux get_sigframe);
+/// AUTODISARM one-shots the stack like Linux's on_sig_stack reset.
+/// Otherwise the live rsp — the classic behavior.
+fn sig_frame_sp(t: &mut Task, rsp: u64, onstack: bool) -> u64 {
+    let alt_ok = t.sig_size > 0 && t.sig_sflags & SS_DISABLE == 0;
+    if onstack && alt_ok && rsp.wrapping_sub(t.sig_sp) >= t.sig_size {
+        let top = t.sig_sp + t.sig_size;
+        if t.sig_sflags & SS_AUTODISARM != 0 {
+            t.sig_sp = 0;
+            t.sig_size = 0;
+            t.sig_sflags |= SS_DISABLE;
+        }
+        top
+    } else {
+        rsp
+    }
+}
+
+fn i386_sigframe_write(
+    t: &mut Task,
+    ctx: &UCtx,
+    sig: u64,
+    saved_mask: u32,
+    onstack: bool,
+) -> Option<u64> {
+    let frame = ((sig_frame_sp(t, ctx.rsp, onstack).wrapping_sub(I386_SIGFRAME)) & !15)
+        .wrapping_sub(4);
     let mut b = [0u8; I386_SIGFRAME as usize];
     b[0..4].copy_from_slice(&(COMPAT_SIGTRAMP_VA as u32).to_le_bytes()); // pretcode
     b[4..8].copy_from_slice(&(sig as u32).to_le_bytes());
@@ -1404,7 +1437,13 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                         t.sigmask
                     };
                     t.frame_mask = u64::MAX;
-                    let Some(frame) = i386_sigframe_write(t, ctx, sig as u64, saved_mask) else {
+                    let Some(frame) = i386_sigframe_write(
+                        t,
+                        ctx,
+                        sig as u64,
+                        saved_mask,
+                        fl & SA_ONSTACK != 0,
+                    ) else {
                         t.state = TaskState::Exited;
                         t.exit_status = SIGSEGV as u64;
                         return;
@@ -1426,7 +1465,14 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                 // SIGTRAMP_VA's `mov $15; syscall` stub — so ret IS
                 // rt_sigreturn (the handler runs at rsp=frame; the
                 // stub sees the UCtx at rsp+8).
-                let frame = (ctx.rsp.wrapping_sub(SIGFRAME_SIZE)) & !15;
+                let onstack = {
+                    let st = sigt(t);
+                    st.flags.get(sig - 1).copied().unwrap_or(0) & SA_ONSTACK != 0
+                };
+                let frame = ((sig_frame_sp(t, ctx.rsp, onstack)
+                    .wrapping_sub(SIGFRAME_SIZE))
+                    & !15)
+                    .wrapping_sub(8);
                 let sig64 = sig as u64;
                 let i = sig - 1;
                 let (fl, hm) = {
@@ -2106,6 +2152,13 @@ pub struct Task {
     /// handler's sigreturn IS the suspend's return point), cleared
     /// by the frame push. u64::MAX when no override is set.
     frame_mask: u64,
+    /// sigaltstack(2): {ss_sp, ss_size, ss_flags} — SA_ONSTACK
+    /// handlers deliver onto [sp, sp+size) instead of the live rsp;
+    /// flags hold SS_DISABLE|SS_AUTODISARM.
+    sig_sp: u64,
+    sig_size: u64,
+    sig_sflags: u64,
+
     /// apic::TICKS deadline for a timed Poll wait — 0 means none.
     wait_deadline: u64,
     /// Pending signal bitmask — bit (sig-1), sigs 1..=31.
@@ -7827,6 +7880,9 @@ fn load(img: &[u8]) -> Option<Task> {
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        sig_sp: 0,
+        sig_size: 0,
+        sig_sflags: 0,
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
@@ -9292,6 +9348,128 @@ pub fn sys_sched_setaffinity(pid: u64, size: u64, mask: u64) -> u64 {
     }
     0
 }
+
+/// sigaltstack(ss, oss): set/read the alternate signal stack.
+/// stack_t = {u64 ss_sp; i32 ss_flags; u64 pad; u64 ss_size} = 24B.
+/// Enabling: flags restricted to {0,SS_DISABLE,SS_AUTODISARM},
+/// size >= MINSIGSTKSZ (ENOMEM short), can't enable while running
+/// on the stack (EPERM like Linux). Disabling clears the window.
+/// oss reports the current triple; SS_ONSTACK is computed from the
+/// live rsp like Linux's report path.
+pub fn sys_sigaltstack(ss: u64, oss: u64, ctx: &UCtx) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const ENOMEM_: u64 = (-12i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL };
+    if oss != 0 {
+        if !range_ok_w(oss, 24) {
+            return EFAULT;
+        }
+        let active = t.sig_size > 0 && t.sig_sflags & SS_DISABLE == 0;
+        let on = active && ctx.rsp.wrapping_sub(t.sig_sp) < t.sig_size;
+        let fl = if !active {
+            SS_DISABLE | (t.sig_sflags & SS_AUTODISARM)
+        } else if on {
+            SS_ONSTACK | (t.sig_sflags & SS_AUTODISARM)
+        } else {
+            t.sig_sflags & SS_AUTODISARM
+        };
+        // SAFETY: oss validated writable above.
+        unsafe {
+            (oss as *mut u64).write_unaligned(t.sig_sp);
+            (oss as *mut u64).add(1).write_unaligned(fl);
+            (oss as *mut u64).add(2).write_unaligned(t.sig_size);
+        }
+    }
+    if ss != 0 {
+        if !range_ok(ss, 24) {
+            return EFAULT;
+        }
+        // SAFETY: ss validated readable above.
+        let (sp, fl, sz) = unsafe {
+            (
+                (ss as *const u64).read_unaligned(),
+                (ss as *const u64).add(1).read_unaligned(),
+                (ss as *const u64).add(2).read_unaligned(),
+            )
+        };
+        if fl & !(SS_DISABLE | SS_AUTODISARM) != 0 {
+            return EINVAL;
+        }
+        let active = t.sig_size > 0 && t.sig_sflags & SS_DISABLE == 0;
+        if active && ctx.rsp.wrapping_sub(t.sig_sp) < t.sig_size {
+            return EPERM_; // no ss change while running on the stack
+        }
+        if fl & SS_DISABLE == 0 && sz < MINSIGSTKSZ {
+            return ENOMEM_;
+        }
+        t.sig_sp = sp;
+        t.sig_size = sz;
+        t.sig_sflags = fl;
+    }
+    0
+}
+
+/// settimeofday(tv, tz): wall-clock write via rtc::set_wall —
+/// the timezone arg is validated readable but ignored like every
+/// post-2.6 kernel that keeps tz only for ABI (glibc passes NULL).
+pub fn sys_settimeofday(tv: u64, tz: u64) -> u64 {
+    if tz != 0 && !range_ok(tz, 8) {
+        return EFAULT;
+    }
+    if tv == 0 {
+        // tv==NULL is the timezone-only form — accepted, inert.
+        return 0;
+    }
+    if !range_ok(tv, 16) {
+        return EFAULT;
+    }
+    // SAFETY: tv validated readable above.
+    let (sec, usec) = unsafe {
+        (
+            (tv as *const i64).read_unaligned(),
+            (tv as *const i64).add(1).read_unaligned(),
+        )
+    };
+    if sec < 0 || !(0..1_000_000).contains(&usec) {
+        return EINVAL;
+    }
+    crate::rtc::set_wall(sec as u64);
+    0
+}
+
+/// syncfs(fd): fd must resolve to a real file — one flat store
+/// means fsync-all has nothing outstanding to schedule; inert 0
+/// like fd_fsync. Non-file fds EINVAL like Linux's no-superblock
+/// answer.
+pub fn sys_syncfs(fd: u64) -> u64 {
+    let Some(t) = cur_mut() else { return EBADF };
+    match ofd(t, fd).map(|o| &o.kind) {
+        Some(FdKind::File(_)) | Some(FdKind::Ram(_)) => 0,
+        Some(_) => EINVAL,
+        None => EBADF,
+    }
+}
+
+/// get_robust_list(pid, head_ptr, len_ptr): peer read of the
+/// robust-futex list — the kernel records nothing (see
+/// sys_set_robust_list), so the honest answer is an empty list at
+/// NULL/0. pid==0 is self like Linux.
+pub fn sys_get_robust_list(pid: u64, head: u64, len: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if !range_ok_w(head, 8) || !range_ok_w(len, 8) {
+        return EFAULT;
+    }
+    if pid != 0 && task_slot_by_pid(pid).is_none() {
+        return ESRCH_;
+    }
+    // SAFETY: both pointers validated writable above.
+    unsafe {
+        (head as *mut u64).write_unaligned(0);
+        (len as *mut u64).write_unaligned(0);
+    }
+    0
+}
+
 
 /// munmap(addr, len): Linux never fails on an aligned range — holes
 /// and foreign areas are silent no-ops. Pages are freed, range
@@ -14986,6 +15164,9 @@ pub fn nt_thread_create(
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        sig_sp: 0,
+        sig_size: 0,
+        sig_sflags: 0,
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
@@ -20113,7 +20294,7 @@ pub fn fs_unlink(path: &[u8]) -> u64 {
 /// rename(old, new): VFile names only — the archive can't be renamed
 /// (EROFS). Renaming over a live VFile unlinks it; renaming over an
 /// archive name just shadows it (the VFile wins lookups anyway).
-pub fn fs_rename(old: &[u8], new: &[u8]) -> u64 {
+pub fn fs_rename(old: &[u8], new: &[u8], noreplace: bool) -> u64 {
     const EROFS_: u64 = (-30i64) as u64;
     const EINVAL_: u64 = (-22i64) as u64;
     const ENAMETOOLONG_: u64 = (-36i64) as u64;
@@ -20140,6 +20321,13 @@ pub fn fs_rename(old: &[u8], new: &[u8]) -> u64 {
         return ENAMETOOLONG_;
     }
     let new = &nb[..nc];
+    // RENAME_NOREPLACE: any existing target wins — file, dir,
+    // or an initrd object the rename can't remove anyway.
+    if noreplace
+        && (dir_exists(new) || is_file(new) || fs_lookup(new).is_some())
+    {
+        return (-17i64) as u64; // EEXIST
+    }
     // Directories move too — vdir_rename rewrites the subtree.
     if vdir_find(old).is_some() {
         return vdir_rename(old, new);
@@ -32167,6 +32355,9 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        sig_sp: 0,
+        sig_size: 0,
+        sig_sflags: 0,
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
@@ -32356,6 +32547,9 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        sig_sp: 0,
+        sig_size: 0,
+        sig_sflags: 0,
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
