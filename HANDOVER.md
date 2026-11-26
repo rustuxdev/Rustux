@@ -8079,3 +8079,24 @@ stale word=1 and CLEARTID could zero join_word before the SETTID
 check read it — word reset so the child blocks, woken after the
 check. seltest 36 checks green; exit 33, 96 tasks, zero leak.
 Audit run-65: 0 confirmed. Ledger at 300 CVEs.
+
+run-307 lands the SysV SHM API on the SHMSEGS machinery that
+MAP_SHARED-anon has used since the shared-memory work: shmget(29),
+shmat(30), shmctl(31), shmdt(67). Segments minted through shmget
+carry sysv:true and persist at refs==0 until IPC_RMID marks them —
+the id dies at mark (resolve EINVALs every verb), the frames die at
+the last VMA drop via shm_unref's (!sysv || rmid) gate, Linux's
+two-stage removal verbatim. shmids are (gen << 16) | slot with a
+per-slot generation bumped at mint, so a freed-then-reused slot
+refuses stale ids. shmat resolves the addr rules fully: addr==0
+first-fits, SHM_RND rounds down, SHM_REMAP zaps the window like
+MAP_FIXED, occupied-without-REMAP EINVALs, RDONLY drops the write
+bit and EXEC clears NX. Self-review caught a real UAF: the
+partial-map rollback unmapped pages before the VMA registered, so
+shm_owns freed segment frames still owned by a live seg — the VMA
+now registers first so rollback is shm-aware. shmtest proves real
+cross-process sharing (child attach sees parent's marker, parent
+sees child's writes), not just errno shapes. MAX_TASKS 96->112 —
+shmtest was the refused 97th spawn (pidfdtest hit 88 the same way).
+shmtest 30 checks green; exit 33, 97 tasks, zero leak. Audit
+run-66: 0 confirmed, 1 fixed in-run. Ledger at 305 CVEs.
