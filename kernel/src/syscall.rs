@@ -321,6 +321,8 @@ const NR_MLOCKALL: u64 = 151;
 const NR_MUNLOCKALL: u64 = 152;
 const NR_MLOCK2: u64 = 325;
 const NR_PROCESS_MADVISE: u64 = 440;
+const NR_CACHESTAT: u64 = 451;
+const NR_MSEAL: u64 = 462;
 const NR_RSEQ: u64 = 334;
 const NR_SENDFILE: u64 = 40;
 const NR_STAT: u64 = 4;
@@ -605,6 +607,8 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_MUNLOCKALL => 0, // no args — rdi is user garbage
         NR_MLOCK2 => user::sys_mlock2(a1, a2, a3),
         NR_PROCESS_MADVISE => user::fd_process_madvise(a1, a2, a3, a4, a5),
+        NR_CACHESTAT => user::sys_cachestat(a1, a2, a3),
+        NR_MSEAL => user::sys_mseal(a1, a2, a3),
         NR_CLONE => user::sys_clone(ctx, a1, a2, a3, a4, a5),
         NR_TGKILL => user::sys_tgkill(a1, a2, a3),
         NR_GETCWD => user::sys_getcwd(a1, a2),

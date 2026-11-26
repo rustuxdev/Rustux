@@ -7888,6 +7888,11 @@ const RNG_X: u8 = 4;
 /// AllocationProtect fidelity, so probes must exclude RNG_RES
 /// explicitly — RNG_R|RNG_W on it must NOT pass.
 const RNG_RES: u8 = 8;
+/// mseal'd — sealed ranges reject layout-mutating ops (munmap,
+/// mprotect, mremap, MAP_FIXED-over, madvise DONTNEED/FREE, brk
+/// shrink) with EPERM. The bit rides `ofl` through every split so
+/// sealing survives partial range ops.
+const RNG_SEAL: u8 = 16;
 
 /// Is `[va, va+len)` wholly inside a mapped user range? This is THE
 /// user-pointer gate for the syscall layer — checked arithmetic only.
@@ -8109,6 +8114,45 @@ fn range_committed(t: &Task, a: u64, b: u64) -> bool {
     true
 }
 
+/// Any sealed committed range overlapping [a,b)? The probe every
+/// layout-mutating syscall gates on — RES pieces can't be sealed.
+fn range_sealed(t: &Task, a: u64, b: u64) -> bool {
+    t.ranges[..t.nranges]
+        .iter()
+        .any(|&(lo, hi, fl)| lo < b && hi > a && fl & RNG_SEAL != 0)
+}
+
+/// OR RNG_SEAL into every committed range intersecting [a,b),
+/// splitting edges like range_protect. Callers pre-check capacity
+/// via protect_entry_count. RES pieces are left alone.
+fn range_seal(t: &mut Task, a: u64, b: u64) {
+    for i in 0..t.nranges {
+        let (lo, hi, ofl) = t.ranges[i];
+        if lo >= b || hi <= a || ofl & RNG_RES != 0 {
+            continue;
+        }
+        let nfl = ofl | RNG_SEAL;
+        if nfl == ofl {
+            continue;
+        }
+        if lo < a {
+            t.ranges[i] = (lo, a, ofl);
+            t.ranges[t.nranges] = (a, hi.min(b), nfl);
+            t.nranges += 1;
+            if hi > b {
+                t.ranges[t.nranges] = (b, hi, ofl);
+                t.nranges += 1;
+            }
+        } else {
+            t.ranges[i] = (lo, hi.min(b), nfl);
+            if hi > b {
+                t.ranges[t.nranges] = (b, hi, ofl);
+                t.nranges += 1;
+            }
+        }
+    }
+}
+
 /// Set access bits on the intersection of every range with [a,b).
 /// Precondition: range_covered passed and capacity was pre-checked.
 fn range_protect(t: &mut Task, a: u64, b: u64, fl: u8) {
@@ -8263,6 +8307,9 @@ pub fn sys_brk(addr: u64) -> u64 {
             range_add(t, t.brk_base, new_end, RNG_R | RNG_W);
         }
     } else if new_end < old_end {
+        if range_sealed(t, new_end, old_end) {
+            return t.brk_cur; // EPERM-ish: brk can't report — leave
+        }
         let mut v = new_end;
         while v < old_end {
             unmap_page(t, v);
@@ -8352,6 +8399,9 @@ pub fn sys_mmap(
             // Replace semantics: free the overlapped pages AND clip
             // their VMA entries — map_page would otherwise union-keep
             // the stale frames. Atomic: capacity checked up front.
+            if range_sealed(t, addr, addr + len) {
+                return (-1i64) as u64; // EPERM — mseal'd range
+            }
             if clip_entry_count(t, addr, addr + len) >= MAX_RANGES {
                 return ENOMEM;
             }
@@ -8484,6 +8534,9 @@ fn shm_mmap(t: &mut Task, addr: u64, len: u64, prot: u64, flags: u64) -> u64 {
             return if flags & MAP_FIXED != 0 { EINVAL } else { ENOMEM };
         }
         if flags & MAP_FIXED != 0 {
+            if range_sealed(t, addr, addr + len) {
+                return (-1i64) as u64; // EPERM — mseal'd range
+            }
             if clip_entry_count(t, addr, addr + len) >= MAX_RANGES {
                 return ENOMEM;
             }
@@ -8592,6 +8645,9 @@ pub fn sys_munmap(addr: u64, len: u64) -> u64 {
     if lo >= hi {
         return 0;
     }
+    if range_sealed(t, lo, hi) {
+        return (-1i64) as u64; // EPERM — mseal'd range
+    }
     if clip_entry_count(t, lo, hi) > MAX_RANGES {
         return (-12i64) as u64; // ENOMEM — atomic bail before touching
     }
@@ -8628,6 +8684,9 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
         || protect_entry_count(t, addr, hi) > MAX_RANGES
     {
         return ENOMEM;
+    }
+    if range_sealed(t, addr, hi) {
+        return (-1i64) as u64; // EPERM — mseal'd range
     }
     let leaf = prot_leaf(prot);
     let mut v = addr;
@@ -8687,6 +8746,9 @@ pub fn sys_mremap(
     {
         return EFAULT_;
     }
+    if range_sealed(t, old_addr, old_end) {
+        return (-1i64) as u64; // EPERM — mseal'd range
+    }
     // Same size without MAYMOVE is a trivial no-op.
     if new_len == old_len && flags & MAYMOVE == 0 {
         return old_addr;
@@ -8729,6 +8791,9 @@ pub fn sys_mremap(
             || (new_addr < old_end && dend > old_addr)
         {
             return EFAULT_;
+        }
+        if range_sealed(t, new_addr, dend) {
+            return (-1i64) as u64; // EPERM — mseal'd destination
         }
         // FIXED unmaps whatever the destination held.
         let mut v = new_addr;
@@ -8840,6 +8905,11 @@ pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
     if addr < ulo || hi > uhi || !range_committed(t, addr, hi) {
         return ENOMEM_;
     }
+    // Content-mutating advice EPERMs on a sealed range like Linux.
+    if matches!(advice, 4 | 8) && range_sealed(t, addr, hi) {
+        return (-1i64) as u64; // EPERM — mseal'd range
+    }
+
     if advice == 4 {
         // DONTNEED — zero each present page through its leaf.
         let mut v = addr;
@@ -8972,6 +9042,77 @@ pub fn sys_mlock2(addr: u64, len: u64, flags: u64) -> u64 {
 pub fn sys_mlockall(flags: u64) -> u64 {
     if flags & !7 != 0 {
         return EINVAL;
+    }
+    0
+}
+
+/// mseal(addr, len, flags): seal a fully-committed range against
+/// layout-mutating syscalls. flags must be 0; addr page-aligned;
+/// len rounds up like the other mm calls. Linux answers ENOENT
+/// (not ENOMEM) when the range isn't fully mapped. The seal bit
+/// rides `ofl` through splits so partial ops keep coverage.
+pub fn sys_mseal(addr: u64, len: u64, flags: u64) -> u64 {
+    const ENOENT_: u64 = (-2i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    let Some(t) = cur_mut() else { return EPERM_ };
+    if flags != 0 || addr & (PAGE - 1) != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = addr.checked_add(len) else {
+        return EINVAL;
+    };
+    let hi = end.saturating_add(PAGE - 1) & !(PAGE - 1);
+    let (ulo, uhi) = user_window(t);
+    if addr < ulo || hi > uhi || hi < addr {
+        return ENOENT_;
+    }
+    if !range_committed(t, addr, hi) {
+        return ENOENT_;
+    }
+    if protect_entry_count(t, addr, hi) > MAX_RANGES {
+        return (-12i64) as u64; // ENOMEM
+    }
+    range_seal(t, addr, hi);
+    0
+}
+
+/// cachestat(fd, crange, cstat): page-cache residency report for a
+/// file range — {off,len} in, five counters out. Every byte of a
+/// VFile is RAM-resident (no eviction), so nr_cache is just the
+/// size-clamped page count; dirty/writeback/evicted stay 0.
+/// Non-regular fds EBADF like Linux.
+pub fn sys_cachestat(fd: u64, crange: u64, cstat: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    if !range_ok(crange, 16) || !range_ok(cstat, 40) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let size = match &o.kind {
+        FdKind::File(d) => d.len() as u64,
+        FdKind::Ram(i) => match vfile(*i) {
+            Some(v) => v.len as u64,
+            None => return EBADF,
+        },
+        _ => return EBADF,
+    };
+    // SAFETY: both user blocks validated above.
+    let (off, len) = unsafe {
+        (
+            (crange as *const u64).read_unaligned(),
+            ((crange + 8) as *const u64).read_unaligned(),
+        )
+    };
+    let have = size.saturating_sub(off).min(len);
+    let nr_cache = have.div_ceil(PAGE);
+    unsafe {
+        for i in 0..5 {
+            ((cstat + i * 8) as *mut u64)
+                .write_unaligned(if i == 0 { nr_cache } else { 0 });
+        }
     }
     0
 }
