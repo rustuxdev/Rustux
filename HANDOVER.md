@@ -8481,3 +8481,22 @@ Q_SYNC no-op, queries ESRCH. Divergences: sb_dev is 0:0 (no
 block devices exist); mnt_id==mnt_id_old (no 64->32 aliasing
 since ids mint small); parent_id recomputes live so a reparent
 shows the current coverer, not the mount-time one.
+
+run-327 lands the detached-mount API: open_tree(428)/fspick(433)
+mint mount fds via a new FdKind::Mount carrying the minted mount
+id (resolved to a MOUNTS slot at use — a closed+reused slot can
+never alias a stale fd). open_tree CLONE mints a private detached
+copy; move_mount(429) attaches or moves (F_EMPTY_PATH from an fd
+or an exact mount-point path; occupied/root-move EBUSY, under-
+self EINVAL, SET_GROUP/BENEATH EINVAL); mount_setattr(442) flips
+MS_* flags via the mount_attr struct (set&clr-overlap EINVAL,
+single propagation bit, IDMAP EINVAL — no userns, AT_RECURSIVE
+walks nested attached mounts). Detached mounts die at last fd
+close; fspick is unprivileged like Linux (reference fd only),
+the other three are uid==0. Divergences: CLONE copies the whole
+covering mount (no subtree slicing — mnt_root stays "/"); moving
+a mount doesn't migrate coverage history; propagation stored for
+statmount reporting but no group mechanics. mnttest extended in
+place (no new task, no MAX_TASKS bump). Audit run-86:
+0 confirmed — detached-dissolution/idmap/propagation CVE classes
+all absent by construction; stale-fd alias killed by id-not-slot.
