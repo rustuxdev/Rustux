@@ -7961,3 +7961,15 @@ flags/fd/live/reaped/shared-mm like Linux, then releases a zombie's mm
 early — pml4 user-half cleared so reap's re-walk can't double-free.
 Audit run-57: 0 confirmed, 1 fixed in-run. oa2test 38 checks green;
 exit 33, 88 tasks, zero leak. Ledger at 263 CVEs.
+## run-299 — futex_waitv (449) + fchmodat2 (452)
+
+futex_waitv lands the futex2 multi-wait: up to 128 waiters compared
+up front (EAGAIN/EFAULT), WaitOn::FutexV parks the task's array VA,
+and futex_wake resolves the hit index under the sleeper's pml4 —
+returned in rax like Linux. Absolute timeouts ride MONOTONIC ticks
+or wall_now for REALTIME. fchmodat2 gates NOFOLLOW (chmod the link
+inode — lstat now reports its stored mode like Linux, born 0777) and
+EMPTY_PATH (fchmod-on-dirfd). Audit run-58: 0 confirmed, 1 fixed
+in-run; all futex CVE classes are robust/PI/privhash machinery we
+don't implement. fxvtest 30 checks green; exit 33, 89 tasks, zero
+leak. Ledger at 271 CVEs.
