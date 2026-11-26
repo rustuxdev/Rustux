@@ -8188,3 +8188,23 @@ through glibc syscall() is correct ABI — pass -1L). Audit
 run-70: 0 confirmed — Dirty Pipe (CVE-2022-0847) is n/a by
 construction since rings own private frames and never alias
 page-cache memory.
+run-312 lands the sched/IO-policy gate pack — fourteen small
+syscalls that validate like Linux and return the honest ABI
+answer over an inert single-policy core. The sched block:
+set/getparam (param pointer gated, nonzero priority EINVALs
+since OTHER requires 0), setscheduler (policy must be OTHER —
+FIFO/RR EINVAL honestly rather than silently degrade),
+getscheduler -> OTHER, priority bounds FIFO/RR->[1,99] else 0,
+rr_get_interval writes {0,0} (no quantum exists). ioprio gates
+the packed class<<13|data encoding and reports the BE|4
+default; readahead is EBADF-or-0 (no cache to warm); tkill
+routes to kill(). The NUMA trio validates mode<=4 and the
+get_mempolicy flag lattice (ADDR needs NODE, MEMS_ALLOWED
+stands alone) before reporting MPOL_DEFAULT + empty nodemask.
+schtest exercises every errno ladder; lstest floor 74->75, 102
+tasks. Infrastructure: the ESP image went 96->128MiB —
+kernel.efi (21MB) + initrd (80MB) silently crossed FAT capacity
+this rung (mcopy "Disk full"). Two test-side catches: a vacuous
+check (== binds tighter than |) and a flags=3-vs-2 confusion on
+the NUMA combo probe — both gcc-visible, both fixed. Audit
+run-71: 0 confirmed.
