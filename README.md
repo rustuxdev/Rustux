@@ -1,10 +1,6 @@
 # Rustux
 
 <p align="center">
-  <img src="docs/logo.png" alt="Rustux logo" width="220">
-</p>
-
-<p align="center">
   <a href="https://youtu.be/2G_8bwKKcFk">
     <img src="https://img.youtube.com/vi/2G_8bwKKcFk/maxresdefault.jpg" width="880"
       alt="Rustux in 52 seconds — watch on YouTube">
