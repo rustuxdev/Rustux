@@ -8036,3 +8036,20 @@ documented creds collapse (CVE-2010-2071/ksmbd classes out of scope).
 xattest 50 checks green; exit 33, 94 tasks, zero leak. Audit run-63:
 0 confirmed, 1 hygiene fix (borrow order in fs_setxattr). Ledger at
 298 CVEs.
+
+run-305 stacks the xattrat family (463-466) on run-304's table:
+four thin wrappers — dfd-relative resolution with the
+AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH mask (everything else EINVAL),
+AT_EMPTY_PATH routing a NULL-or-empty path to the dirfd's own
+file, and struct xattr_args packed tails parsed with real
+copy_struct_from_user discipline (usize<16 EINVAL, >page E2BIG,
+nonzero tail E2BIG). NOFOLLOW reuses the l* link-inode semantics;
+every tail delegates to run-304's fs_* helpers — no duplicated
+logic. memfd_secret (447) rides in as a fourth client of the
+extracted memfd_mint_ofd: flags==0 only, born unlinked+sealed
+(F_ADD_SEALS refused — secretmem has no sealing machinery);
+"secret" is documentary since our RAM fs never aliases file bytes
+into kernel maps anyway. Both memfd_secret CVE classes confirmed
+absent (direct-map n/a; MAP_SHARED EINVALs so no truncate-alias
+panic). xat2test 30 checks green; exit 33, 95 tasks, zero leak.
+Audit run-64: 0 confirmed. Ledger at 299 CVEs.

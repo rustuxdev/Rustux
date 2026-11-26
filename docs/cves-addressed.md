@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**298 unique CVEs recorded.**
+**299 unique CVEs recorded.**
 
 ## klib ports
 
@@ -169,6 +169,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-48864 | virtio-net-ctrlq rung: handshake_modern generalised to handshake_modern_feat(common, acce… | audit run-39 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2022-48864 — n/a. Verified: make run exit 33, 78 tasks, frames equal; virtio: net ctrlq promisc… |
 | CVE-2022-49014 | tun/tap rung (/dev/net/tun packet fds): char 10:200 open mints FdKind::Tun(i) over TUNS[4… | resource-leak class (fixed in-run: tun_alloc inside kind but 3 later bail paths — ENOTDIR/OFD-EMFILE/fd-EMFILE — now release the slot; 4 failures would have exhausted TUNS); detac… |
 | CVE-2022-49014 | tun/tap rung (/dev/net/tun packet fds): char 10:200 open mints FdKind::Tun(i) over TUNS[4… | resource-leak class (fixed in-run: tun_alloc inside kind but 3 later bail paths — ENOTDIR/OFD-EMFILE/fd-EMFILE — now release the slot; 4 failures would have exhausted TUNS); detac… |
+| CVE-2022-49049 | xattrat+memfd_secret rung (463-466/447): xattrat = dfd-relative xattr with AT_SYMLINK_NOF… | secretmem classes (CVE-2024-50182 direct-map no-op — n/a, no exclusion machinery, unlinked fd is the only reachability; CVE-2022-49049 ftruncate-grow panic — n/a, MAP_SHARED EINVA… |
+| CVE-2022-49049 | xattrat+memfd_secret rung (463-466/447): xattrat = dfd-relative xattr with AT_SYMLINK_NOF… | secretmem classes (CVE-2024-50182 direct-map no-op — n/a, no exclusion machinery, unlinked fd is the only reachability; CVE-2022-49049 ftruncate-grow panic — n/a, MAP_SHARED EINVA… |
 | CVE-2022-49073 | install prompt/eject + read-cap split + ATA recovery: demomenu verifies, ATAPI-ejects /de… | audit run-113 manual scoped + cve.now over HTTP JSON-RPC (entities.search — analogs above; no mapped sr/cdrom-ioctl CVE): verified every fd_read arm bounds n by source availabilit… |
 | CVE-2022-49077 | mremap+madvise+mincore rung (25/28/27): sys_mremap — MAYMOVE/FIXED EINVAL ladder, uncommi… | audit run-59 scoped quick (security-audit skill): 0 confirmed, 5 fixed in-run; cve-now checked: CVE-2023-52646, CVE-2026-99703, CVE-2022-49077, CVE-2026-99652, CVE-2025-21696, CVE… |
 | CVE-2022-49077 | mremap+madvise+mincore rung (25/28/27): sys_mremap — MAYMOVE/FIXED EINVAL ladder, uncommi… | audit run-59 scoped quick (security-audit skill): 0 confirmed, 5 fixed in-run; cve-now checked: CVE-2023-52646, CVE-2026-99703, CVE-2022-49077, CVE-2026-99652, CVE-2025-21696, CVE… |
@@ -260,6 +262,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2024-50066 | process_madvise+mlock rung (440/149-152/325): fd_process_madvise — flags/advice outside {… | audit run-61 scoped quick (security-audit skill): 0 confirmed, 1 fixed in-run; cve-now checked: CVE-2017-18221, CVE-2026-89757, CVE-2018-1000200, CVE-2024-50066, CVE-2025-38195 —… |
 | CVE-2024-50066 | writable file layer: VFile/Ram OFDs (O_CREAT/O_EXCL/O_TRUNC/O_APPEND), write/read/pread/l… | self-review catches FIXED pre-commit: write(fd,buf,0) at pos>len allocated+extended the file (now early-0 like Linux); fd_pread on an empty VFile took null.add(0) (now n==0 early… |
 | CVE-2024-50182 | memfd rung (anon files + sealing): memfd_create NR 319 mints an O_RDWR Ram-backed VFile b… | kernel/src/user.rs (VFile fields + mint + fcntl arms + 3 write gates + link suffix), kernel/src/syscall.rs (NR 319), kernel/user/memfdtest.c, Makefile |
+| CVE-2024-50182 | xattrat+memfd_secret rung (463-466/447): xattrat = dfd-relative xattr with AT_SYMLINK_NOF… | secretmem classes (CVE-2024-50182 direct-map no-op — n/a, no exclusion machinery, unlinked fd is the only reachability; CVE-2022-49049 ftruncate-grow panic — n/a, MAP_SHARED EINVA… |
+| CVE-2024-50182 | xattrat+memfd_secret rung (463-466/447): xattrat = dfd-relative xattr with AT_SYMLINK_NOF… | secretmem classes (CVE-2024-50182 direct-map no-op — n/a, no exclusion machinery, unlinked fd is the only reachability; CVE-2022-49049 ftruncate-grow panic — n/a, MAP_SHARED EINVA… |
 | CVE-2024-51566 | NVMe write rung: nvme.rs gains write_range — OP_WRITE (0x01) NVM command mirroring the au… | audit run-28 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6536/6535/6356, CVE-2024-51566/51562, CVE-2024-45013, CVE-2025-68756, CVE-2023-6238 — n/a… |
 | CVE-2024-51566 | NVMe write rung: nvme.rs gains write_range — OP_WRITE (0x01) NVM command mirroring the au… | audit run-28 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6536/6535/6356, CVE-2024-51566/51562, CVE-2024-45013, CVE-2025-68756, CVE-2023-6238 — n/a… |
 | CVE-2024-53140 | netlink rung (NETLINK_ROUTE): socket(AF_NETLINK=16, SOCK_RAW | user-oob-write class (fixed in-run: getsockname wrote 8B into a 4B socklen_t* — kernel->user stack overwrite); portid-stamp class (fixed in-run: reply nlmsg_pid = destination pid,… |
