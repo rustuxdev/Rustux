@@ -7862,3 +7862,46 @@ pwrite/ftruncate, dup+fork+SCM_RIGHTS shared-seal proofs,
 MAP_PRIVATE on a fully sealed file. Exit 33, 85 tasks, zero leak.
 
 Audit run-54: 0 confirmed. Ledger at 255 CVEs.
+
+## run-296 — pidfd family (open 434 / send_signal 424 / getfd 438)
+
+`FdKind::Pidfd(pid)` — an anon-fd process handle. next_pid() is
+monotone so a stored pid can never alias a recycled task: the
+whole pid-reuse pinning problem Linux solves with struct pid is
+structurally absent. open gates flags!=0 / pid<=0 EINVAL (pid
+read as i32 — rdi upper bits are user garbage, pid_t is 32-bit),
+missing pid ESRCH. send_signal EINVALs flags!=0 or info!=0
+(Linux requires info==NULL), EBADFs non-pidfd fds, ESRCHs dead
+targets, then rides kill()/pend_one — sig 0 is the liveness
+probe. getfd EINVALs flags, EBADFs targetfd >= MAX_FDS or an
+empty slot, ESRCHs dead targets; it clones the target's OFD —
+refs+=1, rolled back on EMFILE, never CLOEXEC — the same shared-
+object semantics SCM_RIGHTS delivers (seals/position/socket
+state ride along). Documented divergence: no ptrace_may_access
+gate — no creds model exists and kill() is just as open.
+poll POLLIN iff the target is dead; wake_pollers() in
+exit_bookkeeping fires blocked pollers when a task dies
+(proof: poll(-1) wakes on child exit). No io surface:
+read/write EINVAL, lseek ESPIPE, anon-inode stat,
+"anon_inode:[pidfd]" link.
+
+Two in-run fixes, one subtle. (1) The suite task cap turned out
+to be OFD-bound not task-bound (85 tasks x 3 std streams = 255
+vs MAX_OFDS 256) — but raising MAX_OFDS to 512 exposed the real
+bug: FdTab.fds stored Option<u8>, so OFD index >=256 truncated
+and aliased OFD 0. pidfdtest (86th spawn) got bogus std
+streams: writes vanished, syscall answers came from the wrong
+OFD, the pause() child never died — a silent cross-fd confusion
+worse than the ENFILE it was hiding. Widened FdTab.fds,
+EpollEnt.ofd and ofd_revents' param to u16; MAX_TASKS 96
+alongside. (2) My syscall constants were off — send_signal is
+424 (435 is clone3) and getfd is 438 (436 is close_range);
+verified against asm/unistd_64.h. Every pfd_sig/pfd_getfd call
+had been hitting ENOSYS.
+
+Proof: pidfdtest 0 failures — all gates, SIGTERM kill + waitpid
+reap, dead POLLIN/ESRCH, blocked-poll wake on exit, and the
+getfd fd-clone proof via a child writing through a pipe the
+parent pulled out of its table. Exit 33, 86 tasks, zero leak.
+
+Audit run-55: 0 confirmed, 2 fixed in-run. Ledger at 258 CVEs.

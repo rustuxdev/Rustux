@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**255 unique CVEs recorded.**
+**258 unique CVEs recorded.**
 
 ## klib ports
 
@@ -370,6 +370,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-89560 | char devices + real /dev: VFile.fmt/rdev + FdKind::Dev + mknod/mknodat + dev_init boot no… | 89560 n/a (no overlayfs/LSM; no-CAP_MKNOD = standing no-cred-model divergence). audit caught+fixed: open() admitted all major-1/5 minors and fd_read's catch-all routed unhandled r… |
 | CVE-2026-89595 | inotify: init/init1/add_watch/rm_watch + path-keyed watch table, dir vs self event routin… | 1479 n/a (Rust, single commit point); 46040 defensive pattern followed (slot rollback on anon_fd failure, single-assignment watch commit); 54119/89595 n/a by construction (single-… |
 | CVE-2026-89596 | `pci` | **n/a to mechanism** — our CF8/CFC access has no save/restore arrays; reminder: all config ops must stay IRQ-safe (they are — port I/O only) |
+| CVE-2026-89766 | pidfd rung (process-handle fds): pidfd_open NR 434 -> FdKind::Pidfd(pid) anon-fd (next_pi… | fd-confusion class (fixed in-run: Option<u8> OFD index would truncate >=256 -> aliased OFD 0 — every task past the cap got bogus std streams; u16 widen); abi-number class (fixed i… |
+| CVE-2026-89766 | pidfd rung (process-handle fds): pidfd_open NR 434 -> FdKind::Pidfd(pid) anon-fd (next_pi… | fd-confusion class (fixed in-run: Option<u8> OFD index would truncate >=256 -> aliased OFD 0 — every task past the cap got bogus std streams; u16 widen); abi-number class (fixed i… |
 | CVE-2026-89852 | statx(2) syscall NR 332: sys_statx (flags EINVAL on unknown AT_* bits incl AT_SYMLINK_FOL… | audit run-101 quick scoped: 1 confirmed LOW finding fixed in-diff — AT_SYMLINK_FOLLOW (0x400) EINVAL'd though Linux accepts it (== default follow semantics); added to KNOWN mask +… |
 | CVE-2026-89971 | multi-namespace NVMe rung: identify-ctrl NN now .min(MAXNS=4) clamps a per-ns identify lo… | audit run-33 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-89971, CVE-2026-98726, CVE-2026-98727 — handled or n/a. Verified: make run exit 33, 76 tas… |
 | CVE-2026-89971 | multi-namespace NVMe rung: identify-ctrl NN now .min(MAXNS=4) clamps a per-ns identify lo… | audit run-33 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-89971, CVE-2026-98726, CVE-2026-98727 — handled or n/a. Verified: make run exit 33, 76 tas… |
@@ -390,6 +392,9 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-98814 | nvme-passthrough rung (nvme-cli ABI): /dev/nvme0 controller char node (major 243, minted… | audit run-45 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-99596, CVE-2026-98814 — n/a. Verified: make run exit 33, 80 tasks, frames equal; nvmtest 2… |
 | CVE-2026-98839 | tty stdin: IRQ1->scancode ring->line discipline->read(0)/poll(0)/FIONREAD, WaitOn::Stdin,… | bounded queues throughout: 256B canonical edit buffer + 4KiB ready queue, drop-on-full = Linux input discard; feed runs from the timer tick (printk is irq_save-safe, kill marks pe… |
 | CVE-2026-98866 | CLONE_VM threads: shared address space via MM_REFS (pml4,users) ledger, exec_mmap-style d… | SELF-REVIEW CAUGHT two refcount-safety bugs pre-commit: mm_share silently dropped the ref when the (provably-unreachable) table was full — a shared pml4 would have freed under a l… |
+| CVE-2026-98989 | pidfd rung (process-handle fds): pidfd_open NR 434 -> FdKind::Pidfd(pid) anon-fd (next_pi… | fd-confusion class (fixed in-run: Option<u8> OFD index would truncate >=256 -> aliased OFD 0 — every task past the cap got bogus std streams; u16 widen); abi-number class (fixed i… |
+| CVE-2026-98992 | pidfd rung (process-handle fds): pidfd_open NR 434 -> FdKind::Pidfd(pid) anon-fd (next_pi… | fd-confusion class (fixed in-run: Option<u8> OFD index would truncate >=256 -> aliased OFD 0 — every task past the cap got bogus std streams; u16 widen); abi-number class (fixed i… |
+| CVE-2026-98992 | pidfd rung (process-handle fds): pidfd_open NR 434 -> FdKind::Pidfd(pid) anon-fd (next_pi… | fd-confusion class (fixed in-run: Option<u8> OFD index would truncate >=256 -> aliased OFD 0 — every task past the cap got bogus std streams; u16 widen); abi-number class (fixed i… |
 | CVE-2026-99088 | ipv6/ndp/icmpv6 | no direct CVEs; frag-header CVEs reinforce the no-extension-headers/no-fragments design; hop==255 + solicited-dst + target==us enforced; pseudo-header csum validated (neg-zero res… |
 | CVE-2026-99116 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
 | CVE-2026-99201 | netlink rung (NETLINK_ROUTE): socket(AF_NETLINK=16, SOCK_RAW | user-oob-write class (fixed in-run: getsockname wrote 8B into a 4B socklen_t* — kernel->user stack overwrite); portid-stamp class (fixed in-run: reply nlmsg_pid = destination pid,… |
