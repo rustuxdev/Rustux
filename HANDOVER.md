@@ -8466,3 +8466,18 @@ lstest floor 87->88, MAX_TASKS 114->115. Audit run-84: 0
 confirmed — CAP gate EPERM-proven, EROFS coverage test-proven
 on 14 mutation paths, the umount-UAF class is absent (statics,
 no superblock lifetimes).
+
+run-326 lands the mount-table consumers: statmount(457) fills
+the 512B fixed struct + string tail off MOUNTS (only requested
+mask groups get strings, str-relative offsets, EOVERFLOW writes
+back the needed size; parent_id is computed on demand as the
+mount covering the point's parent dir so an unmounted parent
+can't leave a dangling id — root's parent is itself, all
+propagation fields 0/private). listmount(458) enumerates
+children of a mount with last-id pagination (LSMT_ROOT ->
+root's children). quotactl(179) is the honest quota-less
+surface: type>2/unknown subop EINVAL, bad special ENOENT,
+Q_SYNC no-op, queries ESRCH. Divergences: sb_dev is 0:0 (no
+block devices exist); mnt_id==mnt_id_old (no 64->32 aliasing
+since ids mint small); parent_id recomputes live so a reparent
+shows the current coverer, not the mount-time one.
