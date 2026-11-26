@@ -9733,6 +9733,105 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             0
         }
+        0x41B5 | 0x41B7 => {
+            // NVME_IOCTL_ADMIN_CMD / NVME_IOCTL_IO_CMD — the
+            // passthrough ABI nvme-cli uses. Valid on /dev/nvme0
+            // (char 243) and whole-disk nvme block nodes; partition
+            // nodes are ENOTTY (same escape class as SG_IO) and a
+            // writable fd stands in for CAP_SYS_ADMIN. The 72-byte
+            // nvme_passthru_cmd is parsed by field offset; result
+            // fields write back in place and the return value is the
+            // NVMe status field (0 = success), matching Linux.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            let Some(v) = vfile(*i) else { return ENOTTY_ };
+            let (ctrl, bns) = match v.rdev >> 8 {
+                243 => (true, None),
+                259 if v.fmt == 0o60000 && v.rdev & 0xf == 0 => {
+                    (false, Some((v.rdev as usize >> 4) & 0xf))
+                }
+                _ => return ENOTTY_,
+            };
+            if crate::nvme::disks() == 0 {
+                return (-6i64) as u64; // ENXIO
+            }
+            if req == 0x41B7 && ctrl {
+                return ENOTTY_; // IO commands need a namespace node
+            }
+            if let Some(d) = bns {
+                if d >= crate::nvme::disks() as usize {
+                    return (-6i64) as u64; // ENXIO
+                }
+            }
+            if o.accmode == 0 {
+                // No CAP_SYS_ADMIN model: the writable-fd gate is
+                // the honest analog — pass-through can't come
+                // through a read-only open.
+                return (-13i64) as u64; // EACCES
+            }
+            if !range_ok_w(arg, 72) {
+                return EFAULT;
+            }
+            // SAFETY: validated 72-byte user window under cur cr3;
+            // all field reads/writes stay inside it.
+            unsafe {
+                let p = arg as *const u8;
+                let metadata = (p.add(16) as *const u64).read();
+                let addr = (p.add(24) as *const u64).read();
+                let mlen = (p.add(32) as *const u32).read();
+                let dlen = (p.add(36) as *const u32).read() as usize;
+                if metadata != 0 || mlen != 0 {
+                    // No metadata path — Linux splits it into its
+                    // own buffer we don't implement.
+                    return EINVAL;
+                }
+                if dlen > 4096 {
+                    // Staging bound — SCRATCH/DATA are one page.
+                    return EINVAL;
+                }
+                if dlen > 0 && !range_ok_w(addr, dlen as u64) {
+                    return EFAULT;
+                }
+                let mut ent = [0u8; 64];
+                ent[0] = p.add(0).read();                      // opcode
+                ent[1] = p.add(1).read();                      // flags
+                // ent[4..8] nsid — set below (block nodes force it)
+                if ctrl {
+                    let nsid = (p.add(4) as *const u32).read();
+                    if nsid > 0xffff_fffc {
+                        return EINVAL;
+                    }
+                    ent[4..8].copy_from_slice(&nsid.to_le_bytes());
+                }
+                ent[8..16].copy_from_slice(core::slice::from_raw_parts(
+                    p.add(8), 8));                             // cdw2+3
+                ent[40..64].copy_from_slice(core::slice::from_raw_parts(
+                    p.add(40), 24));                           // cdw10-15
+                let din = if dlen > 0 {
+                    core::slice::from_raw_parts(addr as *const u8, dlen)
+                } else {
+                    &[]
+                };
+                let sf = if req == 0x41B5 {
+                    crate::nvme::admin_passthrough(&mut ent, din)
+                } else {
+                    let d = bns.unwrap_or(0);
+                    crate::nvme::io_passthrough(
+                        &mut ent, (d + 1) as u32, din)
+                };
+                if dlen > 0 {
+                    let mut tmp = [0u8; 4096];
+                    if req == 0x41B5 {
+                        crate::nvme::scratch_read(dlen, &mut tmp);
+                    } else {
+                        crate::nvme::data_read(dlen, &mut tmp);
+                    }
+                    core::ptr::copy_nonoverlapping(
+                        tmp.as_ptr(), addr as *mut u8, dlen);
+                }
+                (p as *mut u8).add(68).cast::<u32>().write(0); // result
+                sf as u64
+            }
+        }
         0x5309 => {
             // CDROMEJECT — the ATAPI START STOP UNIT packet on the
             // secondary-channel CD drive. The fd must be an sr
@@ -15855,6 +15954,18 @@ pub fn dev_init() {
             }
         }
     }
+    // /dev/nvme0 — the NVMe controller char node (major 243) for
+    // NVME_IOCTL_ADMIN_CMD/IO_CMD pass-through, minted on probe.
+    if crate::nvme::disks() > 0 {
+        let r = vfile_create(b"dev/nvme0");
+        if (r as i64) >= 0 {
+            if let Some(v) = vfile(r as usize) {
+                vfile_stamp(v, 0o660, 0);
+                v.fmt = 0o20000; // S_IFCHR
+                v.rdev = 243 << 8;
+            }
+        }
+    }
     // /dev/sda — the node only exists when the ATA probe found a
     // disk, matching udev behavior (no hardware, no node). /dev/sr0
     // is always minted: the CDROM* ioctls probe the secondary
@@ -17099,6 +17210,9 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                         // crafted node past the probed disks.
                         21 if (v.rdev & 0xff) < crate::virtio::scsi_disks() => i,
                         21 => return ENXIO,
+                        // /dev/nvme0 — the controller char node.
+                        243 if crate::nvme::disks() > 0 => i,
+                        243 => return ENXIO,
                         // input core — evdev event nodes.
                         13 => i,
                         _ => return ENODEV,

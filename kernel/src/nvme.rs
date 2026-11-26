@@ -484,6 +484,79 @@ fn ioq() -> Option<&'static mut NvmeQ> {
     unsafe { (*core::ptr::addr_of_mut!(IOQ)).as_mut() }
 }
 
+/// Pass one user-built 64-byte command entry through the admin
+/// queue, with `stage` as the data buffer: the caller's bytes are
+/// copied in first (covers write-direction commands; for reads the
+/// device simply overwrites), PRP1 is pointed at `stage`, and the
+/// completion status field comes back — 0 is success. `stage` is
+/// SCRATCH/DATA, both 4KiB.
+fn passthrough(q: Option<&'static mut NvmeQ>, qid: u16, stage: u64, ent: &mut [u8; 64], din: &[u8]) -> u32 {
+    let Some(q) = q else { return 0x7ff };
+    if stage == 0 || din.len() > 4096 {
+        return 0x7ff;
+    }
+    // SAFETY: stage is our own DMA buffer for the driver's life;
+    // din len validated <= 4KiB.
+    unsafe {
+        if !din.is_empty() {
+            core::ptr::copy_nonoverlapping(
+                din.as_ptr(),
+                mm::pmap(stage) as *mut u8,
+                din.len(),
+            );
+        }
+        ent[24..32].copy_from_slice(&stage.to_le_bytes());
+    }
+    let dstrd = DSTRD.load(Ordering::Relaxed);
+    if q.submit(qid, dstrd, ent) {
+        0
+    } else {
+        LAST_SF.load(Ordering::Relaxed)
+    }
+}
+
+/// Admin-queue pass-through (NVME_IOCTL_ADMIN_CMD): entry through
+/// the admin queue, data through the 4KiB SCRATCH block.
+pub fn admin_passthrough(ent: &mut [u8; 64], din: &[u8]) -> u32 {
+    passthrough(admin(), 0, SCRATCH.load(Ordering::Relaxed), ent, din)
+}
+
+/// I/O-queue pass-through (NVME_IOCTL_IO_CMD): entry through the
+/// I/O queue, data through the 4KiB DATA staging block. `nsid` is
+/// forced into the entry — a block node's namespace can't be
+/// overridden by the caller.
+pub fn io_passthrough(ent: &mut [u8; 64], nsid: u32, din: &[u8]) -> u32 {
+    ent[4..8].copy_from_slice(&nsid.to_le_bytes());
+    passthrough(ioq(), 1, DATA.load(Ordering::Relaxed), ent, din)
+}
+
+/// Copy `len` bytes back out of the admin staging block — the
+/// data the last admin_passthrough returned.
+pub fn scratch_read(len: usize, buf: &mut [u8]) {
+    let n = len.min(buf.len()).min(4096);
+    // SAFETY: n bounded by both sides; SCRATCH is our own block.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            mm::pmap(SCRATCH.load(Ordering::Relaxed)) as *const u8,
+            buf.as_mut_ptr(),
+            n,
+        )
+    };
+}
+
+/// Copy `len` bytes back out of the I/O staging block.
+pub fn data_read(len: usize, buf: &mut [u8]) {
+    let n = len.min(buf.len()).min(4096);
+    // SAFETY: n bounded by both sides; DATA is our own block.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            mm::pmap(DATA.load(Ordering::Relaxed)) as *const u8,
+            buf.as_mut_ptr(),
+            n,
+        )
+    };
+}
+
 /// Bound disk count.
 pub fn disks() -> u32 {
     NDISKS.load(Ordering::Acquire)
