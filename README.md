@@ -16,6 +16,17 @@ behavior is recorded to `cases.jsonl`, the Rust port must match every recorded
 case (`diff`) and pass `gate` before it is adopted.
 
 <p align="center">
+  <video src="docs/assets/rustux.mp4" controls muted loop autoplay playsinline
+    title="Rustux in 52 seconds — boot, the record/port/diff/gate method, real userspace, a self-installing Debian disk, DOOM, the NT personality, the driver/IPC shelf, IPv8"></video>
+</p>
+
+*Fifty-two seconds of Rustux: OVMF boot footage, the
+record→port→diff→gate method, real bash/BusyBox/apt, the
+self-installing ext2 disk with `apt install -y nginx` at exit 0,
+DOOM on `/dev/fb0`, the native NT `.exe` personality, the
+Nov 26 driver + IPC shelf, and IPv8 on the wire.*
+
+<p align="center">
   <img src="docs/assets/rustux-boot.gif" alt="Rustux booting under OVMF/QEMU — GOP framebuffer console: memory map, APIC, PCI, e1000 DHCP, then the 61-task userspace suite including a real static BusyBox, GNU bash, and native PE .exe tasks">
 </p>
 
