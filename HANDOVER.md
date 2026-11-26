@@ -8290,3 +8290,24 @@ sigev_notify -> OOB disclosure) is gated EINVAL; all 20
 posix-cpu-timers family CVEs are n/a — no cpu-timer, timerqueue
 or sighand machinery exists. lstest floor 78->79, 106 tasks.
 Audit run-75: 0 confirmed.
+
+run-317 lands POSIX message queues — mq_open/unlink/timedsend/
+timedreceive/notify/getsetattr (240-245) on a 16-slot MQUEUES
+table; an mqd is a real OFD so poll/fstat/close all work. Two
+ABI traps took real debugging: glibc strips the leading '/'
+client-side so the kernel sees the bare name (inner '/' is
+EACCES, verified by host strace), and mq_send is NR 242 not
+241 — the off-by-one wiring dropped sends onto the receive arm
+and produced a phantom EMSGSIZE. Blocking send/receive reuse
+the msgsnd block_switch pattern with staged
+[prio][len][payload] records (order-0 stage_alloc so frames
+stay honest; EINTR and ETIMEDOUT hooks free them). ABSTIME is
+CLOCK_REALTIME, converted delta-from-wall_now — feeding raw
+epoch seconds to the tick deadline was a never-expires bug.
+mq_notify registers once per queue, fires on the
+empty->nonempty edge only with nobody blocked, accepts exactly
+{0,1,4} like the kernel (THREAD_ID bounded to same-tgid tid),
+and clears at reap so a reused pid can't catch a stale
+si_value. lstest floor 79->80, 107 tasks, zero leak. Audit
+run-76: 0 confirmed; CVE-2017-11176 netlink-UAF class absent
+by construction.
