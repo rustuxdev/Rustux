@@ -4,20 +4,6 @@
   <img src="docs/logo.png" alt="Rustux logo" width="220">
 </p>
 
-<p align="center">
-  <a href="https://github.com/rustuxdev/Rustux/blob/main/docs/assets/rustux-v2.mp4">
-    <img src="docs/assets/rustux-v2-poster.png" width="880"
-      alt="Rustux video — 'It installs itself': the boot chain iso → MBR+ext2 → pivot_root → login: → apt install -y nginx, stamped nginx/1.22.1 — exit 0">
-  </a>
-</p>
-
-*▶ [Watch the 52-second video](docs/assets/rustux-v2.mp4): OVMF
-boot footage, the record→port→diff→gate method, real
-bash/BusyBox/apt, the self-installing ext2 disk with
-`apt install -y nginx` at exit 0, DOOM on `/dev/fb0`, the native NT
-`.exe` personality, the Nov 26 driver + IPC shelf, and IPv8 on the
-wire.*
-
 An incremental reimplementation of the Linux kernel in Rust, verified against
 the original C kernel's recorded behavior — the first kernel to speak
 IPv8 on the wire, and already running native Windows `.exe` binaries
@@ -154,7 +140,7 @@ non-transitional transport). ext2/ext3/ext4 readers feed a real
 xterm-subset console hosts ncurses.
 The suite boots a real static **BusyBox** (x86-64 *and* i386),
 real Debian **dash**, and dynamically linked **GNU bash 5.2** —
-106 tasks, all passing; `make run-bash` boots an
+107 tasks, all passing; `make run-bash` boots an
 interactive `-bash` login shell on the serial console.
 Beyond the suite, `make run-apt` proves real Debian package
 management end to end — `apt-get update`/`apt install` fetch from
@@ -178,7 +164,7 @@ Every rung is also security-reviewed: a scoped audit of the diff plus a
 check of that subsystem's published kernel CVEs — each gets a written
 verdict in [docs/cve-matrix.md](docs/cve-matrix.md) (structurally
 absent, explicitly mitigated, or a documented divergence), gathered
-into a flat ledger of 362 unique CVEs so far.
+into a flat ledger of 366 unique CVEs so far.
 
 **The pace, and what is still missing.** ~550 commits and 316 audited
 rungs landed in nine days — the git log is the honest measure of that.
