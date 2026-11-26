@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**214 unique CVEs recorded.**
+**216 unique CVEs recorded.**
 
 ## klib ports
 
@@ -321,6 +321,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-98726 | multi-namespace NVMe rung: identify-ctrl NN now .min(MAXNS=4) clamps a per-ns identify lo… | audit run-33 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-89971, CVE-2026-98726, CVE-2026-98727 — handled or n/a. Verified: make run exit 33, 76 tas… |
 | CVE-2026-98727 | multi-namespace NVMe rung: identify-ctrl NN now .min(MAXNS=4) clamps a per-ns identify lo… | audit run-33 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-89971, CVE-2026-98726, CVE-2026-98727 — handled or n/a. Verified: make run exit 33, 76 tas… |
 | CVE-2026-98788 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
+| CVE-2026-98814 | nvme-passthrough rung (nvme-cli ABI): /dev/nvme0 controller char node (major 243, minted… | audit run-45 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-99596, CVE-2026-98814 — n/a. Verified: make run exit 33, 80 tasks, frames equal; nvmtest 2… |
 | CVE-2026-98839 | tty stdin: IRQ1->scancode ring->line discipline->read(0)/poll(0)/FIONREAD, WaitOn::Stdin,… | bounded queues throughout: 256B canonical edit buffer + 4KiB ready queue, drop-on-full = Linux input discard; feed runs from the timer tick (printk is irq_save-safe, kill marks pe… |
 | CVE-2026-98866 | CLONE_VM threads: shared address space via MM_REFS (pml4,users) ledger, exec_mmap-style d… | SELF-REVIEW CAUGHT two refcount-safety bugs pre-commit: mm_share silently dropped the ref when the (provably-unreachable) table was full — a shared pml4 would have freed under a l… |
 | CVE-2026-99088 | ipv6/ndp/icmpv6 | no direct CVEs; frag-header CVEs reinforce the no-extension-headers/no-fragments design; hop==255 + solicited-dst + target==us enforced; pseudo-header csum validated (neg-zero res… |
@@ -328,5 +329,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-99463 | brk/mmap/munmap/mprotect: per-task VMA table + eager zeroed pages | VMA == ranges[] entry: gate, first-fit, and teardown share one truth, so a mapped page can never escape the syscall pointer gate; first-fit scans holes between entries (freed VA i… |
 | CVE-2026-99463 | physmap rung: supervisor mirror of all phys RAM at PML4 slot 256 (0xFFFF_8000_0000_0000)… | PRESENT |
 | CVE-2026-99571 | NVMe storage rung: nvme.rs — PCI MMIO probe (1b36:0010, QEMU's newer id; 0004 fallback),… | audit run-27 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6238, CVE-2025-21927, CVE-2023-6535/6536/6356, CVE-2026-89972, CVE-2024-45013, CVE-2026-99… |
+| CVE-2026-99596 | nvme-passthrough rung (nvme-cli ABI): /dev/nvme0 controller char node (major 243, minted… | audit run-45 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-99596, CVE-2026-98814 — n/a. Verified: make run exit 33, 80 tasks, frames equal; nvmtest 2… |
+| CVE-2026-99596 | nvme-passthrough rung (nvme-cli ABI): /dev/nvme0 controller char node (major 243, minted… | audit run-45 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-99596, CVE-2026-98814 — n/a. Verified: make run exit 33, 80 tasks, frames equal; nvmtest 2… |
 | CVE-2026-99682 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
 | CVE-2026-99682 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |

@@ -7566,3 +7566,26 @@ SG_IO on /dev/sdb + READ(10) MBR sig, EINVAL/EFAULT/ENOTTY/
 EACCES gates. Exit 33, 79 tasks, zero leak.
 
 Audit run-44: 0 confirmed, 3 fixed in-run. Ledger at 214 CVEs.
+
+## run-286 — NVMe pass-through ioctls
+
+The nvme-cli ABI: `/dev/nvme0` controller char node (major 243)
+plus `NVME_IOCTL_ADMIN_CMD` (0x41B5) and `NVME_IOCTL_IO_CMD`
+(0x41B7), reusing run-285's gate model — whole-disk block nodes
+or the controller node only, partition nodes ENOTTY, a writable
+fd stands in for CAP_SYS_ADMIN (the opcode-whitelist divergence
+is documented; no caps model). nvme.rs `passthrough` stages the
+*caller's* buffer into SCRATCH/DATA before issuing (so write-
+direction commands work and a short device write can never
+return stale kernel data — the pre-fill is the user's own
+bytes), PRP1 is force-pointed at staging (no user phys addr),
+and the completion status field becomes the ioctl's positive
+return value like modern Linux. IO_CMD forces nsid from the
+block node; on the controller node it's ENOTTY.
+
+Proof: nvmtest 21 checks 0 failures — IDENTIFY ctrl (vid 0x1b36,
+serial nv0), IDENTIFY ns (nsze 32768), ADMIN_CMD on nvme0n1,
+IO_CMD READ lba0 -> MBR sig, ENOTTY/EACCES/EINVAL/EFAULT gates.
+Exit 33, 80 tasks, zero leak.
+
+Audit run-45: 0 confirmed. Ledger at 216 CVEs.
