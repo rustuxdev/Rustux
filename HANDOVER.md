@@ -8426,3 +8426,20 @@ Audit run-82: 0 confirmed — both CAP gates EPERM-proven, the
 record write is grow-then-fixed-copy, the personality W^X classes
 (CVE-2024-47745 / CVE-2016-10044) are absent by construction
 (stored-only field, no mmap/AIO consumer, no LSM layer).
+
+run-324 lands unshare(272) plus two honest stubs. unshare
+dissociates shared tables exactly like clone's negative flags:
+CLONE_FILES/CLONE_FS/CLONE_SIGHAND mint fresh dup'd FdTab/FsTab/
+disposition copies then release the old index (dup-then-release —
+never a window where the task lacks a table; the sibling keeps
+its slot, proven by parent-fd-survives-child-close). VM/THREAD/
+every CLONE_NEW* and unknown bits -> EINVAL (no namespaces to
+mint); CLONE_SYSVSEM inert (the undo ledger is already
+pid-keyed). modify_ldt(154) reads the honest empty default LDT
+(funcs 0/2 -> 0, writes EINVAL — the CONFIG_MODIFY_LDT_SYSCALL=n
+surface; every LDT CVE class needs an LDT to exist, absent).
+pkey trio (329-331) is uniform EINVAL — no PKU. lstest floor
+86->87, MAX_TASKS 113->114 (the suite cap caught unstest too —
+same class as accttest last rung). Audit run-83: 0 confirmed —
+dissociation refcounting is the whole risk surface, and it's
+test-proven.
