@@ -802,9 +802,11 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_FCHDIR => user::sys_fchdir(a1),
         161 => sys_chroot(a1),
         163 => sys_acct(a1),
+        165 => sys_mount(a1, a2, a3, a4),
+        166 => sys_umount2(a1, a2),
         272 => user::sys_unshare(a1),
         154 => user::sys_modify_ldt(a1, a2, a3),
-        329 | 330 | 331 => user::sys_pkey(a1, a2, a3),
+        329..=331 => user::sys_pkey(a1, a2, a3),
         135 => user::sys_personality(a1),
         159 => user::sys_adjtimex(a1),
         305 => user::sys_clock_adjtime(a1, a2),
@@ -1597,6 +1599,37 @@ fn sys_acct(path: u64) -> u64 {
         Err(e) => return e,
     };
     user::sys_acct(&name[..n])
+}
+
+/// mount(165): three user strings (source, target, fstype) then the
+/// flags word; data is ignored (no fstype consumes it).
+fn sys_mount(src: u64, tgt: u64, fstype: u64, flags: u64) -> u64 {
+    let mut sb = [0u8; 257];
+    let mut tb = [0u8; 257];
+    let mut fb = [0u8; 257];
+    let sn = match copy_user_path(src, &mut sb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let tn = match copy_user_path(tgt, &mut tb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let fn_ = match copy_user_path(fstype, &mut fb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_mount(&sb[..sn], &tb[..tn], &fb[..fn_], flags)
+}
+
+/// umount2(166): user target string + flags word.
+fn sys_umount2(tgt: u64, flags: u64) -> u64 {
+    let mut tb = [0u8; 257];
+    let tn = match copy_user_path(tgt, &mut tb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_umount2(&tb[..tn], flags)
 }
 
 /// name_to_handle_at(303): copy the path then delegate — the

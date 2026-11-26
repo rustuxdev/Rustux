@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 114;
+const MAX_TASKS: usize = 115;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -2808,8 +2808,12 @@ pub fn root_copy_up(path: &[u8], data: &[u8]) -> bool {
 fn vfile_create(path: &[u8]) -> u64 {
     const ENOSPC_: u64 = (-28i64) as u64;
     const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    const EROFS_: u64 = (-30i64) as u64;
     if path.is_empty() || path.len() > 128 {
         return ENAMETOOLONG_;
+    }
+    if mount_ro(path) {
+        return EROFS_;
     }
     let vs = unsafe { &mut *core::ptr::addr_of_mut!(VFILES) };
     let Some(i) = vs.iter().position(Option::is_none) else {
@@ -15318,7 +15322,8 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, typ: u64, idx1: u64, idx2: u64) -> u64 {
 //   3 = the root dir (implicit, no slot)                  (1B)
 //   4 = initrd-archive file: [4, data ptr u64le]          (9B)
 //   5 = any other dir, canonical path bytes               (1+N B)
-// mount_id is always 1 — the flat archive is the only exported fs.
+// mount_id comes from the mount table — the resolved path's
+// longest-prefix mount mints the reported id.
 // EOPNOTSUPP: /proc entries and dev/fifo nodes (no exportfs
 // equivalent exists); ESTALE: dead slot or generation mismatch.
 
@@ -15331,12 +15336,15 @@ const FH_DIR: u8 = 5;
 /// `cap` is the caller's handle_bytes capacity — the caller must
 /// see the required size even when it doesn't fit (EOVERFLOW
 /// contract), so this returns (encoded, errno).
-fn handle_encode(path: &[u8]) -> Result<(usize, [u8; 129]), u64> {
+fn handle_encode(path: &[u8]) -> Result<(usize, [u8; 129], u32), u64> {
     const EOPNOTSUPP_: u64 = (-95i64) as u64;
     let mut enc = [0u8; 129];
     if path == b"proc" || path.starts_with(b"proc/") {
         return Err(EOPNOTSUPP_); // procfs has no exportfs
     }
+    let mid = mount_i(path)
+        .and_then(|i| mounts()[i].as_ref().map(|m| m.id))
+        .unwrap_or(1);
     if let Some(i) = vfile_find(path) {
         let i = vfile_real(i);
         let v = vfile(i).unwrap();
@@ -15346,7 +15354,7 @@ fn handle_encode(path: &[u8]) -> Result<(usize, [u8; 129]), u64> {
         enc[0] = FH_FILE;
         enc[1..3].copy_from_slice(&(i as u16).to_le_bytes());
         enc[3..7].copy_from_slice(&v.gen.to_le_bytes());
-        return Ok((8, enc));
+        return Ok((8, enc, mid));
     }
     let arc = unsafe { *core::ptr::addr_of!(INITRD) };
     if arc.is_some_and(|a| crate::cpio::find(a, path).is_some())
@@ -15355,24 +15363,26 @@ fn handle_encode(path: &[u8]) -> Result<(usize, [u8; 129]), u64> {
         let d = crate::cpio::find(arc.unwrap(), path).unwrap();
         enc[0] = FH_ARCH;
         enc[1..9].copy_from_slice(&(d.as_ptr() as u64).to_le_bytes());
-        return Ok((9, enc));
+        return Ok((9, enc, mid));
     }
     if dir_exists(path) {
         if path.is_empty() {
             enc[0] = FH_ROOT;
-            return Ok((1, enc));
+            return Ok((1, enc, mid));
         }
         enc[0] = FH_DIR;
         let n = path.len().min(128);
         enc[1..1 + n].copy_from_slice(&path[..n]);
-        return Ok((1 + n, enc));
+        return Ok((1 + n, enc, mid));
     }
     Err(ENOENT)
 }
 
 /// Encode a handle for the object an OFD names (AT_EMPTY_PATH's
 /// dirfd path) — same kind mapping as handle_encode.
-fn handle_encode_ofd(o: &OpenFile) -> Result<(usize, [u8; 129]), u64> {
+fn handle_encode_ofd(
+    o: &OpenFile,
+) -> Result<(usize, [u8; 129], u32), u64> {
     const EOPNOTSUPP_: u64 = (-95i64) as u64;
     let mut enc = [0u8; 129];
     match &o.kind {
@@ -15381,16 +15391,19 @@ fn handle_encode_ofd(o: &OpenFile) -> Result<(usize, [u8; 129]), u64> {
             if !v.is_link && v.fmt & 0o170000 != 0o100000 {
                 return Err(EOPNOTSUPP_);
             }
+            let mid = mount_i(&v.name[..v.nlen])
+                .and_then(|mi| mounts()[mi].as_ref().map(|m| m.id))
+                .unwrap_or(1);
             enc[0] = FH_FILE;
             enc[1..3].copy_from_slice(&(*i as u16).to_le_bytes());
             enc[3..7].copy_from_slice(&v.gen.to_le_bytes());
-            Ok((8, enc))
+            Ok((8, enc, mid))
         }
         FdKind::Dir(dp) => handle_encode(dp.bytes()),
         FdKind::File(d) => {
             enc[0] = FH_ARCH;
             enc[1..9].copy_from_slice(&(d.as_ptr() as u64).to_le_bytes());
-            Ok((9, enc))
+            Ok((9, enc, 1))
         }
         _ => Err(EOPNOTSUPP_),
     }
@@ -15418,7 +15431,7 @@ pub fn sys_name_to_handle_at(
     let Some(t) = cur_mut() else { return EBADF };
     // SAFETY: handle readable for 8 bytes (checked).
     let cap = unsafe { (handle as *const u32).read_unaligned() } as usize;
-    let (need, enc) = if name.is_empty() {
+    let (need, enc, mid) = if name.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return ENOENT;
         }
@@ -15466,7 +15479,7 @@ pub fn sys_name_to_handle_at(
     if cap < need {
         // SAFETY: handle writable for 8 bytes (checked).
         unsafe { (handle as *mut u32).write_unaligned(need as u32) };
-        unsafe { (mount_id as *mut u32).write_unaligned(1) };
+        unsafe { (mount_id as *mut u32).write_unaligned(mid) };
         return EOVERFLOW_;
     }
     if !range_ok_w(handle + 8, need as u64) {
@@ -15479,7 +15492,7 @@ pub fn sys_name_to_handle_at(
         let dst = (handle + 8) as *mut u8;
         core::ptr::copy_nonoverlapping(enc.as_ptr().add(1), dst.add(1), need - 1);
         *dst = enc[0];
-        (mount_id as *mut u32).write_unaligned(1);
+        (mount_id as *mut u32).write_unaligned(mid);
     }
     0
 }
@@ -15602,6 +15615,208 @@ pub fn sys_open_by_handle_at(mfd: u64, handle: u64, flags: u64) -> u64 {
     fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, flags & O_CLOEXEC != 0);
     fi as u64
+}
+
+// ---- mount table (mount 165 / umount2 166) ---------------------
+/// A mount point: the canonical path it covers ("" = root), the
+/// fstype name Linux would report, the mount source for
+/// /proc/mounts, a minted mount_id, and ST_* flag bits (same bit
+/// values as MS_*). The ramfs namespace already serves every
+/// path — a mount point records ownership and enforces
+/// MS_RDONLY on every mutation underneath.
+struct Mount {
+    path: [u8; 128],
+    n: u8,
+    fstype: [u8; 16],
+    fnlen: u8,
+    source: [u8; 32],
+    slen: u8,
+    id: u32,
+    flags: u32,
+}
+
+const MAX_MOUNTS: usize = 16;
+static mut MOUNTS: [Option<Mount>; MAX_MOUNTS] =
+    [const { None }; MAX_MOUNTS];
+static mut MOUNT_ID: u32 = 4;
+static mut MOUNTS_INIT: bool = false;
+
+fn mounts() -> &'static mut [Option<Mount>; MAX_MOUNTS] {
+    let ms = unsafe { &mut *core::ptr::addr_of_mut!(MOUNTS) };
+    if unsafe { !*core::ptr::addr_of!(MOUNTS_INIT) } {
+        let mut seed = |i: usize, p: &[u8], f: &[u8], s: &[u8], fl: u32| {
+            let mut m = Mount {
+                path: [0; 128],
+                n: 0,
+                fstype: [0; 16],
+                fnlen: 0,
+                source: [0; 32],
+                slen: 0,
+                id: (i + 1) as u32,
+                flags: fl,
+            };
+            m.path[..p.len()].copy_from_slice(p);
+            m.n = p.len() as u8;
+            m.fstype[..f.len()].copy_from_slice(f);
+            m.fnlen = f.len() as u8;
+            m.source[..s.len()].copy_from_slice(s);
+            m.slen = s.len() as u8;
+            ms[i] = Some(m);
+        };
+        seed(0, b"", b"rustux", b"rustux", 0);
+        // proc reports RO|NOSUID|NODEV|NOEXEC — statfs agrees.
+        seed(1, b"proc", b"proc", b"proc", 0xf);
+        seed(2, b"dev", b"devtmpfs", b"devtmpfs", 0);
+        unsafe { *core::ptr::addr_of_mut!(MOUNTS_INIT) = true };
+    }
+    ms
+}
+
+/// Longest mount-point prefix containing cpath ("" covers all).
+fn mount_i(cpath: &[u8]) -> Option<usize> {
+    let ms = mounts();
+    let mut best: Option<usize> = None;
+    for (i, m) in ms.iter().enumerate() {
+        let Some(m) = m else { continue };
+        let p = &m.path[..m.n as usize];
+        let covers = p.is_empty()
+            || (cpath.len() >= p.len()
+                && cpath[..p.len()] == *p
+                && (cpath.len() == p.len() || cpath[p.len()] == b'/'));
+        if covers && best.is_none_or(|b| m.n > ms[b].as_ref().unwrap().n) {
+            best = Some(i);
+        }
+    }
+    best
+}
+
+/// Mount index whose point IS cpath exactly ("" = root mount).
+fn mount_exact(cpath: &[u8]) -> Option<usize> {
+    mounts()
+        .iter()
+        .position(|m| m.as_ref().is_some_and(|m| {
+            &m.path[..m.n as usize] == cpath
+        }))
+}
+
+fn mount_ro(cpath: &[u8]) -> bool {
+    mount_i(cpath)
+        .is_some_and(|i| mounts()[i].as_ref().unwrap().flags & 1 != 0)
+}
+
+/// mount(source, target, fstype, flags, data): tmpfs mounts only —
+/// the namespace already serves every dir, so a tmpfs mount
+/// records ownership + MS_* flags (MS_RDONLY enforced on writes).
+/// uid==0 (CAP_SYS_ADMIN); unknown fstype ENODEV; target must be
+/// an existing dir (ENOENT/ENOTDIR); mounting over a mount point
+/// EBUSY; MS_REMOUNT re-sets the flags of an existing mount.
+/// MS_BIND/MOVE/REC etc. are real subtree mechanics -> EINVAL.
+pub fn sys_mount(src: &[u8], tgt: &[u8], fstype: &[u8], flags: u64) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const ENOTDIR_: u64 = (-20i64) as u64;
+    const EBUSY_: u64 = (-16i64) as u64;
+    const ENODEV_: u64 = (-19i64) as u64;
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    const ENOSPC_: u64 = (-28i64) as u64;
+    // MS_RDONLY|NOSUID|NODEV|NOEXEC|SYNCHRONOUS|REMOUNT|NOATIME|
+    // NODIRATIME|DIRSYNC|NOSYMFOLLOW|RELATIME|SILENT|STRICTATIME
+    const MS_KNOWN: u64 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20
+        | 0x400 | 0x800 | 0x80 | 0x100 | 0x200000 | 0x8000
+        | 0x1000000;
+    const MS_REMOUNT: u64 = 0x20;
+    if flags & !MS_KNOWN != 0 {
+        return EINVAL_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    if t.uid != 0 {
+        return EPERM_;
+    }
+    let (cb, cn) = match canon_path(u64::MAX, tgt) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let (rb, rn, _) = match resolve_links(&cb[..cn], true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let p = &rb[..rn];
+    if flags & MS_REMOUNT != 0 {
+        let Some(i) = mount_exact(p) else { return EINVAL_ };
+        let st = (flags & (0x1 | 0x2 | 0x4 | 0x8 | 0x400 | 0x800)) as u32;
+        mounts()[i].as_mut().unwrap().flags = st;
+        return 0;
+    }
+    if is_file(p) {
+        return ENOTDIR_;
+    }
+    if !dir_exists(p) {
+        return ENOENT_;
+    }
+    if mount_exact(p).is_some() {
+        return EBUSY_;
+    }
+    if fstype != b"tmpfs" {
+        return ENODEV_; // unknown fstype to the mounter
+    }
+    if p.len() > 128 || src.len() > 32 {
+        return ENAMETOOLONG_;
+    }
+    let ms = mounts();
+    let Some(i) = ms.iter().position(Option::is_none) else {
+        return ENOSPC_;
+    };
+    let id = unsafe { *core::ptr::addr_of!(MOUNT_ID) };
+    unsafe { *core::ptr::addr_of_mut!(MOUNT_ID) = id + 1 };
+    let mut m = Mount {
+        path: [0; 128],
+        n: p.len() as u8,
+        fstype: [0; 16],
+        fnlen: 5,
+        source: [0; 32],
+        slen: src.len() as u8,
+        id,
+        flags: flags as u32,
+    };
+    m.path[..p.len()].copy_from_slice(p);
+    m.fstype[..5].copy_from_slice(b"tmpfs");
+    m.source[..src.len()].copy_from_slice(src);
+    ms[i] = Some(m);
+    0
+}
+
+/// umount2(target, flags): uid==0; flags ⊆ {MNT_FORCE,
+/// MNT_DETACH, MNT_EXPIRE, UMOUNT_NOFOLLOW}; target must be a
+/// mount point exactly (EINVAL) — a covered child path is not a
+/// mount; the root mount never unmounts (EBUSY).
+pub fn sys_umount2(tgt: &[u8], flags: u64) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const EBUSY_: u64 = (-16i64) as u64;
+    const EINVAL_: u64 = (-22i64) as u64;
+    const UMOUNT_KNOWN: u64 = 0x1 | 0x2 | 0x4 | 0x8;
+    if flags & !UMOUNT_KNOWN != 0 {
+        return EINVAL_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    if t.uid != 0 {
+        return EPERM_;
+    }
+    let (cb, cn) = match canon_path(u64::MAX, tgt) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let (rb, rn, _) = match resolve_links(&cb[..cn], true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let p = &rb[..rn];
+    let Some(i) = mount_exact(p) else { return EINVAL_ };
+    if i == 0 {
+        return EBUSY_; // the root mount is busy forever
+    }
+    mounts()[i] = None;
+    0
 }
 
 // ---- BSD process accounting (acct 163) -------------------------
@@ -16027,6 +16242,7 @@ pub fn fs_mkdir(dfd: u64, path: &[u8], mode: u64) -> u64 {
     const ENOSPC_: u64 = (-28i64) as u64;
     const ENOTDIR_: u64 = (-20i64) as u64;
     const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    const EROFS_: u64 = (-30i64) as u64;
     let (buf, n) = match canon_path(dfd, path) {
         Ok(x) => x,
         Err(e) => return e,
@@ -16044,6 +16260,9 @@ pub fn fs_mkdir(dfd: u64, path: &[u8], mode: u64) -> u64 {
     }
     if p.is_empty() || is_file(p) || dir_exists(p) {
         return EEXIST_;
+    }
+    if mount_ro(p) {
+        return EROFS_;
     }
     if let Some(pi) = p.iter().rposition(|&c| c == b'/') {
         let par = &p[..pi];
@@ -16087,6 +16306,7 @@ pub fn fs_rmdir(dfd: u64, path: &[u8]) -> u64 {
     const ENOTDIR_: u64 = (-20i64) as u64;
     const ENOTEMPTY_: u64 = (-39i64) as u64;
     const EBUSY_: u64 = (-16i64) as u64;
+    const EROFS_: u64 = (-30i64) as u64;
     let (buf, n) = match canon_path(dfd, path) {
         Ok(x) => x,
         Err(e) => return e,
@@ -16106,6 +16326,9 @@ pub fn fs_rmdir(dfd: u64, path: &[u8]) -> u64 {
     }
     if !dir_exists(p) {
         return ENOENT;
+    }
+    if mount_ro(p) {
+        return EROFS_;
     }
     let mut pre = [0u8; 256];
     pre[..p.len()].copy_from_slice(p);
@@ -16313,39 +16536,46 @@ pub fn sys_getrusage(who: u64, ru: u64) -> u64 {
     0
 }
 
-/// Shared statfs body: honest numbers. The root fs is memory-backed
-/// — capacity IS the frame allocator (4KiB blocks, total/free frames)
-/// and the inode count is the dynamic vfile table. /proc reports its
-/// own superblock: PROC_SUPER_MAGIC, read-only, no storage. struct
-/// statfs: type@0 bsize@8 blocks@16 bfree@24 bavail@32 files@40
+/// Shared statfs body, driven by the mount table: honest numbers.
+/// The ramfs namespace is memory-backed — capacity IS the frame
+/// allocator (4KiB blocks, total/free frames) and the inode count
+/// is the dynamic vfile table. procfs reports its own superblock:
+/// PROC_SUPER_MAGIC, read-only, no storage. struct statfs:
+/// type@0 bsize@8 blocks@16 bfree@24 bavail@32 files@40
 /// ffree@48 fsid@56 namelen@64 frsize@72 flags@80 spare@88.
-fn fill_statfs(buf: u64, proc: bool) {
+fn fill_statfs(buf: u64, mi: usize) {
     // SAFETY: buf validated writable for 120 bytes by the caller.
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, 120);
         let w = |i: usize, v: u64| (buf as *mut u64).add(i).write_unaligned(v);
-        if proc {
-            w(0, 0x9fa0); // PROC_SUPER_MAGIC
-            w(1, 4096);
-            w(8, 255);
-            // ST_RDONLY | ST_NOSUID | ST_NODEV | ST_NOEXEC
-            w(10, 0x1 | 0x2 | 0x4 | 0x8);
-        } else {
-            let vfree = (*core::ptr::addr_of!(VFILES))
-                .iter()
-                .filter(|s| s.is_none())
-                .count() as u64;
-            let free = kalloc::free_frames();
-            w(0, 0x8584_58f6); // RAMFS_MAGIC
-            w(1, 4096); // f_bsize
-            w(2, kalloc::total_frames());
-            w(3, free);
-            w(4, free); // no root-reserved blocks
-            w(5, MAX_VFILES as u64);
-            w(6, vfree);
-            w(8, 255);
-            w(9, 4096); // f_frsize
+        let Some(m) = mounts()[mi].as_ref() else { return };
+        let magic: u64 = match &m.fstype[..m.fnlen as usize] {
+            b"proc" => 0x9fa0,     // PROC_SUPER_MAGIC
+            b"tmpfs" => 0x1021994, // TMPFS_MAGIC
+            _ => 0x8584_58f6,      // RAMFS_MAGIC (rustux, devtmpfs)
+        };
+        // ST_* = MS_* for the low bits; RELATIME reports via opts,
+        // not f_flags (kernel s_flags carries no SB_RELATIME).
+        let st = (m.flags as u64)
+            & (0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x400 | 0x800);
+        w(0, magic);
+        w(1, 4096);
+        w(8, 255);
+        w(10, st);
+        if magic == 0x9fa0 {
+            return; // procfs has no storage accounting
         }
+        let vfree = (*core::ptr::addr_of!(VFILES))
+            .iter()
+            .filter(|s| s.is_none())
+            .count() as u64;
+        let free = kalloc::free_frames();
+        w(2, kalloc::total_frames());
+        w(3, free);
+        w(4, free); // no root-reserved blocks
+        w(5, MAX_VFILES as u64);
+        w(6, vfree);
+        w(9, 4096); // f_frsize
     }
 }
 
@@ -16364,7 +16594,7 @@ pub fn statfs_path(cpath: &[u8], buf: u64) -> u64 {
     if !range_ok_w(buf, 120) {
         return EFAULT;
     }
-    fill_statfs(buf, cpath == b"proc" || cpath.starts_with(b"proc/"));
+    fill_statfs(buf, mount_i(cpath).unwrap_or(0));
     0
 }
 
@@ -16376,15 +16606,12 @@ pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
     }
     let Some(t) = cur_mut() else { return EBADF };
     let Some(o) = ofd(t, fd) else { return EBADF };
-    let proc = match &o.kind {
-        FdKind::Proc { .. } => true,
-        FdKind::Dir(d) => {
-            let b = d.bytes();
-            b == b"proc" || b.starts_with(b"proc/")
-        }
-        _ => false,
+    let mi = match &o.kind {
+        FdKind::Proc { .. } => 1, // the seeded proc mount
+        FdKind::Dir(d) => mount_i(d.bytes()).unwrap_or(0),
+        _ => 0,
     };
-    fill_statfs(buf, proc);
+    fill_statfs(buf, mi);
     0
 }
 
@@ -22359,13 +22586,47 @@ fn proc_fill(ent: &ProcEnt, s: &mut klib::seqbuf::SeqBuf) {
                 );
             }
             b"filesystems" => {
-                // The two filesystem interfaces this kernel serves —
-                // both are pseudo (no block device exists).
-                s.puts(b"nodev\trustux\nnodev\tproc\n");
+                // One line per fstype the mount table has used —
+                // all nodev (no block device exists).
+                let ms = mounts();
+                let mut seen = [[0u8; 16]; 8];
+                let mut nseen = 0usize;
+                for m in ms.iter().flatten() {
+                    let f = &m.fstype[..m.fnlen as usize];
+                    let dup = seen[..nseen].iter().any(|se| {
+                        se[..f.len()] == *f && se[f.len()] == 0
+                    });
+                    if !dup && nseen < 8 {
+                        seen[nseen][..f.len()].copy_from_slice(f);
+                        nseen += 1;
+                        s.puts(b"nodev\t");
+                        s.putmem(f);
+                        s.putc(b'\n');
+                    }
+                }
             }
             b"mounts" => {
-                s.puts(b"rustux / rustux rw,relatime 0 0\n\
-                      proc /proc proc rw,relatime 0 0\n");
+                for m in mounts().iter().flatten() {
+                    s.putmem(&m.source[..m.slen as usize]);
+                    s.putc(b' ');
+                    s.putc(b'/');
+                    s.putmem(&m.path[..m.n as usize]);
+                    s.putc(b' ');
+                    s.putmem(&m.fstype[..m.fnlen as usize]);
+                    s.putc(b' ');
+                    let f = m.flags;
+                    s.puts(if f & 1 != 0 { b"ro" } else { b"rw" });
+                    if f & 0x2 != 0 {
+                        s.puts(b",nosuid");
+                    }
+                    if f & 0x4 != 0 {
+                        s.puts(b",nodev");
+                    }
+                    if f & 0x8 != 0 {
+                        s.puts(b",noexec");
+                    }
+                    s.puts(b",relatime 0 0\n");
+                }
             }
             _ => {}
         },
@@ -22832,6 +23093,9 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         cloexec_set(t, fi, flags & O_CLOEXEC != 0);
         return fi as u64;
     }
+    if writing && mount_ro(path) {
+        return EROFS;
+    }
     let kind = if let Some(i) = vfile_find(path) {
         // RAM file wins over the archive — mount-shadowing order.
         if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) {
@@ -23286,6 +23550,12 @@ pub fn fd_xattr_vfi(fd: u64) -> Result<usize, u64> {
 /// setxattr core: namespace/flag gates, target type, create/replace,
 /// size caps, then the user-buffer read and the table write.
 pub fn fs_setxattr(vfi: usize, name: &[u8], value: u64, size: u64, flags: u64) -> u64 {
+    const EROFS_: u64 = (-30i64) as u64;
+    if let Some(v) = vfile(vfi) {
+        if mount_ro(&v.name[..v.nlen]) {
+            return EROFS_;
+        }
+    }
     const EEXIST_: u64 = (-17i64) as u64;
     const ENODATA_: u64 = (-61i64) as u64;
     const EOPNOTSUPP_: u64 = (-95i64) as u64;
@@ -23422,6 +23692,12 @@ pub fn fs_listxattr(vfi: usize, buf: u64, size: u64) -> u64 {
 
 /// removexattr core: name gates like get; clears the slot.
 pub fn fs_removexattr(vfi: usize, name: &[u8]) -> u64 {
+    const EROFS_: u64 = (-30i64) as u64;
+    if let Some(v) = vfile(vfi) {
+        if mount_ro(&v.name[..v.nlen]) {
+            return EROFS_;
+        }
+    }
     const ENODATA_: u64 = (-61i64) as u64;
     const ERANGE_: u64 = (-34i64) as u64;
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
@@ -23507,8 +23783,12 @@ pub fn fs_linkat(old: &[u8], new: &[u8], flags: u64) -> u64 {
     if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
         return EINVAL;
     }
+    const EROFS_: u64 = (-30i64) as u64;
     if new.len() > 128 {
         return ENAMETOOLONG_;
+    }
+    if mount_ro(new) {
+        return EROFS_;
     }
     // old's final component follows only under SYMLINK_FOLLOW —
     // without it the link would name the link inode, which the
@@ -23608,6 +23888,9 @@ pub fn fs_unlink(path: &[u8]) -> u64 {
     if dir_exists(path) {
         return EISDIR_;
     }
+    if mount_ro(path) {
+        return EROFS_;
+    }
     let Some(i) = vfile_find(path) else {
         return if fs_lookup(path).is_some() { EROFS_ } else { ENOENT };
     };
@@ -23645,6 +23928,9 @@ pub fn fs_rename(old: &[u8], new: &[u8], noreplace: bool) -> u64 {
         return ENAMETOOLONG_;
     }
     let new = &nb[..nc];
+    if mount_ro(old) || mount_ro(new) {
+        return EROFS_;
+    }
     // RENAME_NOREPLACE: any existing target wins — file, dir,
     // or an initrd object the rename can't remove anyway.
     if noreplace
@@ -23854,6 +24140,9 @@ pub fn fs_truncate(path: &[u8], len: u64) -> u64 {
         Err(e) => return e,
     };
     let path = &rb[..rn];
+    if mount_ro(path) {
+        return EROFS_;
+    }
     let Some(i) = vfile_find(path) else {
         return if fs_lookup(path).is_some() { EROFS_ } else { ENOENT };
     };
@@ -23881,6 +24170,10 @@ pub fn fd_ftruncate(fd: u64, len: u64) -> u64 {
     let FdKind::Ram(i) = o.kind else { return EINVAL };
     let Some(v) = vfile(i) else { return EBADF };
     const EPERM_: u64 = (-1i64) as u64;
+    const EROFS_: u64 = (-30i64) as u64;
+    if mount_ro(&v.name[..v.nlen]) {
+        return EROFS_;
+    }
     // F_SEAL_SHRINK/F_SEAL_GROW freeze the size in their direction;
     // ftruncate is the only path that can still move v.len of a
     // memfd (the write gates cover extension-by-write).
@@ -23904,6 +24197,9 @@ pub fn fd_ftruncate(fd: u64, len: u64) -> u64 {
 /// (or deliberately not, for the fd path on a Ram link inode).
 fn chmod_obj(p: &[u8], mode: u64) -> u64 {
     const EROFS_: u64 = (-30i64) as u64;
+    if mount_ro(p) {
+        return EROFS_;
+    }
     let (s, ns) = now();
     if let Some(i) = vfile_find(p) {
         let Some(v) = vfile(vfile_real(i)) else { return ENOENT };
@@ -23951,6 +24247,9 @@ pub fn fd_chmod(fd: u64, mode: u64) -> u64 {
     match &o.kind {
         FdKind::Ram(i) | FdKind::Dev(i) => {
             let Some(v) = vfile(*i) else { return EBADF };
+            if mount_ro(&v.name[..v.nlen]) {
+                return EROFS_;
+            }
             v.mode = (mode & 0o7777) as u16;
             v.ctime = s;
             v.ctime_ns = ns;
@@ -23960,6 +24259,9 @@ pub fn fd_chmod(fd: u64, mode: u64) -> u64 {
             0
         }
         FdKind::Dir(dp) => {
+            if mount_ro(dp.bytes()) {
+                return EROFS_;
+            }
             let Some(i) = vdir_find(dp.bytes()) else { return EROFS_ };
             let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
             let Some(d) = ds[i].as_mut() else { return ENOENT };
@@ -23980,6 +24282,9 @@ pub fn fd_chmod(fd: u64, mode: u64) -> u64 {
 /// (userspace -1). ctime bumps like Linux; IN_ATTRIB emits.
 fn chown_obj(p: &[u8], uid: u32, gid: u32) -> u64 {
     const EROFS_: u64 = (-30i64) as u64;
+    if mount_ro(p) {
+        return EROFS_;
+    }
     let (s, ns) = now();
     if let Some(i) = vfile_find(p) {
         let Some(v) = vfile(vfile_real(i)) else { return ENOENT };
@@ -24038,6 +24343,9 @@ pub fn fd_chown(fd: u64, uid: u64, gid: u64) -> u64 {
     match &o.kind {
         FdKind::Ram(i) | FdKind::Dev(i) => {
             let Some(v) = vfile(*i) else { return EBADF };
+            if mount_ro(&v.name[..v.nlen]) {
+                return EROFS_;
+            }
             if uid != u32::MAX {
                 v.uid = uid;
             }
@@ -24052,6 +24360,9 @@ pub fn fd_chown(fd: u64, uid: u64, gid: u64) -> u64 {
             0
         }
         FdKind::Dir(dp) => {
+            if mount_ro(dp.bytes()) {
+                return EROFS_;
+            }
             let Some(i) = vdir_find(dp.bytes()) else { return EROFS_ };
             let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
             let Some(d) = ds[i].as_mut() else { return ENOENT };
@@ -24113,6 +24424,9 @@ pub fn fs_utimens(
     }
     let p = &rb[..rn];
     const EROFS_: u64 = (-30i64) as u64;
+    if mount_ro(p) {
+        return EROFS_;
+    }
     let nw = now();
     if let Some(i) = vfile_find(p) {
         let Some(v) = vfile(vfile_real(i)) else { return ENOENT };
@@ -24164,6 +24478,9 @@ pub fn fd_utimens(fd: u64, ts: Option<[[u64; 2]; 2]>) -> u64 {
     match &o.kind {
         FdKind::Ram(i) | FdKind::Dev(i) => {
             let Some(v) = vfile(*i) else { return EBADF };
+            if mount_ro(&v.name[..v.nlen]) {
+                return EROFS_;
+            }
             (v.atime, v.atime_ns) =
                 utspec(at, (v.atime, v.atime_ns), nw);
             (v.mtime, v.mtime_ns) =
@@ -24176,6 +24493,9 @@ pub fn fd_utimens(fd: u64, ts: Option<[[u64; 2]; 2]>) -> u64 {
             0
         }
         FdKind::Dir(dp) => {
+            if mount_ro(dp.bytes()) {
+                return EROFS_;
+            }
             let Some(i) = vdir_find(dp.bytes()) else { return EROFS_ };
             let ds = unsafe { &mut *core::ptr::addr_of_mut!(VDIRS) };
             let Some(d) = ds[i].as_mut() else { return ENOENT };
