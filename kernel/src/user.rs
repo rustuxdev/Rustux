@@ -10918,6 +10918,119 @@ pub fn sys_vfork(ctx: &mut UCtx) -> u64 {
     child
 }
 
+/// clone3(cl_args, size): the struct-args clone — eleven u64s at
+/// cl. Differences from clone: signal bits may NOT live in flags
+/// (EINVAL), exit_signal is its own field, stack is a base+size
+/// (the child's rsp lands at stack+stack_size), and CLONE_PIDFD
+/// mints the child's pidfd into *args.pidfd — composed with
+/// run-296's FdKind::Pidfd. size < 64 EINVALs (the v0 struct);
+/// size > 88 is forward-compat only when the tail is all zeros
+/// (E2BIG like Linux). set_tid/cgroup are unhonorable — EINVAL
+/// when nonzero. parent_tid/child_tid map onto the PARENT_SETTID
+/// and CHILD_SETTID|CHILD_CLEARTID flag bits; Linux EINVALs
+/// pairing CLONE_PIDFD with PARENT_SETTID.
+pub fn sys_clone3(ctx: &mut UCtx, cl: u64, size: u64) -> u64 {
+    const E2BIG_: u64 = (-7i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    const CLONE_PIDFD: u64 = 0x0000_1000;
+    const PARENT_SETTID: u64 = 0x0010_0000;
+    const CHILD_CLEARTID: u64 = 0x0020_0000;
+    const CHILD_SETTID: u64 = 0x0100_0000;
+    const KNOWN: u64 = 0x0000_0100 // CLONE_VM
+        | 0x0000_0200 // CLONE_FS
+        | 0x0000_0400 // CLONE_FILES
+        | 0x0000_0800 // CLONE_SIGHAND
+        | 0x0001_0000 // CLONE_THREAD
+        | 0x0004_0000 // CLONE_SYSVSEM
+        | 0x0008_0000 // CLONE_SETTLS
+        | PARENT_SETTID
+        | CHILD_CLEARTID
+        | CHILD_SETTID
+        | CLONE_PIDFD;
+    if size < 64 {
+        return EINVAL;
+    }
+    if size > 4096 {
+        return E2BIG_;
+    }
+    if !range_ok(cl, size) {
+        return EFAULT_;
+    }
+    if size > 88 {
+        // Forward-compat: bytes past the v2 struct must all be zero.
+        for i in 88..size {
+            if unsafe { ((cl + i) as *const u8).read_unaligned() } != 0 {
+                return E2BIG_;
+            }
+        }
+    }
+    let mut a = [0u64; 11];
+    let n = (size.min(88) / 8) as usize;
+    for (i, e) in a.iter_mut().enumerate().take(n) {
+        *e = unsafe { ((cl + i as u64 * 8) as *const u64).read_unaligned() };
+    }
+    let (flags, pidfd, ctid, ptid, exit_sig) = (a[0], a[1], a[2], a[3], a[4]);
+    let (stack, stack_size, tls) = (a[5], a[6], a[7]);
+    if flags & 0xff != 0 {
+        return EINVAL; // signal bits live in exit_signal for clone3
+    }
+    if flags & !(KNOWN | CLONE_PIDFD) != 0 {
+        return EINVAL;
+    }
+    if exit_sig > 63 {
+        return EINVAL;
+    }
+    if a[8] != 0 || a[9] != 0 {
+        return EINVAL; // set_tid/set_tid_size: exact pids unhonorable
+    }
+    if a[10] != 0 {
+        return EINVAL; // cgroup
+    }
+    if flags & CLONE_PIDFD != 0 && (flags & PARENT_SETTID != 0 || ptid != 0) {
+        return EINVAL;
+    }
+    if stack != 0 && stack_size == 0 {
+        return EINVAL;
+    }
+    if flags & CLONE_PIDFD != 0 {
+        if !range_ok_w(pidfd, 4) {
+            return EFAULT_;
+        }
+        // Pre-flight the mint — Linux allocates the pidfd file
+        // before copy_process, so EMFILE must fail before the
+        // child exists, not after.
+        let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+        let room = ofds.iter().position(Option::is_none).is_some()
+            && cur_mut().is_some_and(|t| fdt(t).fds.iter().position(Option::is_none).is_some());
+        if !room {
+            return EMFILE;
+        }
+    }
+    let mut cf = (flags & !CLONE_PIDFD) | exit_sig;
+    if ptid != 0 {
+        cf |= PARENT_SETTID;
+    }
+    if ctid != 0 {
+        cf |= CHILD_SETTID | CHILD_CLEARTID;
+    }
+    let Some(rsp) = stack.checked_add(stack_size) else {
+        return EINVAL;
+    };
+    let child = sys_clone(ctx, cf, rsp, ptid, ctid, tls);
+    if (child as i64) < 0 {
+        return child;
+    }
+    if flags & CLONE_PIDFD != 0 {
+        let pfd = anon_fd(FdKind::Pidfd(child), false);
+        if (pfd as i64) < 0 {
+            return pfd; // pre-flight makes this unreachable
+        }
+        // SAFETY: pidfd range validated writable above.
+        unsafe { (pidfd as *mut u32).write_unaligned(pfd as u32) };
+    }
+    child
+}
+
 /// A vfork parent sleeps in WaitOn::Vfork(child_pid) until the child
 /// execs (mm swap in exec()) or exits (task_exit_inner's wake match
 /// covers Vfork too). Resuming it returns the child's pid — exactly
@@ -19837,6 +19950,60 @@ pub fn fd_close(fd: u64) -> u64 {
     0
 }
 
+/// close_range(first, last, flags): CLOSE_RANGE_UNSHARE swaps in a
+/// private fd table first (fdtab_dup bumps every OFD ref, so the
+/// closes then apply only to our copy — sharers keep their slots);
+/// CLOSE_RANGE_CLOEXEC marks instead of closing. first > last and
+/// the UNSHARE|CLOEXEC combo EINVAL (Linux: the combo is
+/// meaningless); an out-of-range last clamps to the table end and
+/// empty slots pass silently.
+pub fn fd_close_range(first: u64, last: u64, flags: u64) -> u64 {
+    const UNSHARE: u64 = 2;
+    const CLOEXEC: u64 = 4;
+    if flags & !(UNSHARE | CLOEXEC) != 0
+        || flags & (UNSHARE | CLOEXEC) == (UNSHARE | CLOEXEC)
+        || first > last
+    {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let top = last.min(MAX_FDS as u64 - 1);
+    if flags & UNSHARE != 0 && t.fdi != FDI_NONE {
+        if fdt(t).users > 1 {
+            const ENOMEM_: u64 = (-12i64) as u64;
+            let Some(ni) = fdtab_dup(t.fdi) else {
+                return ENOMEM_;
+            };
+            fdtab_release(t.fdi);
+            t.fdi = ni;
+        }
+    }
+    if flags & CLOEXEC != 0 {
+        for fd in first..=top {
+            cloexec_set(t, fd as usize, true);
+        }
+        return 0;
+    }
+    for fd in first..=top {
+        let f = fd as usize;
+        let tag = fdt(t)
+            .fds
+            .get(f)
+            .and_then(|s| *s)
+            .and_then(|oi| {
+                unsafe { (*core::ptr::addr_of_mut!(OFDS))[oi as usize].as_ref() }
+            })
+            .and_then(ofd_lock_tag);
+        if let Some(oi) = fdt(t).fds[f].take() {
+            ofd_release(oi as usize);
+            if let Some(tag) = tag {
+                flock_close_sweep(tag, t.tgid);
+            }
+        }
+    }
+    0
+}
+
 /// Drop one reference on OFD `oi`; at zero, retire it — pipe ends
 /// then run endpoint accounting (a dup'd end only counts once).
 fn ofd_release(oi: usize) {
@@ -21746,6 +21913,41 @@ pub fn fd_epoll_wait(
         return t.ctx.rax;
     }
     block_switch()
+}
+
+/// epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsize):
+/// the timespec-timeout pwait — NULL waits forever like epoll_wait's
+/// -1; an invalid timespec EINVALs (sec < 0 or nsec outside
+/// 0..1e9) and a valid one rounds up to whole ms, matching
+/// poll_schedule_timeout's ceil-to-jiffy.
+pub fn fd_epoll_pwait2(
+    ctx: &mut UCtx,
+    epfd: u64,
+    events: u64,
+    maxevents: u64,
+    timeout: u64,
+    sigmask: u64,
+    sigsize: u64,
+) -> u64 {
+    let ms = if timeout == 0 {
+        -1
+    } else {
+        if !range_ok(timeout, 16) {
+            return EFAULT;
+        }
+        // SAFETY: timeout range validated readable above.
+        let (sec, nsec) = unsafe {
+            (
+                (timeout as *const i64).read_unaligned(),
+                ((timeout + 8) as *const i64).read_unaligned(),
+            )
+        };
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return EINVAL;
+        }
+        sec.saturating_mul(1000).saturating_add((nsec + 999_999) / 1_000_000)
+    };
+    fd_epoll_wait(ctx, epfd, events, maxevents, ms, sigmask, sigsize)
 }
 
 // --- eventfd + timerfd -------------------------------------------
