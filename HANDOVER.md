@@ -7668,3 +7668,31 @@ Proof: pkttest 24 checks 0 failures. Exit 33, 81 tasks, zero
 leak.
 
 Audit run-48: 0 confirmed, 1 fixed in-run. Ledger at 231 CVEs.
+
+`socket(AF_UNIX, SOCK_STREAM|SOCK_DGRAM)` + `socketpair(2)` (NR 53
+was absent — wired through the syscall table). `UNIXSOCKS` holds
+endpoints, `UNIXCONNS` connected pairs (two 4KiB byte rings,
+open[]/rd_shut[] per side), `UNIXDQ` the flat datagram queues
+(si*4 slice — kept off the enum for clippy's large-variant rule).
+
+sockaddr_un honours both namespaces: paths stop at the first NUL,
+`\0`-abstract names span the addrlen tail — addrlen can be 3, so
+the `len>=8` bind/connect prologues yield to the unix arm's own
+gate. Stream connect() enqueues on the listener backlog and
+answers 0 (Linux completes before accept); accept() mints the
+server fd. A full backlog blocks on UnixConn(li,ui) — the waker
+performs the enqueue since block_switch never returns for a
+retry. Datagrams resolve bound names (or the connect/socketpair
+peer) into per-sock queues; queue-full is honest loss.
+
+Three in-run findings: name-collision matched the bind caller's
+own name (re-bind EINVAL ordering), blocked connects resumed
+with stale rax (waker now completes them), and wait arming left
+stale wait_deadline values. All fixed before commit.
+
+Proof: unixtest 49 checks 0 failures — duplex streams via
+socketpair and via bind/listen/connect/accept, shutdown
+EOF/EPIPE, both name kinds, FIONREAD, poll, recvfrom source
+name, a fork()'d cross-task read. Exit 33, 82 tasks, zero leak.
+
+Audit run-49: 0 confirmed, 3 fixed in-run. Ledger at 239 CVEs.
