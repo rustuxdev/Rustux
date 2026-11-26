@@ -7589,3 +7589,29 @@ IO_CMD READ lba0 -> MBR sig, ENOTTY/EACCES/EINVAL/EFAULT gates.
 Exit 33, 80 tasks, zero leak.
 
 Audit run-45: 0 confirmed. Ledger at 216 CVEs.
+
+## run-287 — loop devices
+
+The losetup ABI: `/dev/loop-control` (misc 10:237) with
+`LOOP_CTL_GET_FREE`, `/dev/loop0-7` block nodes on major 7 with
+direct minor indexing (no partition nibble), and the LOOP_*
+ioctl family — SET_FD/CLR_FD/SET_STATUS64/GET_STATUS64/
+SET_CAPACITY. A `Loop` binds an fd's backing — `FdKind::File`
+initrd slices (read-only) or `FdKind::Ram` VFiles (read-write),
+bounded by `lo_offset`+`lo_sizelimit` — and the loop rides the
+normal blk dispatch (pread/pwrite/BLKGETSIZE64/fsync all work).
+
+Two semantics caught in-run:
+- Unbound loop minors must *open* — losetup needs the fd for
+  SET_FD. The gate is `7 => i`; transport answers ENXIO on reads
+  and CLR on unbound.
+- `Ram` backings pin the backing OFD — without it the VFile slot
+  could be freed+reused while bound and the loop would alias an
+  unrelated file's bytes.
+
+Proof: blktest +24 checks, 0 failures — GET_FREE, unbound open/
+ENXIO, SET_FD + EBUSY, capacity, read/write cross-path verify,
+STATUS64 offset/limit, CLR_FD, rebind, EINVAL/ENOTTY gates.
+Exit 33, 80 tasks, zero leak.
+
+Audit run-46: 0 confirmed, 2 fixed in-run. Ledger at 220 CVEs.
