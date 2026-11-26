@@ -7822,3 +7822,43 @@ blocked-reader wake, reopen freshness. Exit 33, 84 tasks,
 zero leak.
 
 Audit run-53: 0 confirmed, 1 fixed in-run. Ledger at 249 CVEs.
+
+## run-295 — memfd_create (NR 319) + file sealing
+
+memfd_create mints an anonymous O_RDWR file: a Ram-backed VFile
+born unlinked so no path ever names it, reclaimed by
+vfile_free_if_dead at last close (dup/fork/SCM_RIGHTS views hold
+real OFD refs). The name is a display label — <=249 bytes like
+Linux, stored "memfd:<label>" so fd links read
+"/memfd:name (deleted)" (the link printer now appends " (deleted)"
+for any unlinked-while-open inode, matching Linux's format).
+Flags are whitelisted to MFD_CLOEXEC|MFD_ALLOW_SEALING —
+HUGETLB/EXEC bits get an honest EINVAL since no hugetlbfs or
+exec-scope machinery exists.
+
+Sealing: VFile.seals holds the F_SEAL_* set on the inode (shared
+by every aliased view, which is the point of the ABI). Without
+MFD_ALLOW_SEALING the file is born F_SEAL_SEAL; fcntl(1033/1034)
+accept memfd fds only, EINVAL non-memfd and unknown bits, EPERM
+once SEAL_SEAL is set. Enforcement covers all three remaining
+size/content mutators: write/pwrite EPERM under SEAL_WRITE or
+SEAL_FUTURE_WRITE, extension past EOF EPERM under SEAL_GROW
+(in-bounds overwrite stays legal), ftruncate EPERMs per direction
+under GROW/SHRINK. path-truncate can't reach a born-unlinked
+inode by construction.
+
+No in-run findings — the two structural n/a's worth recording:
+CVE-2026-63952 (SEAL_EXEC's implied SEAL_WRITE lands after the
+writable-map check) can't exist here — SEAL_EXEC is rejected at
+the fcntl mask, MFD_EXEC at mint, and file-backed MAP_SHARED mmap
+is ENODEV outright. And CVE-2026-99336/-64283/-99473 (KVM
+guest_memfd), CVE-2024-50182 (memfd_secret), the gup/hugetlb
+memfd families — separate syscalls, all unimplemented.
+
+Proof: memfdtest 46 checks, 0 failures — mint/flags/name bounds,
+O_RDWR/S_IFREG/link-shape/path-invisibility, the seal fcntl gate
+set, GROW/SHRINK/WRITE/SEAL_SEAL enforcement across write/
+pwrite/ftruncate, dup+fork+SCM_RIGHTS shared-seal proofs,
+MAP_PRIVATE on a fully sealed file. Exit 33, 85 tasks, zero leak.
+
+Audit run-54: 0 confirmed. Ledger at 255 CVEs.
