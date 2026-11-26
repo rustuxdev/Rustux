@@ -7221,3 +7221,25 @@ Audit run-34: 0 confirmed — CVE-2011-1577 (crafted header size) and
 CVE-2011-1776 (unchecked entry size) handled by the clamps +
 fixed-size buffers; CVE-2026-64318 count-parse class handled.
 Ledger at 194 CVEs. Commits pushed origin main.
+
+## run-276 — virtio-rng entropy feed + pool reseed
+
+The pool was a one-shot rdrand seed at boot with no reseed path —
+and no virtio-rng, the canonical guest entropy tap (QEMU feeds it
+from the host's getrandom). virtio.rs gains a third device: probe
+transitional 0x1005 through the shared legacy path, post 8x64B
+DESC_WRITE fill buffers, SPIN-bounded drain with an absolute
+RNG_SEEN cursor, id<N_RNG + len.min(64) gates, drained slots
+re-posted. rand.rs gains reseed(): entropy XOR-folds into the
+ChaCha key words + rdtsc into the nonce — future output stays a
+function of every seed ever fed (a weak source perturbs, can't
+wipe); counter bumps and idx=64 drops the stale block buffer so
+no old-key bytes are drawn again. Empty input is a no-op.
+
+Proof: `rng 0x60e0 fed 256B -> reseed (nonuniform true)`;
+/dev/urandom nonzero ok. Exit 33, 76 tasks, zero leak.
+
+Audit run-35: 0 confirmed — CVE-2023-53998's writer/reader race
+n/a (boot-context only), CVE-2026-87043's unready-device class
+handled (pool seeded first; absent device returns 0, reseed
+no-ops). Ledger at 196 CVEs. Commits pushed origin main.

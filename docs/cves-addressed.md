@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**194 unique CVEs recorded.**
+**196 unique CVEs recorded.**
 
 ## klib ports
 
@@ -150,6 +150,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2023-53035 | physmap rung: supervisor mirror of all phys RAM at PML4 slot 256 (0xFFFF_8000_0000_0000)… | PRESENT |
 | CVE-2023-53798 | real statfs/fstatfs: frame-allocator capacity + vfile inode counts, procfs superblock dis… | struct zeroed then fixed-offset fills only; fsid/spare stay zero; ENOENT-before-write ordering matches Linux; no new class rows. audit run-76: 0 confirmed; iotest +7 green, zero l… |
 | CVE-2023-53798 | real-busybox verification: sysinfo struct fill (totalram/freeram/procs/mem_unit) + lstat/… | struct zeroed then fully written at fixed offsets — no kernel bytes escape; unrelated-driver entries recorded for the class, n/a by construction (sysinfo writes only known values)… |
+| CVE-2023-53998 | virtio-rng entropy rung: DEV_RNG 0x1005 transitional probe through probe_io/handshake/Vq:… | audit run-35 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-53998, CVE-2026-87043 — handled or n/a. Verified: make run exit 33, 76 tasks, frames equal… |
+| CVE-2023-53998 | virtio-rng entropy rung: DEV_RNG 0x1005 transitional probe through probe_io/handshake/Vq:… | audit run-35 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-53998, CVE-2026-87043 — handled or n/a. Verified: make run exit 33, 76 tasks, frames equal… |
 | CVE-2023-54019 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
 | CVE-2023-54019 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) — interest pins OFD index (… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
 | CVE-2023-54019 | poll(2): pollfd readiness + timeout wait | poller-vs-polled lifetime class structurally absent: no waitqueue pointers -- wait state is (wait_ptr,wait_len) into the sleeper's OWN address space and every wake re-derives read… |
@@ -267,6 +269,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-80758 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
 | CVE-2026-80776 | real Debian apt-get install end-to-end: aptprobe run() children now execve with PATH envp… | audit run-110 manual scoped + cve.now over HTTP JSON-RPC (entities.search confirmed the lost-wakeup class analogs): verified wait4_collect preserves Linux ordering (EINVAL on bad… |
 | CVE-2026-80808 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
+| CVE-2026-87043 | virtio-rng entropy rung: DEV_RNG 0x1005 transitional probe through probe_io/handshake/Vq:… | audit run-35 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-53998, CVE-2026-87043 — handled or n/a. Verified: make run exit 33, 76 tasks, frames equal… |
+| CVE-2026-87043 | virtio-rng entropy rung: DEV_RNG 0x1005 transitional probe through probe_io/handshake/Vq:… | audit run-35 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-53998, CVE-2026-87043 — handled or n/a. Verified: make run exit 33, 76 tasks, frames equal… |
 | CVE-2026-89560 | char devices + real /dev: VFile.fmt/rdev + FdKind::Dev + mknod/mknodat + dev_init boot no… | 89560 n/a (no overlayfs/LSM; no-CAP_MKNOD = standing no-cred-model divergence). audit caught+fixed: open() admitted all major-1/5 minors and fd_read's catch-all routed unhandled r… |
 | CVE-2026-89595 | inotify: init/init1/add_watch/rm_watch + path-keyed watch table, dir vs self event routin… | 1479 n/a (Rust, single commit point); 46040 defensive pattern followed (slot rollback on anon_fd failure, single-assignment watch commit); 54119/89595 n/a by construction (single-… |
 | CVE-2026-89596 | `pci` | **n/a to mechanism** — our CF8/CFC access has no save/restore arrays; reminder: all config ops must stay IRQ-safe (they are — port I/O only) |
