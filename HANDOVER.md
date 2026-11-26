@@ -7163,3 +7163,23 @@ socket suite (nettest + wgettest) over the modern-only NIC.
 
 Audit run-32: 0 confirmed — cap-walk bounds hardening applied
 in-run (CVE-2026-13216 class). Commit pushed origin main.
+## run-274 — multi-namespace NVMe
+
+nvme.rs binds up to MAXNS(4) namespaces: identify-ctrl's NN is
+clamped to the table size and drives a per-ns identify loop —
+each ns must pass nsze!=0 AND lbads==512 to bind (inactive ns
+identify as zeroed and are skipped, logged). NSID[] records the
+real nsid per bound index so a skipped ns can't silently renumber
+later disks; read/write commands carry the validated nsid and
+bound against NS_SECTORS[i]. The sector0 + write-verify-restore
+proofs now run per bound disk.
+
+Makefile: nvme,id=nvme0 + nvme-ns nsid=1/2 (QEMU 8.2 accepts the
+auto-attached nvme-bus). Boot proof: ns1+ns2 bound (ns3/4 zero,
+skipped), disk0/disk1 sector0+write proofs green, ext4 mounts
+over disk2p0 AND disk3p0. blktest +5 checks: /dev/nvme0n2 open,
+S_IFBLK 259:16, BLKGETSIZE64, pread 55AA, pwrite/restore — 31
+checks, 0 failures.
+
+Audit run-33: 0 confirmed — CVE-2026-89971's failed-identify
+class handled (zero data never binds). Commit pushed origin main.

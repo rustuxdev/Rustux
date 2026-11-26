@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**190 unique CVEs recorded.**
+**192 unique CVEs recorded.**
 
 ## klib ports
 
@@ -265,6 +265,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-89595 | inotify: init/init1/add_watch/rm_watch + path-keyed watch table, dir vs self event routin… | 1479 n/a (Rust, single commit point); 46040 defensive pattern followed (slot rollback on anon_fd failure, single-assignment watch commit); 54119/89595 n/a by construction (single-… |
 | CVE-2026-89596 | `pci` | **n/a to mechanism** — our CF8/CFC access has no save/restore arrays; reminder: all config ops must stay IRQ-safe (they are — port I/O only) |
 | CVE-2026-89852 | statx(2) syscall NR 332: sys_statx (flags EINVAL on unknown AT_* bits incl AT_SYMLINK_FOL… | audit run-101 quick scoped: 1 confirmed LOW finding fixed in-diff — AT_SYMLINK_FOLLOW (0x400) EINVAL'd though Linux accepts it (== default follow semantics); added to KNOWN mask +… |
+| CVE-2026-89971 | multi-namespace NVMe rung: identify-ctrl NN now .min(MAXNS=4) clamps a per-ns identify lo… | audit run-33 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-89971, CVE-2026-98726, CVE-2026-98727 — handled or n/a. Verified: make run exit 33, 76 tas… |
+| CVE-2026-89971 | multi-namespace NVMe rung: identify-ctrl NN now .min(MAXNS=4) clamps a per-ns identify lo… | audit run-33 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-89971, CVE-2026-98726, CVE-2026-98727 — handled or n/a. Verified: make run exit 33, 76 tas… |
 | CVE-2026-89972 | NVMe storage rung: nvme.rs — PCI MMIO probe (1b36:0010, QEMU's newer id; 0004 fallback),… | audit run-27 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6238, CVE-2025-21927, CVE-2023-6535/6536/6356, CVE-2026-89972, CVE-2024-45013, CVE-2026-99… |
 | CVE-2026-90003 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
 | CVE-2026-90138 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
@@ -272,6 +274,9 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-98163 | CLONE_SIGHAND+CLONE_THREAD: SIGTABS shared-disposition ledger (users refcount, sighand_st… | cgroup dying-task iteration UAF class — structurally absent: no cgroups, no resurrect-able task refs, slot free is synchronous under the IF-masked sweep; DEAD_THREADS flag + cur-g… |
 | CVE-2026-98205 | /dev/input/event0 evdev + DOOM keyboard input: PS/2 decoder now emits Linux keycode press… | audit run-118 quick scoped + cve.now MCP live (entities.search on evdev/input classes — analogs above): verified ev_push bounded to EVR_SIZE with drop-on-full; ev_pop memmove stay… |
 | CVE-2026-98726 | legacy BIOS boot rung: Multiboot2 front end — kernel also builds for x86_64-unknown-none… | audit run-120 quick scoped via safe-anything MCP (kernel/ 119 files clean; security-audit skill still absent on disk — limitation recorded) + cve.now entities.search (parsing clas… |
+| CVE-2026-98726 | multi-namespace NVMe rung: identify-ctrl NN now .min(MAXNS=4) clamps a per-ns identify lo… | audit run-33 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-89971, CVE-2026-98726, CVE-2026-98727 — handled or n/a. Verified: make run exit 33, 76 tas… |
+| CVE-2026-98726 | multi-namespace NVMe rung: identify-ctrl NN now .min(MAXNS=4) clamps a per-ns identify lo… | audit run-33 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-89971, CVE-2026-98726, CVE-2026-98727 — handled or n/a. Verified: make run exit 33, 76 tas… |
+| CVE-2026-98727 | multi-namespace NVMe rung: identify-ctrl NN now .min(MAXNS=4) clamps a per-ns identify lo… | audit run-33 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-89971, CVE-2026-98726, CVE-2026-98727 — handled or n/a. Verified: make run exit 33, 76 tas… |
 | CVE-2026-98788 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
 | CVE-2026-98839 | tty stdin: IRQ1->scancode ring->line discipline->read(0)/poll(0)/FIONREAD, WaitOn::Stdin,… | bounded queues throughout: 256B canonical edit buffer + 4KiB ready queue, drop-on-full = Linux input discard; feed runs from the timer tick (printk is irq_save-safe, kill marks pe… |
 | CVE-2026-98866 | CLONE_VM threads: shared address space via MM_REFS (pml4,users) ledger, exec_mmap-style d… | SELF-REVIEW CAUGHT two refcount-safety bugs pre-commit: mm_share silently dropped the ref when the (provably-unreachable) table was full — a shared pml4 would have freed under a l… |
