@@ -695,6 +695,12 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         65 => user::sys_semop(ctx, a1, a2, a3),
         66 => user::sys_semctl(a1, a2, a3, a4),
         220 => user::sys_semtimedop(ctx, a1, a2, a3, a4),
+        // POSIX per-process timers.
+        222 => user::sys_timer_create(a1, a2, a3),
+        223 => user::sys_timer_settime(a1, a2, a3, a4),
+        224 => user::sys_timer_gettime(a1, a2),
+        225 => user::sys_timer_getoverrun(a1),
+        226 => user::sys_timer_delete(a1),
         68 => user::sys_msgget(a1, a2),
         69 => user::sys_msgsnd(ctx, a1, a2, a3, a4),
         70 => user::sys_msgrcv(ctx, a1, a2, a3, a4, a5),

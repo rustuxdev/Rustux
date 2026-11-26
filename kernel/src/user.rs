@@ -3096,6 +3096,19 @@ impl Task {
         // SEM_UNDO adjustments land at process death like Linux —
         // the freed vals can unblock another task's whole op array.
         sem_undo_all(self.pid);
+        // POSIX timers are thread-group objects — free this tgid's
+        // slots when its last live member is reaped.
+        let last = unsafe { &*core::ptr::addr_of!(TASKS) }
+            .iter()
+            .flatten()
+            .all(|o| {
+                o.tgid != self.tgid
+                    || o.pid == self.pid
+                    || o.state == TaskState::Exited
+            });
+        if last {
+            ptimer_release_tgid(self.tgid);
+        }
         if self.kstack_base != 0 {
             // SAFETY: kstack_base came from kmalloc, freed once here.
             unsafe { kalloc::kfree(self.kstack_base as *mut u8) };
@@ -26940,6 +26953,324 @@ pub fn sys_alarm(sec: u64) -> u64 {
     prev
 }
 
+// --- POSIX per-process timers (timer_create..timer_delete) ------
+
+const MAX_PTIMERS: usize = 32;
+/// si_code a timer notification carries — Linux's SI_TIMER.
+const SI_TIMER: i32 = -2;
+const SIGEV_SIGNAL: u64 = 0;
+const SIGEV_NONE: u64 = 1;
+const SIGEV_THREAD_ID: u64 = 2;
+const TIMER_ABSTIME: u64 = 1;
+
+struct PTimer {
+    /// Creating task's tgid — Linux scopes timerids per-process.
+    tgid: u64,
+    /// Notify target pid — the creator, or _THREAD_ID's tid.
+    tid: u64,
+    notify: u64,
+    signo: u32,
+    /// sigev_value.sival_int — rides SigSrc.aux into si_value.
+    sev_val: i32,
+    armed: bool,
+    deadline: u64, // ticks
+    interval: u64, // ticks, 0 = one-shot
+    /// Expirations while the last notification still pends.
+    overrun: i32,
+}
+
+static mut PTIMERS: [Option<PTimer>; MAX_PTIMERS] =
+    [const { None }; MAX_PTIMERS];
+
+/// Look up a live timerid belonging to `t`'s process.
+fn ptimer_resolve(t: &Task, id: u64) -> Option<usize> {
+    let i = id as usize;
+    let ts = unsafe { &*core::ptr::addr_of!(PTIMERS) };
+    match ts.get(i) {
+        Some(Some(p)) if p.tgid == t.tgid => Some(i),
+        _ => None,
+    }
+}
+
+/// Drop every timer owned by `tgid` — Linux's exit_itimers runs
+/// at exec and when the thread group dies; an orphaned slot would
+/// otherwise hold its table entry forever.
+pub fn ptimer_release_tgid(tgid: u64) {
+    let ts = unsafe { &mut *core::ptr::addr_of_mut!(PTIMERS) };
+    for e in ts.iter_mut() {
+        if e.as_ref().map(|p| p.tgid) == Some(tgid) {
+            *e = None;
+        }
+    }
+}
+
+/// Tick service: fire armed deadlines — pend the notification
+/// (or just lapse for SIGEV_NONE), count expirations that land
+/// while the previous signal still pends as overrun, rearm or
+/// disarm like Linux's posix-timer expiry.
+pub fn ptimer_expire() {
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let ts = unsafe { &mut *core::ptr::addr_of_mut!(PTIMERS) };
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for e in ts.iter_mut() {
+        let Some(p) = e.as_mut() else { continue };
+        if !p.armed || now < p.deadline {
+            continue;
+        }
+        // Missed intervals collapse into overrun the same way
+        // timerfd rolls the deadline forward.
+        let missed = (now - p.deadline).checked_div(p.interval).unwrap_or(0);
+        if p.notify != SIGEV_NONE {
+            // Same-tgid like create validated: a dead target's pid
+            // can be reused by another process — don't let the
+            // pending notification cross that boundary.
+            if let Some(t) = tasks.iter_mut().flatten().find(|t| {
+                t.pid == p.tid
+                    && t.tgid == p.tgid
+                    && t.state != TaskState::Exited
+            }) {
+                let bit = 1u32 << (p.signo - 1);
+                if t.pending & bit != 0 {
+                    p.overrun = p.overrun.saturating_add(1);
+                } else {
+                    let _ = pend_one(
+                        t,
+                        p.signo as u64,
+                        SigSrc {
+                            code: SI_TIMER,
+                            pid: 0,
+                            uid: 0,
+                            aux: p.sev_val as u64,
+                        },
+                    );
+                    p.overrun = 0;
+                }
+            }
+        }
+        if p.interval == 0 {
+            p.armed = false;
+        } else {
+            p.deadline = p
+                .deadline
+                .saturating_add(p.interval.saturating_mul(missed + 1));
+        }
+    }
+}
+
+/// itimerspec {it_interval {sec,nsec}, it_value {sec,nsec}} —
+/// 4 i64s at va. Validated readable by the caller.
+fn read_timespec2(va: u64) -> Result<[i64; 4], u64> {
+    const EFAULT_: u64 = (-14i64) as u64;
+    if !range_ok(va, 32) {
+        return Err(EFAULT_);
+    }
+    Ok(unsafe {
+        [
+            (va as *const i64).read_unaligned(),
+            ((va + 8) as *const i64).read_unaligned(),
+            ((va + 16) as *const i64).read_unaligned(),
+            ((va + 24) as *const i64).read_unaligned(),
+        ]
+    })
+}
+
+/// Write {interval, remaining} as itimerspec into va — validated
+/// writable by the caller. Disarmed reports {0,0}.
+fn write_timespec2(va: u64, interval: u64, deadline: u64, now: u64) {
+    let rem = deadline.saturating_sub(now);
+    unsafe {
+        (va as *mut i64).write_unaligned((interval / 100) as i64);
+        ((va + 8) as *mut i64)
+            .write_unaligned(((interval % 100) * 10_000_000) as i64);
+        ((va + 16) as *mut i64).write_unaligned((rem / 100) as i64);
+        ((va + 24) as *mut i64)
+            .write_unaligned(((rem % 100) * 10_000_000) as i64);
+    }
+}
+
+/// timer_create(clockid, sevp, timerid): mint a per-process timer.
+/// clockid collapses REALTIME+MONOTONIC onto the TICKS clock like
+/// every other deadline in the kernel; NULL sevp is SIGALRM.
+pub fn sys_timer_create(clk: u64, sevp: u64, timerid: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const EAGAIN_: u64 = (-11i64) as u64;
+    if clk > 1 {
+        return EINVAL; // REALTIME/MONOTONIC only
+    }
+    if !range_ok_w(timerid, 4) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let (mut notify, mut signo, mut tid, mut val) =
+        (SIGEV_SIGNAL, 14u32, t.pid, 0i32); // default: SIGALRM
+    if sevp != 0 {
+        if !range_ok(sevp, 20) {
+            return EFAULT_;
+        }
+        val = unsafe { (sevp as *const i32).read_unaligned() };
+        signo = unsafe {
+            ((sevp + 8) as *const u32).read_unaligned()
+        };
+        notify = unsafe {
+            ((sevp + 12) as *const u32).read_unaligned() as u64
+        };
+        if notify > SIGEV_THREAD_ID {
+            return EINVAL;
+        }
+        if !(1..32).contains(&signo) {
+            return EINVAL;
+        }
+        if notify == SIGEV_THREAD_ID {
+            tid = unsafe {
+                ((sevp + 16) as *const u32).read_unaligned() as u64
+            };
+            // The tid must be a live task in this process.
+            let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+            let ok = tasks.iter().flatten().any(|o| {
+                o.pid == tid
+                    && o.tgid == t.tgid
+                    && o.state != TaskState::Exited
+            });
+            if !ok {
+                return EINVAL;
+            }
+        }
+    }
+    let ts = unsafe { &mut *core::ptr::addr_of_mut!(PTIMERS) };
+    let Some(i) = ts.iter().position(Option::is_none) else {
+        return EAGAIN_; // Linux's answer on the resource limit
+    };
+    ts[i] = Some(PTimer {
+        tgid: t.tgid,
+        tid,
+        notify,
+        signo,
+        sev_val: val,
+        armed: false,
+        deadline: 0,
+        interval: 0,
+        overrun: 0,
+    });
+    write_task_u32(t.pml4, timerid, i as u32);
+    0
+}
+
+/// timer_settime(timerid, flags, new, old): arm/disarm and report
+/// the previous state. TIMER_ABSTIME reads it_value as an
+/// absolute deadline against the TICKS clock.
+pub fn sys_timer_settime(
+    id: u64,
+    flags: u64,
+    new: u64,
+    old: u64,
+) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    if flags & !TIMER_ABSTIME != 0 {
+        return EINVAL;
+    }
+    let nv = match read_timespec2(new) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    for &f in &nv {
+        if f < 0 {
+            return EINVAL;
+        }
+    }
+    if !(0..1_000_000_000).contains(&nv[1])
+        || !(0..1_000_000_000).contains(&nv[3])
+    {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(i) = ptimer_resolve(t, id) else {
+        return EINVAL;
+    };
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let ts = unsafe { &mut *core::ptr::addr_of_mut!(PTIMERS) };
+    let p = ts[i].as_mut().unwrap();
+    if old != 0 {
+        if !range_ok_w(old, 32) {
+            return EFAULT_;
+        }
+        // Disarmed reports {0,0} remaining like Linux.
+        write_timespec2(
+            old,
+            p.interval,
+            if p.armed { p.deadline } else { 0 },
+            now,
+        );
+    }
+    let interval = (nv[0] as u64)
+        .saturating_mul(100)
+        .saturating_add((nv[1] as u64).div_ceil(10_000_000));
+    let value = (nv[2] as u64)
+        .saturating_mul(100)
+        .saturating_add((nv[3] as u64).div_ceil(10_000_000));
+    if value == 0 {
+        p.armed = false;
+        p.interval = 0;
+        p.overrun = 0;
+        return 0;
+    }
+    // ABSTIME counts down from now; relative adds to it.
+    let dl = if flags & TIMER_ABSTIME != 0 {
+        value.saturating_sub(now)
+    } else {
+        value
+    };
+    p.interval = interval;
+    p.deadline = now.saturating_add(dl.max(1));
+    p.armed = true;
+    p.overrun = 0;
+    0
+}
+
+/// timer_gettime(timerid, cur): report {interval, remaining}.
+pub fn sys_timer_gettime(id: u64, cur: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    if !range_ok_w(cur, 32) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(i) = ptimer_resolve(t, id) else {
+        return EINVAL;
+    };
+    let ts = unsafe { &*core::ptr::addr_of!(PTIMERS) };
+    let p = ts[i].as_ref().unwrap();
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    write_timespec2(
+        cur,
+        p.interval,
+        if p.armed { p.deadline } else { 0 },
+        now,
+    );
+    0
+}
+
+/// timer_getoverrun(timerid): expirations queued on top of the
+/// last still-pending notification.
+pub fn sys_timer_getoverrun(id: u64) -> u64 {
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(i) = ptimer_resolve(t, id) else {
+        return EINVAL;
+    };
+    let ts = unsafe { &*core::ptr::addr_of!(PTIMERS) };
+    ts[i].as_ref().unwrap().overrun as u64
+}
+
+/// timer_delete(timerid): free the slot — a queued notification
+/// stays pending like Linux's orphaned timer signal.
+pub fn sys_timer_delete(id: u64) -> u64 {
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(i) = ptimer_resolve(t, id) else {
+        return EINVAL;
+    };
+    let ts = unsafe { &mut *core::ptr::addr_of_mut!(PTIMERS) };
+    ts[i] = None;
+    0
+}
+
 pub fn timerfd_expire() {
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     {
@@ -33567,6 +33898,9 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     // every shm VMA dies with it; dropping refs here also covers the
     // shared-mm detach where free_user_mappings never ran.
     shm_drop_all(t);
+    // exec replaces the signal struct — the group's POSIX timers
+    // die with it (Linux exit_itimers at begin_new_exec).
+    ptimer_release_tgid(t.tgid);
     t.nranges = 0;
     t.stack_top = 0;
     t.fs_base = 0; // TLS dies with the old image — new one SET_FSs
@@ -34232,6 +34566,7 @@ pub fn tick(img: &mut UCtx) -> *const UCtx {
     poll_expire(); // timed poll waits age one tick
     timerfd_expire(); // armed timerfds fire + wake their readers
     itimer_expire(); // alarm/setitimer deadlines -> SIGALRM family
+    ptimer_expire(); // timer_create deadlines -> SIGEV notifications
     nt_wait_expire(); // NT thread-object waits: dead/timeout wakes
     crate::e1000::rx_drain(); // feed socket queues from the live ring
     tcp_retx(); // SYN retransmit on the initial-RTO schedule
