@@ -461,6 +461,14 @@ enum WaitOn {
     Vfork(u64),
     /// wait4(-pgid)/wait4(0): any child in this process group.
     Group(u64),
+    /// waitid(P_ALL): like Any, but the waker writes a 128-byte
+    /// siginfo record to wait_ptr and rax lands 0; wait_len carries
+    /// the waitid option mask (WNOWAIT leaves the report consumable).
+    WaitIdAny,
+    /// waitid(P_PID / P_PIDFD resolved): one child pid.
+    WaitIdChild(u64),
+    /// waitid(P_PGID): any child in this process group.
+    WaitIdGroup(u64),
     /// pselect6(): `wait_ptr/2/3` are the user read/write/except
     /// fd_set VAs, `wait_len` the nfds; wait_deadline bounds it like
     /// Poll. Ready bits are rewritten through the sleeper's tables.
@@ -1087,6 +1095,11 @@ const SIGSRC_NONE: SigSrc = SigSrc {
 const WNOHANG: u64 = 1;
 const WUNTRACED: u64 = 2;
 const WCONTINUED: u64 = 8;
+/// waitid-only option bits: WEXITED names the zombie class (2 is
+/// WSTOPPED there — same slot as WUNTRACED) and WNOWAIT reports
+/// without consuming.
+const WEXITED: u64 = 4;
+const WNOWAIT: u64 = 0x1000000;
 /// Bytes pushed on the task's user stack per delivered signal:
 /// restorer (8) + signo (8) + the interrupted UCtx (160) +
 /// siginfo_t (128) + the pre-delivery sigmask (8).
@@ -1853,6 +1866,12 @@ fn child_change(cpid: u64, cpgid: u64, cppid: u64, status: u64, flag: u64) {
         return;
     }
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let cuid = tasks
+        .iter()
+        .flatten()
+        .find(|t| t.pid == cpid)
+        .map(|t| t.uid)
+        .unwrap_or(0);
     let mut delivered = false;
     for s in tasks.iter_mut() {
         let Some(p) = s else { continue };
@@ -1861,20 +1880,54 @@ fn child_change(cpid: u64, cpgid: u64, cppid: u64, status: u64, flag: u64) {
             && p.wait_len & flag != 0
             && (p.wait_on == WaitOn::Any
                 || p.wait_on == WaitOn::Child(cpid)
-                || p.wait_on == WaitOn::Group(cpgid))
+                || p.wait_on == WaitOn::Group(cpgid)
+                || p.wait_on == WaitOn::WaitIdAny
+                || p.wait_on == WaitOn::WaitIdChild(cpid)
+                || p.wait_on == WaitOn::WaitIdGroup(cpgid))
         {
-            p.ctx.rax = cpid;
-            if p.wait_ptr != 0 {
-                if let Some(pa) = translate(p.pml4, p.wait_ptr) {
-                    // SAFETY: pa is a writable user dword in p's map.
-                    unsafe { (crate::mm::pmap(pa) as *mut u32).write_unaligned(status as u32) };
+            let is_wid = matches!(
+                p.wait_on,
+                WaitOn::WaitIdAny | WaitOn::WaitIdChild(_) | WaitOn::WaitIdGroup(_)
+            );
+            if is_wid {
+                // waitid: the 128-byte siginfo and rax=0, like the
+                // exit path's WaitId arm.
+                if p.wait_ptr != 0 {
+                    let (code, st) = if flag == WUNTRACED {
+                        (CLD_STOPPED, ((status >> 8) & 0xff) as i32)
+                    } else {
+                        (CLD_CONTINUED, SIGCONT as i32)
+                    };
+                    let rec = fill_sig_rec(
+                        SIGCHLD as u64,
+                        SigSrc {
+                            code,
+                            pid: cpid as u32,
+                            uid: cuid,
+                            aux: st as u64,
+                        },
+                        false,
+                    );
+                    write_task_bytes(p.pml4, p.wait_ptr, &rec);
+                }
+                p.ctx.rax = 0;
+            } else {
+                p.ctx.rax = cpid;
+                if p.wait_ptr != 0 {
+                    if let Some(pa) = translate(p.pml4, p.wait_ptr) {
+                        // SAFETY: pa is a writable user dword in p's map.
+                        unsafe { (crate::mm::pmap(pa) as *mut u32).write_unaligned(status as u32) };
+                    }
                 }
             }
+            // A waitid-WNOWAIT peek leaves the event consumable —
+            // it doesn't count as a delivered report.
+            let consumed = !(is_wid && p.wait_len & WNOWAIT != 0);
             p.state = TaskState::Runnable;
             p.wait_on = WaitOn::None;
             p.wait_ptr = 0;
             p.wait_len = 0;
-            delivered = true;
+            delivered |= consumed;
         }
     }
     // A delivered report is consumed — without this, the child's
@@ -35107,8 +35160,15 @@ fn exit_bookkeeping(n: usize) {
         return;
     };
     t.state = TaskState::Exited;
-    let (cpid, cppid, wstatus, is_thread, cpgid, ctgid) =
-        (t.pid, t.ppid, t.exit_status, t.tgid != t.pid, t.pgid, t.tgid);
+    let (cpid, cppid, wstatus, is_thread, cpgid, ctgid, cuid) = (
+        t.pid,
+        t.ppid,
+        t.exit_status,
+        t.tgid != t.pid,
+        t.pgid,
+        t.tgid,
+        t.uid,
+    );
     // exit_files(2): the dying task's fds release NOW, not at reap —
     // a pipe writer's OFD must hit refs=0 here so blocked readers
     // see EOF instead of waiting for the scheduler's reaper pass.
@@ -35190,30 +35250,63 @@ fn exit_bookkeeping(n: usize) {
     let mut collected = false;
     for s in tasks.iter_mut() {
         let Some(p) = s else { continue };
+        // A waitid waiter also needs its WEXITED class bit armed —
+        // a WSTOPPED-only waitid sleeps through an exit like Linux.
+        let wid_hit = p.wait_len & WEXITED != 0
+            && (p.wait_on == WaitOn::WaitIdAny
+                || p.wait_on == WaitOn::WaitIdChild(cpid)
+                || p.wait_on == WaitOn::WaitIdGroup(cpgid));
         if p.state == TaskState::Blocked
             && p.pid == cppid
-            && (p.wait_on == WaitOn::Any
+            && (wid_hit
+                || p.wait_on == WaitOn::Any
                 || p.wait_on == WaitOn::Child(cpid)
                 || p.wait_on == WaitOn::Group(cpgid)
                 || p.wait_on == WaitOn::Vfork(cpid))
         {
-            // wait4 returns the child's pid; its status was already
-            // validated writable when the parent blocked.
-            p.ctx.rax = cpid;
-            if p.wait_ptr != 0 {
-                if let Some(pa) = translate(p.pml4, p.wait_ptr) {
-                    // SAFETY: pa is a translated, present user frame.
-                    unsafe {
-                        ((crate::mm::pmap(pa)) as *mut u32)
-                            .write_unaligned((wstatus & 0xffff) as u32)
-                    };
+            if wid_hit {
+                // waitid reports the 128-byte siginfo (validated at
+                // arm) and returns 0 — WNOWAIT peeks: the zombie
+                // stays consumable for a later wait.
+                if p.wait_ptr != 0 {
+                    let (code, st) = cld_code(wstatus);
+                    let rec = fill_sig_rec(
+                        SIGCHLD as u64,
+                        SigSrc {
+                            code,
+                            pid: cpid as u32,
+                            uid: cuid,
+                            aux: st as u64,
+                        },
+                        false,
+                    );
+                    write_task_bytes(p.pml4, p.wait_ptr, &rec);
+                }
+                p.ctx.rax = 0;
+            } else {
+                // wait4 returns the child's pid; its status was
+                // already validated writable when the parent blocked.
+                p.ctx.rax = cpid;
+                if p.wait_ptr != 0 {
+                    if let Some(pa) = translate(p.pml4, p.wait_ptr) {
+                        // SAFETY: pa is a translated, present user frame.
+                        unsafe {
+                            ((crate::mm::pmap(pa)) as *mut u32)
+                                .write_unaligned((wstatus & 0xffff) as u32)
+                        };
+                    }
                 }
             }
             // A Vfork wake only resumes the suspended parent — it
             // collected no status, so the zombie stays waitable for
-            // the parent's own wait4. wait4 wakes mark the zombie
+            // the parent's own wait4. A waitid-WNOWAIT peek is the
+            // same kind of non-consume. Real waits mark the zombie
             // collected so a second wait can't see it twice.
-            collected = p.wait_on != WaitOn::Vfork(cpid);
+            if !(p.wait_on == WaitOn::Vfork(cpid)
+                || (wid_hit && p.wait_len & WNOWAIT != 0))
+            {
+                collected = true;
+            }
             p.state = TaskState::Runnable;
             p.wait_on = WaitOn::None;
             p.wait_ptr = 0;
@@ -36176,6 +36269,207 @@ pub fn wait4(ctx: &mut UCtx, pid: i64, status_va: u64, flags: u64) -> u64 {
     block_switch()
 }
 
+/// Write a waitid report: the 128-byte siginfo_t for SIGCHLD to
+/// infop (already range-checked callers pass 0 for a NULL infop —
+/// report-only, no copy). Returns 0 or -EFAULT.
+fn waitid_report(t: &Task, code: i32, st: i32, infop: u64, pml4: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    if infop != 0 {
+        if !range_ok_w(infop, 128) {
+            return EFAULT_;
+        }
+        let rec = fill_sig_rec(
+            SIGCHLD as u64,
+            SigSrc {
+                code,
+                pid: t.pid as u32,
+                uid: t.uid,
+                aux: st as u64,
+            },
+            false,
+        );
+        write_task_bytes(pml4, infop, &rec);
+    }
+    0
+}
+
+/// waitid_collect — wait4_collect's twin: same selector and event
+/// classes keyed by the waitid mask, but the report is a siginfo
+/// and WNOWAIT leaves the state consumable (no reap, no flag
+/// clear) so a later wait sees the same event.
+fn waitid_collect(
+    tasks: &mut [Option<Task>],
+    cpid: u64,
+    sel: i64,
+    infop: u64,
+    pml4: u64,
+    flags: u64,
+) -> Option<u64> {
+    let relevant = |t: &Task| {
+        t.ppid == cpid && (sel == -1 || (sel > 0 && t.pid == sel as u64) || (sel < -1 && t.pgid == (-sel) as u64))
+    };
+    let nowait = flags & WNOWAIT != 0;
+    if flags & WEXITED != 0 {
+        if let Some(i) = tasks.iter().position(|s| {
+            s.as_ref()
+                .is_some_and(|t| relevant(t) && t.state == TaskState::Exited)
+        }) {
+            let t = tasks[i].as_ref().unwrap();
+            let (code, st) = cld_code(t.exit_status);
+            let r = waitid_report(t, code, st, infop, pml4);
+            if r != 0 {
+                return Some(r);
+            }
+            if !nowait {
+                let t = tasks[i].as_mut().unwrap();
+                t.reap();
+                tasks[i] = None;
+            }
+            return Some(0);
+        }
+    }
+    if flags & WUNTRACED != 0 {
+        // waitid's WSTOPPED occupies WUNTRACED's bit — same mask.
+        if let Some(t) = tasks
+            .iter_mut()
+            .flatten()
+            .find(|t| relevant(t) && t.state == TaskState::Stopped && t.stop_sig != 0)
+        {
+            let r = waitid_report(t, CLD_STOPPED, t.stop_sig as i32, infop, pml4);
+            if r != 0 {
+                return Some(r);
+            }
+            if !nowait {
+                t.stop_sig = 0;
+            }
+            return Some(0);
+        }
+    }
+    if flags & WCONTINUED != 0 {
+        if let Some(t) = tasks
+            .iter_mut()
+            .flatten()
+            .find(|t| relevant(t) && t.cont_report)
+        {
+            let r = waitid_report(t, CLD_CONTINUED, SIGCONT as i32, infop, pml4);
+            if r != 0 {
+                return Some(r);
+            }
+            if !nowait {
+                t.cont_report = false;
+            }
+            return Some(0);
+        }
+    }
+    None
+}
+
+/// waitid(247): wait4 with a siginfo report and finer masks. idtype
+/// P_ALL/P_PID/P_PGID/P_PIDFD selects the child set; options must
+/// name an event class (WEXITED|WSTOPPED|WCONTINUED) — EINVAL
+/// without one. WNOHANG answers now (a zeroed si_pid marks "no
+/// state change"); WNOWAIT reports but leaves the event consumable.
+pub fn waitid(ctx: &mut UCtx, idtype: u64, id: u64, infop: u64, flags: u64) -> u64 {
+    const ECHILD: u64 = (-10i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    if flags
+        & !(WNOHANG
+            | WUNTRACED
+            | WEXITED
+            | WCONTINUED
+            | WNOWAIT
+            | 0x20000000
+            | 0x40000000
+            | 0x80000000)
+        != 0
+        || flags & (WUNTRACED | WEXITED | WCONTINUED) == 0
+    {
+        return EINVAL;
+    }
+    // Map idtype to wait4's signed-pid selector: P_ALL -> -1, P_PID
+    // -> +id, P_PGID -> -pgid. P_PIDFD resolves its fd once here —
+    // EBADF for a bad fd, EINVAL for a non-pidfd like Linux. P_PID
+    // and P_PGID EINVAL a nonpositive id (kernel_waitid's upid<=0).
+    let sel: i64 = match idtype {
+        0 => -1,
+        1 | 2 if id == 0 || id >= 0x8000_0000 => return EINVAL,
+        1 => id as i64,
+        2 => -(id as i64),
+        3 => {
+            let Some(t) = cur_mut() else { return EINVAL };
+            let Some(o) = ofd(t, id) else { return EBADF };
+            let FdKind::Pidfd(pid) = o.kind else {
+                return EINVAL;
+            };
+            pid as i64
+        }
+        _ => return EINVAL,
+    };
+    let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
+    let (cpid, pml4) = unsafe {
+        (*core::ptr::addr_of!(TASKS))[cur]
+            .as_ref()
+            .map(|t| (t.pid, t.pml4))
+            .unwrap_or((0, 0))
+    };
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    if let Some(r) = waitid_collect(tasks, cpid, sel, infop, pml4, flags) {
+        return r;
+    }
+    let relevant = |t: &Task| {
+        t.ppid == cpid && (sel == -1 || (sel > 0 && t.pid == sel as u64) || (sel < -1 && t.pgid == (-sel) as u64))
+    };
+    if !tasks.iter().flatten().any(relevant) {
+        return ECHILD;
+    }
+    if flags & WNOHANG != 0 {
+        // Live children, no state change — a zeroed record (si_pid
+        // 0) distinguishes this from a real report, per waitid(2).
+        if infop != 0 {
+            if !range_ok_w(infop, 128) {
+                return EFAULT_;
+            }
+            write_task_bytes(pml4, infop, &[0u8; 128]);
+        }
+        return 0;
+    }
+    // Validate the siginfo target BEFORE blocking like wait4's
+    // status pointer — a bad infop fails with EFAULT, not a sleep.
+    if infop != 0 && !range_ok_w(infop, 128) {
+        return EFAULT_;
+    }
+    {
+        let t = tasks[cur].as_mut().unwrap();
+        if deliverable(t) {
+            return (-4i64) as u64; // -EINTR: signal before sleep
+        }
+        t.wait_on = match sel {
+            -1 => WaitOn::WaitIdAny,
+            s if s > 0 => WaitOn::WaitIdChild(s as u64),
+            s => WaitOn::WaitIdGroup((-s) as u64),
+        };
+        t.wait_ptr = infop;
+        t.wait_len = flags;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+    }
+    // Armed recheck — a child exiting between the scan and the
+    // arming ran the wake loop with nobody home; with wait_on set
+    // the exit path now sees us and leaves the pid in ctx.rax.
+    if tasks[cur].as_ref().unwrap().state == TaskState::Blocked {
+        if let Some(r) = waitid_collect(tasks, cpid, sel, infop, pml4, flags) {
+            let t = tasks[cur].as_mut().unwrap();
+            t.wait_on = WaitOn::None;
+            t.wait_ptr = 0;
+            t.state = TaskState::Runnable;
+            return r;
+        }
+    } else {
+        return tasks[cur].as_ref().unwrap().ctx.rax;
+    }
+    block_switch()
+}
+
 /// getpid() -> current task's pid.
 pub fn getpid() -> u64 {
     cur_mut().map(|t| t.tgid).unwrap_or(0)
@@ -36301,7 +36595,10 @@ pub fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
         let mut wakes = [0u64; MAX_TASKS];
         let mut nw = 0usize;
         for s in tasks.iter().flatten() {
-            if s.state == TaskState::Blocked && s.wait_on == WaitOn::Group(old_pgid) {
+            if s.state == TaskState::Blocked
+                && (s.wait_on == WaitOn::Group(old_pgid)
+                    || s.wait_on == WaitOn::WaitIdGroup(old_pgid))
+            {
                 wakes[nw] = s.pid;
                 nw += 1;
             }
@@ -36314,7 +36611,8 @@ pub fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
             if empty {
                 if let Some(p) = tasks.iter_mut().flatten().find(|t| t.pid == *w) {
                     if p.state == TaskState::Blocked
-                        && p.wait_on == WaitOn::Group(old_pgid)
+                        && (p.wait_on == WaitOn::Group(old_pgid)
+                            || p.wait_on == WaitOn::WaitIdGroup(old_pgid))
                     {
                         p.ctx.rax = (-10i64) as u64; // -ECHILD
                         p.state = TaskState::Runnable;

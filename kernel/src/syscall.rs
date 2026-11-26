@@ -561,6 +561,10 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         // sign-extends. Without the i32 cast, wait4(-1) becomes a
         // search for pid 4294967295 -> ECHILD (found by real dash).
         NR_WAIT4 => user::wait4(ctx, a1 as i32 as i64, a2, a3),
+        // waitid(idtype, id, infop, options): id is uid_t/fd-sized —
+        // truncate to u32 like the pid args so a stray high bit can't
+        // fabricate a selector the caller didn't pass.
+        247 => user::waitid(ctx, a1 as u32 as u64, a2 as u32 as u64, a3, a4),
         NR_KILL => user::kill(a1 as i32 as i64, a2),
         NR_GETPPID => user::getppid(),
         NR_GETDENTS => user::fd_getdents(a1, a2, a3),
