@@ -7024,3 +7024,24 @@ leak, ext4 disk2p0 MOUNTED walked=true.
 
 Next candidates: NVMe write_range + /dev/nvme0n1 in the OFD layer,
 modern virtio transport, virtio IRQ RX.
+
+## run-269 — NVMe write path + write datapath proofs
+
+nvme.rs gains write_range: OP_WRITE (0x01) NVM command, the audited
+read path's mirror — same index/bounds gates, BATCH-capped copy-in
+to the staging page, PRP1 carries the page, cid-tagged phase-bit
+polling. Both drivers now selftest writes at lba 64 — MBR gap before
+the ext4 partition; -snapshot keeps the host image clean anyway.
+Read -> write pattern -> verify -> restore -> re-verify, all true
+on virtio and NVMe. virtio::write_range exercised for the first time
+(was dead API — clippy warning cleared).
+
+Audit: scoped quick, security-audit skill, run-28 — 0 confirmed.
+cve-now: nvme-tcp target classes + bhyve hypervisor classes + keep-
+alive teardown all n/a; CVE-2023-6238 device-DMA class extends to
+writes via the same staging-bounded copy-in. make run exit 33,
+zero leak, both ext4 transports still mount.
+
+Next candidates: /dev block nodes in the OFD layer (write_range has
+no userspace reach yet), virtio IRQ-driven RX, modern-only virtio
+transport (cap list), multi-namespace NVMe.
