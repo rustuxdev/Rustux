@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**192 unique CVEs recorded.**
+**194 unique CVEs recorded.**
 
 ## klib ports
 
@@ -61,6 +61,10 @@ by hand; append to the matrix and regenerate.
 | CVE-2010-5328 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
 | CVE-2011-1020 | procfs breadth 2: fd/fdinfo dirs + fd-link share-open, exe/cwd/root links, statm/environ/… | 1020 n/a by construction: Rustux has no uids/setuid/credentials — no privilege boundary exists for the missing check to cross; single-tenant, all tasks already see all files. Shar… |
 | CVE-2011-1479 | inotify: init/init1/add_watch/rm_watch + path-keyed watch table, dir vs self event routin… | 1479 n/a (Rust, single commit point); 46040 defensive pattern followed (slot rollback on anon_fd failure, single-assignment watch commit); 54119/89595 n/a by construction (single-… |
+| CVE-2011-1577 | GPT-partition rung: protective-MBR 0xEE detect -> gpt_scan parses the LBA-1 header (EFI P… | audit run-34 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2011-1577, CVE-2011-1776, CVE-2026-64318 — handled by design. Verified: make run exit 33, 76 ta… |
+| CVE-2011-1577 | GPT-partition rung: protective-MBR 0xEE detect -> gpt_scan parses the LBA-1 header (EFI P… | audit run-34 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2011-1577, CVE-2011-1776, CVE-2026-64318 — handled by design. Verified: make run exit 33, 76 ta… |
+| CVE-2011-1776 | GPT-partition rung: protective-MBR 0xEE detect -> gpt_scan parses the LBA-1 header (EFI P… | audit run-34 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2011-1577, CVE-2011-1776, CVE-2026-64318 — handled by design. Verified: make run exit 33, 76 ta… |
+| CVE-2011-1776 | GPT-partition rung: protective-MBR 0xEE detect -> gpt_scan parses the LBA-1 header (EFI P… | audit run-34 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2011-1577, CVE-2011-1776, CVE-2026-64318 — handled by design. Verified: make run exit 33, 76 ta… |
 | CVE-2012-0217 | ia32 compat foundation: ELFCLASS32/EM_386 static ELF32 loading + IA-32e compat-mode execu… | audit run-121 quick scoped + cve.now MCP (entities.search on ia32/compat classes — analogs above): verified int80 mask covers nr+a1..a6 (a REX-literate compat task can't smuggle h… |
 | CVE-2012-0217 | physmap rung: supervisor mirror of all phys RAM at PML4 slot 256 (0xFFFF_8000_0000_0000)… | PRESENT |
 | CVE-2013-7446 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) — interest pins OFD index (… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
@@ -237,6 +241,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-63833 | real file metadata: chmod/fchmod/fchmodat + chown/lchown/fchown/fchownat + utime/utimensa… | 63833 n/a by construction — metadata stored but never enforced (no credential model/setuid-on-exec/perm checks); audit fixed: times read after pathname copy + nsec validated after… |
 | CVE-2026-63910 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
 | CVE-2026-63913 | tcp/ipv4 (mini) | exact seq+ack required on every transition (no blind RST/state jumps — 63913 class out); option walk bounded, wscale never shifted (31495); seq state fully initialized (72020); do… |
+| CVE-2026-64318 | GPT-partition rung: protective-MBR 0xEE detect -> gpt_scan parses the LBA-1 header (EFI P… | audit run-34 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2011-1577, CVE-2011-1776, CVE-2026-64318 — handled by design. Verified: make run exit 33, 76 ta… |
+| CVE-2026-64318 | GPT-partition rung: protective-MBR 0xEE detect -> gpt_scan parses the LBA-1 header (EFI P… | audit run-34 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2011-1577, CVE-2011-1776, CVE-2026-64318 — handled by design. Verified: make run exit 33, 76 ta… |
 | CVE-2026-64318 | partition-minors rung (sd1/vd1/nvme0n1pN nodes): user.rs gains DEV_PARTS[32] registry + d… | audit run-30 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-64318 (handled by design), CVE-2025-40295 (fscrypt i_blkbits — n/a, fixed 512B sectors). V… |
 | CVE-2026-64318 | partition-minors rung (sd1/vd1/nvme0n1pN nodes): user.rs gains DEV_PARTS[32] registry + d… | audit run-30 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-64318 (handled by design), CVE-2025-40295 (fscrypt i_blkbits — n/a, fixed 512B sectors). V… |
 | CVE-2026-64371 | procfs breadth: generated /proc — global uptime/meminfo/loadavg/version/stat + per-pid di… | 64371 n/a by construction: single-CPU IF-masked syscall context means a task cannot exec while its stat is read, and the seq_file snapshot freezes content at open — reads never sa… |

@@ -7183,3 +7183,41 @@ checks, 0 failures.
 
 Audit run-33: 0 confirmed — CVE-2026-89971's failed-identify
 class handled (zero data never binds). Commit pushed origin main.
+
+## run-275 — GPT partition-table support
+
+The disk scan was MBR-only; real disks use GPT. gpt_scan in main.rs:
+protective-MBR detect (any slot's type 0xEE) -> LBA-1 header parse —
+"EFI PART" sig, header size 92..=512, header CRC over the size-limited
+region with the crc field zeroed -> entries array bounded inside the
+disk (elba*512 + nent*esz, checked mul+add, nent<=4096, esz 128..=1024
+mult-of-8, <=512KiB region) -> usable-range sanity (first_usable!=0,
+last_usable>=first_usable, inside disk) -> single-pass chunked stream
+that accumulates the entries CRC AND parses each fully-contained entry
+(esz<=512 entries always land whole inside a sector chunk) -> entries
+must sit inside the usable range AND the disk -> on CRC mismatch or
+mid-stream IO failure parts[] is zeroed before return. Entries fill
+parts[] by GPT index so sparse tables keep pN numbering; only indices
+1..=15 fit the minor nibble. The unified parts list feeds dev_part_add
++ ext2::mount unchanged — GPT and MBR disks coexist.
+
+Two bugs found mid-run: BlockIo::read takes a BYTE offset, not an lba
+index (read(io,1) hit byte 1 of the MBR -> all-zero header); and the
+header-CRC check compared raw-vs-stored-final (always-reject).
+
+tools/mkgpt.py builds the test image: protective MBR, primary+backup
+GPT headers with real zlib CRC32s, one Linux-fs GUID entry holding
+ext4_test.img at lba 2048. Makefile wires it as nvme-ns nsid=3 ->
+nvme disk2 -> /dev/nvme0n3 (259:32) + /dev/nvme0n3p1 (259:33).
+
+Boot proof: `gpt: 1 partition(s) registered` -> `disk4p0 MOUNTED`
+type=0xfc63daf (the GUID prefix — ext4 walked, motd read). blktest
++9 checks: nvme0n3 protective-MBR pread (55AA + 0xEE at 446+4),
+nvme0n3p1 open/S_IFBLK 259:33/BLKGETSIZE64/ext4 magic at +1080/
+last-sector pread, unregistered p2 minor -> ENXIO — 40 checks,
+0 failures. Exit 33, 76 tasks, zero leak.
+
+Audit run-34: 0 confirmed — CVE-2011-1577 (crafted header size) and
+CVE-2011-1776 (unchecked entry size) handled by the clamps +
+fixed-size buffers; CVE-2026-64318 count-parse class handled.
+Ledger at 194 CVEs. Commits pushed origin main.
