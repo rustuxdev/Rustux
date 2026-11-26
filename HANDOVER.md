@@ -8375,3 +8375,16 @@ two-child dance: c1 arms a blocking read, c2 exits, sys_exit's
 'pid N exit' printk wakes c1 on the next tick. lstest floor 82->83.
 Audit run-79: 0 confirmed — dirent-UAF and rlimit-bypass CVE classes
 all n/a by construction.
+run-321 lands kcmp(312) — CRIU's kernel-object identity checker.
+KCMP_FILE resolves each task's fd through its own fd table into OFD
+slot ids (empty fd and idx>=MAX_FDS -> EBADF, matching
+get_file_raw); VM/FILES/FS/SIGHAND compare the shared-table
+identities pml4/fdi/fsi/sigh; IO always equal (no io_context);
+SYSVSEM compares the pid-keyed sem-undo lists. Return contract is
+0/1/2 — Linux orders by kernel pointer, we order by table index;
+the only guarantee callers use is 0==identical. The access gate
+stands in for ptrace_may_access: uid==0 passes, a nonroot caller
+needs uid==both targets' uid else EPERM. lstest floor 83->84.
+Audit run-80: 0 confirmed — the missing-access-check class is the
+only kcmp security class; gate modelled + EPERM-proven by test;
+cve-now has no kcmp-class CVEs.
