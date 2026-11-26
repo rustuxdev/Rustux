@@ -7437,3 +7437,31 @@ Audit run-40: 0 confirmed — target bounded by BAL_MAX,
 held_remove verification, kalloc IRQ-safety all by design;
 CVE-2026-74481 (suspend-time UAF) n/a. Ledger at 204 CVEs.
 
+## run-282 — block write-cache flush (run-41 audit, pushed)
+
+The write-capable block layer had no durability path at all —
+writes completed when the command retired, not when data hit
+the medium. Flush commands added on every transport:
+
+- virtio-blk: negotiate F_BLK_FLUSH (bit 9, fallback to plain
+  handshake), REQ_FLUSH = 2-desc chain (hdr OUT + status IN)
+- NVMe: opcode 0x00 on the I/O SQ per-ns — no PRP
+- AHCI: FLUSH CACHE EXT (0xea) non-data — count=1 keeps issue()'s
+  PRDT a valid 512B descriptor (count=0 underflows to 4MiB)
+- PIIX ata.rs already flushed per write; standalone flush_d added
+
+User surface: blk_flush(rdev) dispatches like blk_rd/blk_wr
+(partition minors flush the parent disk); BLKFLSBUF (0x1261)
+with the size-trio's node gating; fd_fsync drives the flush on
+block fds only — RAM/archive fds keep the honest-0 answer.
+
+Proof: `flush=true` negotiated + REQ_FLUSH acked on vda; nvme
+flush true on all 3 namespaces; ahci disk0 flush true; blktest
++8 checks 0 failures (BLKFLSBUF, fsync, fdatasync, ENOTTY).
+Exit 33, 78 tasks, zero leak.
+
+Audit run-41: 0 confirmed — unsupported-op gating by design
+(CVE-2024-47680 pattern), PRDT bound, fsync scope. One fix:
+flush_d's index guard compared against a sector count.
+CVE-2023-54008 (vdpa affinity) n/a. Ledger at 206 CVEs.
+

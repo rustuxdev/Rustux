@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**204 unique CVEs recorded.**
+**206 unique CVEs recorded.**
 
 ## klib ports
 
@@ -156,6 +156,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2023-53798 | real-busybox verification: sysinfo struct fill (totalram/freeram/procs/mem_unit) + lstat/… | struct zeroed then fully written at fixed offsets — no kernel bytes escape; unrelated-driver entries recorded for the class, n/a by construction (sysinfo writes only known values)… |
 | CVE-2023-53998 | virtio-rng entropy rung: DEV_RNG 0x1005 transitional probe through probe_io/handshake/Vq:… | audit run-35 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-53998, CVE-2026-87043 — handled or n/a. Verified: make run exit 33, 76 tasks, frames equal… |
 | CVE-2023-53998 | virtio-rng entropy rung: DEV_RNG 0x1005 transitional probe through probe_io/handshake/Vq:… | audit run-35 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-53998, CVE-2026-87043 — handled or n/a. Verified: make run exit 33, 76 tasks, frames equal… |
+| CVE-2023-54008 | block-flush rung (write-cache durability): transport flush across all three write-capable… | audit run-41 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-54008, CVE-2024-47680 — n/a or handled. Verified: make run exit 33, 78 tasks, frames equal… |
+| CVE-2023-54008 | block-flush rung (write-cache durability): transport flush across all three write-capable… | audit run-41 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-54008, CVE-2024-47680 — n/a or handled. Verified: make run exit 33, 78 tasks, frames equal… |
 | CVE-2023-54019 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
 | CVE-2023-54019 | epoll: create(213)/create1(291)/ctl(233)/wait(232)/pwait(281) — interest pins OFD index (… | all n/a by construction: single-threaded kernel so no refcount-under-lock; interests pin OFD indices validated per scan and purged at OFD teardown (no dangling epitem); fixed-slot… |
 | CVE-2023-54019 | poll(2): pollfd readiness + timeout wait | poller-vs-polled lifetime class structurally absent: no waitqueue pointers -- wait state is (wait_ptr,wait_len) into the sleeper's OWN address space and every wake re-derives read… |
@@ -175,6 +177,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2024-45013 | NVMe storage rung: nvme.rs — PCI MMIO probe (1b36:0010, QEMU's newer id; 0004 fallback),… | audit run-27 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6238, CVE-2025-21927, CVE-2023-6535/6536/6356, CVE-2026-89972, CVE-2024-45013, CVE-2026-99… |
 | CVE-2024-45013 | NVMe write rung: nvme.rs gains write_range — OP_WRITE (0x01) NVM command mirroring the au… | audit run-28 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6536/6535/6356, CVE-2024-51566/51562, CVE-2024-45013, CVE-2025-68756, CVE-2023-6238 — n/a… |
 | CVE-2024-45013 | NVMe write rung: nvme.rs gains write_range — OP_WRITE (0x01) NVM command mirroring the au… | audit run-28 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6536/6535/6356, CVE-2024-51566/51562, CVE-2024-45013, CVE-2025-68756, CVE-2023-6238 — n/a… |
+| CVE-2024-47680 | block-flush rung (write-cache durability): transport flush across all three write-capable… | audit run-41 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-54008, CVE-2024-47680 — n/a or handled. Verified: make run exit 33, 78 tasks, frames equal… |
+| CVE-2024-47680 | block-flush rung (write-cache durability): transport flush across all three write-capable… | audit run-41 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-54008, CVE-2024-47680 — n/a or handled. Verified: make run exit 33, 78 tasks, frames equal… |
 | CVE-2024-50066 | writable file layer: VFile/Ram OFDs (O_CREAT/O_EXCL/O_TRUNC/O_APPEND), write/read/pread/l… | self-review catches FIXED pre-commit: write(fd,buf,0) at pos>len allocated+extended the file (now early-0 like Linux); fd_pread on an empty VFile took null.add(0) (now n==0 early… |
 | CVE-2024-51566 | NVMe write rung: nvme.rs gains write_range — OP_WRITE (0x01) NVM command mirroring the au… | audit run-28 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6536/6535/6356, CVE-2024-51566/51562, CVE-2024-45013, CVE-2025-68756, CVE-2023-6238 — n/a… |
 | CVE-2024-51566 | NVMe write rung: nvme.rs gains write_range — OP_WRITE (0x01) NVM command mirroring the au… | audit run-28 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6536/6535/6356, CVE-2024-51566/51562, CVE-2024-45013, CVE-2025-68756, CVE-2023-6238 — n/a… |
