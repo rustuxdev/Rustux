@@ -1673,6 +1673,13 @@ pub(crate) fn rustux_main(
             let virq = virtio::net_irq_selftest();
             kprintln!(con, "rustux: virtio: net MSI receive path {virq}");
         }
+        // The NVMe I/O CQ's MSI-X path: one read must drop an IRQ
+        // on 0xf5 — count-only handler, completions still consumed
+        // by the phase-bit poll.
+        if nvme::disks() > 0 {
+            let nirq = nvme::irq_selftest();
+            kprintln!(con, "rustux: nvme: I/O-CQ MSI receive path {nirq}");
+        }
         // A virtio-only boot never ran DHCP — seed the static slirp
         // lease so the socket layer considers the NIC usable. No-op
         // when the e1000 leased an address above.

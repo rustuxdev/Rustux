@@ -134,7 +134,15 @@ pub fn msix_cap(bus: u8, dev: u8, f: u8) -> Option<MsixCap> {
     if bar == 0 || bar == u32::MAX || bar & 1 != 0 {
         return None;
     }
-    let base = (bar & !0xf) as usize;
+    // A 64-bit BAR (type bits 0b100) holds its high dword in the
+    // next BAR — dropping it pointed the table at low memory and
+    // silently ate every entry write (seen on NVMe's BAR above 4G).
+    let base = if bar & 6 == 4 && bir < 5 {
+        ((read32(bus, dev, f, 0x10 + 4 * (bir + 1)) as u64) << 32
+            | (bar & !0xf) as u64) as usize
+    } else {
+        (bar & !0xf) as usize
+    };
     Some(MsixCap {
         off,
         table: base + (tbl & !7) as usize,

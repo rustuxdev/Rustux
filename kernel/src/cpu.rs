@@ -587,6 +587,7 @@ stub!(stub_irq_pit, "0xf1");
 stub!(stub_irq_kbd, "0xf2");
 stub!(stub_irq_net, "0xf3");
 stub!(stub_irq_vnet, "0xf4");
+stub!(stub_irq_nvme, "0xf5");
 stub!(stub_irq_spurious, "0xff");
 
 /// Install our GDT (reload CS via far return, data segments via ax), TSS
@@ -660,7 +661,7 @@ pub fn init() {
         core::arch::asm!("mov cr4, {}", in(reg) cr4);
     }
 
-    let gates: [(usize, u64, u8); 27] = [
+    let gates: [(usize, u64, u8); 28] = [
         (0, stub_de as *const () as u64, 0),
         (1, stub_db as *const () as u64, 0),
         (2, stub_nmi as *const () as u64, 0),
@@ -687,6 +688,7 @@ pub fn init() {
         (0xf2, stub_irq_kbd as *const () as u64, 0),
         (0xf3, stub_irq_net as *const () as u64, 0),
         (0xf4, stub_irq_vnet as *const () as u64, 0),
+        (0xf5, stub_irq_nvme as *const () as u64, 0),
         (0xff, stub_irq_spurious as *const () as u64, 0),
     ];
     for v in 0..256 {

@@ -54,6 +54,16 @@ const SPIN: u64 = 40_000_000;
 
 static BAR: AtomicU64 = AtomicU64::new(0);
 static NDISKS: AtomicU32 = AtomicU32::new(0);
+/// I/O-CQ MSI-X deliveries — count only: the submit path consumes
+/// completions via the phase bit, so the IRQ is purely a wake /
+/// wiring proof, same contract as virtio-net's handler.
+static IO_IRQS: AtomicU32 = AtomicU32::new(0);
+
+/// MSI-X delivery on the I/O completion queue. Nothing to ack —
+/// completions are phase-bit events, not a latched line.
+pub fn on_irq() {
+    IO_IRQS.fetch_add(1, Ordering::Relaxed);
+}
 /// Sector counts per bound namespace (512B units — only that LBAF
 /// is bound; disk index indexes both arrays).
 static NS_SECTORS: [AtomicU64; 4] = [
@@ -331,6 +341,29 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
     if bound == 0 {
         return 0;
     }
+    // MSI-X: the admin CQ is architecturally bound to vector 0 —
+    // mask that entry and route the I/O CQ to entry 1 -> IRQ_NVME.
+    // The CQ's interrupt vector is fixed at create time (cdw11), so
+    // the table must be programmed BEFORE Create-IOCQ.
+    let mut msix_io: Option<u32> = None;
+    if let Some(cap) = pci::msix_cap(bus, dev, f) {
+        let dest = crate::apic::lapic_id() as u8;
+        // SAFETY: cap.table is the device's MSI-X BAR window.
+        unsafe {
+            for v in 0..cap.nvec {
+                pci::msix_set(&cap, v, 0, 0, true);
+            }
+            pci::msix_set(
+                &cap,
+                1,
+                crate::apic::IRQ_NVME as u8,
+                dest,
+                false,
+            );
+        }
+        pci::msix_enable(bus, dev, f, &cap);
+        msix_io = Some(1);
+    }
     // I/O queue pair: CQ first (its id feeds the SQ's cdw11). The
     // queue's physical base travels in PRP1 — without it QEMU binds
     // the ring at phys 0 and the datapath silently dies.
@@ -339,7 +372,13 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
     e[0] = OP_CREATE_IO_CQ;
     e[24..32].copy_from_slice(&iq_phys.cq.to_le_bytes());
     e[40..44].copy_from_slice(&(((IQSIZE as u32 - 1) << 16) | 1).to_le_bytes());
-    e[44] = 1; // PC — physically contiguous
+    // cdw11 = iv<<16 | ien<<1 | pc — when MSI-X armed, bind the CQ
+    // to table entry 1; without it, interrupts stay off entirely.
+    let cq11 = match msix_io {
+        Some(iv) => (iv << 16) | (1 << 1) | 1,
+        None => 1,
+    };
+    e[44..48].copy_from_slice(&cq11.to_le_bytes());
     if !aq.submit(0, dstrd, &mut e) {
         crate::log::printk(format_args!("rustux: nvme: create iocq failed"));
         return 0;
@@ -360,7 +399,8 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
     }
     NDISKS.store(bound, Ordering::Release);
     crate::log::printk(format_args!(
-        "rustux: nvme: {base:#x} {bound} namespace(s) dstrd={dstrd}"
+        "rustux: nvme: {base:#x} {bound} namespace(s) dstrd={dstrd} msix={}",
+        msix_io.is_some()
     ));
     // Datapath proofs at probe time, per bound namespace: sector 0
     // through the I/O queue — the same path the partition scan
@@ -389,6 +429,39 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
         ));
     }
     bound
+}
+
+/// Post-sti IRQ proof: one read through the I/O queue must drop at
+/// least one MSI-X delivery on IRQ_NVME — the handler counts only,
+/// so the phase-bit consume stays the single completion path.
+/// Returns false when MSI-X wasn't armed or no IRQ arrived.
+pub fn irq_selftest() -> bool {
+    if NDISKS.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let before = IO_IRQS.load(Ordering::Relaxed);
+    let mut b = [0u8; 512];
+    if !read_range(0, 0, 1, &mut b) {
+        return false;
+    }
+    // A completion IRQ lands before or during the poll — the read
+    // itself is the wait. Give the LAPIC a moment in case the MSI
+    // posted after the phase-bit consumed the slot.
+    let mut irqs = IO_IRQS.load(Ordering::Relaxed);
+    for _ in 0..100_000 {
+        if irqs > before {
+            break;
+        }
+        irqs = IO_IRQS.load(Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+    let got = irqs > before;
+    crate::log::printk(format_args!(
+        "rustux: nvme: {} I/O-CQ MSI IRQs on vec {:#x} (read-caused)",
+        irqs,
+        crate::apic::IRQ_NVME
+    ));
+    got
 }
 
 static DSTRD: AtomicU32 = AtomicU32::new(0);
