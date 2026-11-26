@@ -14056,6 +14056,7 @@ fn blk_window(rdev: u32) -> Option<(u32, usize, u64, u64)> {
         }
         254 => crate::virtio::disk_capacity(drv),
         259 => crate::nvme::disk_capacity(drv),
+        65 => crate::virtio::scsi_capacity(drv),
         _ => return None,
     };
     if disk_cap == 0 {
@@ -14108,6 +14109,7 @@ fn blk_rd(t: u32, d: usize, lba: u64, n: usize, b: &mut [u8]) -> bool {
             }
         }
         254 => crate::virtio::read_range(d, lba, n, b),
+        65 => crate::virtio::scsi_read(d, lba, n, b),
         _ => crate::nvme::read_range(d, lba, n, b),
     }
 }
@@ -14122,6 +14124,7 @@ fn blk_wr(t: u32, d: usize, lba: u64, n: usize, b: &[u8]) -> bool {
             }
         }
         254 => crate::virtio::write_range(d, lba, n, b),
+        65 => crate::virtio::scsi_write(d, lba, n, b),
         _ => crate::nvme::write_range(d, lba, n, b),
     }
 }
@@ -14147,7 +14150,7 @@ fn blk_discard(rdev: u32, lba: u64, nsec: usize) -> Option<bool> {
                 Some(false)
             }
         }
-        _ => None, // ata/ahci — no TRIM path
+        _ => None, // ata/ahci/scsi — no TRIM/UNMAP path
     }
 }
 
@@ -14166,6 +14169,7 @@ fn blk_flush(rdev: u32) -> bool {
             }
         }
         254 => crate::virtio::blk_flush(d),
+        65 => crate::virtio::scsi_flush(d),
         _ => crate::nvme::flush(d),
     }
 }
@@ -14304,7 +14308,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             // Block devices read at the OFD position — sector I/O
             // through a kernel bounce buffer.
             match v.rdev >> 8 {
-                8 | 254 | 259 => return blk_read(o, v.rdev, buf, len),
+                8 | 65 | 254 | 259 => return blk_read(o, v.rdev, buf, len),
                 _ => {}
             }
             match v.rdev {
@@ -14629,7 +14633,7 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         // Block devices write at the OFD position; partial sectors
         // read-modify-write through a kernel bounce buffer.
         match v.rdev >> 8 {
-            8 | 254 | 259 => return blk_write(o, v.rdev, buf, len),
+            8 | 65 | 254 | 259 => return blk_write(o, v.rdev, buf, len),
             _ => {}
         }
         const ENOSPC_: u64 = (-28i64) as u64;
@@ -15792,6 +15796,28 @@ pub fn dev_init() {
             v.rdev = 11 << 8;
         }
     }
+    // virtio-scsi disks — Linux's extended sd majors: major 65,
+    // minor 16*i; the letter continues past the sd nodes minted
+    // above (sdb when ahci took sda).
+    {
+        let sdbase = if crate::ata::sectors() > 0 {
+            2usize
+        } else {
+            crate::ahci::disks() as usize
+        };
+        for i in 0..(crate::virtio::scsi_disks() as usize).min(4) {
+            let mut nm = *b"dev/sdA";
+            nm[6] = b'a' + (sdbase + i) as u8;
+            let r = vfile_create(&nm);
+            if (r as i64) >= 0 {
+                if let Some(v) = vfile(r as usize) {
+                    vfile_stamp(v, 0o660, 0);
+                    v.fmt = 0o60000; // S_IFBLK
+                    v.rdev = (65 << 8) | ((i as u32) * 16);
+                }
+            }
+        }
+    }
     // virtio-blk disks — Linux's vd family: major 254, minor 16*i,
     // nodes minted only for probed disks like sd.
     for i in 0..(crate::virtio::disks() as usize).min(4) {
@@ -15847,6 +15873,17 @@ pub fn dev_init() {
             254 => {
                 put(b"dev/vd", &mut nm, &mut n);
                 put(&[b'a' + p.drv], &mut nm, &mut n);
+            }
+            65 => {
+                // virtio-scsi — same sd letters the disk mint used:
+                // sdb when ahci took sda.
+                let base = if crate::ata::sectors() > 0 {
+                    2u8
+                } else {
+                    crate::ahci::disks() as u8
+                };
+                put(b"dev/sd", &mut nm, &mut n);
+                put(&[b'a' + base + p.drv], &mut nm, &mut n);
             }
             _ => {
                 put(b"dev/nvme0n", &mut nm, &mut n);
@@ -16868,8 +16905,8 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                     // AHCI-backed node open with ENXIO, which is why
                     // the installer could see /dev/sda (access()
                     // passes on the node) but never open it.
-                    8 | 254 | 259 if blk_capacity(v.rdev) > 0 => i,
-                    8 | 254 | 259 => return ENXIO,
+                    8 | 65 | 254 | 259 if blk_capacity(v.rdev) > 0 => i,
+                    8 | 65 | 254 | 259 => return ENXIO,
                     // /dev/sr0 — the ATAPI CD drive. No sector I/O
                     // (read/write are ENXIO below); it exists for
                     // the CDROM* ioctl family like eject.
@@ -17917,7 +17954,7 @@ pub fn fd_pread(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
             let saved = o.pos;
             o.pos = pos as usize;
             let r = match rdev >> 8 {
-                8 | 254 | 259 => blk_read(o, rdev, buf, len),
+                8 | 65 | 254 | 259 => blk_read(o, rdev, buf, len),
                 _ => {
                     o.pos = saved;
                     return ESPIPE_;
@@ -18013,7 +18050,7 @@ pub fn fd_pwrite(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
             let saved = o.pos;
             o.pos = pos as usize;
             let r = match rdev >> 8 {
-                8 | 254 | 259 => blk_write(o, rdev, buf, len),
+                8 | 65 | 254 | 259 => blk_write(o, rdev, buf, len),
                 _ => {
                     o.pos = saved;
                     return ESPIPE_;

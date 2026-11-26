@@ -550,6 +550,7 @@ pub fn disk_count() -> usize {
     n_ata + crate::ahci::disks() as usize
         + crate::virtio::disks() as usize
         + crate::nvme::disks() as usize
+        + crate::virtio::scsi_disks() as usize
 }
 
 /// Which transport owns global disk index `i`: ATA occupies the low
@@ -571,7 +572,12 @@ pub fn transport(i: usize) -> (u8, usize) {
     if i < n_virtio {
         return (2, i);
     }
-    (3, i - n_virtio)
+    let i = i - n_virtio;
+    let n_nvme = crate::nvme::disks() as usize;
+    if i < n_nvme {
+        return (3, i);
+    }
+    (4, i - n_nvme)
 }
 
 impl BlockIo for DiskIo {
@@ -580,7 +586,8 @@ impl BlockIo for DiskIo {
             (0, i) => crate::ata::capacity_d(i),
             (1, i) => crate::ahci::disk_capacity(i),
             (2, i) => crate::virtio::disk_capacity(i),
-            (_, i) => crate::nvme::disk_capacity(i),
+            (3, i) => crate::nvme::disk_capacity(i),
+            (_, i) => crate::virtio::scsi_capacity(i),
         }
     }
 
@@ -600,7 +607,8 @@ impl BlockIo for DiskIo {
                 0 => crate::ata::read_d(lba as u32, &mut sec, i),
                 1 => crate::ahci::read_range(i, lba, 1, &mut sec),
                 2 => crate::virtio::read_range(i, lba, 1, &mut sec),
-                _ => crate::nvme::read_range(i, lba, 1, &mut sec),
+                3 => crate::nvme::read_range(i, lba, 1, &mut sec),
+                _ => crate::virtio::scsi_read(i, lba, 1, &mut sec),
             };
             if !ok {
                 return false;

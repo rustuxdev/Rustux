@@ -2080,3 +2080,298 @@ pub fn balloon_init() -> bool {
     ));
     true
 }
+
+// -------------------------------------------------------------------
+// virtio-scsi
+//
+// Queue 0 is the control queue, 1 the event queue, 2..2+num_queues
+// the request queues — the driver uses request queue 2 only and
+// leaves control/events unset (QEMU serves requests without them).
+// A request is one descriptor chain: OUT cmd_req header, optional
+// dataout OUT, then IN cmd_resp header, optional datain IN — all
+// device-readable descriptors must precede all device-writable
+// ones, so the resp header lands between dataout and datain.
+
+/// Transitional virtio-scsi PCI slot.
+const DEV_SCSI: u16 = 0x1004;
+/// Sector count per request — the shared data staging block bound.
+const S_BATCH: usize = 8;
+/// cmd_req header size with the 32-byte CDB field QEMU advertises.
+const S_REQ: u32 = 51;
+/// cmd_resp fixed header — the IN buffer must also cover the
+/// device's advertised sense_size (QEMU 96), or the request is
+/// rejected as malformed and the device is marked broken.
+const S_RESP_OFF: u64 = 64;
+const S_RESP: u32 = 128;
+/// SCSI status byte value for a completed command.
+const SCSI_GOOD: u8 = 0;
+/// Transport response code for "command complete".
+const SCSI_RSP_OK: u8 = 0;
+
+/// One bound SCSI LUN — enough of the request state to issue
+/// read/write/sync commands at the same (target, lun).
+struct SDisk {
+    vq: Vq,
+    ctrl: u64,
+    data: u64,
+    sectors: u64,
+    /// lun[1..4] of the request header — target and LUN fields.
+    lun: [u8; 8],
+}
+
+static mut SDISKS: [Option<SDisk>; 2] = [None, None];
+static NSDISKS: AtomicU32 = AtomicU32::new(0);
+
+fn sdisk_for(i: usize) -> Option<&'static SDisk> {
+    // SAFETY: SDISKS is written once at init (single-threaded boot).
+    unsafe { (*core::ptr::addr_of!(SDISKS)).get(i).and_then(|o| o.as_ref()) }
+}
+
+/// Issue one SCSI command and spin for the transport response.
+/// `wr` selects the data-phase direction; `dn` is the byte count.
+/// The request header sits at ctrl+0, the response at ctrl+64,
+/// and the data phase rides the shared staging block.
+fn scsi_cmd(d: &SDisk, cdb: &[u8], wr: bool, dn: usize) -> bool {
+    let ctrl = mm::pmap(d.ctrl);
+    // SAFETY: ctrl/data are our own DMA blocks; the CDB field is
+    // 32 bytes at req+19, zero-padded past cdb.len().
+    unsafe {
+        let r = ctrl as *mut u8;
+        r.write_bytes(0, S_REQ as usize);
+        core::ptr::copy_nonoverlapping(d.lun.as_ptr(), r, 8);
+        for (i, &b) in cdb.iter().take(32).enumerate() {
+            r.add(19 + i).write_volatile(b);
+        }
+        ((ctrl + S_RESP_OFF) as *mut u8).write_bytes(0, S_RESP as usize);
+    }
+    let mut i = 0usize;
+    d.vq.put_desc(i, d.ctrl, S_REQ, DESC_NEXT, (i + 1) as u16);
+    i += 1;
+    if wr && dn > 0 {
+        d.vq.put_desc(i, d.data, dn as u32, DESC_NEXT, (i + 1) as u16);
+        i += 1;
+    }
+    let tail = !wr && dn > 0; // a datain descriptor follows resp
+    d.vq.put_desc(
+        i,
+        d.ctrl + S_RESP_OFF,
+        S_RESP,
+        DESC_WRITE | if tail { DESC_NEXT } else { 0 },
+        (i + 1) as u16,
+    );
+    i += 1;
+    if tail {
+        d.vq.put_desc(i, d.data, dn as u32, DESC_WRITE, 0);
+    }
+    fence(Ordering::SeqCst);
+    if !d.vq.poll_once(0) {
+        return false;
+    }
+    // SAFETY: resp header the device just wrote.
+    let (status, resp) = unsafe {
+        (
+            ((ctrl + S_RESP_OFF + 8) as *const u8).read_volatile(),
+            ((ctrl + S_RESP_OFF + 9) as *const u8).read_volatile(),
+        )
+    };
+    status == SCSI_GOOD && resp == SCSI_RSP_OK
+}
+
+/// Probe the transitional virtio-scsi function, bind request
+/// queue 2, and identify LUN 0 on target 0 — INQUIRY +
+/// READ CAPACITY(10) + a read/write/flush datapath proof in
+/// the MBR gap (QEMU runs -snapshot).
+pub fn scsi_init() -> bool {
+    let Some((io, bdf)) = probe_io(DEV_SCSI) else {
+        return false;
+    };
+    let _ = bdf;
+    if !handshake(io) {
+        return false;
+    }
+    // Config: num_queues @+0, seg_max @+4, max_sectors @+8,
+    // cmd_per_lun @+12, event_info_size @+16, sense_size @+20,
+    // cdb_size @+24. We require at least one request queue and a
+    // 32-byte CDB slot (QEMU's default).
+    let nq = inl(io + R_CFG);
+    let cdb_sz = inl(io + R_CFG + 24);
+    if nq == 0 || cdb_sz < 32 {
+        crate::log::printk(format_args!("rustux: virtio: scsi {io:#x} nq={nq} cdb={cdb_sz} — skipped"));
+        fail(io);
+        return false;
+    }
+    let Some(vq) = Vq::setup(io, 2) else {
+        crate::log::printk(format_args!("rustux: virtio: scsi {io:#x} reqvq setup failed"));
+        fail(io);
+        return false;
+    };
+    let (Some(ctrl), Some(data)) = (kalloc::alloc_frames(0), kalloc::alloc_frames(1)) else {
+        crate::log::printk(format_args!("rustux: virtio: scsi {io:#x} dma alloc failed"));
+        fail(io);
+        return false;
+    };
+    outb(io + R_STATUS, S_ACK | S_DRV | S_FEATOK | S_DRVOK);
+    // LUN {1, target, 0x40|lun_hi, lun_lo} — single-level encoding
+    // for target 0, lun 0.
+    let d = SDisk {
+        vq,
+        ctrl,
+        data,
+        sectors: 0,
+        lun: [1, 0, 0x40, 0, 0, 0, 0, 0],
+    };
+    let sectors = probe_scsi_disk(&d).unwrap_or(0);
+    if sectors == 0 {
+        crate::log::printk(format_args!("rustux: virtio: scsi {io:#x} LUN0 probe failed"));
+        fail(io);
+        return false;
+    }
+    let secs = sectors;
+    // SAFETY: init runs once, before tasks exist.
+    unsafe {
+        (*core::ptr::addr_of_mut!(SDISKS))[0] = Some(SDisk { sectors, ..d })
+    };
+    NSDISKS.store(1, Ordering::Release);
+    crate::log::printk(format_args!(
+        "rustux: virtio: scsi {io:#x} nq={nq} {secs} sectors ({} MiB)",
+        secs / 2048
+    ));
+    // Datapath proof: sector-0 signature read, then write-verify-
+    // restore in the MBR gap — the same recipe as virtio-blk.
+    let mut s0 = [0u8; 512];
+    let r = scsi_read(0, 0, 1, &mut s0);
+    crate::log::printk(format_args!(
+        "rustux: virtio: scsi sector0 read {r} sig {:#x}{:#x}",
+        s0[510], s0[511]
+    ));
+    let _ = r;
+    let mut orig = [0u8; 512];
+    let mut back = [0u8; 512];
+    let mut pat = [0u8; 512];
+    pat[..7].copy_from_slice(b"rustux!");
+    let ro = scsi_read(0, 64, 1, &mut orig);
+    let w = ro && scsi_write(0, 64, 1, &pat);
+    let v = w && scsi_read(0, 64, 1, &mut back) && back[..7] == pat[..7];
+    let s = scsi_write(0, 64, 1, &orig);
+    let s = s && scsi_read(0, 64, 1, &mut back) && back == orig;
+    let f = scsi_flush(0);
+    crate::log::printk(format_args!(
+        "rustux: virtio: scsi write datapath {w} verify {v} restore {s} flush {f}"
+    ));
+    true
+}
+
+/// TEST UNIT READY + INQUIRY + READ CAPACITY(10) for target0/lun0
+/// — returns the LBA48 sector count, 0 when the LUN is absent.
+fn probe_scsi_disk(d: &SDisk) -> Option<u64> {
+    if !scsi_cmd(d, &[0x00], false, 0) {
+        return None; // TEST UNIT READY
+    }
+    // INQUIRY standard, 96-byte response — the command must
+    // complete even though we keep only the vendor/product tail.
+    if !scsi_cmd(d, &[0x12, 0, 0, 0, 96, 0], false, 96) {
+        return None;
+    }
+    let (vend, prod) = unsafe {
+        let p = mm::pmap(d.data) as *const u8;
+        let mut v = [0u8; 8];
+        let mut m = [0u8; 16];
+        v.copy_from_slice(core::slice::from_raw_parts(p.add(8), 8));
+        m.copy_from_slice(core::slice::from_raw_parts(p.add(16), 16));
+        (v, m)
+    };
+    // READ CAPACITY(10): 8-byte response = last_lba + block_size,
+    // both big-endian.
+    if !scsi_cmd(d, &[0x25], false, 8) {
+        return None;
+    }
+    let (last, bsz) = unsafe {
+        let p = mm::pmap(d.data) as *const u32;
+        (p.read_volatile().swap_bytes(), p.add(1).read_volatile().swap_bytes())
+    };
+    if bsz != 512 {
+        crate::log::printk(format_args!("rustux: virtio: scsi lbads {bsz} != 512 — skipped"));
+        return None;
+    }
+    crate::log::printk(format_args!(
+        "rustux: virtio: scsi inquiry '{}' '{}' last_lba {last}",
+        core::str::from_utf8(&vend).unwrap_or("?").trim(),
+        core::str::from_utf8(&prod).unwrap_or("?").trim(),
+    ));
+    Some(last as u64 + 1)
+}
+
+/// READ(10) — `count` 512B sectors at `lba` into `buf`, batched
+/// through the staging block. Same contract as read_range.
+pub fn scsi_read(i: usize, lba: u64, count: usize, buf: &mut [u8]) -> bool {
+    let Some(d) = sdisk_for(i) else { return false };
+    if buf.len() < count * 512 || lba + count as u64 > d.sectors {
+        return false;
+    }
+    let mut done = 0usize;
+    while done < count {
+        let n = (count - done).min(S_BATCH);
+        let mut cdb = [0u8; 10];
+        cdb[0] = 0x28;
+        cdb[2..6].copy_from_slice(&((lba + done as u64) as u32).to_be_bytes());
+        cdb[7..9].copy_from_slice(&(n as u16).to_be_bytes());
+        if !scsi_cmd(d, &cdb, false, n * 512) {
+            return false;
+        }
+        // SAFETY: data is our DMA block just filled by the device.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                mm::pmap(d.data) as *const u8,
+                buf.as_mut_ptr().add(done * 512),
+                n * 512,
+            );
+        }
+        done += n;
+    }
+    true
+}
+
+/// WRITE(10) — `count` 512B sectors at `lba` from `buf`.
+pub fn scsi_write(i: usize, lba: u64, count: usize, buf: &[u8]) -> bool {
+    let Some(d) = sdisk_for(i) else { return false };
+    if buf.len() < count * 512 || lba + count as u64 > d.sectors {
+        return false;
+    }
+    let mut done = 0usize;
+    while done < count {
+        let n = (count - done).min(S_BATCH);
+        // SAFETY: staging page is ours; buf covers n*512 bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr().add(done * 512),
+                mm::pmap(d.data) as *mut u8,
+                n * 512,
+            );
+        }
+        let mut cdb = [0u8; 10];
+        cdb[0] = 0x2a;
+        cdb[2..6].copy_from_slice(&((lba + done as u64) as u32).to_be_bytes());
+        cdb[7..9].copy_from_slice(&(n as u16).to_be_bytes());
+        if !scsi_cmd(d, &cdb, true, n * 512) {
+            return false;
+        }
+        done += n;
+    }
+    true
+}
+
+/// SYNCHRONIZE CACHE(10) — the SCSI flush command.
+pub fn scsi_flush(i: usize) -> bool {
+    let Some(d) = sdisk_for(i) else { return false };
+    scsi_cmd(d, &[0x35], false, 0)
+}
+
+/// Number of SCSI disks the init probe bound.
+pub fn scsi_disks() -> u32 {
+    NSDISKS.load(Ordering::Acquire)
+}
+
+/// SCSI disk capacity in bytes — same contract as disk_capacity.
+pub fn scsi_capacity(i: usize) -> u64 {
+    sdisk_for(i).map_or(0, |d| d.sectors * 512)
+}

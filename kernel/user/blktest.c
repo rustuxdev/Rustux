@@ -196,6 +196,43 @@ int main(void) {
         close(fd);
     }
 
+    // ---- /dev/sdb — the virtio-scsi disk (major 65) ----
+    fd = open("/dev/sdb", O_RDWR);
+    check(fd >= 0, "open sdb");
+    if (fd >= 0) {
+        check(fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)
+              && major(st.st_rdev) == 65 && minor(st.st_rdev) == 0,
+              "fstat S_IFBLK 65:0");
+        check(ioctl(fd, BLKGETSIZE64, &cap) == 0 && cap > 0,
+              "scsi BLKGETSIZE64");
+        check(pread(fd, sec, 512, 0) == 512
+              && (unsigned char)sec[510] == 0x55
+              && (unsigned char)sec[511] == 0xaa,
+              "scsi pread MBR sig");
+        check(pread(fd, sec, 4, 2048 * 512 + 1080) == 4
+              && (unsigned char)sec[0] == 0x53
+              && (unsigned char)sec[1] == 0xef,
+              "scsi ext4 magic");
+        check(rw_roundtrip(fd, "scsi-tag"), "scsi pwrite/verify/restore");
+        close(fd);
+    }
+
+    // ---- /dev/sdb1 — the scsi partition node (65:1) ----
+    fd = open("/dev/sdb1", O_RDWR);
+    check(fd >= 0, "open sdb1");
+    if (fd >= 0) {
+        check(fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)
+              && major(st.st_rdev) == 65 && minor(st.st_rdev) == 1,
+              "fstat S_IFBLK 65:1");
+        check(ioctl(fd, BLKGETSIZE64, &cap) == 0 && cap > 0,
+              "scsi part BLKGETSIZE64");
+        check(pread(fd, sec, 4, 1080) == 4
+              && (unsigned char)sec[0] == 0x53
+              && (unsigned char)sec[1] == 0xef,
+              "scsi part ext4 magic");
+        close(fd);
+    }
+
     // A crafted partition node with no registered partition must
     // answer ENXIO — vda5 does not exist on the test disk.
     unlink("vda5.nod");

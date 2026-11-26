@@ -174,6 +174,9 @@ run: build $(VIRTIO_DISK) $(GPT_DISK)
 		-device virtio-keyboard-pci \
 		-qmp unix:/tmp/vkbd-qmp.sock,server=on,wait=off \
 		-device virtio-balloon-pci \
+		-device virtio-scsi-pci \
+		-drive file=$(VIRTIO_DISK),format=raw,if=none,id=sc0 \
+		-device scsi-hd,drive=sc0 \
 		-qmp unix:/tmp/balloon-qmp.sock,server=on,wait=off \
 		-snapshot \
 		-serial stdio -display none \

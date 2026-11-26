@@ -1455,6 +1455,7 @@ pub(crate) fn rustux_main(
     // virtio-balloon: memory give/take with the host — the pump
     // tracks num_pages, deflate returns frames to the allocator.
     virtio::balloon_init();
+    virtio::scsi_init();
     // virtio-net: second NIC next to the e1000e — its own RX/TX
     // virtqueues, ARP round-trip proves the datapath (socket-layer
     // NIC dispatch is a later rung).
@@ -1537,7 +1538,8 @@ pub(crate) fn rustux_main(
                 let tmajor = match tr {
                     0 | 1 => 8,   // PIIX + AHCI are both sd
                     2 => 254,     // vd
-                    _ => 259,     // nvme
+                    3 => 259,     // nvme
+                    _ => 65,      // virtio-scsi — sd's extended majors
                 };
                 user::dev_part_add(tmajor, tdrv, slot + 1, start, count);
                 if let Some(m) = ext2::mount(&io, base, size) {
