@@ -598,6 +598,21 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_PROCESS_MRELEASE => user::fd_process_mrelease(a1, a2),
         NR_FUTEX_WAITV => user::sys_futex_waitv(ctx, a1, a2, a3, a4, a5),
         NR_FCHMODAT2 => sys_fchmodat2(a1, a2, a3, a4),
+        // xattr family: path (follow final link), l* (no follow),
+        // f* (by fd); core logic lives in user.rs's XATTRS table.
+        188 => sys_setxattr(a1, a2, a3, a4, a5),
+        189 => sys_lsetxattr(a1, a2, a3, a4, a5),
+        190 => sys_fsetxattr(a1, a2, a3, a4, a5),
+        191 => sys_getxattr(a1, a2, a3, a4),
+        192 => sys_lgetxattr(a1, a2, a3, a4),
+        193 => sys_fgetxattr(a1, a2, a3, a4),
+        194 => sys_listxattr(a1, a2, a3),
+        195 => sys_llistxattr(a1, a2, a3),
+        196 => sys_flistxattr(a1, a2, a3),
+        197 => sys_removexattr(a1, a2),
+        198 => sys_lremovexattr(a1, a2),
+        199 => sys_fremovexattr(a1, a2),
+
         NR_FUTEX_WAKE => user::sys_futex_wake(a1, a2, a3, a4),
         NR_FUTEX_WAIT => user::sys_futex_wait(ctx, a1, a2, a3, a4, a5, a6),
         NR_FUTEX_REQUEUE => user::sys_futex_requeue(a1, a2, a3, a4),
@@ -1531,6 +1546,150 @@ fn sys_fchmodat2(dirfd: u64, path: u64, mode: u64, flags: u64) -> u64 {
         Err(e) => return e,
     };
     user::fs_chmod(&cb[..cn], mode, flags & AT_SYMLINK_NOFOLLOW != 0)
+}
+
+
+/// copy_user_name: an xattr name is a bounded C string, not a path —
+/// >255 bytes ERANGEs like Linux instead of ENAMETOOLONG.
+fn copy_user_name(p: u64, name: &mut [u8; 256]) -> Result<usize, u64> {
+    const ERANGE_: u64 = (-34i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    let mut n = 0usize;
+    loop {
+        if n == 256 {
+            return Err(ERANGE_);
+        }
+        if !user::range_ok(p + n as u64, 1) {
+            return Err(EFAULT_);
+        }
+        // SAFETY: range_ok proved this byte is inside a mapped range.
+        let b = unsafe { *((p + n as u64) as *const u8) };
+        if b == 0 {
+            return Ok(n);
+        }
+        name[n] = b;
+        n += 1;
+    }
+}
+
+/// Shared path+name resolve for the path-form xattr calls:
+/// `follow` splits setxattr from lsetxattr (final link kept).
+fn xattr_path(path: u64, name: u64, follow: bool) -> Result<(usize, [u8; 256], usize), u64> {
+    let mut pbuf = [0u8; 257];
+    let pn = copy_user_path(path, &mut pbuf)?;
+    let vfi = user::xattr_vfi(u64::MAX, &pbuf[..pn], follow)?;
+    let mut nb = [0u8; 256];
+    let nn = copy_user_name(name, &mut nb)?;
+    Ok((vfi, nb, nn))
+}
+
+fn sys_setxattr(path: u64, name: u64, value: u64, size: u64, flags: u64) -> u64 {
+    match xattr_path(path, name, true) {
+        Ok((vfi, nb, nn)) => user::fs_setxattr(vfi, &nb[..nn], value, size, flags),
+        Err(e) => e,
+    }
+}
+
+fn sys_lsetxattr(path: u64, name: u64, value: u64, size: u64, flags: u64) -> u64 {
+    match xattr_path(path, name, false) {
+        Ok((vfi, nb, nn)) => user::fs_setxattr(vfi, &nb[..nn], value, size, flags),
+        Err(e) => e,
+    }
+}
+
+fn sys_fsetxattr(fd: u64, name: u64, value: u64, size: u64, flags: u64) -> u64 {
+    let mut nb = [0u8; 256];
+    let nn = match copy_user_name(name, &mut nb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    match user::fd_xattr_vfi(fd) {
+        Ok(vfi) => user::fs_setxattr(vfi, &nb[..nn], value, size, flags),
+        Err(e) => e,
+    }
+}
+
+fn sys_getxattr(path: u64, name: u64, value: u64, size: u64) -> u64 {
+    match xattr_path(path, name, true) {
+        Ok((vfi, nb, nn)) => user::fs_getxattr(vfi, &nb[..nn], value, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_lgetxattr(path: u64, name: u64, value: u64, size: u64) -> u64 {
+    match xattr_path(path, name, false) {
+        Ok((vfi, nb, nn)) => user::fs_getxattr(vfi, &nb[..nn], value, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_fgetxattr(fd: u64, name: u64, value: u64, size: u64) -> u64 {
+    let mut nb = [0u8; 256];
+    let nn = match copy_user_name(name, &mut nb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    match user::fd_xattr_vfi(fd) {
+        Ok(vfi) => user::fs_getxattr(vfi, &nb[..nn], value, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_listxattr(path: u64, list: u64, size: u64) -> u64 {
+    let mut pbuf = [0u8; 257];
+    let pn = match copy_user_path(path, &mut pbuf) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    match user::xattr_vfi(u64::MAX, &pbuf[..pn], true) {
+        Ok(vfi) => user::fs_listxattr(vfi, list, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_llistxattr(path: u64, list: u64, size: u64) -> u64 {
+    let mut pbuf = [0u8; 257];
+    let pn = match copy_user_path(path, &mut pbuf) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    match user::xattr_vfi(u64::MAX, &pbuf[..pn], false) {
+        Ok(vfi) => user::fs_listxattr(vfi, list, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_flistxattr(fd: u64, list: u64, size: u64) -> u64 {
+    match user::fd_xattr_vfi(fd) {
+        Ok(vfi) => user::fs_listxattr(vfi, list, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_removexattr(path: u64, name: u64) -> u64 {
+    match xattr_path(path, name, true) {
+        Ok((vfi, nb, nn)) => user::fs_removexattr(vfi, &nb[..nn]),
+        Err(e) => e,
+    }
+}
+
+fn sys_lremovexattr(path: u64, name: u64) -> u64 {
+    match xattr_path(path, name, false) {
+        Ok((vfi, nb, nn)) => user::fs_removexattr(vfi, &nb[..nn]),
+        Err(e) => e,
+    }
+}
+
+fn sys_fremovexattr(fd: u64, name: u64) -> u64 {
+    let mut nb = [0u8; 256];
+    let nn = match copy_user_name(name, &mut nb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    match user::fd_xattr_vfi(fd) {
+        Ok(vfi) => user::fs_removexattr(vfi, &nb[..nn]),
+        Err(e) => e,
+    }
 }
 
 /// chown/lchown(dirfd-less and dirfd variants share this): canon

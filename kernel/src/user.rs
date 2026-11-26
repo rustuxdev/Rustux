@@ -19005,6 +19005,230 @@ pub fn fs_exists(path: &[u8]) -> bool {
     dir_exists(path) || is_file(path)
 }
 
+/// --- user.* xattrs ---------------------------------------------------
+/// A small global name->value table keyed by VFile slot. Linux
+/// namespaces a name by prefix (user./trusted./security./system.);
+/// only user.* is implementable for arbitrary files, so the other
+/// namespaces EINVAL on set like a filesystem without them and
+/// ENODATA on get/remove. Linux gate values: name >255 -> ERANGE,
+/// value >64KiB -> E2BIG, flags outside XATTR_CREATE|REPLACE -> EINVAL,
+/// XATTR_CREATE on an existing attr -> EEXIST, XATTR_REPLACE on a
+/// missing one -> ENODATA, links/special files -> EPERM on set.
+const XATTR_NAME_MAX: usize = 255;
+const XATTR_VALUE_MAX: usize = 4096;
+const MAX_XATTRS: usize = 48;
+struct XAttr {
+    vfi: usize,
+    name: [u8; XATTR_NAME_MAX],
+    nlen: usize,
+    vlen: usize,
+    value: [u8; XATTR_VALUE_MAX],
+}
+static mut XATTRS: [Option<XAttr>; MAX_XATTRS] = [const { None }; MAX_XATTRS];
+
+fn xattr_slot(vfi: usize, name: &[u8]) -> Option<usize> {
+    let xs = unsafe { &*core::ptr::addr_of!(XATTRS) };
+    xs.iter()
+        .position(|x| x.as_ref().is_some_and(|x| x.vfi == vfi && &x.name[..x.nlen] == name))
+}
+
+/// Free every attr a vfile owns — called as the slot dies so a later
+/// file reusing the index never inherits stale metadata.
+fn xattr_purge(vfi: usize) {
+    let xs = unsafe { &mut *core::ptr::addr_of_mut!(XATTRS) };
+    for x in xs.iter_mut() {
+        if x.as_ref().is_some_and(|x| x.vfi == vfi) {
+            *x = None;
+        }
+    }
+}
+
+/// setxattr target gate: user.* lives only on regular files and
+/// directories like Linux; links and specials EPERM.
+fn xattr_settable(v: &VFile) -> bool {
+    let fmt = v.fmt & 0o170000;
+    !v.is_link && (fmt == 0o100000 || fmt == 0o40000)
+}
+
+/// Path -> vfile index for the xattr calls: canon + optional
+/// final-link resolution. lsetxattr keeps the link itself like
+/// Linux — no vfile_real on the raw slot or the l* forms would
+/// silently act on the target inode.
+pub fn xattr_vfi(dfd: u64, path: &[u8], follow: bool) -> Result<usize, u64> {
+    let (cb, cn) = canon_path(dfd, path)?;
+    let (rb, rn, _) = resolve_links(&cb[..cn], follow)?;
+    let Some(i) = vfile_find(&rb[..rn]) else {
+        return Err(ENOENT);
+    };
+    Ok(if follow { vfile_real(i) } else { i })
+}
+
+/// fd -> vfile index for fsetxattr/fgetxattr/flistxattr/fremovexattr.
+/// Only Ram OFDs (real filesystem vfiles) carry attrs; initrd File
+/// OFDs, dirs, pipes, sockets EOPNOTSUPP like a fs without xattrs.
+pub fn fd_xattr_vfi(fd: u64) -> Result<usize, u64> {
+    const EOPNOTSUPP_: u64 = (-95i64) as u64;
+    let Some(t) = cur_mut() else { return Err(EBADF) };
+    let Some(o) = ofd(t, fd) else { return Err(EBADF) };
+    match &o.kind {
+        FdKind::Ram(i) => Ok(vfile_real(*i)),
+        _ => Err(EOPNOTSUPP_),
+    }
+}
+
+/// setxattr core: namespace/flag gates, target type, create/replace,
+/// size caps, then the user-buffer read and the table write.
+pub fn fs_setxattr(vfi: usize, name: &[u8], value: u64, size: u64, flags: u64) -> u64 {
+    const EEXIST_: u64 = (-17i64) as u64;
+    const ENODATA_: u64 = (-61i64) as u64;
+    const EOPNOTSUPP_: u64 = (-95i64) as u64;
+    const ERANGE_: u64 = (-34i64) as u64;
+    const E2BIG_: u64 = (-7i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    if flags & !3 != 0 || flags == 3 {
+        return EINVAL;
+    }
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE_;
+    }
+    if !name.starts_with(b"user.") {
+        return EOPNOTSUPP_;
+    }
+    if size > XATTR_VALUE_MAX as u64 {
+        return E2BIG_;
+    }
+    let Some(v) = vfile(vfi) else { return ENOENT };
+    if !xattr_settable(v) {
+        return (-1i64) as u64; // EPERM
+    }
+    if size > 0 && !range_ok(value, size) {
+        return EFAULT_;
+    }
+    let hit = xattr_slot(vfi, name);
+    if flags == 1 && hit.is_some() {
+        return EEXIST_;
+    }
+    if flags == 2 && hit.is_none() {
+        return ENODATA_;
+    }
+    let xs = unsafe { &mut *core::ptr::addr_of_mut!(XATTRS) };
+    let Some(i) = hit.or_else(|| xs.iter().position(Option::is_none)) else {
+        return (-28i64) as u64; // ENOSPC — the table quota
+    };
+    let mut x = XAttr {
+        vfi,
+        name: [0; XATTR_NAME_MAX],
+        nlen: name.len(),
+        vlen: size as usize,
+        value: [0; XATTR_VALUE_MAX],
+    };
+    x.name[..name.len()].copy_from_slice(name);
+    if size > 0 {
+        // SAFETY: range_ok proved the window is mapped under the
+        // caller's cr3 and we are still running in that context.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                value as *const u8,
+                x.value.as_mut_ptr(),
+                size as usize,
+            )
+        };
+    }
+    xs[i] = Some(x);
+    0
+}
+
+/// getxattr core: attr miss ENODATAs; buf=0 asks the size; a short
+/// buffer ERANGEs; writes the value under the caller's cr3.
+pub fn fs_getxattr(vfi: usize, name: &[u8], buf: u64, size: u64) -> u64 {
+    const ENODATA_: u64 = (-61i64) as u64;
+    const ERANGE_: u64 = (-34i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE_;
+    }
+    if !name.starts_with(b"user.") {
+        return ENODATA_;
+    }
+    let Some(i) = xattr_slot(vfi, name) else { return ENODATA_ };
+    let xs = unsafe { &*core::ptr::addr_of!(XATTRS) };
+    let Some(x) = xs[i].as_ref() else { return ENODATA_ };
+    if buf == 0 {
+        return x.vlen as u64;
+    }
+    if size < x.vlen as u64 {
+        return ERANGE_;
+    }
+    if x.vlen > 0 {
+        if !range_ok(buf, x.vlen as u64) {
+            return EFAULT_;
+        }
+        // SAFETY: validated window under the caller's cr3.
+        unsafe {
+            core::ptr::copy_nonoverlapping(x.value.as_ptr(), buf as *mut u8, x.vlen)
+        };
+    }
+    x.vlen as u64
+}
+
+/// listxattr core: NUL-separated names for this vfi; buf=0 or
+/// size=0 asks the total; a short buffer ERANGEs.
+pub fn fs_listxattr(vfi: usize, buf: u64, size: u64) -> u64 {
+    const ERANGE_: u64 = (-34i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    let xs = unsafe { &*core::ptr::addr_of!(XATTRS) };
+    let mut total = 0u64;
+    for x in xs.iter().flatten() {
+        if x.vfi == vfi {
+            total += x.nlen as u64 + 1;
+        }
+    }
+    if buf == 0 || size == 0 {
+        return total;
+    }
+    if size < total {
+        return ERANGE_;
+    }
+    if total > 0 {
+        if !range_ok(buf, total) {
+            return EFAULT_;
+        }
+        let mut off = 0u64;
+        for x in xs.iter().flatten() {
+            if x.vfi != vfi {
+                continue;
+            }
+            // SAFETY: total fit inside the validated window.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    x.name.as_ptr(),
+                    (buf + off) as *mut u8,
+                    x.nlen,
+                );
+                *((buf + off + x.nlen as u64) as *mut u8) = 0;
+            }
+            off += x.nlen as u64 + 1;
+        }
+    }
+    total
+}
+
+/// removexattr core: name gates like get; clears the slot.
+pub fn fs_removexattr(vfi: usize, name: &[u8]) -> u64 {
+    const ENODATA_: u64 = (-61i64) as u64;
+    const ERANGE_: u64 = (-34i64) as u64;
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE_;
+    }
+    if !name.starts_with(b"user.") {
+        return ENODATA_;
+    }
+    let Some(i) = xattr_slot(vfi, name) else { return ENODATA_ };
+    let xs = unsafe { &mut *core::ptr::addr_of_mut!(XATTRS) };
+    xs[i] = None;
+    0
+}
+
 /// Free inode slot `i` once nothing can reach it: name removed,
 /// no OFD references, and no live hard alias still naming it. A
 /// name removed while all three hold leaves the slot as an
@@ -19030,6 +19254,7 @@ fn vfile_free_if_dead(i: usize) {
         // right after so nothing can reach it.
         unsafe { kalloc::kfree(data) };
     }
+    xattr_purge(i);
     vs[i] = None;
 }
 
