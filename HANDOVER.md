@@ -8518,3 +8518,26 @@ see the new tree too (their root string covers all); fs_context
 has no log output fd side. mnttest extended (same task). Audit
 run-87: 0 confirmed — the pivot parent-UAF class needs parent
 pointers we don't have; NEWNS class needs namespaces we reject.
+
+run-329 lands the keyctl trio (add_key 248 / request_key 249 /
+keyctl 250) — the last self-contained classic subsystem. Real
+keys/keyrings: KEYS[32] + KEYRINGS[16] statics, one serial
+counter names either; rings hold a u16 bitmask of member key
+slots (not a link graph — rings can't contain rings, so no
+cycle-detection class exists). add_key mints "user"-type keys
+(KEY_SPEC rings lazily resolved: thread=pid process=tgid
+session=sid-or-joined user=uid usession=uid group->EINVAL),
+dup-desc updates in place, ENOSPC at the cap. request_key walks
+the identity ladder narrowed by SET_REQKEY_KEYRING mode and
+links hits into dest. keyctl multiplexes 15 ops incl. named
+session-ring join (per-sid), describe/read/search/link/unlink/
+clear/invalidate/chown/setperm/caps — perm model is uid-match
+or the perm word's class bits, foreign keys ENOKEY not EACCES.
+Divergences: no instantiation/negation callout (request_key
+miss is ENOKEY — no /sbin/request-key), no timeout/gc-delay
+schedule (dead keys free eagerly at unlink-to-zero), rings are
+permanent once minted (bounded 16, never freed — session_ring
+index can't alias), no LSM. keytest.c new task -> MAX_TASKS
+115->116. Audit run-88: 0 confirmed — every keyctl CVE class
+needs refcounts, ring-in-ring graphs, or unbounded allocation;
+all absent by construction.
