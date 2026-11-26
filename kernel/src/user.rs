@@ -8861,6 +8861,121 @@ pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
     0
 }
 
+/// process_madvise(pidfd, iov, iovcnt, advice, flags): advise on
+/// another task's ranges. The advice set is narrower than madvise
+/// — Linux only allows COLD(20)/PAGEOUT(21)/COLLAPSE(25), all
+/// inert here (no reclaim/THP). ptrace_may_access gating is a
+/// documented collapse — no creds model (pidfd_getfd is just as
+/// open). Per-iov the VMA walk skips holes and counts only
+/// committed-overlap bytes toward the return, like Linux.
+pub fn fd_process_madvise(
+    fd: u64,
+    iov: u64,
+    iovcnt: u64,
+    advice: u64,
+    flags: u64,
+) -> u64 {
+    const ESRCH: u64 = (-3i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    if flags != 0 || !matches!(advice, 20 | 21 | 25) {
+        return EINVAL;
+    }
+    if iovcnt == 0 {
+        return 0;
+    }
+    if iovcnt > 1024 || iov == 0 {
+        return EINVAL;
+    }
+    if !range_ok(iov, iovcnt.saturating_mul(16)) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let FdKind::Pidfd(pid) = o.kind else { return EBADF };
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let Some(tgt) = tasks
+        .iter_mut()
+        .flatten()
+        .find(|tt| tt.pid == pid && tt.state != TaskState::Exited)
+    else {
+        return ESRCH;
+    };
+    let mut advised = 0u64;
+    for i in 0..iovcnt {
+        // SAFETY: the caller iov block validated readable above.
+        let (base, len) = unsafe {
+            (
+                ((iov + i * 16) as *const u64).read_unaligned(),
+                ((iov + i * 16 + 8) as *const u64).read_unaligned(),
+            )
+        };
+        if len == 0 {
+            continue;
+        }
+        if base & (PAGE - 1) != 0 || len & (PAGE - 1) != 0 {
+            return EINVAL;
+        }
+        let Some(end) = base.checked_add(len) else {
+            return EINVAL;
+        };
+        // Count the committed-overlap bytes; holes advise nothing.
+        for r in tgt.ranges.iter() {
+            if r.1 <= base || r.0 >= end {
+                continue;
+            }
+            if r.2 & RNG_RES == 0 {
+                advised += r.1.min(end) - r.0.max(base);
+            }
+        }
+    }
+    advised
+}
+
+/// mlock/munlock(addr, len): pin/unpin a range — inert here since
+/// nothing evicts or swaps user pages, but the ENOMEM-on-unmapped
+/// gate is real (committed-range check, RES ranges excluded).
+/// addr rounds down to its page, the tail rounds up like Linux.
+pub fn sys_mlock(addr: u64, len: u64) -> u64 {
+    const ENOMEM_: u64 = (-12i64) as u64;
+    let Some(t) = cur_mut() else { return ENOMEM_ };
+    if len == 0 {
+        return 0;
+    }
+    let ulo = crate::elf::USER_VA_LO;
+    let uhi = crate::elf::USER_VA_HI;
+    let lo = addr & !(PAGE - 1);
+    let Some(end) = addr.checked_add(len) else {
+        return ENOMEM_;
+    };
+    let hi = end.saturating_add(PAGE - 1) & !(PAGE - 1);
+    if lo < ulo || hi > uhi || hi < lo {
+        return ENOMEM_;
+    }
+    if !range_committed(t, lo, hi) {
+        return ENOMEM_;
+    }
+    0
+}
+
+/// mlock2(addr, len, flags): mlock plus MLOCK_ONFAULT(1) — a
+/// population hint that's inert here; unknown flags EINVAL.
+pub fn sys_mlock2(addr: u64, len: u64, flags: u64) -> u64 {
+    if flags & !1 != 0 {
+        return EINVAL;
+    }
+    sys_mlock(addr, len)
+}
+
+/// mlockall/munlockall(flags): whole-mm variants — same inert
+/// truth: nothing evicts. mlockall EINVALs unknown MCL_* bits
+/// (CURRENT|FUTURE|ONFAULT = 7 valid).
+pub fn sys_mlockall(flags: u64) -> u64 {
+    if flags & !7 != 0 {
+        return EINVAL;
+    }
+    0
+}
+
 /// mincore(addr, len, vec): per-page residency bits — everything a
 /// leaf maps is resident (no swap). vec gets one bit per page.
 /// EINVAL unaligned addr; EFAULT bad vec; ENOMEM when the range
