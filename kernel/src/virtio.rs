@@ -428,7 +428,7 @@ const NET_HDR: usize = 10;
 /// Per-buffer size — covers an Ethernet MTU with slack.
 const NET_BUFSZ: usize = 2048;
 /// Posted receive buffers / transmit slots.
-const N_RX: usize = 16;
+const N_RX: usize = 64;
 const N_TX: usize = 8;
 
 struct VNet {
@@ -464,9 +464,9 @@ pub fn net_init() -> bool {
         fail(io);
         return false;
     };
-    // RX: N_RX * 2048 = 32 KiB contiguous; TX: N_TX * 2048 = 16 KiB.
+    // RX: N_RX * 2048 = 128 KiB contiguous; TX: N_TX * 2048 = 16 KiB.
     let (Some(rx_bufs), Some(tx_bufs)) =
-        (kalloc::alloc_frames(3), kalloc::alloc_frames(2))
+        (kalloc::alloc_frames(5), kalloc::alloc_frames(2))
     else {
         fail(io);
         return false;
@@ -523,6 +523,13 @@ pub fn net_mac() -> Option<[u8; 6]> {
     vnet().map(|n| n.mac)
 }
 
+/// Whether the RX used-ring holds an unconsumed entry — the peek the
+/// socket layer's drain loop polls between frame copies.
+pub fn net_rx_pending() -> bool {
+    let Some(n) = vnet() else { return false };
+    n.rx.used_idx().wrapping_sub(n.rx_seen) != 0
+}
+
 /// Copy the next received frame into `buf` (header stripped) and
 /// re-post its buffer. Returns the frame length, or None when the
 /// queue is empty.
@@ -537,7 +544,20 @@ pub fn net_rx(buf: &mut [u8]) -> Option<usize> {
     let (id, len) = n.rx.used_entry(n.rx_seen as usize);
     n.rx_seen = n.rx_seen.wrapping_add(1);
     let id = id as usize;
-    if id >= N_RX || len < NET_HDR as u32 {
+    if id >= N_RX {
+        return None; // consumed; the slot can't be re-posted
+    }
+    if len < NET_HDR as u32 {
+        // Malformed completion — re-post so the pool doesn't shrink.
+        n.rx.put_desc(
+            id,
+            n.rx_bufs + (id * NET_BUFSZ) as u64,
+            NET_BUFSZ as u32,
+            DESC_WRITE,
+            0,
+        );
+        n.rx.avail_push(id as u16);
+        n.rx.notify();
         return None;
     }
     let take = ((len as usize) - NET_HDR)

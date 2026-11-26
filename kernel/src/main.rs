@@ -1499,6 +1499,12 @@ pub(crate) fn rustux_main(
                 ip[0], ip[1], ip[2], ip[3]
             );
         }
+        // A virtio-only boot never ran DHCP — seed the static slirp
+        // lease so the socket layer considers the NIC usable. No-op
+        // when the e1000 leased an address above.
+        if let Some(mac) = virtio::net_mac() {
+            e1000::seed_virtio_identity(mac);
+        }
 
         // Decoded keys now feed the tty input queue via the tick-side
         // stdin pump — read(0)/poll(0) are live for the whole suite,

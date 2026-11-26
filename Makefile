@@ -203,6 +203,25 @@ run-net: build
 	if [ $$status -eq 33 ]; then echo "boot test: PASS (qemu exit 33)"; \
 	else echo "boot test: FAIL (qemu exit $$status)"; exit 1; fi
 
+# Same suite with the virtio-net NIC as the ONLY link — proves the
+# socket layer rides the virtio datapath (identity seeded statically,
+# no e1000 DHCP): ARP/TX/RX all cross the virtqueue.
+run-vnet: build
+	$(QEMU) \
+		-machine q35 \
+		-m 1G \
+		-cpu qemu64,+rdrand \
+		-bios $(OVMF) \
+		-drive file=$(ESP_IMG),format=raw,if=ide \
+		-snapshot \
+		-netdev user,id=n1 -device virtio-net-pci,netdev=n1 \
+		-serial stdio -display none \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		-no-reboot; \
+	status=$$?; \
+	if [ $$status -eq 33 ]; then echo "boot test: PASS (qemu exit 33)"; \
+	else echo "boot test: FAIL (qemu exit $$status)"; exit 1; fi
+
 ESP_BASH    := esp-bash.img
 
 # Interactive login shell on the serial console: a solo initrd whose

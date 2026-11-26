@@ -1865,9 +1865,26 @@ pub fn our_mask() -> [u8; 4] {
     OUR_MASK.load(Ordering::Relaxed).to_be_bytes()
 }
 
-/// Live socket path up: ring programmed and an address leased.
+/// Live socket path up: a NIC present (e1000 ring or virtio-net) and
+/// an address seeded/leased.
 pub fn net_up() -> bool {
-    LIVE_BASE.load(Ordering::Relaxed) != 0 && OUR_IP.load(Ordering::Relaxed) != 0
+    (LIVE_BASE.load(Ordering::Relaxed) != 0 || crate::virtio::net_up())
+        && OUR_IP.load(Ordering::Relaxed) != 0
+}
+
+/// Seed the socket-layer identity for a virtio-only boot — no e1000
+/// ran DHCP, so the static slirp lease every user-net instance hands
+/// out is programmed directly. No-op once any identity exists.
+pub fn seed_virtio_identity(mac: [u8; 6]) {
+    if OUR_IP.load(Ordering::Relaxed) != 0 || LIVE_BASE.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let mut m = [0u8; 8];
+    m[2..8].copy_from_slice(&mac);
+    OUR_MAC.store(u64::from_be_bytes(m), Ordering::Relaxed);
+    OUR_IP.store(u32::from_be_bytes([10, 0, 2, 15]), Ordering::Relaxed);
+    OUR_MASK.store(u32::from_be_bytes([255, 255, 255, 0]), Ordering::Relaxed);
+    GW_IP.store(u32::from_be_bytes([10, 0, 2, 2]), Ordering::Relaxed);
 }
 
 /// The cached gateway MAC (None until the boot ARP reply).
@@ -1976,15 +1993,93 @@ fn drain_desc(d: usize) -> Option<([u8; 4], [u8; 6])> {
     out
 }
 
+/// NIC egress switch: e1000's live ring when programmed, the virtio
+/// NIC otherwise. When egressing via virtio the frame's source MAC —
+/// and the ARP body's sender hardware address — must be the virtio
+/// NIC's, or slirp's replies go to a MAC the device filters out.
+fn tx_eth(f: &mut [u8]) -> bool {
+    let base = LIVE_BASE.load(Ordering::Relaxed);
+    if base != 0 {
+        return tx_once(base, f);
+    }
+    if !crate::virtio::net_up() {
+        return false;
+    }
+    if let Some(mac) = crate::virtio::net_mac() {
+        f[6..12].copy_from_slice(&mac);
+        if f.len() >= 28 && f[12] == 0x08 && f[13] == 0x06 {
+            f[22..28].copy_from_slice(&mac);
+        }
+    }
+    crate::virtio::net_tx(f)
+}
+
+/// Whether any socket-capable NIC is present.
+fn nic_live() -> bool {
+    LIVE_BASE.load(Ordering::Relaxed) != 0 || crate::virtio::net_up()
+}
+
+/// Drain one virtio-RX frame: ARP requests for us get answered (the
+/// reply egresses on the same NIC via tx_eth), ARP replies report
+/// (spa,sha) for arp_resolve's spin, IPv4 feeds the shared demux.
+fn virtio_rx_one() -> Option<([u8; 4], [u8; 6])> {
+    let fr = unsafe { &mut *core::ptr::addr_of_mut!(VDRAIN_F) };
+    let n = crate::virtio::net_rx(fr)?;
+    if n < 14 {
+        return None;
+    }
+    let et = u16::from_be_bytes([fr[12], fr[13]]);
+    if et == 0x0806 && n >= 42 {
+        let op = u16::from_be_bytes([fr[20], fr[21]]);
+        let mut sha = [0u8; 6];
+        sha.copy_from_slice(&fr[22..28]);
+        let mut spa = [0u8; 4];
+        spa.copy_from_slice(&fr[28..32]);
+        let our = our_ip();
+        if op == 1 && fr[38..42] == our && our != [0; 4] {
+            // Who-has us? Answer out the NIC the request arrived on —
+            // in a dual-NIC boot tx_eth would pick e1000 and the
+            // requester on this segment would never see it.
+            if let Some(nmac) = crate::virtio::net_mac() {
+                let mut f = [0u8; 60];
+                f[..6].copy_from_slice(&sha);
+                f[6..12].copy_from_slice(&nmac);
+                f[12] = 0x08;
+                f[13] = 0x06;
+                f[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 2]);
+                f[22..28].copy_from_slice(&nmac);
+                f[28..32].copy_from_slice(&our);
+                f[32..38].copy_from_slice(&sha);
+                f[38..42].copy_from_slice(&spa);
+                let _ = crate::virtio::net_tx(&f);
+            }
+        } else if op == 2 {
+            return Some((spa, sha));
+        }
+    } else if et == 0x0800 {
+        let mut m = [0u8; 6];
+        m.copy_from_slice(&fr[6..12]);
+        ip_demux(&fr[14..n], m);
+    }
+    None
+}
+
 /// Drain every posted descriptor once — called from the timer tick
 /// and before a socket recv blocks, so a datagram already in the
 /// ring never waits for the next tick.
 pub fn rx_drain() {
-    if LIVE_BASE.load(Ordering::Relaxed) == 0 {
-        return;
+    if LIVE_BASE.load(Ordering::Relaxed) != 0 {
+        for d in 0..N_RX {
+            drain_desc(d);
+        }
     }
-    for d in 0..N_RX {
-        drain_desc(d);
+    if crate::virtio::net_up() {
+        // virtio_rx_one consumes a frame whenever one is posted and
+        // reports Some only for ARP replies — drain until the used
+        // ring is empty regardless of what each frame was.
+        while crate::virtio::net_rx_pending() {
+            virtio_rx_one();
+        }
     }
     lo_drain();
 }
@@ -2042,6 +2137,8 @@ static mut LO_DRAIN: bool = false;
 /// loopback chain live inside an 8-16KiB kstack.
 static mut TX_F: [u8; 1600] = [0; 1600];
 static mut DRAIN_F: [u8; 1600] = [0; 1600];
+/// Virtio-RX staging for the ingress drain — same lifetime argument.
+static mut VDRAIN_F: [u8; 1600] = [0; 1600];
 
 /// Pop the oldest queued loopback frame into a caller buffer.
 fn lo_pop(out: &mut [u8]) -> Option<u16> {
@@ -2097,8 +2194,7 @@ pub fn tcp_tx(
     payload: &[u8],
     wnd: u16,
 ) -> bool {
-    let base = LIVE_BASE.load(Ordering::Relaxed);
-    if base == 0 {
+    if !nic_live() {
         return false;
     }
     let mac = OUR_MAC.load(Ordering::Relaxed).to_be_bytes();
@@ -2142,7 +2238,7 @@ pub fn tcp_tx(
         lo_drain();
         return true;
     }
-    tx_once(base, &f[..n.max(60)])
+    tx_eth(&mut f[..n.max(60)])
 }
 
 /// Route a destination IPv4 to a link-layer MAC: self/loopback and
@@ -2163,15 +2259,19 @@ pub fn route_mac(dip: [u8; 4]) -> Option<[u8; 6]> {
             return Some(m);
         }
     }
-    gw_mac()
+    // Off-link: the cached gateway MAC, else resolve it — a virtio-
+    // seeded boot has GW_IP but no cached MAC until the first ARP.
+    gw_mac().or_else(|| {
+        let g = GW_IP.load(Ordering::Relaxed).to_be_bytes();
+        (g != [0; 4]).then(|| arp_resolve(g)).flatten()
+    })
 }
 
 /// Resolve an on-link IPv4 to a MAC: gateway is cached from boot;
 /// otherwise broadcast a who-has and spin the live ring for the
 /// reply (other traffic keeps demuxing during the spin).
 pub fn arp_resolve(target: [u8; 4]) -> Option<[u8; 6]> {
-    let base = LIVE_BASE.load(Ordering::Relaxed);
-    if base == 0 {
+    if !nic_live() {
         return None;
     }
     let gw = GW_IP.load(Ordering::Relaxed);
@@ -2193,15 +2293,37 @@ pub fn arp_resolve(target: [u8; 4]) -> Option<[u8; 6]> {
     f[22..28].copy_from_slice(&mac[2..8]);
     f[28..32].copy_from_slice(&our);
     f[38..42].copy_from_slice(&target);
-    if !tx_once(base, &f) {
+    if !tx_eth(&mut f) {
         return None;
     }
     for _ in 0..4_000_000u32 {
         for d in 0..N_RX {
             if let Some((spa, sha)) = drain_desc(d) {
                 if spa == target {
+                    if target == gw.to_be_bytes() {
+                        GW_MAC.store(
+                            u64::from_be_bytes([
+                                0, 0, sha[0], sha[1], sha[2], sha[3], sha[4], sha[5],
+                            ]),
+                            Ordering::Relaxed,
+                        );
+                    }
                     return Some(sha);
                 }
+            }
+        }
+        // The reply may land on the other NIC — drain it too.
+        if let Some((spa, sha)) = virtio_rx_one() {
+            if spa == target {
+                if target == gw.to_be_bytes() {
+                    GW_MAC.store(
+                        u64::from_be_bytes([
+                            0, 0, sha[0], sha[1], sha[2], sha[3], sha[4], sha[5],
+                        ]),
+                        Ordering::Relaxed,
+                    );
+                }
+                return Some(sha);
             }
         }
     }
@@ -2211,8 +2333,7 @@ pub fn arp_resolve(target: [u8; 4]) -> Option<[u8; 6]> {
 /// Transmit one UDP datagram through the live ring — checksums
 /// computed by build_udp4, our leased address as the source.
 pub fn udp_tx(dst_mac: [u8; 6], dst_ip: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> bool {
-    let base = LIVE_BASE.load(Ordering::Relaxed);
-    if base == 0 {
+    if !nic_live() {
         return false;
     }
     let mac = OUR_MAC.load(Ordering::Relaxed).to_be_bytes();
@@ -2220,5 +2341,5 @@ pub fn udp_tx(dst_mac: [u8; 6], dst_ip: [u8; 4], sport: u16, dport: u16, payload
     m.copy_from_slice(&mac[2..8]);
     let mut f = [0u8; 1600];
     let n = crate::net::build_udp4(&mut f, dst_mac, m, our_ip(), dst_ip, sport, dport, payload);
-    n != 0 && tx_once(base, &f[..n.max(60)])
+    n != 0 && tx_eth(&mut f[..n.max(60)])
 }
