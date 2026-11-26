@@ -15138,6 +15138,87 @@ pub fn sys_setrlimit(res: u64, new: u64) -> u64 {
     sys_prlimit64(0, res, new, 0)
 }
 
+/// kcmp(pid1, pid2, type, idx1, idx2): kernel-object identity
+/// comparison for two live tasks (CRIU's checker). Return is 0 when
+/// the objects are the same, else a stable ordering (1 = first sorts
+/// before second, 2 = after) — Linux orders by kernel pointer; our
+/// proxy is the table index / identity value, which preserves the
+/// only guarantee callers use (0 == identical).
+///   FILE(0): idx are fds — resolve to OFD slot, EBADF on empty
+///   VM(1): pml4 identity (CLONE_VM siblings share an address space)
+///   FILES(2): fdi (CLONE_FILES)   FS(3): fsi (CLONE_FS)
+///   SIGHAND(4): sigh (CLONE_SIGHAND)
+///   IO(5): no io_context exists — NULL==NULL -> always equal
+///   SYSVSEM(6): sem undo is pid-keyed -> pid identity
+/// EPERM unless uid==0 or the caller's uid matches BOTH targets —
+/// the uid-model stand-in for ptrace_may_access.
+pub fn sys_kcmp(pid1: u64, pid2: u64, typ: u64, idx1: u64, idx2: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    if typ > 6 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return ESRCH_ };
+    let Some(s1) = task_slot_by_pid(pid1) else {
+        return ESRCH_;
+    };
+    let Some(s2) = task_slot_by_pid(pid2) else {
+        return ESRCH_;
+    };
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    let (t1, t2) = match (tasks[s1].as_ref(), tasks[s2].as_ref()) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return ESRCH_,
+    };
+    if t.uid != 0 && (t1.uid != t.uid || t2.uid != t.uid) {
+        return EPERM_;
+    }
+    fn ord(a: u64, b: u64) -> u64 {
+        if a == b {
+            0
+        } else if a < b {
+            1
+        } else {
+            2
+        }
+    }
+    match typ {
+        0 => {
+            // KCMP_FILE: idx1/idx2 are per-task fd numbers resolved
+            // through each task's own table into OFD slot ids.
+            if idx1 >= MAX_FDS as u64 || idx2 >= MAX_FDS as u64 {
+                return EBADF;
+            }
+            let f1 = if t1.fdi == FDI_NONE {
+                None
+            } else {
+                unsafe {
+                    (*core::ptr::addr_of!(FDTABS))[t1.fdi as usize]
+                        .fds[idx1 as usize]
+                }
+            };
+            let f2 = if t2.fdi == FDI_NONE {
+                None
+            } else {
+                unsafe {
+                    (*core::ptr::addr_of!(FDTABS))[t2.fdi as usize]
+                        .fds[idx2 as usize]
+                }
+            };
+            match (f1, f2) {
+                (Some(a), Some(b)) => ord(a as u64, b as u64),
+                _ => EBADF, // an empty fd is EBADF, not "equal"
+            }
+        }
+        1 => ord(t1.pml4, t2.pml4),
+        2 => ord(t1.fdi as u64, t2.fdi as u64),
+        3 => ord(t1.fsi as u64, t2.fsi as u64),
+        4 => ord(t1.sigh as u64, t2.sigh as u64),
+        5 => 0, // io_context is NULL on both — always "same"
+        _ => ord(t1.pid, t2.pid), // sem-undo list is keyed by pid
+    }
+}
+
 /// syslog(type, bufp, len): the kernel-log-ring reader (klogctl).
 /// Types <9 need uid==0 (CAP_SYSLOG/CAP_SYS_ADMIN upstream; uid is
 /// this model's privilege bit, same as chroot/setuid checks).

@@ -801,6 +801,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_CHDIR => sys_chdir(a1),
         NR_FCHDIR => user::sys_fchdir(a1),
         161 => sys_chroot(a1),
+        312 => user::sys_kcmp(a1, a2, a3, a4, a5),
         NR_CHMOD => sys_chmod(a1, a2),
         NR_FCHMOD => user::fd_chmod(a1, a2),
         NR_FCHMODAT => sys_fchmodat(a1, a2, a3),

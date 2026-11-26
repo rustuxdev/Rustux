@@ -154,8 +154,20 @@ int main(void) {
     // ---- WSTOPPED-only mask sleeps through an exit ----------------------
     pid_t c6 = fork();
     if (c6 == 0) { msleep(150); die(6); }
+    // wait deterministically for the zombie — fixed sleeps lose
+    // under suite load (c6's msleep(150) can outrun ours); peek
+    // with WNOWAIT until it exists, bounded ~3s.
+    int z6 = 0;
+    for (int i = 0; i < 300 && !z6; i++) {
+        memset(&si, 0, sizeof si);
+        if (waitid(P_PID, c6, &si, WEXITED | WNOHANG | WNOWAIT) == 0
+            && si.si_pid == c6)
+            z6 = 1;
+        else
+            msleep(10);
+    }
+    check(z6, "c6 became a zombie");
     memset(&si, 0, sizeof si);
-    msleep(250); // let c6 die first
     check(waitid(P_PID, c6, &si, WSTOPPED | WNOHANG) == 0 && si.si_pid == 0,
           "WSTOPPED mask sees no exit");
     memset(&si, 0, sizeof si);
