@@ -619,6 +619,15 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         465 => sys_listxattrat(a1, a2, a3, a4, a5),
         466 => sys_removexattrat(a1, a2, a3, a4),
         447 => user::fd_memfd_secret(a1),
+        // small classics: select is pselect with a timeval
+        // converted in place; msync validates then no-ops (eager
+        // private copies); getcpu/getattr/setattr report the fixed
+        // single-CPU normal-class scheduler.
+        23 => user::fd_select(ctx, a1, a2, a3, a4, a5),
+        26 => user::sys_msync(a1, a2, a3),
+        309 => user::sys_getcpu(a1, a2, a3),
+        314 => user::sys_sched_setattr(a1, a2, a3, a4),
+        315 => user::sys_sched_getattr(a1, a2, a3, a4),
 
         NR_FUTEX_WAKE => user::sys_futex_wake(a1, a2, a3, a4),
         NR_FUTEX_WAIT => user::sys_futex_wait(ctx, a1, a2, a3, a4, a5, a6),

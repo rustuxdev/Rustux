@@ -56,11 +56,14 @@ int main(void) {
     // at clone; on exit the kernel zeroes it and futex-wakes — the
     // pthread_join mechanism verbatim.
     join_word = 0;
+    word = 0; // phase-2 child must BLOCK, not EAGAIN off phase-1's 1
     pid_t j = clone(fwait, st2 + sizeof(st2),
                     CLONE_VM | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
                     (void *)&started, 0, 0, (void *)&join_word);
     check(j > 0 && join_word == (int)j, "SETTID wrote child pid");
     int tid = join_word;
+    word = 1;
+    syscall(SYS_futex, (void *)&word, FUTEX_WAKE, 1, 0, 0, 0);
     while (join_word == tid && tid != 0)
         syscall(SYS_futex, (void *)&join_word, FUTEX_WAIT, tid, 0, 0, 0);
     check(join_word == 0, "CLEARTID zeroed the tid word + woke us");

@@ -2068,6 +2068,11 @@ pub struct Task {
     /// The syscall applies the caller's set for the sleep and the
     /// wake paths restore this one before userspace resumes.
     psel_mask: u64,
+    /// select() remaining-time writeback: user timeval ptr +
+    /// deadline ticks — armed by fd_select, serviced by
+    /// psel_restore on every resume path.
+    wait_tv: u64,
+    wait_tv_dl: u64,
     /// Mask a delivered signal frame should restore on sigreturn
     /// when it differs from t.sigmask at push time — set for
     /// in-wake deliveries where a psel restore is owed (the
@@ -7793,6 +7798,8 @@ fn load(img: &[u8]) -> Option<Task> {
         wait_ptr3: 0,
         wait_lock: FLockReq::EMPTY,
         psel_mask: u64::MAX,
+        wait_tv: 0,
+        wait_tv_dl: 0,
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
@@ -14315,6 +14322,8 @@ pub fn nt_thread_create(
         wait_ptr3: 0,
         wait_lock: FLockReq::EMPTY,
         psel_mask: u64::MAX,
+        wait_tv: 0,
+        wait_tv_dl: 0,
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
@@ -22323,6 +22332,15 @@ fn psel_restore(t: &mut Task) {
         t.sigmask = t.psel_mask as u32;
         t.psel_mask = u64::MAX;
     }
+    if t.wait_tv != 0 {
+        // select()'s timeval writeback — the deadline was captured
+        // at arm time because wait_deadline clears before restore.
+        let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        let rem_us = t.wait_tv_dl.saturating_sub(now).saturating_mul(10_000);
+        write_task_u64(t.pml4, t.wait_tv, rem_us / 1_000_000);
+        write_task_u64(t.pml4, t.wait_tv + 8, rem_us % 1_000_000);
+        t.wait_tv = 0;
+    }
 }
 
 // --- synchronous signals: sigwait*, signalfd -------------------------
@@ -24092,6 +24110,203 @@ pub fn fd_pselect(
         return t.ctx.rax;
     }
     block_switch()
+}
+
+/// select(nfds, rfd, wfd, efd, tv): the timeval-timed pselect —
+/// the 16-byte {sec,usec} buffer converts in place to a valid
+/// timespec for the shared path, and converts back to remaining
+/// time on the way out like Linux's select writeback.
+pub fn fd_select(
+    ctx: &mut UCtx,
+    nfds: u64,
+    rfd: u64,
+    wfd: u64,
+    efd: u64,
+    tv: u64,
+) -> u64 {
+    let mut deadline = 0u64;
+    if tv != 0 {
+        if !range_ok_w(tv, 16) {
+            return EFAULT;
+        }
+        // SAFETY: validated user timeval under cur cr3.
+        let (sec, usec) = unsafe {
+            (
+                (tv as *const i64).read_unaligned(),
+                (tv as *const i64).add(1).read_unaligned(),
+            )
+        };
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return EINVAL;
+        }
+        // Rewrite the same 16-byte window as a timespec — the
+        // {sec,nsec} layout is identical, usec*1000 stays <1e9.
+        // SAFETY: same validated window.
+        unsafe {
+            (tv as *mut i64).write_unaligned(sec);
+            (tv as *mut i64).add(1).write_unaligned(usec * 1000);
+        }
+        deadline = ts_deadline(tv).unwrap_or(0);
+    }
+    // Arm the writeback ticket first: if pselect blocks, every
+    // resume path services it through psel_restore.
+    if tv != 0 {
+        if let Some(t) = cur_mut() {
+            t.wait_tv = tv;
+            t.wait_tv_dl = deadline;
+        }
+    }
+    let r = fd_pselect(ctx, nfds, rfd, wfd, efd, tv, 0);
+    // Synchronous return (never armed, or resolved before the
+    // block): the ticket is still set — write remaining now.
+    if tv != 0 {
+        if let Some(t) = cur_mut() {
+            if t.wait_tv != 0 && !matches!(t.wait_on, WaitOn::Pselect) {
+                let now = crate::apic::TICKS
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let rem_us = t
+                    .wait_tv_dl
+                    .saturating_sub(now)
+                    .saturating_mul(10_000);
+                // SAFETY: window still valid in this task context.
+                unsafe {
+                    (tv as *mut i64).write_unaligned((rem_us / 1_000_000) as i64);
+                    (tv as *mut i64)
+                        .add(1)
+                        .write_unaligned((rem_us % 1_000_000) as i64);
+                }
+                t.wait_tv = 0;
+            }
+        }
+    }
+    r
+}
+
+/// msync(addr, len, flags): validate like Linux — page-aligned
+/// addr, MS_SYNC|MS_ASYNC never both, no unknown flag bits, and
+/// ENOMEM for any uncommitted page in the window. Then it is inert
+/// success: every writable mapping is an eager private copy, so
+/// there is never anything outstanding to push anywhere.
+pub fn sys_msync(addr: u64, len: u64, flags: u64) -> u64 {
+    const MS_ASYNC: u64 = 1;
+    const MS_INVALIDATE: u64 = 2;
+    const MS_SYNC: u64 = 4;
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 {
+        return EINVAL;
+    }
+    const ENOMEM_: u64 = (-12i64) as u64;
+    if flags & MS_ASYNC != 0 && flags & MS_SYNC != 0 {
+        return EINVAL;
+    }
+    if addr & (PAGE - 1) != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    if range_committed(t, addr, addr.saturating_add(len)) {
+        0
+    } else {
+        ENOMEM_
+    }
+}
+
+/// getcpu(cpu, node, tcache): single-CPU single-node — writes 0s.
+/// NULL out-ptrs are skipped like Linux; tcache is ignored.
+pub fn sys_getcpu(cpu: u64, node: u64, _tcache: u64) -> u64 {
+    for p in [cpu, node] {
+        if p == 0 {
+            continue;
+        }
+        if !range_ok_w(p, 4) {
+            return EFAULT;
+        }
+        // SAFETY: validated 4-byte window under cur cr3.
+        unsafe { *(p as *mut u32) = 0 };
+    }
+    0
+}
+
+/// The sched_attr ABI block sched_getattr fills / sched_setattr
+/// reads: {size32, policy32, flags64, nice32, priority32,
+/// runtime64, deadline64, period64} = 48 bytes. Our scheduler is a
+/// fixed normal-class runner — policy/nice/priority are uniform.
+const SCHED_ATTR_SIZE: u64 = 48;
+
+fn sched_pid_ok(pid: u64) -> bool {
+    pid == 0 || pidfd_alive(pid)
+}
+
+/// sched_getattr(pid, attr, size, flags): reports the fixed
+/// SCHED_OTHER parameters every task runs — size>=48 like Linux's
+/// minimum, zero-fills the caller's whole `size` window.
+pub fn sys_sched_getattr(pid: u64, attr: u64, size: u64, flags: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if flags != 0 || !(SCHED_ATTR_SIZE..=4096).contains(&size) {
+        return EINVAL;
+    }
+    if !sched_pid_ok(pid) {
+        return ESRCH_;
+    }
+    if !range_ok_w(attr, size) {
+        return EFAULT;
+    }
+    // SAFETY: validated user window under cur cr3 — {size=48,
+    // policy=SCHED_OTHER(0), everything else 0}.
+    unsafe {
+        core::ptr::write_bytes(attr as *mut u8, 0, size as usize);
+        *(attr as *mut u32) = SCHED_ATTR_SIZE as u32;
+    }
+    0
+}
+
+/// sched_setattr(pid, attr, size, flags): accepts the normal-class
+/// shapes our fixed scheduler can honor — SCHED_OTHER/BATCH/IDLE
+/// with nice in [-20,19], priority 0, no deadline fields. Anything
+/// RT (FIFO/RR/DEADLINE) or unknown EINVALs like a kernel without
+/// those policies; flags!=0 EINVALs.
+pub fn sys_sched_setattr(pid: u64, attr: u64, size: u64, flags: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    const E2BIG_: u64 = (-7i64) as u64;
+    if flags != 0 || !(SCHED_ATTR_SIZE..=4096).contains(&size) {
+        return EINVAL;
+    }
+    if !sched_pid_ok(pid) {
+        return ESRCH_;
+    }
+    if !range_ok(attr, size) {
+        return EFAULT;
+    }
+    // SAFETY: validated user window under cur cr3.
+    let (policy, nice, priority, runtime, deadline, period) = unsafe {
+        (
+            *((attr + 4) as *const u32),
+            *((attr + 16) as *const i32),
+            *((attr + 20) as *const u32),
+            *((attr + 24) as *const u64),
+            *((attr + 32) as *const u64),
+            *((attr + 40) as *const u64),
+        )
+    };
+    // copy_struct_from_user tail: bytes past 48 must be zero.
+    for i in SCHED_ATTR_SIZE..size {
+        // SAFETY: same validated window.
+        if unsafe { *((attr + i) as *const u8) } != 0 {
+            return E2BIG_;
+        }
+    }
+    let policy_ok = matches!(policy, 0 | 3 | 5); // OTHER | BATCH | IDLE
+    if !policy_ok
+        || !( -20..=19 ).contains(&nice)
+        || priority != 0
+        || runtime != 0
+        || deadline != 0
+        || period != 0
+    {
+        return EINVAL;
+    }
+    0
 }
 
 /// Parse a user timespec {sec, nsec} into a tick deadline — shared
@@ -31288,6 +31503,8 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         wait_ptr3: 0,
         wait_lock: FLockReq::EMPTY,
         psel_mask: u64::MAX,
+        wait_tv: 0,
+        wait_tv_dl: 0,
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
@@ -31475,6 +31692,8 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         wait_ptr3: 0,
         wait_lock: FLockReq::EMPTY,
         psel_mask: u64::MAX,
+        wait_tv: 0,
+        wait_tv_dl: 0,
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
