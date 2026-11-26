@@ -54,8 +54,24 @@ const SPIN: u64 = 40_000_000;
 
 static BAR: AtomicU64 = AtomicU64::new(0);
 static NDISKS: AtomicU32 = AtomicU32::new(0);
-/// Namespace size in sectors (512B units — only that LBAF is bound).
-static NS_SECTORS: AtomicU64 = AtomicU64::new(0);
+/// Sector counts per bound namespace (512B units — only that LBAF
+/// is bound; disk index indexes both arrays).
+static NS_SECTORS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// Bound disk index -> real nsid (inactive/unsupported namespaces
+/// are skipped, so index i is NOT necessarily nsid i+1).
+static NSID: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+/// Cap on bound namespaces — QEMU test rigs present two.
+const MAXNS: u32 = 4;
 
 /// One queue pair: contiguous DMA blocks for SQ entries (64B) and
 /// CQ entries (16B), plus the ring bookkeeping. Phase flips each
@@ -184,7 +200,7 @@ impl NvmeQ {
                 }
                 w32(dbl(qid, true, dstrd), self.head as u32);
                 if got_cid == cid {
-                    LAST_SF.store(sf as u32, Ordering::Relaxed);
+                    LAST_SF.store(sf, Ordering::Relaxed);
                     return sf == 0;
                 }
                 // Stray completion (device can't inject these without
@@ -267,30 +283,52 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
     };
     SCRATCH.store(scratch, Ordering::Relaxed);
     DATA.store(data, Ordering::Relaxed);
-    // Identify Controller: NN at byte 516, then namespace 1.
+    // Identify Controller: NN at byte 516, then each active
+    // namespace up to MAXNS — inactive ids identify as all-zero.
     if !identify(aq, 0, dstrd, 0, 1) {
         crate::log::printk(format_args!("rustux: nvme: identify ctrl failed"));
         return 0;
     }
     // SAFETY: scratch is our own page, filled by the device.
-    let nn = unsafe { ((mm::pmap(scratch) + 516) as *const u32).read_volatile() };
-    if nn == 0 || !identify(aq, 0, dstrd, 1, 0) {
-        crate::log::printk(format_args!("rustux: nvme: identify ns failed nn={nn}"));
+    let nn = unsafe { ((mm::pmap(scratch) + 516) as *const u32).read_volatile() }
+        .min(MAXNS);
+    if nn == 0 {
+        crate::log::printk(format_args!("rustux: nvme: no namespaces"));
         return 0;
     }
-    // NSZE at +0 (u64 sectors); LBAF index at +26, LBAF table at +128
-    // with the chosen format's data size as 1<<ldsf.
-    let (nsze, lbads) = unsafe {
-        let p = mm::pmap(scratch) as *const u8;
-        let n = (p as *const u64).read_volatile();
-        let flbas = *p.add(26) & 0xf;
-        let ldsf = *p.add(128 + flbas as usize * 4 + 2);
-        (n, 1u32 << ldsf.min(15))
-    };
-    if nsze == 0 || lbads != 512 {
+    // Per-namespace bounds: NSZE at +0 (u64 sectors); LBAF index at
+    // +26, LBAF table at +128 with the format size as 1<<ldsf.
+    let mut bound = 0u32;
+    for nsid in 1..=nn {
+        if !identify(aq, 0, dstrd, nsid, 0) {
+            crate::log::printk(format_args!(
+                "rustux: nvme: identify ns{nsid} failed — skipped"
+            ));
+            continue;
+        }
+        let (nsze, lbads) = unsafe {
+            let p = mm::pmap(scratch) as *const u8;
+            let n = (p as *const u64).read_volatile();
+            let flbas = *p.add(26) & 0xf;
+            let ldsf = *p.add(128 + flbas as usize * 4 + 2);
+            (n, 1u32 << ldsf.min(15))
+        };
+        if nsze == 0 || lbads != 512 {
+            crate::log::printk(format_args!(
+                "rustux: nvme: ns{nsid} {nsze} sectors lbads={lbads} — only 512B bound, skipped"
+            ));
+            continue;
+        }
+        NS_SECTORS[bound as usize].store(nsze, Ordering::Relaxed);
+        NSID[bound as usize].store(nsid, Ordering::Relaxed);
+        bound += 1;
         crate::log::printk(format_args!(
-            "rustux: nvme: ns1 {nsze} sectors lbads={lbads} — only 512B bound, skipped"
+            "rustux: nvme: ns{nsid} {nsze} sectors ({} MiB) -> disk{}",
+            nsze / 2048,
+            bound - 1
         ));
+    }
+    if bound == 0 {
         return 0;
     }
     // I/O queue pair: CQ first (its id feeds the SQ's cdw11). The
@@ -320,37 +358,37 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
         ));
         return 0;
     }
-    NS_SECTORS.store(nsze, Ordering::Relaxed);
-    NDISKS.store(1, Ordering::Release);
+    NDISKS.store(bound, Ordering::Release);
     crate::log::printk(format_args!(
-        "rustux: nvme: {base:#x} ns1 {nsze} sectors ({} MiB) dstrd={dstrd}",
-        nsze / 2048
+        "rustux: nvme: {base:#x} {bound} namespace(s) dstrd={dstrd}"
     ));
-    // Datapath proof at probe time: read sector 0 through the I/O
-    // queue — the same path the partition scan then drives.
-    let mut b = [0u8; 512];
-    let r = read_range(0, 0, 1, &mut b);
-    crate::log::printk(format_args!(
-        "rustux: nvme: sector0 read {r} sig {:#x}{:#x} sf={:#x}",
-        b[510], b[511],
-        LAST_SF.load(Ordering::Relaxed)
-    ));
-    // Write datapath proof in the MBR gap — lba 64 sits before the
-    // ext4 partition (2048+) and -snapshot keeps the host image
-    // clean: read, write a pattern, verify, restore, verify.
-    let mut orig = [0u8; 512];
-    let mut back = [0u8; 512];
-    let mut pat = [0u8; 512];
-    pat[..7].copy_from_slice(b"rustux!");
-    let ro = read_range(0, 64, 1, &mut orig);
-    let w = ro && write_range(0, 64, 1, &pat);
-    let v = w && read_range(0, 64, 1, &mut back) && back[..7] == pat[..7];
-    let s = write_range(0, 64, 1, &orig);
-    let s = s && read_range(0, 64, 1, &mut back) && back == orig;
-    crate::log::printk(format_args!(
-        "rustux: nvme: write datapath {w} verify {v} restore {s}"
-    ));
-    1
+    // Datapath proofs at probe time, per bound namespace: sector 0
+    // through the I/O queue — the same path the partition scan
+    // drives — then a write-verify-restore in the MBR gap (lba 64
+    // sits before the ext4 partition; -snapshot keeps the host
+    // image clean).
+    for d in 0..bound as usize {
+        let mut b = [0u8; 512];
+        let r = read_range(d, 0, 1, &mut b);
+        crate::log::printk(format_args!(
+            "rustux: nvme: disk{d} sector0 read {r} sig {:#x}{:#x} sf={:#x}",
+            b[510], b[511],
+            LAST_SF.load(Ordering::Relaxed)
+        ));
+        let mut orig = [0u8; 512];
+        let mut back = [0u8; 512];
+        let mut pat = [0u8; 512];
+        pat[..7].copy_from_slice(b"rustux!");
+        let ro = read_range(d, 64, 1, &mut orig);
+        let w = ro && write_range(d, 64, 1, &pat);
+        let v = w && read_range(d, 64, 1, &mut back) && back[..7] == pat[..7];
+        let s = write_range(d, 64, 1, &orig);
+        let s = s && read_range(d, 64, 1, &mut back) && back == orig;
+        crate::log::printk(format_args!(
+            "rustux: nvme: disk{d} write datapath {w} verify {v} restore {s}"
+        ));
+    }
+    bound
 }
 
 static DSTRD: AtomicU32 = AtomicU32::new(0);
@@ -379,7 +417,7 @@ pub fn disk_capacity(i: usize) -> u64 {
     if i >= NDISKS.load(Ordering::Acquire) as usize {
         0
     } else {
-        NS_SECTORS.load(Ordering::Relaxed) * 512
+        NS_SECTORS[i].load(Ordering::Relaxed) * 512
     }
 }
 
@@ -392,7 +430,7 @@ pub fn read_range(i: usize, lba: u64, count: usize, buf: &mut [u8]) -> bool {
     {
         return false;
     }
-    let sectors = NS_SECTORS.load(Ordering::Relaxed);
+    let sectors = NS_SECTORS[i].load(Ordering::Relaxed);
     if lba + count as u64 > sectors {
         return false;
     }
@@ -404,7 +442,7 @@ pub fn read_range(i: usize, lba: u64, count: usize, buf: &mut [u8]) -> bool {
         let n = (count - done).min(BATCH);
         let mut e = [0u8; 64];
         e[0] = OP_READ;
-        e[4..8].copy_from_slice(&1u32.to_le_bytes()); // nsid 1
+        e[4..8].copy_from_slice(&NSID[i].load(Ordering::Relaxed).to_le_bytes());
         e[24..32].copy_from_slice(&data.to_le_bytes());
         e[40..48].copy_from_slice(&(lba + done as u64).to_le_bytes());
         e[48..50].copy_from_slice(&(n as u16 - 1).to_le_bytes());
@@ -433,7 +471,7 @@ pub fn write_range(i: usize, lba: u64, count: usize, buf: &[u8]) -> bool {
     {
         return false;
     }
-    let sectors = NS_SECTORS.load(Ordering::Relaxed);
+    let sectors = NS_SECTORS[i].load(Ordering::Relaxed);
     if lba + count as u64 > sectors {
         return false;
     }
@@ -454,7 +492,7 @@ pub fn write_range(i: usize, lba: u64, count: usize, buf: &[u8]) -> bool {
         core::sync::atomic::fence(Ordering::SeqCst);
         let mut e = [0u8; 64];
         e[0] = OP_WRITE;
-        e[4..8].copy_from_slice(&1u32.to_le_bytes()); // nsid 1
+        e[4..8].copy_from_slice(&NSID[i].load(Ordering::Relaxed).to_le_bytes());
         e[24..32].copy_from_slice(&data.to_le_bytes());
         e[40..48].copy_from_slice(&(lba + done as u64).to_le_bytes());
         e[48..50].copy_from_slice(&(n as u16 - 1).to_le_bytes());

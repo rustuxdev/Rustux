@@ -124,6 +124,23 @@ int main(void) {
         close(fd);
     }
 
+    // ---- /dev/nvme0n2 — the second namespace (259:16) ----
+    fd = open("/dev/nvme0n2", O_RDWR);
+    check(fd >= 0, "open nvme0n2");
+    if (fd >= 0) {
+        check(fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)
+              && major(st.st_rdev) == 259 && minor(st.st_rdev) == 16,
+              "fstat S_IFBLK 259:16");
+        check(ioctl(fd, BLKGETSIZE64, &cap) == 0 && cap > 0,
+              "ns2 BLKGETSIZE64");
+        check(pread(fd, sec, 512, 0) == 512
+              && (unsigned char)sec[510] == 0x55
+              && (unsigned char)sec[511] == 0xaa,
+              "ns2 pread sector0");
+        check(rw_roundtrip(fd, "ns2-tag"), "ns2 pwrite/restore");
+        close(fd);
+    }
+
     // ---- /dev/nvme0n1p1 — the NVMe partition node (259:1) ----
     fd = open("/dev/nvme0n1p1", O_RDWR);
     check(fd >= 0, "open nvme0n1p1");

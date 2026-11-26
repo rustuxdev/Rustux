@@ -151,7 +151,10 @@ run: build $(VIRTIO_DISK)
 		-drive file=$(ESP_IMG),format=raw,if=ide \
 		-drive file=$(VIRTIO_DISK),format=raw,if=virtio \
 		-drive file=$(VIRTIO_DISK),format=raw,if=none,id=nvm0 \
-		-device nvme,drive=nvm0,serial=nv0 \
+		-drive file=$(VIRTIO_DISK),format=raw,if=none,id=nvm1 \
+		-device nvme,id=nvme0,serial=nv0 \
+		-device nvme-ns,drive=nvm0,nsid=1 \
+		-device nvme-ns,drive=nvm1,nsid=2 \
 		-netdev user,id=n0 -device e1000e,netdev=n0 \
 		-netdev user,id=n1 -device virtio-net-pci-non-transitional,netdev=n1 \
 		-snapshot \
