@@ -6955,3 +6955,42 @@ into sockets (net_up/net_mac/net_rx/net_tx ready; the socket layer's
 NIC abstraction is the next step — then route egress by NIC and demux
 ingress from both rings), no IRQ-driven rx (polling only), virtio
 modern-only transport (cap-list) absent, NVMe absent, /dev/vdN absent.
+
+---
+
+## run-267 — virtio-net wired into the socket layer (NIC abstraction)
+
+e1000.rs is now the NIC-agnostic IP stack; virtio-net is a second NIC
+beneath it. tx_eth is the single egress switch (e1000 live ring when
+programmed, virtio otherwise — patching src MAC and the ARP body's
+sender-sha to the egress NIC so slirp's replies come back where the
+device filters them in). virtio_rx_one mirrors drain_desc on the
+virtqueue: answers who-has-us ARP out the ARRIVAL NIC, reports op2
+replies for arp_resolve's spin, feeds IPv4 to ip_demux. rx_drain
+(runs every tick + before socket blocks) now drains both. net_up()
+is NIC-agnostic. A virtio-only boot seeds the identity statically
+(seed_virtio_identity: 10.0.2.15/24, gw 10.0.2.2 — QEMU's fixed
+slirp layout; no-op once any identity exists). route_mac ARP-resolves
+the gateway when GW_MAC is uncached; both drain paths cache it.
+
+Three real bugs caught by the boot proofs: (1) net_rx ate a posted
+buffer per malformed used-entry — silent RX starvation; in-range ids
+now re-post. (2) N_RX=16 was thin under 75-task load — now 64. (3)
+off-link routes had no path to an uncached gateway MAC — the first
+external connect timed out on virtio-only; route_mac falls back to
+arp_resolve(GW_IP) now.
+
+Proof: `make run-vnet` (virtio-net the ONLY NIC) — exit 33, zero
+leak, DNS resolve + TCP connect :80 + HTTP/1.1 200 OK, busybox wget
+6152 bytes off deb.debian.org, all socket tests exit(0). Dual-NIC
+`make run` unchanged: e1000 preferred, all green.
+
+Audit: scoped quick, security-audit skill, run-26 — 0 confirmed.
+cve-now: CVE-2025-40292 re-verified (clamp + repost); ARP-spoof
+class = solicited-replies-only window, narrower than Linux.
+
+Still missing (next-rung candidates): virtio IRQ-driven RX (polling
+only — works because rx_drain runs every tick, but it's latency not
+interrupts), modern-only virtio transport (1042 cap-list), NVMe,
+/dev/vdN in the OFD layer, per-NIC ARP caches + routing table if a
+second real segment ever exists.
