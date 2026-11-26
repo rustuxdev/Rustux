@@ -164,6 +164,7 @@ run: build $(VIRTIO_DISK) $(GPT_DISK)
 		-device nvme-ns,drive=nvm2,nsid=3 \
 		-netdev user,id=n0 -device e1000e,netdev=n0 \
 		-netdev user,id=n1 -device virtio-net-pci-non-transitional,netdev=n1 \
+		-device virtio-rng-pci \
 		-snapshot \
 		-serial stdio -display none \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \

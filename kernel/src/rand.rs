@@ -135,6 +135,32 @@ pub fn init() -> bool {
     have
 }
 
+/// Mix fresh hardware entropy into the pool: bytes XOR-fold into
+/// the ChaCha key words and nonce, so future output stays a
+/// function of every seed ever fed — a weak or compromised new
+/// source can only perturb, never wipe the established secret.
+/// The stale block buffer is dropped so the next draw mints under
+/// the updated key; the counter bumps to keep (key, counter)
+/// pairs unique. Same boot-context contract as next_u64 — not
+/// IRQ/reentrant-safe.
+pub fn reseed(entropy: &[u8]) {
+    if !SEEDED.load(Ordering::Relaxed) || entropy.is_empty() {
+        return;
+    }
+    let rng = rng();
+    for (i, &b) in entropy.iter().enumerate() {
+        let w = 4 + (i / 4) % 8;
+        rng.state[w] ^= (b as u32) << ((i % 4) * 8);
+    }
+    // A fresh rdtsc fold keeps the nonce moving even when entropy
+    // arrives in bursts.
+    let t = unsafe { core::arch::x86_64::_rdtsc() };
+    rng.state[14] ^= t as u32;
+    rng.state[15] ^= (t >> 32) as u32;
+    rng.state[12] = rng.state[12].wrapping_add(1);
+    rng.idx = 64;
+}
+
 /// Per-boot secret key for keyed-hash uses (TCP ISN, future cookies).
 pub fn isn_key() -> (u64, u64) {
     (

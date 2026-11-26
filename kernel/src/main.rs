@@ -1443,6 +1443,9 @@ pub(crate) fn rustux_main(
     if n_nvme > 0 {
         kprintln!(con, "rustux: nvme: {n_nvme} disk(s)");
     }
+    // virtio-rng: the canonical guest entropy tap — feed the pool
+    // a reseed after the one-shot rdrand seed.
+    virtio::rng_init();
     // virtio-net: second NIC next to the e1000e — its own RX/TX
     // virtqueues, ARP round-trip proves the datapath (socket-layer
     // NIC dispatch is a later rung).

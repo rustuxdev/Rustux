@@ -1110,3 +1110,113 @@ pub fn net_irq_selftest() -> bool {
     ));
     delivered > 0 && got_reply
 }
+
+// -------------------------------------------------------------------
+// virtio-rng — a hardware entropy tap for the kernel pool.
+
+/// Transitional virtio-rng (QEMU's `virtio-rng-pci` presents this).
+const DEV_RNG: u16 = 0x1005;
+/// Fill buffers posted at once; each is a 64-byte single-descriptor
+/// request the device writes entropy into.
+const N_RNG: usize = 8;
+
+static mut RNGQ: Option<Vq> = None;
+static mut RNGPG: u64 = 0;
+static mut RNG_SEEN: u16 = 0;
+
+/// Drain completed entropy buffers into `out`, re-posting each
+/// drained slot so the posted pool never shrinks. Returns bytes
+/// collected. Boot-context only — the ring state is unguarded.
+fn rng_collect(out: &mut [u8]) -> usize {
+    // SAFETY: RNGQ/RNGPG write-once at init; same single-context
+    // contract as the rest of the driver statics.
+    let q = unsafe { (*core::ptr::addr_of_mut!(RNGQ)).as_mut() };
+    let Some(q) = q else { return 0 };
+    let pg = unsafe { *core::ptr::addr_of!(RNGPG) };
+    let mut got = 0usize;
+    let used = q.used_idx();
+    while unsafe { *core::ptr::addr_of!(RNG_SEEN) } != used && got < out.len() {
+        let seen = unsafe { *core::ptr::addr_of!(RNG_SEEN) };
+        let (id, len) = q.used_entry(seen as usize);
+        unsafe {
+            *core::ptr::addr_of_mut!(RNG_SEEN) = seen.wrapping_add(1)
+        };
+        let id = id as usize;
+        if id >= N_RNG {
+            break; // device wrote a bogus id — nothing to re-post
+        }
+        let n = (len as usize).min(64).min(out.len() - got);
+        // SAFETY: our fill page; the device wrote len<=64 bytes at
+        // id*64.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (mm::pmap(pg) + (id * 64) as u64) as *const u8,
+                out[got..].as_mut_ptr(),
+                n,
+            );
+        }
+        got += n;
+        q.put_desc(id, pg + (id * 64) as u64, 64, DESC_WRITE, 0);
+        q.avail_push(id as u16);
+    }
+    if got > 0 {
+        q.notify();
+    }
+    got
+}
+
+/// Probe a transitional virtio-rng function, post its fill buffers,
+/// spin for the first draw, and fold it into the kernel pool.
+/// Returns the number of entropy bytes fed — 0 when absent.
+pub fn rng_init() -> u32 {
+    let Some((io, _)) = probe_io(DEV_RNG) else {
+        return 0;
+    };
+    if !handshake(io) {
+        return 0;
+    }
+    let Some(q) = Vq::setup(io, 0) else {
+        fail(io);
+        return 0;
+    };
+    let Some(pg) = kalloc::alloc_frames(0) else {
+        fail(io);
+        return 0;
+    };
+    outb(io + R_STATUS, S_ACK | S_DRV | S_FEATOK | S_DRVOK);
+    // SAFETY: init runs once, before tasks exist.
+    unsafe {
+        *core::ptr::addr_of_mut!(RNGPG) = pg;
+        *core::ptr::addr_of_mut!(RNGQ) = Some(q);
+        *core::ptr::addr_of_mut!(RNG_SEEN) = 0;
+    }
+    // SAFETY: RNGQ was just published above.
+    let q = unsafe { (*core::ptr::addr_of!(RNGQ)).as_ref().unwrap() };
+    for i in 0..N_RNG {
+        q.put_desc(i, pg + (i * 64) as u64, 64, DESC_WRITE, 0);
+        q.avail_push(i as u16);
+    }
+    q.notify();
+    // The backend fills at its own pace (QEMU rate-limits to
+    // ~64B/period) — spin until the used ring drains something.
+    let mut spins = 0u64;
+    while unsafe { *core::ptr::addr_of!(RNG_SEEN) } == q.used_idx()
+        && spins < SPIN
+    {
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    let mut ent = [0u8; 256];
+    let fed = rng_collect(&mut ent);
+    // Feed the pool before the buffer is reused.
+    crate::rand::reseed(&ent[..fed]);
+    // Proof the feed is real entropy, not a zero page: a live device
+    // never returns a constant buffer.
+    let nonuniform =
+        fed > 0 && ent[..fed].iter().any(|b| *b != ent[0]);
+    crate::log::printk(format_args!(
+        "rustux: virtio: rng {io:#x} fed {fed}B -> reseed (nonuniform {nonuniform})"
+    ));
+    ent.fill(0);
+    fed as u32
+}
