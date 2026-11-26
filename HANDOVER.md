@@ -7272,3 +7272,55 @@ Audit run-36: 0 confirmed — the MSI-X lifecycle CVEs
 (CVE-2026-46141, CVE-2026-80620) are teardown/domain classes, n/a
 with no unload path. Ledger at 198 CVEs. Commits pushed origin
 main.
+
+## run-278 — virtio-console /dev/hvc0
+
+virtio.rs gains the virtio-serial console channel. QEMU wiring:
+`-chardev socket,path=/tmp/hvc.sock,server=on,wait=off,id=vc0
+-device virtio-serial-pci -device virtconsole,chardev=vc0` —
+`virtio-console` is NOT a QEMU device name; the console is a
+virtconsole PORT on a virtio-serial bus. tools/hvcfeed.py is the
+socket peer: injects `rx-proof-line` every 250ms, captures guest
+TX to /tmp/hvc_captured.log.
+
+Probe: transitional DEV_CON 0x1003, handshake_feat accepts only
+F_MULTIPORT (bit 3). The multiport topology took empirical
+decoding — QEMU builds one ivq/ovq pair per EXISTING port in id
+order, then the control pair (identifiable by qnum 32 vs data
+queues' 128), then spare pairs. The 'queue interleave at
+2i/2i+1, control at 2*(max_ports+1)' spec reading was wrong:
+with one port QEMU creates only 6 queues; control is sel 2/3.
+
+Control protocol: ports start CLOSED under multiport. Post ctrl
+event buffers, send DEVICE_READY {id 0, ev 0, val 1}, device
+answers PORT_ADD on the ctrl-in queue carrying the port id
+(0 — collided with the first sentinel, now u32::MAX), send
+PORT_OPEN {id, ev 6, val 1}, then set up the port's data pair
+(sel 2*id / 2*id+1) and post 8x128B RX buffers.
+
+Data path: con_drain consumes used entries — id<N_CON gate,
+len.min(128).min(FIFO room) before copy into a 2KiB kernel FIFO,
+re-post + notify on ANY consumption (a zero-length completion
+used to re-post silently). console_read drains+copies;
+console_write stages one desc + poll_once; console_pending
+drains for the poll path.
+
+user.rs: /dev/hvc0 minted rdev 229<<8 only when console_present;
+open gate `229 if console_present => i, 229 => ENXIO` (the
+missing arm was the first open FAIL — fell through to ENODEV);
+read arm 0xe500 range_ok_w -> console_read; write arm ->
+console_write; poll arm POLLIN while bytes queue.
+
+Bugs the run dug out: (1) port-id sentinel 0 == QEMU's real id
+0; (2) open gate had no 229 arm; (3) drain re-post without
+notify on zero-len completions.
+
+Proof: `console ctrl ev=1 id=0` -> `console 0x60c0 rxq=128
+txq=128 tx-proof 28B`; host capture shows both the init line and
+`hvc-user-tx-proof`. hvctest 8 checks 0 failures — open, fstat,
+S_IFCHR, rdev 229:0, write, poll POLLIN, rx bytes,
+rx-proof-line. Exit 33, 77 tasks, zero leak.
+
+Audit run-37: 0 confirmed — used-ring id/len trust and
+port-id/queue-sel trust bounded by design; CVE-2025-38064 /
+CVE-2022-49100 n/a. Commits pushed origin main.

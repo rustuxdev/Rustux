@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**198 unique CVEs recorded.**
+**200 unique CVEs recorded.**
 
 ## klib ports
 
@@ -125,6 +125,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-1304 | installed-apt rung: glibc DNS/NSS chain shipped (libnss_dns/libnss_files/libresolv + etc/… | audit run-259 scoped quick (security-audit skill): cve-now e2fsprogs class — CVE-2022-1304, CVE-2019-5188, CVE-2019-5094, CVE-2015-0247, CVE-2015-1572, CVE-2007-5497 all crafted-i… |
 | CVE-2022-4378 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
 | CVE-2022-49073 | install prompt/eject + read-cap split + ATA recovery: demomenu verifies, ATAPI-ejects /de… | audit run-113 manual scoped + cve.now over HTTP JSON-RPC (entities.search — analogs above; no mapped sr/cdrom-ioctl CVE): verified every fd_read arm bounds n by source availabilit… |
+| CVE-2022-49100 | virtio-console rung (/dev/hvc0): virtio.rs gains the virtio-serial channel — transitional… | audit run-37 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2025-38064, CVE-2022-49100 — n/a. Verified: make run exit 33, 77 tasks, frames equal; console c… |
+| CVE-2022-49100 | virtio-console rung (/dev/hvc0): virtio.rs gains the virtio-serial channel — transitional… | audit run-37 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2025-38064, CVE-2022-49100 — n/a. Verified: make run exit 33, 77 tasks, frames equal; console c… |
 | CVE-2022-49146 | virtio-net IRQ-RX rung (MSI-X on the legacy interface): probe_io returns the function's p… | audit run-31 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2021-47613, CVE-2025-38048, CVE-2022-49146, CVE-2023-52839 — handled or n/a. Verified: make run… |
 | CVE-2022-49146 | virtio-net IRQ-RX rung (MSI-X on the legacy interface): probe_io returns the function's p… | audit run-31 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2021-47613, CVE-2025-38048, CVE-2022-49146, CVE-2023-52839 — handled or n/a. Verified: make run… |
 | CVE-2022-49264 | execve image replacement | user rip round-trips SAVED_UIP so sysret can be redirected; canonicality holds — only stub (CPU-saved rip) and exec_return (elf-bounded entry) write it; ZERO_CTX gives exec'd imag… |
@@ -187,6 +189,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2025-23161 | `pci` | **n/a to mechanism** — our CF8/CFC access has no save/restore arrays; reminder: all config ops must stay IRQ-safe (they are — port I/O only) |
 | CVE-2025-38048 | virtio-net IRQ-RX rung (MSI-X on the legacy interface): probe_io returns the function's p… | audit run-31 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2021-47613, CVE-2025-38048, CVE-2022-49146, CVE-2023-52839 — handled or n/a. Verified: make run… |
 | CVE-2025-38048 | virtio-net IRQ-RX rung (MSI-X on the legacy interface): probe_io returns the function's p… | audit run-31 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2021-47613, CVE-2025-38048, CVE-2022-49146, CVE-2023-52839 — handled or n/a. Verified: make run… |
+| CVE-2025-38064 | virtio-console rung (/dev/hvc0): virtio.rs gains the virtio-serial channel — transitional… | audit run-37 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2025-38064, CVE-2022-49100 — n/a. Verified: make run exit 33, 77 tasks, frames equal; console c… |
+| CVE-2025-38064 | virtio-console rung (/dev/hvc0): virtio.rs gains the virtio-serial channel — transitional… | audit run-37 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2025-38064, CVE-2022-49100 — n/a. Verified: make run exit 33, 77 tasks, frames equal; console c… |
 | CVE-2025-38222 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
 | CVE-2025-38314 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
 | CVE-2025-38314 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |
