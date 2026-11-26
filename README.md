@@ -5,16 +5,18 @@
 </p>
 
 <p align="center">
-  <video src="https://github.com/rustuxdev/Rustux/raw/main/docs/assets/rustux-v2.mp4"
-    controls muted loop autoplay playsinline width="880"
-    title="Rustux in 52 seconds — boot, the record/port/diff/gate method, real userspace, a self-installing Debian disk, DOOM, the NT personality, the driver/IPC shelf, IPv8"></video>
+  <a href="https://github.com/rustuxdev/Rustux/blob/main/docs/assets/rustux-v2.mp4">
+    <img src="docs/assets/rustux-v2-poster.png" width="880"
+      alt="Rustux video — 'It installs itself': the boot chain iso → MBR+ext2 → pivot_root → login: → apt install -y nginx, stamped nginx/1.22.1 — exit 0">
+  </a>
 </p>
 
-*Fifty-two seconds of Rustux: OVMF boot footage, the
-record→port→diff→gate method, real bash/BusyBox/apt, the
-self-installing ext2 disk with `apt install -y nginx` at exit 0,
-DOOM on `/dev/fb0`, the native NT `.exe` personality, the
-Nov 26 driver + IPC shelf, and IPv8 on the wire.*
+*▶ [Watch the 52-second video](docs/assets/rustux-v2.mp4): OVMF
+boot footage, the record→port→diff→gate method, real
+bash/BusyBox/apt, the self-installing ext2 disk with
+`apt install -y nginx` at exit 0, DOOM on `/dev/fb0`, the native NT
+`.exe` personality, the Nov 26 driver + IPC shelf, and IPv8 on the
+wire.*
 
 An incremental reimplementation of the Linux kernel in Rust, verified against
 the original C kernel's recorded behavior — the first kernel to speak
