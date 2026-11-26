@@ -7762,3 +7762,33 @@ Proof: nltest 33 checks 0 failures, including real-binary
 Exit 33, 83 tasks, zero leak.
 
 Audit run-51: 0 confirmed, 1 fixed in-run. Ledger at 249 CVEs.
+
+## run-293 — AF_UNIX SOCK_SEQPACKET + recvmmsg
+
+socketpair/socket(AF_UNIX, SOCK_SEQPACKET) — the last socket-type
+hole. The seq flag rides UnixSock (fresh→listen→accept→connect
+propagation) and UnixConn (ring framing): records go into the
+same two byte rings as [u16 len][payload]. Every send path is
+atomic — inline VA, inline slice, and both blocked wakers —
+free < 2+len blocks rather than half-write (EMSGSIZE past
+ring-2); KSEND staging grew to 4098 so a framed record fits.
+Recv paths consume exactly one record: surplus past the caller
+buffer discards, recvmsg reports MSG_TRUNC, FIONREAD answers
+the pending record's payload len, SO_TYPE answers 5. A seq
+client can't reach a stream listener (ECONNREFUSED) and vice
+versa. recvmmsg (NR 299) is the recv twin of sendmmsg —
+per-entry recvmsg with msg_len writeback, short-stop on the
+first error after >=1.
+
+Two in-run hardenings: the seq send waker wrote the record
+header before copying the payload — a bad sleeper VA mid-copy
+committed a half record (now tail only advances on success);
+and rl is clamped to avail before `head += 2 + rl` — a corrupt
+record length can't desync the ring into stale reads.
+
+Proof: unixtest +19 checks, 0 failures — record boundaries,
+truncation discard, MSG_TRUNC, FIONREAD, EMSGSIZE, type
+mismatch refusal, recvmmsg batch + drained EAGAIN. Exit 33,
+83 tasks, zero leak.
+
+Audit run-52: 0 confirmed, 2 hardened in-run. Ledger at 249 CVEs.
