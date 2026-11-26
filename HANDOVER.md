@@ -6994,3 +6994,33 @@ only — works because rx_drain runs every tick, but it's latency not
 interrupts), modern-only virtio transport (1042 cap-list), NVMe,
 /dev/vdN in the OFD layer, per-NIC ARP caches + routing table if a
 second real segment ever exists.
+
+---
+
+## run-268 — NVMe storage driver
+
+nvme.rs: QEMU's nvme function (1b36:0010; 0004 fallback), 64-bit BAR0
+MMIO, the spec dance — CC=0/RDY, admin SQ16+CQ16 via AQA/ASQ/ACQ,
+CC.EN|RDY, identify controller (NN) + namespace 1 (NSZE, 512B LBAF
+only), I/O CQ32+SQ32 created with the ring's phys in PRP1, NVM read
+commands (PRP1=data, BATCH=8), completions polled by the CQ phase
+bit and tagged by cid. DiskIo's 4th transport; the suite's shared
+MBR+ext4 image mounts over BOTH virtio and NVMe.
+
+Three spec bugs the proofs caught: (1) completion DW3 decoded as
+{status,cid} — it's {command_id low16, status high16} with phase at
+bit16. (2) create-CQ/SQ need the ring phys in PRP1 — without it QEMU
+binds queues at phys 0 and the datapath silently dies (sector0
+selftest caught it). (3) QEMU refuses qprio=0 — its priority range
+is 1-based.
+
+Read-only datapath (no write command yet); single namespace; no
+MSI-X (phase polling); no SGL/PRP-list (PRP1 covers ≤4KiB).
+
+Audit: scoped quick, security-audit skill, run-27 — 0 confirmed.
+cve-now: CVE-2023-6238 (device-DMA class — copy-out bounded by
+request); nvme-tcp + teardown classes n/a. make run exit 33, zero
+leak, ext4 disk2p0 MOUNTED walked=true.
+
+Next candidates: NVMe write_range + /dev/nvme0n1 in the OFD layer,
+modern virtio transport, virtio IRQ RX.
