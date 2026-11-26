@@ -8559,3 +8559,27 @@ parses it). systest.c new task -> MAX_TASKS 116->117, lstest
 floor 88->90. Audit run-89: 0 confirmed — no Linux-kernel
 sysinfo/reboot/sysfs CVE classes exist; the one real risk
 (missing CAP_SYS_BOOT) shipped as the fix.
+
+run-331 lands seccomp(317) — a real filter engine. SECFILT[8]
+holds immutable installed programs users-counted across fork
+(bump at the tasks[] insert, drop in reap); sys_seccomp handles
+STRICT (one-way ratchet, nonroot needs PR_SET_NO_NEW_PRIVS)
+and FILTER (flag bits EINVAL — no TSYNC/LISTENER infra) plus
+GET_ACTION_AVAIL + GET_NOTIF_SIZES. cbpf_validate runs the
+classic-verifier checks at install (known opcodes, last insn
+RET, jumps in-bounds, scratch <16, ABS loads inside the 64-byte
+seccomp_data, W-size only); cbpf_run interprets over a real
+{nr,arch,ip,args[6]} record. seccomp_gate sits in both the
+64-bit and ia32 dispatchers before the match — strict pends
+SIGKILL on anything outside r/w/exit/exit_group/sigreturn,
+filter runs the stack most-severe-verdict-wins (KILL_PROCESS
+sweeps the tgid, TRAP pends SIGSYS + reports ENOSYS, ERRNO
+returns -(data&0xfff), TRACE/NOTIF answer ENOSYS — no ptrace
+or listener path exists). Divergences: LOG is a silent allow
+(no audit ring), SIGSYS carries no syscall-nr siginfo, notify
+unavailable (GET_NOTIF_SIZES still reports real ABI sizes),
+512-insn cap vs Linux's 4096. sctest.c new task -> MAX_TASKS
+117->118, lstest floor 90->91. Audit run-90: 0 confirmed —
+the filter-leak class needs a post-refcount failure path we
+don't have; verifier/malformed-prog classes are closed by the
+install-time checks + KILL-safe-verdict convention.
