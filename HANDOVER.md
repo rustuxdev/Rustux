@@ -7109,3 +7109,27 @@ Audit run-30: 0 confirmed — CVE-2026-64318's class (on-disk
 count driving an OOB partition scan) is handled by design:
 fixed 4-slot MBR, u32 bounds at registration, per-call
 re-validation in blk_window. Commit pushed origin main.
+## run-272 — virtio-net IRQ-driven RX (MSI-X on the legacy interface)
+
+The virtio NIC now raises MSI-X vector 0xf4 on RX used-buffer
+completions: probe_io returns the function bdf, NBDF stores it,
+net_irq_selftest arms MSI-X table entry 0 -> IRQ_VNET -> this
+LAPIC (rest masked), binds the RX queue to entry 0 via the legacy
+R_MSIX_Q register (config-change and TX stay at MSIX_NO_VEC —
+only RX fires), and proofs it with the same ARP probe + hlt-wait
+e1000 uses: "net 1 MSI IRQs on vec 0xf4 (rx-caused), reply
+received". apic.rs gains IRQ_VNET + a dispatch arm; cpu.rs the
+stub + IDT gate.
+
+net_on_irq only reads R_ISR (the architected ack) and counts —
+never drains. rx_seen/avail mutations are unguarded, so an
+IRQ-context drain could re-enter an interrupted syscall-side
+net_rx and double-post a descriptor. The IRQ's real value is
+waking the sti;hlt idle loops: a blocked socket task reschedules
+and drains at arrival latency instead of the next 100Hz tick.
+Ordering note: MSI-X enable shifts the legacy device config
+window +4 — the MAC is read during net_init while MSI-X is off.
+
+Audit run-31: 0 confirmed — CVE-2021-47613's partial-completion
+class handled (consumers re-check the ring; IRQ is only a wake).
+Commit pushed origin main.
