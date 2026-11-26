@@ -7531,3 +7531,38 @@ BLKGETSIZE64/MBR sig/ext4 magic/pwrite-verify-restore. Exit 33,
 78 tasks, zero leak.
 
 Audit run-43: 0 confirmed. Ledger at 208 CVEs.
+
+## run-285 — SG_IO scsi generic pass-through
+
+The sg(4) ABI on top of run-284's transport: `/dev/sgN` char nodes
+(major 21, one minor per probed scsi disk, minted in dev_init) +
+`SG_IO` (0x2285) accepted on sg nodes *and* whole-disk scsi block
+nodes (major 65, minor%16==0 — partition nodes are rejected, see
+below). The ioctl arm parses the 88-byte `sg_io_hdr_t` (x86_64
+field offsets incl. the 8-alignment pad before usr_ptr@56),
+validates the header whitelists, then hands the CDB to
+`virtio::scsi_passthrough` which issues it through one request
+chain and returns raw status/response + bounded sense — the
+caller sees CHECK CONDITION as status=2 + sense like Linux, not
+an errno.
+
+Gates (three were security findings fixed in-run):
+- dxfer_len <= 4096 (the disk's S_BATCH staging bound) checked
+  before pointer validation — oversize is EINVAL not EFAULT.
+- FROM_DEV zeroes the staging first: a no-data-phase CDB (TUR
+  with dxfer_len>0) must return zeros, not prior IO contents —
+  the CVE-2018-1000204 uninitialized-dxfer class.
+- Partition nodes (minor%16!=0) reject SG_IO — a partition fd
+  would issue commands across the whole disk, the CVE-2011-4127
+  bypass class.
+- TO_DEV direction on an O_RDONLY fd is EACCES — write commands
+  can't bypass the open mode.
+- Documented divergence: no CAP_SYS_RAWIO opcode whitelist
+  (CVE-2012-4542 needs a capability model we don't have).
+
+Proof: sgtest 24 checks 0 failures — hdr size, sg0 open/fstat
+21:0, INQUIRY vendor 'QEMU', READ CAPACITY last_lba 32767, TUR,
+SG_IO on /dev/sdb + READ(10) MBR sig, EINVAL/EFAULT/ENOTTY/
+EACCES gates. Exit 33, 79 tasks, zero leak.
+
+Audit run-44: 0 confirmed, 3 fixed in-run. Ledger at 214 CVEs.
