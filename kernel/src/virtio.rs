@@ -350,6 +350,21 @@ pub fn init() -> u32 {
     crate::log::printk(format_args!(
         "rustux: virtio: datapath sector0 read {r} sig {b510:#x}{b511:#x}"
     ));
+    // Write datapath proof in the MBR gap — lba 64 sits before the
+    // ext4 partition (2048+) and -snapshot keeps the host image
+    // clean: read, write a pattern, verify, restore, verify.
+    let mut orig = [0u8; 512];
+    let mut back = [0u8; 512];
+    let mut pat = [0u8; 512];
+    pat[..7].copy_from_slice(b"rustux!");
+    let ro = read_range(0, 64, 1, &mut orig);
+    let w = ro && write_range(0, 64, 1, &pat);
+    let v = w && read_range(0, 64, 1, &mut back) && back[..7] == pat[..7];
+    let s = write_range(0, 64, 1, &orig);
+    let s = s && read_range(0, 64, 1, &mut back) && back == orig;
+    crate::log::printk(format_args!(
+        "rustux: virtio: write datapath {w} verify {v} restore {s}"
+    ));
     1
 }
 

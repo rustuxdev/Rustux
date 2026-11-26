@@ -38,8 +38,9 @@ const CC_IOCQES: u32 = 4 << 20; // 16B completion entries
 const OP_CREATE_IO_SQ: u8 = 0x01;
 const OP_CREATE_IO_CQ: u8 = 0x05;
 const OP_IDENTIFY: u8 = 0x06;
-// NVM command-set opcode.
+// NVM command-set opcodes.
 const OP_READ: u8 = 0x02;
+const OP_WRITE: u8 = 0x01;
 
 const AQSIZE: u16 = 16;
 const IQSIZE: u16 = 32;
@@ -331,6 +332,21 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
         b[510], b[511],
         LAST_SF.load(Ordering::Relaxed)
     ));
+    // Write datapath proof in the MBR gap — lba 64 sits before the
+    // ext4 partition (2048+) and -snapshot keeps the host image
+    // clean: read, write a pattern, verify, restore, verify.
+    let mut orig = [0u8; 512];
+    let mut back = [0u8; 512];
+    let mut pat = [0u8; 512];
+    pat[..7].copy_from_slice(b"rustux!");
+    let ro = read_range(0, 64, 1, &mut orig);
+    let w = ro && write_range(0, 64, 1, &pat);
+    let v = w && read_range(0, 64, 1, &mut back) && back[..7] == pat[..7];
+    let s = write_range(0, 64, 1, &orig);
+    let s = s && read_range(0, 64, 1, &mut back) && back == orig;
+    crate::log::printk(format_args!(
+        "rustux: nvme: write datapath {w} verify {v} restore {s}"
+    ));
     1
 }
 
@@ -399,6 +415,48 @@ pub fn read_range(i: usize, lba: u64, count: usize, buf: &mut [u8]) -> bool {
                 buf.as_mut_ptr().add(done * 512),
                 n * 512,
             );
+        }
+        done += n;
+    }
+    true
+}
+
+/// Write `count` 512B sectors at `lba` from `buf` — the read path's
+/// mirror: staging page fills from the caller, PRP1 carries it.
+pub fn write_range(i: usize, lba: u64, count: usize, buf: &[u8]) -> bool {
+    if i >= NDISKS.load(Ordering::Acquire) as usize
+        || count == 0
+        || buf.len() < count * 512
+    {
+        return false;
+    }
+    let sectors = NS_SECTORS.load(Ordering::Relaxed);
+    if lba + count as u64 > sectors {
+        return false;
+    }
+    let Some(q) = ioq() else { return false };
+    let dstrd = DSTRD.load(Ordering::Relaxed);
+    let data = DATA.load(Ordering::Relaxed);
+    let mut done = 0usize;
+    while done < count {
+        let n = (count - done).min(BATCH);
+        // SAFETY: staging page is ours; fill n blocks for the device.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr().add(done * 512),
+                mm::pmap(data) as *mut u8,
+                n * 512,
+            );
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let mut e = [0u8; 64];
+        e[0] = OP_WRITE;
+        e[4..8].copy_from_slice(&1u32.to_le_bytes()); // nsid 1
+        e[24..32].copy_from_slice(&data.to_le_bytes());
+        e[40..48].copy_from_slice(&(lba + done as u64).to_le_bytes());
+        e[48..50].copy_from_slice(&(n as u16 - 1).to_le_bytes());
+        if !q.submit(1, dstrd, &mut e) {
+            return false;
         }
         done += n;
     }
