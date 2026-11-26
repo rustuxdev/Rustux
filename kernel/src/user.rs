@@ -2476,10 +2476,25 @@ struct VFile {
     mtime_ns: u32,
     ctime: u64,
     ctime_ns: u32,
+    /// F_SEAL_* bitmask — nonzero only on memfd_create files (the
+    /// `memfd` flag below). Lives on the inode like Linux: dup,
+    /// fork-inherited and SCM_RIGHTS-passed fds all share it.
+    seals: u8,
+    /// Minted by memfd_create — born unlinked (never path-reachable)
+    /// and the only files F_ADD_SEALS/F_GET_SEALS accept.
+    memfd: bool,
 }
 // SAFETY: VFILES slots own their buffers; single-CPU, IF-masked
 // context means no concurrent access. Raw ptr never escapes.
 static mut VFILES: [Option<VFile>; MAX_VFILES] = [const { None }; MAX_VFILES];
+
+/// fcntl seal bits (linux/fcntl.h) — kept with VFile since seals
+/// live on the inode.
+const F_SEAL_SEAL: u8 = 0x01;
+const F_SEAL_SHRINK: u8 = 0x02;
+const F_SEAL_GROW: u8 = 0x04;
+const F_SEAL_WRITE: u8 = 0x08;
+const F_SEAL_FUTURE_WRITE: u8 = 0x10;
 
 /// Slot of the live VFile named `path`, or None.
 fn vfile_find(path: &[u8]) -> Option<usize> {
@@ -2579,6 +2594,8 @@ fn vfile_create(path: &[u8]) -> u64 {
         mtime_ns: 0,
         ctime: 0,
         ctime_ns: 0,
+        seals: 0,
+        memfd: false,
     };
     v.name[..path.len()].copy_from_slice(path);
     vs[i] = Some(v);
@@ -15569,12 +15586,22 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             return 0;
         }
         let Some(v) = vfile(*i) else { return EBADF };
+        const EPERM_: u64 = (-1i64) as u64;
+        // F_SEAL_WRITE / F_SEAL_FUTURE_WRITE freeze contents; with
+        // no shared writable file mappings both reduce to "writes
+        // EPERM". F_SEAL_GROW only blocks extension past EOF.
+        if v.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+            return EPERM_;
+        }
         // O_APPEND lands every write at EOF; pos arithmetic must not
         // wrap — Linux's answer to overflow is EINVAL.
         let pos = if o.append { v.len } else { o.pos };
         let Some(need) = pos.checked_add(len as usize) else {
             return EINVAL;
         };
+        if need > v.len && v.seals & F_SEAL_GROW != 0 {
+            return EPERM_;
+        }
         if len > 0 && !range_ok(buf, len) {
             return EFAULT;
         }
@@ -17649,14 +17676,18 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
             }
         }
         FdKind::Ram(i) | FdKind::Dev(i) => {
-            let name = unsafe { &*core::ptr::addr_of!(VFILES) }
+            let v = unsafe { &*core::ptr::addr_of!(VFILES) }
                 .get(*i)
-                .and_then(|v| v.as_ref())
-                .map(|v| &v.name[..v.nlen]);
-            match name {
-                Some(n) => {
+                .and_then(|v| v.as_ref());
+            match v {
+                Some(v) => {
                     s.putc(b'/');
-                    s.putmem(n);
+                    s.putmem(&v.name[..v.nlen]);
+                    // unlinked-while-open inodes (memfd included)
+                    // display Linux's " (deleted)" suffix.
+                    if v.unlinked {
+                        s.puts(b" (deleted)");
+                    }
                 }
                 None => {
                     s.puts(b"/deleted");
@@ -18093,6 +18124,91 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
     fi as u64
 }
 
+/// memfd_create(name, flags): an anonymous O_RDWR Ram-backed file —
+/// born unlinked so no path ever names it, and `vfile_free_if_dead`
+/// reclaims it at last close (dup/fork/SCM_RIGHTS shares keep it
+/// alive). MFD_ALLOW_SEALING leaves the inode's seal set empty;
+/// without it the file carries F_SEAL_SEAL from birth so no seal
+/// can ever be added — Linux's opt-in sealing contract. The name
+/// is a display label, not a path: Linux allows 249 bytes and shows
+/// "/memfd:<name> (deleted)" in fd links; our 128-byte name slot
+/// truncates the label (the inode still answers correctly — the
+/// label is cosmetic). HUGETLB/EXEC flags are an honest EINVAL —
+/// no hugetlbfs or exec-scope machinery exists to honor them.
+pub fn fd_memfd_create(name: u64, flags: u64) -> u64 {
+    const MFD_CLOEXEC: u64 = 1;
+    const MFD_ALLOW_SEALING: u64 = 2;
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
+        return EINVAL;
+    }
+    // strndup_user discipline: NUL must land inside the 249-byte
+    // user limit, else EINVAL; an unmapped read is EFAULT.
+    let mut uname = [0u8; 249];
+    let mut un = 0usize;
+    loop {
+        if !range_ok(name + un as u64, 1) {
+            return EFAULT;
+        }
+        // SAFETY: range_ok proved the byte readable user memory.
+        let b = unsafe { *((name + un as u64) as *const u8) };
+        if b == 0 {
+            break;
+        }
+        if un == 249 {
+            return EINVAL;
+        }
+        uname[un] = b;
+        un += 1;
+    }
+    // The inode's stored name is "memfd:<label>" — the fd-link
+    // printer prepends '/'; label bytes past the 128-byte slot
+    // are display-truncated only.
+    let mut vn = [0u8; 128];
+    vn[..6].copy_from_slice(b"memfd:");
+    let nl = un.min(122);
+    vn[6..6 + nl].copy_from_slice(&uname[..nl]);
+    let i = vfile_create(&vn[..6 + nl]);
+    if (i as i64) < 0 {
+        return i;
+    }
+    let i = i as usize;
+    {
+        let Some(v) = vfile(i) else { return EBADF };
+        v.unlinked = true;
+        v.memfd = true;
+        if flags & MFD_ALLOW_SEALING == 0 {
+            v.seals = F_SEAL_SEAL;
+        }
+        vfile_stamp(v, 0o100777, 0);
+    }
+    // Mint the OFD + fd slot — the fd_open tail, minus path lookup.
+    // On EMFILE the inode dies with its slot: it is unlinked and
+    // nothing else names it.
+    let Some(t) = cur_mut() else { return EBADF };
+    let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+    let Some(oi) = ofds.iter().position(Option::is_none) else {
+        let vs = unsafe { &mut *core::ptr::addr_of_mut!(VFILES) };
+        vs[i] = None;
+        return EMFILE;
+    };
+    let Some(fi) = fdt(t).fds.iter().position(Option::is_none) else {
+        let vs = unsafe { &mut *core::ptr::addr_of_mut!(VFILES) };
+        vs[i] = None;
+        return EMFILE;
+    };
+    ofds[oi] = Some(OpenFile {
+        kind: FdKind::Ram(i),
+        pos: 0,
+        refs: 1,
+        append: false,
+        nonblock: false,
+        accmode: 2, // memfd fds are always O_RDWR
+    });
+    fdt(t).fds[fi] = Some(oi as u8);
+    cloexec_set(t, fi, flags & MFD_CLOEXEC != 0);
+    fi as u64
+}
+
 /// Does `path` name anything in either namespace — access(2)'s only
 /// real question on a flat namespace.
 pub fn fs_exists(path: &[u8]) -> bool {
@@ -18237,6 +18353,8 @@ pub fn fs_linkat(old: &[u8], new: &[u8], flags: u64) -> u64 {
         mtime_ns: 0,
         ctime: 0,
         ctime_ns: 0,
+        seals: 0,
+        memfd: false,
     };
     a.name[..new.len()].copy_from_slice(new);
     vs[j] = Some(a);
@@ -18531,6 +18649,15 @@ pub fn fd_ftruncate(fd: u64, len: u64) -> u64 {
     }
     let FdKind::Ram(i) = o.kind else { return EINVAL };
     let Some(v) = vfile(i) else { return EBADF };
+    const EPERM_: u64 = (-1i64) as u64;
+    // F_SEAL_SHRINK/F_SEAL_GROW freeze the size in their direction;
+    // ftruncate is the only path that can still move v.len of a
+    // memfd (the write gates cover extension-by-write).
+    if len > v.len as u64 && v.seals & F_SEAL_GROW != 0
+        || len < v.len as u64 && v.seals & F_SEAL_SHRINK != 0
+    {
+        return EPERM_;
+    }
     let mut nm = [0u8; 128];
     nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
     let r = vfile_truncate(v, len);
@@ -19018,6 +19145,13 @@ pub fn fd_pwrite(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
             else {
                 return EINVAL;
             };
+            const EPERM_: u64 = (-1i64) as u64;
+            if v.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+                return EPERM_;
+            }
+            if need > v.len && v.seals & F_SEAL_GROW != 0 {
+                return EPERM_;
+            }
             if len > 0 && !range_ok(buf, len) {
                 return EFAULT;
             }
@@ -19493,6 +19627,8 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     const F_OFD_SETLK: u64 = 37;
     const F_OFD_SETLKW: u64 = 38;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const F_ADD_SEALS: u64 = 1033;
+    const F_GET_SEALS: u64 = 1034;
     let Some(t) = cur_mut() else { return EBADF };
     match cmd {
         F_GETFD => {
@@ -19547,6 +19683,32 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
         F_OFD_GETLK => fcntl_getlk(t, fd, arg, false),
         F_OFD_SETLK => fcntl_lock(t, fd, arg, false, false),
         F_OFD_SETLKW => fcntl_lock(t, fd, arg, false, true),
+        F_ADD_SEALS => {
+            const EPERM_: u64 = (-1i64) as u64;
+            let Some(o) = ofd(t, fd) else { return EBADF };
+            let FdKind::Ram(i) = o.kind else { return EINVAL };
+            let Some(v) = vfile(vfile_real(i)) else { return EBADF };
+            // Seals are a memfd-only API — every other fd EINVALs.
+            if !v.memfd || arg & !(F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW
+                | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) as u64 != 0
+            {
+                return EINVAL;
+            }
+            if v.seals & F_SEAL_SEAL != 0 {
+                return EPERM_;
+            }
+            v.seals |= arg as u8;
+            0
+        }
+        F_GET_SEALS => {
+            let Some(o) = ofd(t, fd) else { return EBADF };
+            let FdKind::Ram(i) = o.kind else { return EINVAL };
+            let Some(v) = vfile(vfile_real(i)) else { return EBADF };
+            if !v.memfd {
+                return EINVAL;
+            }
+            v.seals as u64
+        }
         _ => EINVAL,
     }
 }

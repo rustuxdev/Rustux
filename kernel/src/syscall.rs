@@ -297,6 +297,7 @@ const NR_EXIT_GROUP: u64 = 231;
 const NR_SET_ROBUST_LIST: u64 = 273;
 const NR_PRLIMIT64: u64 = 302;
 const NR_GETRANDOM: u64 = 318;
+const NR_MEMFD_CREATE: u64 = 319;
 const NR_RSEQ: u64 = 334;
 const NR_SENDFILE: u64 = 40;
 const NR_STAT: u64 = 4;
@@ -558,6 +559,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_SET_ROBUST_LIST => user::sys_set_robust_list(a1, a2),
         NR_PRLIMIT64 => user::sys_prlimit64(a1, a2, a3, a4),
         NR_GETRANDOM => user::sys_getrandom(a1, a2, a3),
+        NR_MEMFD_CREATE => user::fd_memfd_create(a1, a2),
         NR_CLONE => user::sys_clone(ctx, a1, a2, a3, a4, a5),
         NR_TGKILL => user::sys_tgkill(a1, a2, a3),
         NR_GETCWD => user::sys_getcwd(a1, a2),
