@@ -8019,3 +8019,20 @@ DONTNEED|FREE, brk shrink. cachestat reports VFile residency
 gate-coverage gap — four of eight sites were lost in an aborted
 apply; the compiled proof found it. msltest 27 checks green; exit
 33, 93 tasks, zero leak. Ledger at 290 CVEs.
+
+run-304 lands the whole classic xattr family in one block: a 48-slot
+global XATTRS table keyed by vfile index backs set/get/list/remove
+through path (final link followed), l* (link inode kept — no
+vfile_real, so lsetxattr EPERMs and the l-reads see the link's own
+empty set like Linux), and f* (Ram OFDs resolve through vfile_real
+so hard aliases share the inode's attrs). The errno ladder matches
+Linux: flags EINVAL, empty/>255 name ERANGE, non-user.* namespace
+EOPNOTSUPP-on-set/ENODATA-on-read, size>4096 E2BIG, CREATE EEXIST /
+REPLACE ENODATA, links+specials EPERM, short output buffers ERANGE,
+table-full ENOSPC. Attrs die with the inode — xattr_purge runs in
+vfile_free_if_dead so a reused slot inherits nothing (the C proof
+unlinks and recreates to ENODATA). No DAC gate on any of it — the
+documented creds collapse (CVE-2010-2071/ksmbd classes out of scope).
+xattest 50 checks green; exit 33, 94 tasks, zero leak. Audit run-63:
+0 confirmed, 1 hygiene fix (borrow order in fs_setxattr). Ledger at
+298 CVEs.
