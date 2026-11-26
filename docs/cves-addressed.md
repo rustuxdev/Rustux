@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**249 unique CVEs recorded.**
+**250 unique CVEs recorded.**
 
 ## klib ports
 
@@ -154,6 +154,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-48853 | virtio-scsi rung (fourth storage transport): virtio.rs gains the scsi driver — DEV_SCSI 0… | audit run-43 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2024-8612, CVE-2022-48853 — QEMU-side/swiotlb classes, n/a. Verified: make run exit 33, 78 task… |
 | CVE-2022-48864 | virtio-net-ctrlq rung: handshake_modern generalised to handshake_modern_feat(common, acce… | audit run-39 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2022-48864 — n/a. Verified: make run exit 33, 78 tasks, frames equal; virtio: net ctrlq promisc… |
 | CVE-2022-48864 | virtio-net-ctrlq rung: handshake_modern generalised to handshake_modern_feat(common, acce… | audit run-39 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2022-48864 — n/a. Verified: make run exit 33, 78 tasks, frames equal; virtio: net ctrlq promisc… |
+| CVE-2022-49014 | tun/tap rung (/dev/net/tun packet fds): char 10:200 open mints FdKind::Tun(i) over TUNS[4… | resource-leak class (fixed in-run: tun_alloc inside kind but 3 later bail paths — ENOTDIR/OFD-EMFILE/fd-EMFILE — now release the slot; 4 failures would have exhausted TUNS); detac… |
+| CVE-2022-49014 | tun/tap rung (/dev/net/tun packet fds): char 10:200 open mints FdKind::Tun(i) over TUNS[4… | resource-leak class (fixed in-run: tun_alloc inside kind but 3 later bail paths — ENOTDIR/OFD-EMFILE/fd-EMFILE — now release the slot; 4 failures would have exhausted TUNS); detac… |
 | CVE-2022-49073 | install prompt/eject + read-cap split + ATA recovery: demomenu verifies, ATAPI-ejects /de… | audit run-113 manual scoped + cve.now over HTTP JSON-RPC (entities.search — analogs above; no mapped sr/cdrom-ioctl CVE): verified every fd_read arm bounds n by source availabilit… |
 | CVE-2022-49100 | virtio-console rung (/dev/hvc0): virtio.rs gains the virtio-serial channel — transitional… | audit run-37 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2025-38064, CVE-2022-49100 — n/a. Verified: make run exit 33, 77 tasks, frames equal; console c… |
 | CVE-2022-49100 | virtio-console rung (/dev/hvc0): virtio.rs gains the virtio-serial channel — transitional… | audit run-37 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2025-38064, CVE-2022-49100 — n/a. Verified: make run exit 33, 77 tasks, frames equal; console c… |

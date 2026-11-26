@@ -7792,3 +7792,33 @@ mismatch refusal, recvmmsg batch + drained EAGAIN. Exit 33,
 83 tasks, zero leak.
 
 Audit run-52: 0 confirmed, 2 hardened in-run. Ledger at 249 CVEs.
+
+## run-294 — /dev/net/tun (TUN/TAP virtual packet fds)
+
+open("/dev/net/tun") (char 10:200) mints a private FdKind::Tun per
+open over TUNS[4]; TUNSETIFF attaches (IFF_TUN/IFF_TAP, IFF_NO_PI),
+TUNGETIFF reports, TUNSETNOCSUM a noop. Slot i owns the fixed
+10.200.i.0/24 subnet (no SIOCSIFADDR — fixed per slot); tx_eth
+detours dst-matching IPv4 into the tun's read queue — TUN strips
+wire padding to ip total_len, TAP queues the whole frame.
+write() injects inbound: TUN payloads feed ip_demux, TAP frames
+cross the capture tap + eth ingress. TunRecv parks a reader;
+tun_push delivers through the sleeper's tables. FIONREAD = next
+record len incl. PI; poll shows POLLIN/POLLOUT.
+
+Two in-run findings: tun_route indexed the subnet byte as f[33]
+(the host octet — 10.200.0.9 resolved ti=9 and fell through to the
+wire; it's f[32]); and tun_alloc could leak a slot when the three
+post-mint bail paths (ENOTDIR/OFD-EMFILE/fd-EMFILE) returned —
+each now releases it (4 failures would have exhausted the table).
+Also fixed a test-side trap: getsockname on a UDP socket reports
+0.0.0.0 (no stored local addr) — injection dst is the hardcoded
+slirp IP like pkttest's gw.
+
+Proof: tuntest 33 checks, 0 failures — pre-setiff EIO, flag
+EINVAL, EBUSY re-attach, outbound capture (no_pi + PI header),
+inbound UDP injection seen by a bound socket both modes, fork'd
+blocked-reader wake, reopen freshness. Exit 33, 84 tasks,
+zero leak.
+
+Audit run-53: 0 confirmed, 1 fixed in-run. Ledger at 249 CVEs.
