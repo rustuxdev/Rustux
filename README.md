@@ -79,7 +79,9 @@ IPv8 path above.
 
 On top of that sits a growing Linux-ABI userspace: ring-3 tasks running
 ELFs from a cpio initrd — static-PIE binaries and dynamically linked
-ones via `PT_INTERP`/ld.so — a 120+-call syscall surface covering
+ones via `PT_INTERP`/ld.so — a ~150-call syscall surface (plus a
+parallel ia32 `int 0x80` table running real 32-bit ELF32 binaries on
+low-4GiB compat address spaces) covering
 `fork`/`execve`/`waitpid`, real signals with a sigreturn restorer
 trampoline — including queued signals (`sigqueue`/`sigqueueinfo`,
 `SA_SIGINFO` siginfo_t with real `si_code`/`si_pid`/`si_value`),
@@ -108,20 +110,50 @@ SIGHAND|THREAD`, `SETTLS`, futex wait/wake, `CHILD_CLEARTID`), and real
 `vfork` semantics — a shared-mm child running on the parent's stack
 while the parent sleeps, Unix98 PTYs
 (`posix_openpt`/`TIOCGPTN`/`TIOCGPTPEER`/`unlockpt`, pts indexes,
-hangup semantics), a polled ATA PIO driver behind real `/dev/sda`
-and `/dev/sr0` block nodes (`CDROMEJECT` included), and a GOP
-framebuffer xterm-subset console that ncurses targets.
-The suite boots a real static **BusyBox**,
-real Debian **dash**, and dynamically linked **GNU bash 5.2** — 72
-tasks, all passing; `make run-bash` boots an
+hangup semantics), real shared memory (`MAP_SHARED|MAP_ANONYMOUS`
+refcounted segments — fork aliases the same frames, private
+mappings stay private — plus `memfd_create` with `F_SEAL_*`,
+SysV SHM/MSG/SEM), the modern mm shelf
+(`mremap`, `madvise`, `mincore`, `mlock*`/`munlock*`,
+`process_madvise`, `mseal`, `cachestat`, `memfd_secret`), the
+xattr family (`*xattr` + `*xattrat`), the modern syscall shelf
+(`clone3`, `close_range`, `epoll_pwait2`, `openat2` with
+RESOLVE_*, `process_mrelease`, `pidfd_*`, `futex_waitv`,
+`fchmodat2`, `select`, `sched_setattr`/`getattr`, `msync`,
+`process_vm_readv`/`writev`, `copy_file_range`, `splice`/`tee`/
+`vmsplice`, `fallocate`, `preadv`/`pwritev`, `sigaltstack`,
+`execveat` + real credential handover, POSIX per-process
+timers), and socket families beyond TCP — `AF_UNIX`
+stream/dgram/`socketpair` with `SCM_RIGHTS` fd-passing,
+`SOCK_SEQPACKET`, `AF_PACKET`, `AF_NETLINK` route dumps,
+`/dev/net/tun`, `recvmmsg`.
+The block stack runs from polled ATA PIO through AHCI/SATA,
+virtio-blk and NVMe (admin + I/O queues, write path, MSI-X,
+multi-namespace, TRIM/discard + flush) behind real
+`/dev/sdN`/`vdN`/`nvmeXnYpN` nodes, with a GPT partition scan,
+partition minors, SG_IO + virtio-scsi passthrough, `/dev/loopN`
+and the CDROM ioctl family; the rest of the virtio fleet is
+there too (net datapath with IRQ-driven RX + control queue,
+input → evdev, console `/dev/hvc0`, balloon, rng, the modern
+non-transitional transport). ext2/ext3/ext4 readers feed a real
+`mount()` and partition views, and a GOP framebuffer
+xterm-subset console hosts ncurses.
+The suite boots a real static **BusyBox** (x86-64 *and* i386),
+real Debian **dash**, and dynamically linked **GNU bash 5.2** —
+106 tasks, all passing; `make run-bash` boots an
 interactive `-bash` login shell on the serial console.
 Beyond the suite, `make run-apt` proves real Debian package
 management end to end — `apt-get update`/`apt install` fetch from
 deb.debian.org over slirp and dpkg unpacks/configures the package
 under a kernel pty — and `make run-iso` builds a bootable
 **live/install ISO**: El Torito media that offers a live bash
-session or an ATA install to disk, ejects itself, and reboots into
-the installed system.
+session or an install to disk, ejects itself, and reboots into
+the installed system. The install writes a real MBR partition
+table and an ext2 root (the kernel mounts it, pivots in, and pid
+1 runs from the installed tree behind `login:` SHA-512-crypt
+auth) — and on that installed system `apt install -y nginx`
+runs the full Debian dependency chain, maintainer scripts and
+all, to exit 0: **nginx 1.22.1, installed by real dpkg**.
 
 And the kernel is **dual-personality**: next to the Linux ABI sits a
 native NT personality — real PE32+ `.exe` binaries running on a
@@ -132,7 +164,19 @@ Every rung is also security-reviewed: a scoped audit of the diff plus a
 check of that subsystem's published kernel CVEs — each gets a written
 verdict in [docs/cve-matrix.md](docs/cve-matrix.md) (structurally
 absent, explicitly mitigated, or a documented divergence), gathered
-into a flat ledger of 366 unique CVEs so far.
+into a flat ledger of 362 unique CVEs so far.
+
+**The pace, and what is still missing.** ~550 commits and 316 audited
+rungs landed in nine days — the git log is the honest measure of that.
+Still absent, deliberately: `AF_INET6` sockets (the NIC drivers carry
+an IPv6 link-local + NDP selftest, but the socket family isn't wired —
+an nginx `listen [::]` is a real `EAFNOSUPPORT`), SMP (single CPU —
+LAPIC timer, no INIT-SIPI AP bring-up), in-kernel filesystem writes
+(ext2/ext3/ext4 are read paths; installs write disk from a userspace
+mke2, and the installed root rehydrates into a RAM overlay — nothing
+writes back yet), mount/user namespaces, cgroups, capabilities,
+io_uring, USB, a GPU stack beyond the GOP framebuffer, and swap. Those
+are structural rungs, not syscalls — they are where the work goes next.
 
 ## A second personality: native Windows `.exe`, no Wine
 
