@@ -398,6 +398,11 @@ enum WaitOn {
     /// matches the sleeper's pml4 so same-VA waits in different
     /// address spaces stay distinct.
     Futex(u64),
+    /// futex_waitv(): multi-wait — `wait_ptr` is the sleeper's own
+    /// futex_waitv array (24B entries, uaddr at +8), `wait_len`
+    /// the count. futex_wake scans it under the sleeper's pml4
+    /// and returns the hit index in rax.
+    FutexV,
     /// vfork() parent suspended until the child (this pid) execs or
     /// exits — Linux's vfork_done completion. Uninterruptible by
     /// signals (kill() skips it; pending delivers after resume).
@@ -16072,7 +16077,9 @@ pub fn fill_stat(path: &[u8], nofollow: bool) -> Result<[u64; 18], u64> {
                 .count();
             st[1] = (arc_n + vidx + 1) as u64; // st_ino — vfile space
             st[2] = 1;
-            st[3] = 0o120777; // S_IFLNK | 0777
+            // S_IFLNK | stored mode — born 0o777 like Linux, and
+            // fchmodat2's NOFOLLOW chmod lands on the link inode.
+            st[3] = 0o120000 | v.mode as u64;
             st[6] = v.len as u64; // st_size = target length
             st[7] = 4096;
             stat_meta(
@@ -18970,9 +18977,10 @@ fn chmod_obj(p: &[u8], mode: u64) -> u64 {
 }
 
 /// chmod(path, mode)/fchmodat(dirfd, path, mode): follows the final
-/// link like Linux — there is no lchmod.
-pub fn fs_chmod(cpath: &[u8], mode: u64) -> u64 {
-    let (rb, rn, _) = match resolve_links(cpath, true) {
+/// link like Linux. `nofollow` is fchmodat2's AT_SYMLINK_NOFOLLOW
+/// — the lchmod shape, acting on the link itself.
+pub fn fs_chmod(cpath: &[u8], mode: u64, nofollow: bool) -> u64 {
+    let (rb, rn, _) = match resolve_links(cpath, !nofollow) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -20953,11 +20961,32 @@ fn futex_wake(pml4: u64, uaddr: u64, n: u64) -> u64 {
             break;
         }
         let Some(t) = s.as_mut() else { continue };
-        if t.state == TaskState::Blocked
-            && t.wait_on == WaitOn::Futex(uaddr)
-            && t.pml4 == pml4
-        {
-            t.ctx.rax = 0;
+        if t.state != TaskState::Blocked || t.pml4 != pml4 {
+            continue;
+        }
+        let hit = match t.wait_on {
+            WaitOn::Futex(u) if u == uaddr => {
+                t.ctx.rax = 0;
+                true
+            }
+            WaitOn::FutexV => {
+                // wait_ptr/len is the sleeper's own futex_waitv
+                // array — the wake's uaddr picks out its index.
+                let mut h = false;
+                for i in 0..t.wait_len {
+                    if read_task_u64(t.pml4, t.wait_ptr + i * 24 + 8)
+                        == Some(uaddr)
+                    {
+                        t.ctx.rax = i;
+                        h = true;
+                        break;
+                    }
+                }
+                h
+            }
+            _ => false,
+        };
+        if hit {
             t.wait_on = WaitOn::None;
             t.wait_deadline = 0;
             t.state = TaskState::Runnable;
@@ -21046,6 +21075,102 @@ pub fn sys_futex(
     }
 }
 
+/// futex_waitv(waiters, nr, flags, timeout, clockid): the futex2
+/// multi-wait — up to 128 {val,uaddr,flags,reserved} 24B entries,
+/// nr outside [1,128] EINVALs as do nonzero syscall flags and
+/// clockids outside {REALTIME,MONOTONIC}. Every waiter's *uaddr
+/// is compared to val up front (first mismatch EAGAINs; bad
+/// pointers EFAULT), waiter flags must carry FUTEX_32 and may
+/// carry PRIVATE (collapsed like futex's — one key space).
+/// timeout is an ABSOLUTE deadline on clockid — MONOTONIC rides
+/// TICKS directly (100 Hz since boot), REALTIME converts through
+/// wall_now(). On wake the hit index — not 0 — lands in rax.
+pub fn sys_futex_waitv(
+    ctx: &mut UCtx,
+    waiters: u64,
+    nr: u64,
+    flags: u64,
+    timeout: u64,
+    clockid: u64,
+) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const ETIMEDOUT_: u64 = (-110i64) as u64;
+    if flags != 0 || nr == 0 || nr > 128 || !matches!(clockid, 0 | 1) {
+        return EINVAL;
+    }
+    if !range_ok(waiters, nr.saturating_mul(24)) {
+        return EFAULT;
+    }
+    for i in 0..nr {
+        let e = waiters + i * 24;
+        // SAFETY: the whole waiter array validated readable above.
+        let (val, uaddr, wf) = unsafe {
+            (
+                (e as *const u64).read_unaligned(),
+                ((e + 8) as *const u64).read_unaligned(),
+                ((e + 16) as *const u32).read_unaligned() as u64,
+            )
+        };
+        if wf & !(2 | 128) != 0 || wf & 2 == 0 {
+            return EINVAL;
+        }
+        if !range_ok(uaddr, 4) {
+            return EFAULT;
+        }
+        // SAFETY: validated user futex word under cur cr3.
+        if unsafe { (uaddr as *const u32).read_unaligned() } != val as u32
+        {
+            return EAGAIN_;
+        }
+    }
+    let mut deadline = 0u64;
+    if timeout != 0 {
+        if !range_ok(timeout, 16) {
+            return EFAULT;
+        }
+        // SAFETY: validated user timespec under cur cr3.
+        let (sec, nsec) = unsafe {
+            (
+                (timeout as *const i64).read_unaligned(),
+                ((timeout as *const i64).add(1)).read_unaligned(),
+            )
+        };
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return EINVAL;
+        }
+        let ts_ns = (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec as u64);
+        let now =
+            crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        deadline = if clockid == 0 {
+            let (ws, wns) = crate::rtc::wall_now();
+            let wall_ns = ws
+                .saturating_mul(1_000_000_000)
+                .saturating_add(wns);
+            now.saturating_add(
+                ts_ns.saturating_sub(wall_ns).div_ceil(10_000_000),
+            )
+        } else {
+            ts_ns.div_ceil(10_000_000)
+        };
+        if deadline <= now {
+            return ETIMEDOUT_;
+        }
+    }
+    let Some(t) = cur_mut() else { return EAGAIN_ };
+    if deliverable(t) {
+        return (-4i64) as u64; // -EINTR before sleep
+    }
+    t.wait_on = WaitOn::FutexV;
+    t.wait_ptr = waiters;
+    t.wait_len = nr;
+    t.wait_deadline = deadline;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
 /// Timer tick: expire timed poll waits — the return is 0 with
 /// revents zeroed, the Linux timeout shape.
 fn poll_expire() {
@@ -21098,7 +21223,7 @@ fn poll_expire() {
                 // sigtimedwait deadline: nothing arrived — EAGAIN
                 // is Linux's timeout answer (not EINTR).
                 WaitOn::SigTimed => t.ctx.rax = (-11i64) as u64,
-                WaitOn::Futex(_) => {
+                WaitOn::Futex(_) | WaitOn::FutexV => {
                     t.ctx.rax = (-110i64) as u64 // ETIMEDOUT
                 }
                 _ => continue,

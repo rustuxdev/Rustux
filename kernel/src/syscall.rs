@@ -306,6 +306,8 @@ const NR_CLOSE_RANGE: u64 = 436;
 const NR_EPOLL_PWAIT2: u64 = 441;
 const NR_OPENAT2: u64 = 437;
 const NR_PROCESS_MRELEASE: u64 = 448;
+const NR_FUTEX_WAITV: u64 = 449;
+const NR_FCHMODAT2: u64 = 452;
 const NR_RSEQ: u64 = 334;
 const NR_SENDFILE: u64 = 40;
 const NR_STAT: u64 = 4;
@@ -576,6 +578,8 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_EPOLL_PWAIT2 => user::fd_epoll_pwait2(ctx, a1, a2, a3, a4, a5, a6),
         NR_OPENAT2 => sys_openat2(a1, a2, a3, a4),
         NR_PROCESS_MRELEASE => user::fd_process_mrelease(a1, a2),
+        NR_FUTEX_WAITV => user::sys_futex_waitv(ctx, a1, a2, a3, a4, a5),
+        NR_FCHMODAT2 => sys_fchmodat2(a1, a2, a3, a4),
         NR_CLONE => user::sys_clone(ctx, a1, a2, a3, a4, a5),
         NR_TGKILL => user::sys_tgkill(a1, a2, a3),
         NR_GETCWD => user::sys_getcwd(a1, a2),
@@ -1453,7 +1457,7 @@ fn sys_chmod(path: u64, mode: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    user::fs_chmod(&cb[..cn], mode)
+    user::fs_chmod(&cb[..cn], mode, false)
 }
 
 /// fchmodat(dirfd, path, mode): the x86_64 ABI takes no flags arg —
@@ -1468,7 +1472,36 @@ fn sys_fchmodat(dirfd: u64, path: u64, mode: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    user::fs_chmod(&cb[..cn], mode)
+    user::fs_chmod(&cb[..cn], mode, false)
+}
+
+/// fchmodat2(dirfd, path, mode, flags): fchmodat plus flag
+/// support — AT_SYMLINK_NOFOLLOW acts on the link itself (the
+/// lchmod shape), AT_EMPTY_PATH with an empty path acts on the
+/// dirfd's own inode like fchmod. Unknown bits EINVAL.
+fn sys_fchmodat2(dirfd: u64, path: u64, mode: u64, flags: u64) -> u64 {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return EINVAL;
+    }
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if n == 0 {
+        return if flags & AT_EMPTY_PATH != 0 {
+            user::fd_chmod(dirfd, mode)
+        } else {
+            ENOENT
+        };
+    }
+    let (cb, cn) = match user::canon_path(dirfd, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::fs_chmod(&cb[..cn], mode, flags & AT_SYMLINK_NOFOLLOW != 0)
 }
 
 /// chown/lchown(dirfd-less and dirfd variants share this): canon
