@@ -1303,6 +1303,12 @@ pub(crate) fn rustux_main(
     if n_virtio > 0 {
         kprintln!(con, "rustux: virtio: {n_virtio} disk(s)");
     }
+    // virtio-net: second NIC next to the e1000e — its own RX/TX
+    // virtqueues, ARP round-trip proves the datapath (socket-layer
+    // NIC dispatch is a later rung).
+    if virtio::net_init() && virtio::net_selftest() {
+        kprintln!(con, "rustux: virtio: net ARP round-trip true");
+    }
     // DiskIo: the adapter that reads REAL sectors (placed after the
     // disk probes so a disk is known). The boot disk is FAT, so ext2
     // must refuse it cleanly — proving the adapter reads and that the

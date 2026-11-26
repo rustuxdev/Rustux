@@ -150,6 +150,8 @@ run: build $(VIRTIO_DISK)
 		-bios $(OVMF) \
 		-drive file=$(ESP_IMG),format=raw,if=ide \
 		-drive file=$(VIRTIO_DISK),format=raw,if=virtio \
+		-netdev user,id=n0 -device e1000e,netdev=n0 \
+		-netdev user,id=n1 -device virtio-net-pci,netdev=n1 \
 		-snapshot \
 		-serial stdio -display none \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
