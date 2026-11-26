@@ -9430,6 +9430,10 @@ pub fn stdin_inject(s: &[u8]) {
 /// lazily from read/poll so a stale queue never fools a syscall.
 /// Bounded by the 64-entry scancode ring.
 pub fn stdin_pump() {
+    // Balloon housekeeping — tracks the host's num_pages target,
+    // inflates/deflates in syscall context like the other queue
+    // drains. No-op when no device probed.
+    crate::virtio::balloon_pump();
     let mut fed = false;
     while let Some(c) = crate::kbd::poll() {
         stdin_key(c as u8);

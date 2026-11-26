@@ -1770,3 +1770,209 @@ pub fn vinput_selftest() -> bool {
     ));
     n > 0
 }
+
+// -------------------------------------------------------------------
+// virtio-balloon — QEMU's virtio-balloon-pci (transitional slot
+// 0x1002, PCI subsystem carries the real virtio id 5).
+//
+// Queue 0 = inflate (guest hands page-frame numbers to the host —
+// those frames leave the allocator until returned); queue 1 =
+// deflate (host fills a posted buffer with PFNs to give back).
+// Config space at R_CFG: le32 num_pages (host's target) at +0,
+// le32 actual (guest's report) at +4.
+
+/// Transitional virtio-balloon PCI slot.
+const DEV_BALLOON: u16 = 0x1002;
+/// PFNs per queue posting — QEMU's conventional chunk size.
+const BAL_CHUNK: usize = 256;
+/// Held-page registry cap — bounds both the inflate burst and the
+/// deflate verification table.
+const BAL_MAX: usize = 16384;
+
+static mut BAL_IV: Option<Vq> = None;
+static mut BAL_DV: Option<Vq> = None;
+/// One shared staging page: inflate PFN array at +0 (1KiB),
+/// deflate buffer at +2048 (1KiB).
+static mut BAL_PAGE: u64 = 0;
+/// PFNs we have actually ballooned — the deflate free path
+/// verifies against this so a device-returned PFN can never free
+/// a frame the balloon doesn't own.
+static mut BAL_HELD: [u32; BAL_MAX] = [0; BAL_MAX];
+static mut BAL_HELD_N: usize = 0;
+static mut BAL_IO: u16 = 0;
+/// Deflate used-ring position (absolute idx).
+static mut BAL_SEEN: u16 = 0;
+/// PFNs riding the outstanding deflate buffer — freed on completion.
+static mut BAL_DEF_PEND: usize = 0;
+/// One-shot log latches so a long pump doesn't spam the ring.
+/// Re-entrancy guard — the pump is callable from IRQ and syscall context.
+static BAL_BUSY: AtomicU32 = AtomicU32::new(0);
+static BAL_INF_LOGGED: AtomicU32 = AtomicU32::new(0);
+static BAL_DEF_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+/// Remove `pfn` from the held registry — returns true when the
+/// balloon actually owned it.
+fn held_remove(pfn: u32) -> bool {
+    let n = unsafe { *core::ptr::addr_of!(BAL_HELD_N) };
+    let held = unsafe { &mut *core::ptr::addr_of_mut!(BAL_HELD) };
+    if let Some(i) = held[..n].iter().position(|&p| p == pfn) {
+        held[i] = held[n - 1];
+        unsafe { *core::ptr::addr_of_mut!(BAL_HELD_N) = n - 1 };
+        true
+    } else {
+        false
+    }
+}
+
+/// Report the current held count in the config's `actual` field.
+fn bal_report() {
+    let io = unsafe { *core::ptr::addr_of!(BAL_IO) };
+    if io != 0 {
+        let n = unsafe { *core::ptr::addr_of!(BAL_HELD_N) } as u32;
+        outl(io + R_CFG + 4, n);
+    }
+}
+
+/// Periodic pump — called from stdin_pump (syscall/idle context).
+/// Compares the host's num_pages target with the held registry:
+/// inflates the delta in BAL_CHUNK batches, then drains any
+/// deflate completions and frees verified frames.
+pub fn balloon_pump() {
+    let io = unsafe { *core::ptr::addr_of!(BAL_IO) };
+    if io == 0 {
+        return;
+    }
+    // The pump runs from the tick IRQ and from syscall context —
+    // a timer preemption mid-inflate would race the held registry.
+    // Skip a re-entrant call; the active context finishes the work.
+    if BAL_BUSY
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    balloon_pump_inner(io);
+    BAL_BUSY.store(0, Ordering::Release);
+}
+
+fn balloon_pump_inner(io: u16) {
+    let page = unsafe { *core::ptr::addr_of!(BAL_PAGE) };
+    let va = mm::pmap(page);
+    // ---- inflate toward the target ----
+    let target = inl(io + R_CFG) as usize;
+    while unsafe { *core::ptr::addr_of!(BAL_HELD_N) } < target
+        && unsafe { *core::ptr::addr_of!(BAL_HELD_N) } < BAL_MAX
+    {
+        let held = unsafe { *core::ptr::addr_of!(BAL_HELD_N) };
+        let want = (target - held).min(BAL_CHUNK).min(BAL_MAX - held);
+        let mut n = 0usize;
+        while n < want {
+            let Some(p) = kalloc::alloc_frames(0) else { break };
+            // SAFETY: our staging page; n < 256 -> +4n inside +0..+1024.
+            unsafe {
+                ((va + (n * 4) as u64) as *mut u32).write_volatile((p >> 12) as u32);
+                (*core::ptr::addr_of_mut!(BAL_HELD))[held + n] = (p >> 12) as u32;
+            }
+            n += 1;
+        }
+        if n == 0 {
+            break; // allocator empty — can't reach the target
+        }
+        unsafe { *core::ptr::addr_of_mut!(BAL_HELD_N) = held + n };
+        if let Some(iv) = unsafe { (*core::ptr::addr_of!(BAL_IV)).as_ref() } {
+            iv.put_desc(0, page, (n * 4) as u32, 0, 0);
+            iv.poll_once(0);
+        }
+        bal_report();
+        if BAL_INF_LOGGED.swap(1, Ordering::Relaxed) == 0 {
+            crate::log::printk(format_args!(
+                "rustux: virtio: balloon inflated toward target {target} pages"
+            ));
+        }
+    }
+    // ---- deflate toward the target ----
+    // The deflate queue carries guest-posted PFNs (OUT buffers) —
+    // the device releases them, then the completed PFNs may go back
+    // to the allocator once verified against the held registry.
+    let Some(dv) = (unsafe { (*core::ptr::addr_of_mut!(BAL_DV)).as_mut() }) else {
+        return; // flag resets in the wrapper
+    };
+    let pend = unsafe { *core::ptr::addr_of!(BAL_DEF_PEND) };
+    if pend != 0 && unsafe { *core::ptr::addr_of!(BAL_SEEN) } != dv.used_idx() {
+        let seen = unsafe { *core::ptr::addr_of!(BAL_SEEN) };
+        unsafe { *core::ptr::addr_of_mut!(BAL_SEEN) = seen.wrapping_add(1) };
+        let mut freed = 0usize;
+        for i in 0..pend {
+            // SAFETY: we wrote the PFNs at page+2048 before posting.
+            let pfn = unsafe {
+                ((va + 2048 + (i * 4) as u64) as *const u32).read_volatile()
+            };
+            // Only free a frame the balloon actually owns.
+            if held_remove(pfn) {
+                kalloc::free_frame((pfn as u64) << 12);
+                freed += 1;
+            }
+        }
+        unsafe { *core::ptr::addr_of_mut!(BAL_DEF_PEND) = 0 };
+        bal_report();
+        if freed > 0 && BAL_DEF_LOGGED.swap(1, Ordering::Relaxed) == 0 {
+            crate::log::printk(format_args!(
+                "rustux: virtio: balloon deflated {freed} pages back to the allocator"
+            ));
+        }
+    }
+    let held = unsafe { *core::ptr::addr_of!(BAL_HELD_N) };
+    if unsafe { *core::ptr::addr_of!(BAL_DEF_PEND) } == 0 && held > target {
+        let n = (held - target).min(BAL_CHUNK);
+        for i in 0..n {
+            // SAFETY: held[i..] live; staging +2048..+3072 is ours.
+            let pfn = unsafe { (*core::ptr::addr_of!(BAL_HELD))[held - n + i] };
+            unsafe {
+                ((va + 2048 + (i * 4) as u64) as *mut u32).write_volatile(pfn);
+            }
+        }
+        dv.put_desc(0, page + 2048, (n * 4) as u32, 0, 0);
+        dv.avail_push(0);
+        dv.notify();
+        unsafe { *core::ptr::addr_of_mut!(BAL_DEF_PEND) = n };
+    }
+}
+
+/// Probe a transitional virtio-balloon function, set up both
+// queues, post the deflate buffer, and leave the pump to track
+/// the host's num_pages target.
+pub fn balloon_init() -> bool {
+    let Some((io, _)) = probe_io(DEV_BALLOON) else {
+        return false;
+    };
+    if !handshake(io) {
+        return false;
+    }
+    let (Some(iv), Some(dv)) = (Vq::setup(io, 0), Vq::setup(io, 1)) else {
+        fail(io);
+        return false;
+    };
+    let Some(page) = kalloc::alloc_frames(0) else {
+        fail(io);
+        return false;
+    };
+    let (ivsz, dvsz) = (iv.size, dv.size);
+    outb(io + R_STATUS, S_ACK | S_DRV | S_FEATOK | S_DRVOK);
+    // SAFETY: init runs once, before tasks exist.
+    unsafe {
+        *core::ptr::addr_of_mut!(BAL_PAGE) = page;
+        *core::ptr::addr_of_mut!(BAL_HELD_N) = 0;
+        *core::ptr::addr_of_mut!(BAL_SEEN) = 0;
+        *core::ptr::addr_of_mut!(BAL_DEF_PEND) = 0;
+        *core::ptr::addr_of_mut!(BAL_IV) = Some(iv);
+        *core::ptr::addr_of_mut!(BAL_DV) = Some(dv);
+        // Readiness gate LAST: a tick-IRQ pump that sees io!=0 must
+        // find every static already populated.
+        *core::ptr::addr_of_mut!(BAL_IO) = io;
+    }
+    crate::log::printk(format_args!(
+        "rustux: virtio: balloon {io:#x} ivq={ivsz} dvq={dvsz} target {} pages",
+        inl(io + R_CFG)
+    ));
+    true
+}

@@ -150,6 +150,7 @@ $(ESP_IMG): $(KERNEL) $(INITRD)
 run: build $(VIRTIO_DISK) $(GPT_DISK)
 	rm -f /tmp/hvc.sock /tmp/hvc_captured.log; python3 tools/hvcfeed.py & \
 	rm -f /tmp/vkbd-qmp.sock; python3 tools/kbdfeed.py & \
+	rm -f /tmp/balloon-qmp.sock /tmp/balloon_proof.log; python3 tools/balloonfeed.py & \
 	$(QEMU) \
 		-machine q35 \
 		-m 1G \
@@ -172,6 +173,8 @@ run: build $(VIRTIO_DISK) $(GPT_DISK)
 		-device virtconsole,chardev=vc0 \
 		-device virtio-keyboard-pci \
 		-qmp unix:/tmp/vkbd-qmp.sock,server=on,wait=off \
+		-device virtio-balloon-pci \
+		-qmp unix:/tmp/balloon-qmp.sock,server=on,wait=off \
 		-snapshot \
 		-serial stdio -display none \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \

@@ -1452,6 +1452,9 @@ pub(crate) fn rustux_main(
     // virtio-input: QEMU's virtio-keyboard — events fold into the
     // shared evdev ring behind /dev/input/event0.
     virtio::vinput_init();
+    // virtio-balloon: memory give/take with the host — the pump
+    // tracks num_pages, deflate returns frames to the allocator.
+    virtio::balloon_init();
     // virtio-net: second NIC next to the e1000e — its own RX/TX
     // virtqueues, ARP round-trip proves the datapath (socket-layer
     // NIC dispatch is a later rung).
