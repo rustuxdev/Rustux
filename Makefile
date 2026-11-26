@@ -153,7 +153,7 @@ run: build $(VIRTIO_DISK)
 		-drive file=$(VIRTIO_DISK),format=raw,if=none,id=nvm0 \
 		-device nvme,drive=nvm0,serial=nv0 \
 		-netdev user,id=n0 -device e1000e,netdev=n0 \
-		-netdev user,id=n1 -device virtio-net-pci,netdev=n1 \
+		-netdev user,id=n1 -device virtio-net-pci-non-transitional,netdev=n1 \
 		-snapshot \
 		-serial stdio -display none \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -216,7 +216,7 @@ run-vnet: build
 		-bios $(OVMF) \
 		-drive file=$(ESP_IMG),format=raw,if=ide \
 		-snapshot \
-		-netdev user,id=n1 -device virtio-net-pci,netdev=n1 \
+		-netdev user,id=n1 -device virtio-net-pci-non-transitional,netdev=n1 \
 		-serial stdio -display none \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 		-no-reboot; \

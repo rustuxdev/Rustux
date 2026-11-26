@@ -46,6 +46,35 @@ const R_MSIX_CFG: u16 = 0x14; // rw u16 — config-change vector
 const R_MSIX_Q: u16 = 0x16; // rw u16 — vector for the selected queue
 const MSIX_NO_VEC: u16 = 0xFFFF; // VIRTIO_MSI_NO_VECTOR
 
+// Non-transitional device id for virtio-net (virtio 1.0+).
+const DEV_NET_MODERN: u16 = 0x1041;
+
+// Modern common_cfg field offsets (virtio 1.0 section 4.1.4.3).
+const C_DFEAT_SEL: u64 = 0x00; // wo u32 — device feature page
+const C_DFEAT: u64 = 0x04; // ro u32 — device features, selected page
+const C_GFEAT_SEL: u64 = 0x08; // wo u32 — driver feature page
+const C_GFEAT: u64 = 0x0c; // wo u32 — accepted features
+const C_MSIX: u64 = 0x10; // rw u16 — config-change MSI-X vector
+const C_NQ: u64 = 0x12; // ro u16 — queue count
+const C_STATUS: u64 = 0x14; // rw u8 — device status
+const C_QSEL: u64 = 0x16; // wo u16 — queue selector
+const C_QSIZE: u64 = 0x18; // ro u16 — selected queue's max size
+const C_QMSIX: u64 = 0x1a; // rw u16 — selected queue's MSI-X vector
+const C_QENABLE: u64 = 0x1c; // rw u16 — selected queue enable
+const C_QNOTIFY: u64 = 0x1e; // ro u16 — selected queue notify offset
+const C_QDESC: u64 = 0x20; // rw u64 — descriptor table phys
+const C_QDRV: u64 = 0x28; // rw u64 — avail ring phys
+const C_QDEV: u64 = 0x30; // rw u64 — used ring phys
+
+// MMIO accessors over the cap-window physmap mappings.
+fn cr8(p: u64) -> u8 { unsafe { (p as *const u8).read_volatile() } }
+fn cr16(p: u64) -> u16 { unsafe { (p as *const u16).read_volatile() } }
+fn cr32(p: u64) -> u32 { unsafe { (p as *const u32).read_volatile() } }
+fn cw8(p: u64, v: u8) { unsafe { (p as *mut u8).write_volatile(v) } }
+fn cw16(p: u64, v: u16) { unsafe { (p as *mut u16).write_volatile(v) } }
+fn cw32(p: u64, v: u32) { unsafe { (p as *mut u32).write_volatile(v) } }
+fn cw64(p: u64, v: u64) { unsafe { (p as *mut u64).write_volatile(v) } }
+
 // Status byte bits (virtio spec, legacy).
 const S_ACK: u8 = 1;
 const S_DRV: u8 = 2;
@@ -105,6 +134,10 @@ struct Vq {
     sel: u16,
     size: u16,
     phys: u64,
+    /// Modern MMIO notify doorbell — 0 means the legacy I/O port.
+    notify_va: u64,
+    /// Modern ISR-ack byte — 0 means the legacy R_ISR read.
+    isr_va: u64,
 }
 
 impl Vq {
@@ -129,6 +162,47 @@ impl Vq {
             sel,
             size: qsz,
             phys,
+            notify_va: 0,
+            isr_va: 0,
+        })
+    }
+
+    /// Modern-transport queue setup: select, allocate the same ring
+    /// block layout, then publish each region's phys to the
+    /// common_cfg window (modern names the three regions
+    /// separately — no single PFN), read the queue's notify offset,
+    /// and enable it.
+    fn setup_modern(
+        common: u64,
+        notify_base: u64,
+        notify_mult: u32,
+        isr_va: u64,
+        sel: u16,
+    ) -> Option<Vq> {
+        cw16(common + C_QSEL, sel);
+        let qsz = cr16(common + C_QSIZE);
+        if !(8..=MAXQ).contains(&qsz) {
+            return None;
+        }
+        let qs = qsz as usize;
+        let need = used_off(qs) + 6 + 8 * qs;
+        let mut order = 0usize;
+        while (4096usize << order) < need {
+            order += 1;
+        }
+        let phys = kalloc::alloc_frames(order)?;
+        cw64(common + C_QDESC, phys);
+        cw64(common + C_QDRV, phys + 16 * qsz as u64);
+        cw64(common + C_QDEV, phys + used_off(qs) as u64);
+        let notify_va = notify_base + cr16(common + C_QNOTIFY) as u64 * notify_mult as u64;
+        cw16(common + C_QENABLE, 1);
+        Some(Vq {
+            io: 0,
+            sel,
+            size: qsz,
+            phys,
+            notify_va,
+            isr_va,
         })
     }
 
@@ -188,7 +262,12 @@ impl Vq {
 
     /// Kick the device.
     fn notify(&self) {
-        outw(self.io + R_QNOTIFY, self.sel);
+        if self.notify_va != 0 {
+            // SAFETY: our queue's notify MMIO address.
+            unsafe { (self.notify_va as *mut u16).write_volatile(self.sel) };
+        } else {
+            outw(self.io + R_QNOTIFY, self.sel);
+        }
     }
 
     /// Post `head`, kick, and spin until used.idx advances past the
@@ -206,7 +285,12 @@ impl Vq {
             }
             core::hint::spin_loop();
         }
-        inb(self.io + R_ISR); // read acks the interrupt line
+        if self.isr_va != 0 {
+            // SAFETY: the device's mapped ISR byte.
+            unsafe { (self.isr_va as *const u8).read_volatile() };
+        } else {
+            inb(self.io + R_ISR); // read acks the interrupt line
+        }
         true
     }
 }
@@ -451,6 +535,189 @@ const NET_BUFSZ: usize = 2048;
 const N_RX: usize = 64;
 const N_TX: usize = 8;
 
+/// Vendor-capability window addresses (physmap VAs) for a modern
+/// virtio-pci function.
+struct VCaps {
+    common: u64,
+    notify: u64,
+    notify_mult: u32,
+    isr: u64,
+    dev: u64,
+}
+
+/// Physical base of BAR slot `i`, handling 64-bit MEM bars.
+fn bar_phys(bus: u8, dev: u8, f: u8, i: u8) -> u64 {
+    let lo = pci::bar_raw(bus, dev, f, i);
+    if lo == u32::MAX || lo == 0 || lo & 1 != 0 {
+        return 0;
+    }
+    if lo & 6 == 4 {
+        let hi = pci::read32(bus, dev, f, 0x10 + 4 * (i + 1));
+        (hi as u64) << 32 | (lo & !0xf) as u64
+    } else {
+        (lo & !0xf) as u64
+    }
+}
+
+/// Walk the vendor cap list (id 0x09) collecting each cfg_type's
+/// mapped window. Returns None unless common/notify/isr/device all
+/// resolved — a partial map can't drive the device.
+fn virtio_caps(bus: u8, dev: u8, f: u8) -> Option<VCaps> {
+    let mut v = VCaps {
+        common: 0,
+        notify: 0,
+        notify_mult: 0,
+        isr: 0,
+        dev: 0,
+    };
+    let mut off = pci::read8(bus, dev, f, 0x34) & !3;
+    for _ in 0..32 {
+        if off == 0 {
+            break;
+        }
+        // A device-controlled cap chain: bound the field reads to
+        // the 256-byte config window (off+16 is the notify
+        // multiplier) and the BAR index to the six architected
+        // slots — the CVE-2026-13216 class (unvalidated cap data)
+        // applies to offsets too, not just lengths.
+        if pci::read8(bus, dev, f, off) == 0x09 && off <= 0xe8 {
+            let typ = pci::read8(bus, dev, f, off + 3);
+            let bar = pci::read8(bus, dev, f, off + 4);
+            if bar >= 6 {
+                off = pci::read8(bus, dev, f, off + 1) & !3;
+                continue;
+            }
+            let base = bar_phys(bus, dev, f, bar)
+                + pci::read32(bus, dev, f, off + 8) as u64;
+            if base != 0 {
+                let va = mm::pmap(base);
+                match typ {
+                    1 => v.common = va,
+                    2 => {
+                        v.notify = va;
+                        v.notify_mult = pci::read32(bus, dev, f, off + 16);
+                    }
+                    3 => v.isr = va,
+                    4 => v.dev = va,
+                    _ => {}
+                }
+            }
+        }
+        off = pci::read8(bus, dev, f, off + 1) & !3;
+    }
+    (v.common != 0 && v.notify != 0 && v.isr != 0 && v.dev != 0 && v.notify_mult != 0)
+        .then_some(v)
+}
+
+/// Modern handshake: reset (poll status until the device clears it),
+/// ACK|DRIVER, refuse unless the device offers VIRTIO_F_VERSION_1,
+/// accept only VERSION_1, FEATURES_OK. Caller adds DRIVER_OK.
+fn handshake_modern(common: u64) -> bool {
+    cw8(common + C_STATUS, 0);
+    let mut spins = 0u64;
+    while cr8(common + C_STATUS) != 0 {
+        spins += 1;
+        if spins > SPIN {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    cw8(common + C_STATUS, S_ACK);
+    cw8(common + C_STATUS, S_ACK | S_DRV);
+    cw32(common + C_DFEAT_SEL, 1);
+    if cr32(common + C_DFEAT) & 1 == 0 {
+        cw8(common + C_STATUS, cr8(common + C_STATUS) | S_FAIL);
+        crate::log::printk(format_args!(
+            "rustux: virtio: modern device lacks VERSION_1 — refused"
+        ));
+        return false;
+    }
+    cw32(common + C_GFEAT_SEL, 0);
+    cw32(common + C_GFEAT, 0);
+    cw32(common + C_GFEAT_SEL, 1);
+    cw32(common + C_GFEAT, 1); // accept VERSION_1 only
+    cw8(common + C_STATUS, S_ACK | S_DRV | S_FEATOK);
+    if cr8(common + C_STATUS) & S_FEATOK == 0 {
+        cw8(common + C_STATUS, cr8(common + C_STATUS) | S_FAIL);
+        return false;
+    }
+    true
+}
+
+/// Probe a non-transitional virtio-net function over the modern
+/// cap-list transport. The same VNet contract results — only the
+/// queue programming, notify doorbell, and ISR differ.
+fn net_init_modern() -> bool {
+    let Some((bus, dev, f)) = pci::find(VENDOR, DEV_NET_MODERN) else {
+        return false;
+    };
+    NBDF.store(
+        (bus as u32) << 8 | (dev as u32) << 3 | f as u32,
+        Ordering::Relaxed,
+    );
+    pci::command_or(bus, dev, f, pci::CMD_MEM_SPACE | pci::CMD_BUS_MASTER);
+    let Some(vc) = virtio_caps(bus, dev, f) else {
+        crate::log::printk(format_args!(
+            "rustux: virtio: modern net lacks a full cap set — skipped"
+        ));
+        return false;
+    };
+    if !handshake_modern(vc.common) {
+        return false;
+    }
+    if cr16(vc.common + C_NQ) < 2 {
+        cw8(vc.common + C_STATUS, cr8(vc.common + C_STATUS) | S_FAIL);
+        return false;
+    }
+    let (Some(rx), Some(tx)) = (
+        Vq::setup_modern(vc.common, vc.notify, vc.notify_mult, vc.isr, 0),
+        Vq::setup_modern(vc.common, vc.notify, vc.notify_mult, vc.isr, 1),
+    ) else {
+        cw8(vc.common + C_STATUS, cr8(vc.common + C_STATUS) | S_FAIL);
+        return false;
+    };
+    let (Some(rx_bufs), Some(tx_bufs)) =
+        (kalloc::alloc_frames(5), kalloc::alloc_frames(2))
+    else {
+        cw8(vc.common + C_STATUS, cr8(vc.common + C_STATUS) | S_FAIL);
+        return false;
+    };
+    let mut mac = [0u8; 6];
+    for (i, b) in mac.iter_mut().enumerate() {
+        *b = cr8(vc.dev + i as u64);
+    }
+    cw8(vc.common + C_STATUS, S_ACK | S_DRV | S_FEATOK | S_DRVOK);
+    // SAFETY: init runs once, before tasks exist.
+    unsafe {
+        *core::ptr::addr_of_mut!(VNET) = Some(VNet {
+            rx,
+            tx,
+            rx_bufs,
+            tx_bufs,
+            mac,
+            rx_seen: 0,
+            tx_slot: 0,
+            hdr: 12, // virtio_net_hdr_v1 always carries num_buffers
+            common: vc.common,
+        });
+    }
+    let n = vnet().unwrap();
+    for i in 0..N_RX {
+        n.rx
+            .put_desc(i, n.rx_bufs + (i * NET_BUFSZ) as u64, NET_BUFSZ as u32, DESC_WRITE, 0);
+    }
+    for i in 0..N_RX {
+        n.rx.avail_push(i as u16);
+    }
+    n.rx.notify();
+    NET_UP.store(1, Ordering::Release);
+    crate::log::printk(format_args!(
+        "rustux: virtio: net modern mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rxq={} txq={}",
+        n.mac[0], n.mac[1], n.mac[2], n.mac[3], n.mac[4], n.mac[5], n.rx.size, n.tx.size
+    ));
+    true
+}
+
 struct VNet {
     rx: Vq,
     tx: Vq,
@@ -460,6 +727,11 @@ struct VNet {
     /// Next used-ring position the RX drain expects (absolute idx).
     rx_seen: u16,
     tx_slot: u16,
+    /// virtio_net_hdr bytes this transport prepends (10 legacy /
+    /// 12 for the v1 header with num_buffers).
+    hdr: u16,
+    /// Modern common_cfg window VA — 0 means legacy transport.
+    common: u64,
 }
 
 static mut VNET: Option<VNet> = None;
@@ -483,6 +755,11 @@ pub static NET_RX_IRQS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 pub fn net_init() -> bool {
+    // A non-transitional function answers the modern cap-list
+    // transport; fall back to the legacy I/O interface otherwise.
+    if net_init_modern() {
+        return true;
+    }
     let Some((io, bdf)) = probe_io(DEV_NET) else {
         return false;
     };
@@ -516,6 +793,8 @@ pub fn net_init() -> bool {
             mac,
             rx_seen: 0,
             tx_slot: 0,
+            hdr: NET_HDR as u16,
+            common: 0,
         });
     }
     let n = vnet().unwrap();
@@ -577,7 +856,7 @@ pub fn net_rx(buf: &mut [u8]) -> Option<usize> {
     if id >= N_RX {
         return None; // consumed; the slot can't be re-posted
     }
-    if len < NET_HDR as u32 {
+    if len < n.hdr as u32 {
         // Malformed completion — re-post so the pool doesn't shrink.
         n.rx.put_desc(
             id,
@@ -590,13 +869,13 @@ pub fn net_rx(buf: &mut [u8]) -> Option<usize> {
         n.rx.notify();
         return None;
     }
-    let take = ((len as usize) - NET_HDR)
+    let take = ((len as usize) - n.hdr as usize)
         .min(buf.len())
-        .min(NET_BUFSZ - NET_HDR);
+        .min(NET_BUFSZ - n.hdr as usize);
     // SAFETY: the device filled this buffer; id indexes our rx block.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            (mm::pmap(n.rx_bufs) + (id * NET_BUFSZ) as u64 + NET_HDR as u64) as *const u8,
+            (mm::pmap(n.rx_bufs) + (id * NET_BUFSZ) as u64 + n.hdr as u64) as *const u8,
             buf.as_mut_ptr(),
             take,
         );
@@ -622,7 +901,7 @@ pub fn net_tx(frame: &[u8]) -> bool {
     let Some(n) = (unsafe { (*core::ptr::addr_of_mut!(VNET)).as_mut() }) else {
         return false;
     };
-    if frame.is_empty() || frame.len() > NET_BUFSZ - NET_HDR {
+    if frame.is_empty() || frame.len() > NET_BUFSZ - n.hdr as usize {
         return false;
     }
     let slot = n.tx_slot % N_TX as u16;
@@ -635,14 +914,14 @@ pub fn net_tx(frame: &[u8]) -> bool {
         core::ptr::write_bytes(bva as *mut u8, 0, NET_BUFSZ);
         core::ptr::copy_nonoverlapping(
             frame.as_ptr(),
-            (bva + NET_HDR as u64) as *mut u8,
+            (bva + n.hdr as u64) as *mut u8,
             frame.len(),
         );
     }
     n.tx.put_desc(
         slot as usize,
         n.tx_bufs + boff as u64,
-        (NET_HDR + plen) as u32,
+        (n.hdr as usize + plen) as u32,
         0,
         0,
     );
@@ -703,7 +982,11 @@ pub fn net_selftest() -> bool {
 /// task drains the moment a frame lands instead of at next tick.
 pub fn net_on_irq() {
     let Some(n) = vnet() else { return };
-    let isr = inb(n.rx.io + R_ISR);
+    let isr = if n.rx.isr_va != 0 {
+        cr8(n.rx.isr_va)
+    } else {
+        inb(n.rx.io + R_ISR)
+    };
     if isr & 1 != 0 {
         NET_RX_IRQS.fetch_add(1, Ordering::Relaxed);
     }
@@ -743,13 +1026,23 @@ pub fn net_irq_selftest() -> bool {
     }
     pci::msix_enable(bus, dev, f, &cap);
     // Device side: no config-change vector, RX queue -> entry 0,
-    // TX queue stays unvectorized (TX completion is polled).
-    outw(n.rx.io + R_MSIX_CFG, MSIX_NO_VEC);
-    outw(n.rx.io + R_QSEL, 0);
-    outw(n.rx.io + R_MSIX_Q, 0);
-    outw(n.rx.io + R_QSEL, 1);
-    outw(n.rx.io + R_MSIX_Q, MSIX_NO_VEC);
-    let bound = {
+    // TX queue stays unvectorized (TX completion is polled). The
+    // vector registers live in the I/O window on legacy, inside
+    // common_cfg on modern.
+    let bound = if n.common != 0 {
+        cw16(n.common + C_MSIX, MSIX_NO_VEC);
+        cw16(n.common + C_QSEL, 0);
+        cw16(n.common + C_QMSIX, 0);
+        cw16(n.common + C_QSEL, 1);
+        cw16(n.common + C_QMSIX, MSIX_NO_VEC);
+        cw16(n.common + C_QSEL, 0);
+        cr16(n.common + C_QMSIX)
+    } else {
+        outw(n.rx.io + R_MSIX_CFG, MSIX_NO_VEC);
+        outw(n.rx.io + R_QSEL, 0);
+        outw(n.rx.io + R_MSIX_Q, 0);
+        outw(n.rx.io + R_QSEL, 1);
+        outw(n.rx.io + R_MSIX_Q, MSIX_NO_VEC);
         outw(n.rx.io + R_QSEL, 0);
         inw(n.rx.io + R_MSIX_Q)
     };
@@ -786,18 +1079,28 @@ pub fn net_irq_selftest() -> bool {
     }
     let delivered = NET_RX_IRQS.load(Ordering::Relaxed) - before;
     // The IRQ already fired — harvest the reply from the used ring.
+    // The first wake can carry a frame other than the probe's reply
+    // (slirp noise or a stale used entry pending at arm time), so
+    // keep draining through a short window until it arrives.
     let mut buf = [0u8; 1600];
     let mut got_reply = false;
-    while let Some(n) = net_rx(&mut buf) {
-        if n >= 42
-            && buf[12] == 0x08
-            && buf[13] == 0x06
-            && buf[20] == 0
-            && buf[21] == 2
-            && buf[28..32] == [10, 0, 2, 2]
-        {
-            got_reply = true;
+    while crate::apic::TICKS.load(Ordering::Relaxed) - t0 < 160 && !got_reply {
+        while let Some(n) = net_rx(&mut buf) {
+            if n >= 42
+                && buf[12] == 0x08
+                && buf[13] == 0x06
+                && buf[20] == 0
+                && buf[21] == 2
+                && buf[28..32] == [10, 0, 2, 2]
+            {
+                got_reply = true;
+            }
         }
+        if got_reply {
+            break;
+        }
+        // SAFETY: hlt wakes on any delivered IRQ; IF is set.
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
     crate::log::printk(format_args!(
         "rustux: virtio: net {} MSI IRQs on vec {:#x} (rx-caused), reply {}",
