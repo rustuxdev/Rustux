@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 118;
+const MAX_TASKS: usize = 119;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -522,6 +522,14 @@ enum WaitOn {
     /// buffer. kmsg_expire wakes the sleeper once next_reserve_seq
     /// passes it and marshals the records through its tables.
     Kmsg(u64),
+    /// io_getevents()/io_pgetevents() below min_nr — the payload is
+    /// the AIOCTXS slot; `wait_ptr` is the user io_event VA the next
+    /// drain writes from, `wait_len` how many slots remain, and
+    /// `wait_ptr2` how many more completions the sleeper needs
+    /// before its syscall may return. submit's aio_wake re-drains
+    /// through the sleeper's pml4; poll_expire drains whatever is
+    /// queued when the deadline lands.
+    Aio(usize),
 }
 
 /// Max fds per task — a hard bound so a hostile process cannot
@@ -3220,6 +3228,7 @@ impl Task {
         self.release_fds();
         self.release_sighand();
         self.release_fstab();
+        aio_release_tgid(self.tgid);
         // NT handle table dies with the Task: refdown whatever its
         // slots still name or the NT_THREADS/NT_PROCS/NT_SECTIONS
         // ledgers leak an entry per abandoned handle. Idempotent —
@@ -28446,6 +28455,13 @@ fn poll_expire() {
                     };
                     t.ctx.rax = (-110i64) as u64;
                 }
+                // io_getevents deadline: Linux answers however many
+                // completions were dequeued — maybe zero.
+                WaitOn::Aio(slot) => {
+                    let n = aio_drain_into(t, slot);
+                    t.ctx.rax = n;
+                    psel_restore(t); // pgetevents' usig restore
+                }
                 _ => continue,
             }
             t.wait_on = WaitOn::None;
@@ -40310,6 +40326,461 @@ pub fn seccomp_gate(
         0x7ffc_0000 | 0x7fff_0000 => None, // LOG / ALLOW
         _ => Some(ENOSYS_), // TRACE/NOTIFY have no listener path
     }
+}
+
+// --- Linux AIO: io_setup/destroy/submit/cancel/getevents/pgetevents ---
+// The real async model is per-mm submission queues running kiocbs on
+// kernel threads. Ours is synchronous by construction: io_submit runs
+// each iocb's operation inline against the fd layer and posts the
+// completion straight into a kernel-side ring — there is never an
+// in-flight request, which collapses most of the CVE surface (no
+// kiocb lifetime, no completion-vs-cancel race). The user-visible
+// mmap'd ring is an optimization libaio uses for lock-free draining;
+// our ring lives kernel-side and io_getevents is the only drain —
+// documented divergence, not a semantics change.
+// Bounded tables like KEYS/SECFILT: a hostile task can't exhaust
+// kernel space minting contexts, and the per-ctx ring cap bounds the
+// completions a task can leave undrained.
+
+/// One queued completion — mirrors io_event's 32-byte ABI.
+#[derive(Clone, Copy, Default)]
+struct AioEv {
+    data: u64,
+    obj: u64,
+    res: i64,
+    res2: i64,
+}
+
+/// Max live io_setup contexts — aio_max_nr's role.
+const MAX_AIOCTX: usize = 8;
+/// Per-context completion ring bound (io_setup's nr_events may not
+/// exceed it) — keeps a context's undrained completions finite.
+const AIO_RING: usize = 64;
+
+/// An io_setup context: the completion ring plus ownership. Linux
+/// attaches the kioctx to the mm; tgid is our process identity —
+/// threads share the address space, so ctx visibility is tgid-wide.
+struct AioCtx {
+    id: u64,
+    tgid: u64,
+    head: usize,
+    len: usize,
+    cap: usize,
+    evs: [AioEv; AIO_RING],
+}
+
+static mut AIOCTXS: [Option<AioCtx>; MAX_AIOCTX] =
+    [const { None }; MAX_AIOCTX];
+static mut AIOSEQ: u64 = 1;
+
+fn aioctxs() -> &'static mut [Option<AioCtx>; MAX_AIOCTX] {
+    // SAFETY: single CPU, IF-masked syscall path — sole accessor.
+    unsafe { &mut *core::ptr::addr_of_mut!(AIOCTXS) }
+}
+
+/// Resolve a caller-visible ctx id to a slot — foreign tgids see
+/// EINVAL, same as any id that was never minted or already destroyed.
+fn aio_find(id: u64, tgid: u64) -> Option<usize> {
+    let cs = unsafe { &*core::ptr::addr_of!(AIOCTXS) };
+    cs.iter().position(|c| {
+        matches!(c, Some(c) if c.id == id && c.tgid == tgid)
+    })
+}
+
+/// A task dying: drop its tgid's contexts once no sibling thread
+/// keeps the process (and its address space) alive — Linux frees
+/// the kioctx at mm teardown, which is the last CLONE_VM sharer.
+fn aio_release_tgid(tgid: u64) {
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    let alive = tasks.iter().flatten().any(|t| {
+        t.tgid == tgid && t.state != TaskState::Exited
+    });
+    if alive {
+        return;
+    }
+    for c in aioctxs().iter_mut() {
+        if matches!(c, Some(c) if c.tgid == tgid) {
+            *c = None;
+        }
+    }
+}
+
+/// Queue a completion — false when the ring is at cap (the caller
+/// blocks or stops; Linux back-pressures on its kiocb pool).
+fn aio_push(slot: usize, ev: AioEv) -> bool {
+    let Some(c) = aioctxs()[slot].as_mut() else { return false };
+    if c.len >= c.cap {
+        return false;
+    }
+    let tail = (c.head + c.len) % AIO_RING;
+    c.evs[tail] = ev;
+    c.len += 1;
+    true
+}
+
+/// Drain up to `wait_len` completions into the sleeper's io_event
+/// array at `wait_ptr`, written through ITS page tables — used by
+/// both the submit waker and the deadline expire like poll_scan's
+/// revents writebacks. Returns the count delivered.
+fn aio_drain_into(t: &mut Task, slot: usize) -> u64 {
+    let cs = aioctxs();
+    let Some(c) = cs[slot].as_mut() else { return 0 };
+    let take = c.len.min(t.wait_len as usize);
+    for i in 0..take {
+        let ev = c.evs[(c.head + i) % AIO_RING];
+        let va = t.wait_ptr + i as u64 * 32;
+        write_task_u64(t.pml4, va, ev.data);
+        write_task_u64(t.pml4, va + 8, ev.obj);
+        write_task_u64(t.pml4, va + 16, ev.res as u64);
+        write_task_u64(t.pml4, va + 24, ev.res2 as u64);
+    }
+    c.head = (c.head + take) % AIO_RING;
+    c.len -= take;
+    t.wait_ptr += take as u64 * 32;
+    t.wait_len -= take as u64;
+    t.wait_ptr2 = t.wait_ptr2.saturating_sub(take as u64);
+    take as u64
+}
+
+/// A submission queued completions on `slot`: re-check every
+/// getevents sleeper on this ctx — drain and wake whoever's
+/// remaining-min is now satisfied, exactly poll_scan's shape.
+fn aio_wake(slot: usize) {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked {
+            continue;
+        }
+        if !matches!(t.wait_on, WaitOn::Aio(i) if i == slot) {
+            continue;
+        }
+        aio_drain_into(t, slot);
+        if t.wait_ptr2 == 0 {
+            // wait_ptr3 is the nr the syscall asked for — the count
+            // delivered is asked-minus-remaining.
+            t.ctx.rax = t.wait_ptr3 - t.wait_len;
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            psel_restore(t);
+            t.state = TaskState::Runnable;
+        }
+    }
+}
+
+/// io_setup(nr_events, ctxp): mint a context. nr in [1, AIO_RING] —
+/// 0 EINVALs like Linux and over-cap EINVALs at our bound (Linux
+/// answers EAGAIN past aio_max_nr; the cap is a fixed-table bound,
+/// ENOMEM vs EINVAL is the honest-fixed-table convention used
+/// elsewhere — callers see EINVAL for an out-of-range request).
+pub fn sys_io_setup(nr_events: u64, ctxp: u64) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    if nr_events == 0 || nr_events > AIO_RING as u64 {
+        return EINVAL;
+    }
+    if !range_ok_w(ctxp, 8) {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let cs = aioctxs();
+    let Some(slot) = cs.iter().position(|c| c.is_none()) else {
+        return EAGAIN_; // aio_max_nr reached
+    };
+    let id = unsafe { *core::ptr::addr_of!(AIOSEQ) };
+    unsafe { *core::ptr::addr_of_mut!(AIOSEQ) = id + 1 };
+    cs[slot] = Some(AioCtx {
+        id,
+        tgid: t.tgid,
+        head: 0,
+        len: 0,
+        cap: nr_events as usize,
+        evs: [AioEv::default(); AIO_RING],
+    });
+    // SAFETY: validated user u64 under cur cr3.
+    unsafe { (ctxp as *mut u64).write_unaligned(id) };
+    0
+}
+
+/// io_destroy(ctx_id): free the context. Linux blocks until every
+/// in-flight kiocb finishes; there are none in a synchronous model —
+/// undrained completions die with the ring.
+pub fn sys_io_destroy(ctx_id: u64) -> u64 {
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(slot) = aio_find(ctx_id, t.tgid) else {
+        return EINVAL;
+    };
+    // Wake any sibling sleeping on this ctx — its drain sees the
+    // dead slot and reports the completions already delivered.
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(u) = s.as_mut() else { continue };
+        if u.state == TaskState::Blocked
+            && matches!(u.wait_on, WaitOn::Aio(i) if i == slot)
+        {
+            u.ctx.rax = u.wait_ptr3 - u.wait_len;
+            u.wait_on = WaitOn::None;
+            u.wait_deadline = 0;
+            psel_restore(u);
+            u.state = TaskState::Runnable;
+        }
+    }
+    aioctxs()[slot] = None;
+    0
+}
+
+/// Run one parsed iocb — the synchronous engine at io_submit's
+/// heart. res is the op's u64 answer (bytes or -errno) narrowed to
+/// the io_event's i64.
+fn aio_run(t: &mut Task, op: u16, fd: u64, buf: u64, n: u64, off: i64, rwf: u32) -> i64 {
+    match op {
+        0 => fd_pread(fd, buf, n, off) as i64,           // PREAD
+        1 => fd_pwrite(fd, buf, n, off) as i64,          // PWRITE
+        2 | 3 => fd_fsync(fd) as i64,                    // FSYNC/FDSYNC
+        5 => poll_revents(t, fd as i32, buf as u16) as i64, // POLL: buf is events
+        6 => 0,                                          // NOOP
+        7 => fd_preadv2(fd, buf, n, off, rwf as u64) as i64,  // PREADV
+        8 => fd_pwritev2(fd, buf, n, off, rwf as u64) as i64, // PWRITEV
+        _ => EINVAL as i64,
+    }
+}
+
+/// io_submit(ctx_id, nr, iocbpp): run up to nr iocbs, posting each
+/// completion into the ring. Validates the whole iocb before the op
+/// (Linux's iocb_must_load checks); a bad iocb after some submitted
+/// returns the count so far — Linux's "errors only fail the first"
+/// contract. Ring-full blocks on the ctx like the kiocb-pool wait.
+pub fn sys_io_submit(ctx_id: u64, nr: u64, iocbpp: u64) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EOPNOTSUPP_: u64 = (-95i64) as u64;
+    if nr > i32::MAX as u64 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(slot) = aio_find(ctx_id, t.tgid) else {
+        return EINVAL;
+    };
+    if nr == 0 {
+        return 0;
+    }
+    if !range_ok(iocbpp, nr * 8) {
+        return EFAULT;
+    }
+    let mut done = 0u64;
+    for i in 0..nr {
+        // Back-pressure bound: a full ring stops the batch — Linux
+        // blocks on its kiocb pool; the syscall-contract answer is
+        // the count already queued (EAGAIN when that's zero, the
+        // documented divergence — a sleeper can't resume mid-batch).
+        if aioctxs()[slot].as_ref().unwrap().len
+            >= aioctxs()[slot].as_ref().unwrap().cap
+        {
+            return if done == 0 { EAGAIN_ } else { done };
+        }
+        // SAFETY: iocbpp+i*8 inside the range_ok'd array.
+        let ip = unsafe { ((iocbpp + i * 8) as *const u64).read_unaligned() };
+        if !range_ok(ip, 64) {
+            return if done == 0 { EFAULT } else { done };
+        }
+        // SAFETY: validated 64-byte iocb under cur cr3.
+        let (data, rwf, op, fildes, buf, n, off, flags, resfd) = unsafe {
+            let p = ip as *const u8;
+            (
+                (p as *const u64).read_unaligned(),
+                (p.add(12) as *const u32).read_unaligned(),
+                (p.add(16) as *const u16).read_unaligned(),
+                (p.add(20) as *const u32).read_unaligned() as u64,
+                (p.add(24) as *const u64).read_unaligned(),
+                (p.add(32) as *const u64).read_unaligned(),
+                (p.add(40) as *const i64).read_unaligned(),
+                (p.add(56) as *const u32).read_unaligned(),
+                (p.add(60) as *const u32).read_unaligned(),
+            )
+        };
+        // RESFD wants an eventfd to bump at completion; IOPRIO is
+        // accepted-and-ignored (no io scheduler). Unknown bits EINVAL.
+        if flags & !0b11 != 0 || rwf & !0x1f != 0 {
+            return if done == 0 { EINVAL } else { done };
+        }
+        if rwf & 0x8 != 0 {
+            // RWF_NOWAIT can't promise non-blocking in a synchronous
+            // engine — Linux's answer when the file can't NOWAIT.
+            return if done == 0 { EOPNOTSUPP_ } else { done };
+        }
+        let efd = if flags & 1 != 0 {
+            let os = unsafe { &*core::ptr::addr_of!(OFDS) };
+            let ei = ((resfd as usize) < MAX_FDS)
+                .then(|| fdt(t).fds[resfd as usize])
+                .flatten()
+                .and_then(|oi| match os[oi as usize].as_ref().map(|o| &o.kind) {
+                    Some(FdKind::Eventfd(ei)) => Some(*ei),
+                    _ => None,
+                });
+            match ei {
+                Some(ei) => Some(ei),
+                None => return if done == 0 { EINVAL } else { done },
+            }
+        } else {
+            None
+        };
+        let res = aio_run(t, op, fildes, buf, n, off, rwf);
+        if res == EINVAL as i64 && (op > 8 || op == 4) {
+            return if done == 0 { EINVAL } else { done };
+        }
+        if !aio_push(slot, AioEv { data, obj: ip, res, res2: 0 }) {
+            return if done == 0 { EAGAIN_ } else { done };
+        }
+        if let Some(ei) = efd {
+            let evs = unsafe { &mut *core::ptr::addr_of_mut!(EVENTFDS) };
+            if let Some(e) = evs[ei].as_mut() {
+                e.count = e.count.saturating_add(1).min(EFD_MAX);
+                eventfd_wake_readers(ei);
+            }
+        }
+        aio_wake(slot);
+        done += 1;
+    }
+    done
+}
+
+/// io_cancel(ctx_id, iocb, result): Linux cancels a PENDING iocb and
+/// writes its completion to result. Our submissions complete
+/// synchronously at submit time — a matching queued completion
+/// means it already ran (EAGAIN, Linux's answer for a running/completed
+/// kiocb); nothing matching EINVALs. EFAULT on a bad iocb VA.
+pub fn sys_io_cancel(ctx_id: u64, iocb: u64, _result: u64) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    if !range_ok(iocb, 64) {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(slot) = aio_find(ctx_id, t.tgid) else {
+        return EINVAL;
+    };
+    let cs = unsafe { &*core::ptr::addr_of!(AIOCTXS) };
+    let c = cs[slot].as_ref().unwrap();
+    for i in 0..c.len {
+        if c.evs[(c.head + i) % AIO_RING].obj == iocb {
+            return EAGAIN_;
+        }
+    }
+    EINVAL
+}
+
+/// Shared core of io_getevents/io_pgetevents: drain up to `nr`
+/// completions once at least `min_nr` are queued — blocking on
+/// WaitOn::Aio until submit's aio_wake or the relative-timespec
+/// deadline (timeout = NULL means infinite). Linux's contract:
+/// timeout/signal before min_nr returns whatever was dequeued;
+/// EINTR only when nothing arrived.
+pub fn sys_io_getevents(
+    ctx: &mut UCtx,
+    ctx_id: u64,
+    min_nr: u64,
+    nr: u64,
+    events: u64,
+    timeout: u64,
+    usig: u64,
+) -> u64 {
+    const EINTR_: u64 = (-4i64) as u64;
+    if min_nr > nr || nr > i32::MAX as u64 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(slot) = aio_find(ctx_id, t.tgid) else {
+        return EINVAL;
+    };
+    if nr > 0 && !range_ok_w(events, nr * 32) {
+        return EFAULT;
+    }
+    // Relative deadline in ticks — same conversion as futex's.
+    let mut deadline = 0u64;
+    if timeout != 0 {
+        if !range_ok(timeout, 16) {
+            return EFAULT;
+        }
+        // SAFETY: validated user timespec under cur cr3.
+        let (sec, nsec) = unsafe {
+            (
+                (timeout as *const i64).read_unaligned(),
+                (timeout as *const i64).add(1).read_unaligned(),
+            )
+        };
+        if !(0..1_000_000_000).contains(&nsec) {
+            return EINVAL;
+        }
+        deadline = crate::apic::TICKS
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_add(sec.max(0) as u64 * 100)
+            .saturating_add(nsec as u64 / 10_000_000);
+    }
+    // io_pgetevents' aio_sigset {sigmask,sigsetsize}: validate the
+    // indirection BEFORE touching the ring — a malformed usig EINVALs
+    // even when the drain alone would have answered.
+    let mut newmask = 0u64;
+    let mut have_mask = false;
+    if usig != 0 {
+        if !range_ok(usig, 16) {
+            return EFAULT;
+        }
+        // SAFETY: validated user pair under cur cr3.
+        let (mp, msz) = unsafe {
+            (
+                (usig as *const u64).read_unaligned(),
+                (usig as *const u64).add(1).read_unaligned(),
+            )
+        };
+        if msz != 8 || (mp != 0 && !range_ok(mp, 8)) {
+            return EINVAL;
+        }
+        if mp != 0 {
+            // SAFETY: validated user u64 under cur cr3.
+            newmask = unsafe { (mp as *const u64).read_unaligned() };
+            have_mask = true;
+        }
+    }
+    t.wait_ptr = events;
+    t.wait_len = nr;
+    t.wait_ptr2 = min_nr;
+    t.wait_ptr3 = nr; // asked — wakers compute delivered = asked-len
+    // First drain in our own context — often all a caller needs.
+    let got = aio_drain_into(t, slot);
+    if t.wait_ptr2 == 0 {
+        return got;
+    }
+    if deadline != 0 {
+        let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        if now >= deadline {
+            return got; // timed out already: whatever was queued
+        }
+    }
+    if deliverable(t) {
+        return if got == 0 { EINTR_ } else { got };
+    }
+    if have_mask {
+        t.psel_mask = t.sigmask as u64;
+        t.sigmask = newmask as u32;
+    }
+    // Arm the wait; the waker (submit's aio_wake), the deadline
+    // expire, or the generic signal wake writes the answer into
+    // t.ctx.rax — block_switch resumes this task in userland.
+    t.wait_on = WaitOn::Aio(slot);
+    t.wait_deadline = deadline;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
+/// io_pgetevents: same with the aio_sigset indirection arg.
+pub fn sys_io_pgetevents(
+    ctx: &mut UCtx,
+    ctx_id: u64,
+    min_nr: u64,
+    nr: u64,
+    events: u64,
+    timeout: u64,
+    usig: u64,
+) -> u64 {
+    sys_io_getevents(ctx, ctx_id, min_nr, nr, events, timeout, usig)
 }
 
 /// End of the scheduling run: reap whatever tasks remain — the last
