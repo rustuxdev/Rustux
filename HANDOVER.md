@@ -7133,3 +7133,33 @@ window +4 — the MAC is read during net_init while MSI-X is off.
 Audit run-31: 0 confirmed — CVE-2021-47613's partial-completion
 class handled (consumers re-check the ring; IRQ is only a wake).
 Commit pushed origin main.
+## run-273 — modern virtio transport (non-transitional virtio-net)
+
+virtio.rs grows a second transport alongside the legacy I/O
+interface: virtio_caps walks the vendor cap list (id 0x09)
+collecting common/notify(+mult)/isr/device windows as physmap VAs
+(bounds hardened mid-run — vendor caps only parsed at off<=0xe8,
+bar index rejected >=6, chain capped 32); handshake_modern does
+reset-poll + ACK|DRIVER + requires/accepts VIRTIO_F_VERSION_1 +
+FEATOK; Vq::setup_modern publishes desc/avail/used phys
+separately via common_cfg, reads per-queue notify_off, enables;
+Vq carries notify_va/isr_va so notify() and the ISR ack branch
+per-transport; VNet gains hdr (10 legacy / 12 v1 header) and
+common (modern cfg VA, also selects where the MSI-X vectors are
+written). net_init tries modern first, legacy fallback intact.
+
+Real bug caught by the boot proof: the v1 header is 12 bytes and
+the TX copy still ran at offset 10 — bytes 10-11 (num_buffers)
+read garbage MAC bytes and the wire frame lost its first two
+bytes; slirp dropped everything until the copy moved to n.hdr.
+Also fixed: the IRQ selftest's first wake can deliver a
+stale/noise frame — the reply-wait now drains a bounded window.
+
+Makefile flips the net device to virtio-net-pci-non-transitional
+on both run and run-vnet (blk stays transitional — both paths
+exercised per boot). Proven end-to-end: modern mac probe, ARP
+round-trip, MSI IRQ 0xf4 reply received, and run-vnet's full
+socket suite (nettest + wgettest) over the modern-only NIC.
+
+Audit run-32: 0 confirmed — cap-walk bounds hardening applied
+in-run (CVE-2026-13216 class). Commit pushed origin main.

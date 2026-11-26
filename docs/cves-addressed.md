@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**189 unique CVEs recorded.**
+**190 unique CVEs recorded.**
 
 ## klib ports
 
@@ -102,6 +102,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2020-25284 | ATA PIO block driver + /dev/sda + live/install ISO: ata.rs polled LBA28 on the PIIX3 prim… | audit run-112 manual scoped + cve.now over HTTP JSON-RPC (entities.search — block-device-driver class checked: CVE-2020-25284-style perms not applicable to a single-user demo kern… |
 | CVE-2020-29369 | brk/mmap/munmap/mprotect: per-task VMA table + eager zeroed pages | VMA == ranges[] entry: gate, first-fit, and teardown share one truth, so a mapped page can never escape the syscall pointer gate; first-fit scans holes between entries (freed VA i… |
 | CVE-2020-29661 | unconditional SIGTTOU gate on background TIOCSPGRP: run-91 gate core factored into shared… | 29661 n/a by construction: the Linux bug is a missing lock around a refcounted tty freed mid-jobctl-op; Rustux's console is a static singleton and pgrp/sid/FG_PGID are plain integ… |
+| CVE-2021-32847 | modern-virtio-transport rung (non-transitional virtio-net): virtio.rs gains a second tran… | cap-parse class (CVE-2026-13216 device cap data -> OOB access — hardened in-run: no cap_len-driven copies exist, vendor caps parsed only at off<=0xe8 keeping field reads inside th… |
 | CVE-2021-4034 | shebang-exec rung: `#!` scripts all exec'd ENOENT — the shebang's absolute interp path ("… | audit run-260 scoped quick (security-audit skill): bounds verified (interp <=127, bn/sn <= CAP-2, shift <= MAX_EXEC_ARGS); cve-now exec-argv/binfmt classes checked (CVE-2022-49264… |
 | CVE-2021-43267 | real Debian apt-get update over slirp: aptprobe solo-initrd stages /etc/apt+/var layout +… | audit run-109 manual scoped + cve.now reached over HTTP JSON-RPC (entities.get confirmed the analogs above): verified pow2(need+16)-16 >= need for every need (exact-pow2 needs spi… |
 | CVE-2021-4440 | syscall reg preservation + boundary selftest | stub now saves/restores the full Windows-volatile set (rdx/rsi/r8-r10) so syscall clobbers only rax/rcx/r11 per Linux ABI; sysret rcx is CPU-saved rip, canonical by construction (… |
@@ -214,6 +215,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-12365 | wall clock + NT time/system services: rtc.rs CMOS/RTC reader (BCD/binary, UIP-bounded, ce… | audit run-99 quick scoped: 2 confirmed findings fixed in-diff — tsc_hz unbounded OUT2 poll was lazily reachable from NT userspace (now TSC-deadline bail, uncached failure) and NT… |
 | CVE-2026-12366 | real NT threads + per-thread TLS: NT_THREADS ledger (16, handle-refed, exit-status surviv… | audit run-89 quick scoped: 1 confirmed-class issue found + fixed in-run (stale-ledger probe hazard -> mm_owner routes every NT non-leader ranges/heap access to the leader task), n… |
 | CVE-2026-13216 | legacy BIOS boot rung: Multiboot2 front end — kernel also builds for x86_64-unknown-none… | audit run-120 quick scoped via safe-anything MCP (kernel/ 119 files clean; security-audit skill still absent on disk — limitation recorded) + cve.now entities.search (parsing clas… |
+| CVE-2026-13216 | modern-virtio-transport rung (non-transitional virtio-net): virtio.rs gains a second tran… | cap-parse class (CVE-2026-13216 device cap data -> OOB access — hardened in-run: no cap_len-driven copies exist, vendor caps parsed only at off<=0xe8 keeping field reads inside th… |
+| CVE-2026-13216 | modern-virtio-transport rung (non-transitional virtio-net): virtio.rs gains a second tran… | cap-parse class (CVE-2026-13216 device cap data -> OOB access — hardened in-run: no cap_len-driven copies exist, vendor caps parsed only at off<=0xe8 keeping field reads inside th… |
 | CVE-2026-13478 | installed-root pivot rung: the mounted ext2 root is copied whole into the RAM fs at boot… | audit run-258 scoped quick (security-audit skill): verified the walk bounds, the callback re-entrancy claim, the exact-name gate, and the underlay ordering. No findings. needs_val… |
 | CVE-2026-23115 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
 | CVE-2026-23127 | shm-anon rung: MAP_SHARED\ | refcount-lifecycle class (double-free in shm_mmap rollback — unmap_page freed mapped frames then s.frames freed again; fixed by single-free-path); ownership-attribution class (ran… |
