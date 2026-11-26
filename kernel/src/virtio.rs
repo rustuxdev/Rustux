@@ -619,12 +619,19 @@ fn virtio_caps(bus: u8, dev: u8, f: u8) -> Option<VCaps> {
 /// ACK|DRIVER, refuse unless the device offers VIRTIO_F_VERSION_1,
 /// accept only VERSION_1, FEATURES_OK. Caller adds DRIVER_OK.
 fn handshake_modern(common: u64) -> bool {
+    handshake_modern_feat(common, 0).is_some()
+}
+
+/// handshake_modern plus low-dword device features — accepts the
+/// subset of `accept_lo` the device actually offers. Returns the
+/// negotiated low mask (None on refusal).
+fn handshake_modern_feat(common: u64, accept_lo: u32) -> Option<u32> {
     cw8(common + C_STATUS, 0);
     let mut spins = 0u64;
     while cr8(common + C_STATUS) != 0 {
         spins += 1;
         if spins > SPIN {
-            return false;
+            return None;
         }
         core::hint::spin_loop();
     }
@@ -636,18 +643,21 @@ fn handshake_modern(common: u64) -> bool {
         crate::log::printk(format_args!(
             "rustux: virtio: modern device lacks VERSION_1 — refused"
         ));
-        return false;
+        return None;
     }
+    cw32(common + C_DFEAT_SEL, 0);
+    let offered_lo = cr32(common + C_DFEAT);
+    let accepted = accept_lo & offered_lo;
     cw32(common + C_GFEAT_SEL, 0);
-    cw32(common + C_GFEAT, 0);
+    cw32(common + C_GFEAT, accepted);
     cw32(common + C_GFEAT_SEL, 1);
-    cw32(common + C_GFEAT, 1); // accept VERSION_1 only
+    cw32(common + C_GFEAT, 1); // accept VERSION_1 always
     cw8(common + C_STATUS, S_ACK | S_DRV | S_FEATOK);
     if cr8(common + C_STATUS) & S_FEATOK == 0 {
         cw8(common + C_STATUS, cr8(common + C_STATUS) | S_FAIL);
-        return false;
+        return None;
     }
-    true
+    Some(accepted)
 }
 
 /// Probe a non-transitional virtio-net function over the modern
@@ -668,9 +678,13 @@ fn net_init_modern() -> bool {
         ));
         return false;
     };
-    if !handshake_modern(vc.common) {
+    // VIRTIO_NET_F_CTRL_VQ (bit 17) — the only device feature this
+    // datapath asks for; it buys the control queue at sel 2.
+    const F_NET_CTRL_VQ: u32 = 1 << 17;
+    let Some(feat) = handshake_modern_feat(vc.common, F_NET_CTRL_VQ) else {
         return false;
-    }
+    };
+    let has_ctrl = feat & F_NET_CTRL_VQ != 0;
     if cr16(vc.common + C_NQ) < 2 {
         cw8(vc.common + C_STATUS, cr8(vc.common + C_STATUS) | S_FAIL);
         return false;
@@ -681,6 +695,18 @@ fn net_init_modern() -> bool {
     ) else {
         cw8(vc.common + C_STATUS, cr8(vc.common + C_STATUS) | S_FAIL);
         return false;
+    };
+    // The control queue is queue NQ-1 when CTRL_VQ negotiated —
+    // sel 2 for the single queue pair QEMU gives us.
+    let ctl = if has_ctrl && cr16(vc.common + C_NQ) >= 3 {
+        Vq::setup_modern(vc.common, vc.notify, vc.notify_mult, vc.isr, 2)
+    } else {
+        None
+    };
+    let ctl_page = if ctl.is_some() {
+        kalloc::alloc_frames(0)
+    } else {
+        None
     };
     let (Some(rx_bufs), Some(tx_bufs)) =
         (kalloc::alloc_frames(5), kalloc::alloc_frames(2))
@@ -721,7 +747,71 @@ fn net_init_modern() -> bool {
         "rustux: virtio: net modern mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rxq={} txq={}",
         n.mac[0], n.mac[1], n.mac[2], n.mac[3], n.mac[4], n.mac[5], n.rx.size, n.tx.size
     ));
+    // Control queue: publish then prove — a command must come back
+    // with the device's ack byte written to the staging page.
+    if let (Some(q), Some(page)) = (ctl, ctl_page) {
+        unsafe {
+            *core::ptr::addr_of_mut!(NCTL) = Some(q);
+            *core::ptr::addr_of_mut!(NCTL_PAGE) = page;
+        }
+        net_ctrl_selftest();
+    }
     true
+}
+
+/// The negotiated control virtqueue and its staging page.
+static mut NCTL: Option<Vq> = None;
+static mut NCTL_PAGE: u64 = 0;
+
+/// Issue one virtio-net control command: {class, cmd} header +
+/// data as an OUT descriptor chained to a 1-byte device-writable
+/// ack descriptor. Returns true on VIRTIO_NET_OK (ack 0).
+/// Layout on the staging page: hdr+data at +0, ack byte at +511.
+fn net_ctrl(class: u8, cmd: u8, data: &[u8]) -> bool {
+    let Some(q) = (unsafe { (*core::ptr::addr_of_mut!(NCTL)).as_mut() }) else {
+        return false;
+    };
+    if data.len() > 256 {
+        return false;
+    }
+    let page = unsafe { *core::ptr::addr_of!(NCTL_PAGE) };
+    let va = mm::pmap(page);
+    // SAFETY: our staging page; hdr+data <= 258B at +0, ack at +511.
+    unsafe {
+        (va as *mut u8).write_volatile(class);
+        ((va + 1) as *mut u8).write_volatile(cmd);
+        core::ptr::copy_nonoverlapping(data.as_ptr(), (va + 2) as *mut u8, data.len());
+        ((va + 511) as *mut u8).write_volatile(0xff);
+    }
+    q.put_desc(0, page, 2 + data.len() as u32, DESC_NEXT, 1);
+    q.put_desc(1, page + 511, 1, DESC_WRITE, 0);
+    q.avail_push(0);
+    q.notify();
+    if !q.poll_once(0) {
+        return false;
+    }
+    // SAFETY: our staging page.
+    unsafe { ((va + 511) as *const u8).read_volatile() == 0 }
+}
+
+/// Boot proof for the control queue: RX-mode commands (promisc,
+/// allmulti — class VIRTIO_NET_CTRL_RX=0) and a MAC-table set
+/// (class VIRTIO_NET_CTRL_MAC=1, cmd VIRTIO_NET_CTRL_MAC_TABLE_SET=0)
+/// must each ack VIRTIO_NET_OK. Poll-based — safe pre-sti.
+fn net_ctrl_selftest() {
+    let promisc = net_ctrl(0, 0, &[1]);
+    let allmulti = net_ctrl(0, 1, &[1]);
+    // MAC table: the unicast set first {u32 nuni, u8 macs[][6]},
+    // then multicast {u32 nmulti, macs...}.
+    let mut tbl = [0u8; 14];
+    tbl[0..4].copy_from_slice(&1u32.to_le_bytes());
+    if let Some(n) = vnet() {
+        tbl[4..10].copy_from_slice(&n.mac);
+    }
+    let mactbl = net_ctrl(1, 0, &tbl);
+    crate::log::printk(format_args!(
+        "rustux: virtio: net ctrlq promisc {promisc} allmulti {allmulti} mac-table {mactbl}"
+    ));
 }
 
 struct VNet {
