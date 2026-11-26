@@ -463,6 +463,13 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
     // Args 4-6 ride r10/r8/r9 per the syscall ABI (arg4 is r10,
     // never rcx — that's the CPU-clobbered return address).
     let (a4, a5, a6) = (ctx.r10, ctx.r8, ctx.r9);
+    if let Some(r) = user::seccomp_gate(
+        nr, a1, a2, a3, a4, a5, a6, ctx.rip, 0xc000_003e,
+    ) {
+        ctx.rax = r;
+        user::deliver_current(ctx);
+        return;
+    }
     ctx.rax = match nr {
         // fd_read validates the write-target range itself because only
         // it knows how many bytes the source will actually produce.
@@ -788,7 +795,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_GETRUSAGE => user::sys_getrusage(a1, a2),
         NR_STATFS => sys_statfs(a1, a2),
         NR_FSTATFS => user::sys_fstatfs(a1, a2),
-        NR_PRCTL => user::sys_prctl(a1, a2),
+        NR_PRCTL => user::sys_prctl(a1, a2, a3),
         NR_GETGROUPS => user::sys_getgroups(a1, a2),
         NR_SCHED_GETAFFINITY => user::sys_sched_getaffinity(a1, a2, a3),
         // Real vfork: shared mm + uninterruptible parent wait until
@@ -807,6 +814,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         248 => sys_add_key(a1, a2, a3, a4, a5),
         249 => sys_request_key(a1, a2, a3, a4),
         250 => sys_keyctl(a1, a2, a3, a4, a5),
+        317 => user::sys_seccomp(a1, a2, a3),
         165 => sys_mount(a1, a2, a3, a4),
         430 => sys_fsopen(a1, a2),
         431 => sys_fsconfig(a1, a2, a3, a4, a5),
@@ -885,6 +893,13 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         ctx.rdi as u32 as u64,
         ctx.rbp as u32 as u64,
     );
+    if let Some(r) = user::seccomp_gate(
+        nr, a1, a2, a3, a4, a5, a6, ctx.rip, 0x4000_0003,
+    ) {
+        ctx.rax = r;
+        user::deliver_current(ctx);
+        return;
+    }
     ctx.rax = match nr {
         1 | 252 => sys_exit(a1),                 // exit / exit_group
         3 => user::fd_read(ctx, a1, a2, a3.min(MAX_READ)),
@@ -955,7 +970,7 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         120 => user::sys_clone(ctx, a1, a2, a3, a5, a4),
         // vfork: busybox ash and glibc's i386 spawn path use it.
         190 => user::sys_vfork(ctx),
-        172 => user::sys_prctl(a1, a2),
+        172 => user::sys_prctl(a1, a2, a3),
         // ugetrlimit(resource, rlim) — the i386 form takes TWO args;
         // passing the resource as the pointer made every probe EFAULT.
         191 => user::sys_ugetrlimit(a2),

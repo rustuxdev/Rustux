@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 117;
+const MAX_TASKS: usize = 118;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -2328,6 +2328,12 @@ pub struct Task {
     session_ring: u16,
     /// KEYCTL_SET_REQKEY_KEYRING default mode (0 = search all).
     reqkey_mode: u8,
+    /// prctl PR_SET_NO_NEW_PRIVS — sticky bit, fork-inherited.
+    nnp: bool,
+    /// seccomp mode: 0 off, 1 strict, 2 filter.
+    seccomp: u8,
+    /// SECFILT slot bitmask — this task's stacked filters.
+    filtmask: u16,
     /// ELFCLASS32 image: the task runs in IA-32e compatibility mode —
     /// entry on the GDT's 32-bit user CS, the whole address space in
     /// the low-4GiB compat window (private PDPT under PML4[0]), and
@@ -3192,7 +3198,25 @@ impl Task {
         fstab_release(i);
     }
 
+    fn release_secfilt(&mut self) {
+        let m = self.filtmask;
+        self.filtmask = 0;
+        let fs = secfilts();
+        for (i, slot) in fs.iter_mut().enumerate() {
+            if m & (1 << i) == 0 {
+                continue;
+            }
+            if let Some(f) = slot.as_mut() {
+                f.users -= 1;
+                if f.users == 0 {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
     fn reap(&mut self) {
+        self.release_secfilt();
         self.release_fds();
         self.release_sighand();
         self.release_fstab();
@@ -8090,6 +8114,9 @@ fn load(img: &[u8]) -> Option<Task> {
         persona: 0,
         session_ring: u16::MAX,
         reqkey_mode: 0,
+        nnp: false,
+        seccomp: 0,
+        filtmask: 0,
         is_compat: false,
         gs_base: 0,
         tls: [0; 4],
@@ -18477,7 +18504,7 @@ pub fn sys_sched_getaffinity(_pid: u64, size: u64, mask: u64) -> u64 {
 
 /// prctl(option, ...): PR_SET_NAME (15) truncates into the task's
 /// 15-byte name like Linux comm; everything else is honest EINVAL.
-pub fn sys_prctl(op: u64, a2: u64) -> u64 {
+pub fn sys_prctl(op: u64, a2: u64, a3: u64) -> u64 {
     let Some(t) = cur_mut() else { return EINVAL };
     match op {
         15 => {
@@ -18516,6 +18543,25 @@ pub fn sys_prctl(op: u64, a2: u64) -> u64 {
             }
             0
         }
+        21 => t.seccomp as u64, // PR_GET_SECCOMP
+        22 => {
+            // PR_SET_SECCOMP: mode 1 = strict, 2 = filter — the
+            // seccomp(2) ops are shifted down by one.
+            match a2 {
+                1 => sys_seccomp(0, 0, 0),
+                2 => sys_seccomp(1, 0, a3),
+                _ => EINVAL,
+            }
+        }
+        38 => {
+            // PR_SET_NO_NEW_PRIVS — sticky once set.
+            if a2 != 1 {
+                return EINVAL;
+            }
+            t.nnp = true;
+            0
+        }
+        39 => t.nnp as u64, // PR_GET_NO_NEW_PRIVS
         _ => EINVAL,
     }
 }
@@ -20308,6 +20354,9 @@ pub fn nt_thread_create(
         persona: p.persona,
         session_ring: p.session_ring,
         reqkey_mode: p.reqkey_mode,
+        nnp: p.nnp,
+        seccomp: p.seccomp,
+        filtmask: p.filtmask,
         is_compat: p.is_compat,
         gs_base: teb,
         tls: [0; 4],
@@ -20394,6 +20443,7 @@ pub fn nt_thread_create(
     // Shared-mm child: own a ref per copied shm VMA so the parent's
     // exit can't free frames this mm still maps.
     shm_pin_all(&c);
+    secfilt_share(c.filtmask);
     tasks[slot] = Some(c);
     PROCS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Some((idx, tid))
@@ -38871,6 +38921,9 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         persona: p.persona,
         session_ring: p.session_ring,
         reqkey_mode: p.reqkey_mode,
+        nnp: p.nnp,
+        seccomp: p.seccomp,
+        filtmask: p.filtmask,
         is_compat: p.is_compat,
         gs_base: p.gs_base,
         tls: p.tls,
@@ -38924,6 +38977,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
     c.kstack_top = ks + KSTACK_SIZE as u64;
     c.tgid = c.pid; // a fork child leads its own group
     let cpid = c.pid;
+    secfilt_share(c.filtmask);
     tasks[slot] = Some(c);
     PROCS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     cpid
@@ -39069,6 +39123,9 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         persona: p.persona,
         session_ring: p.session_ring,
         reqkey_mode: p.reqkey_mode,
+        nnp: p.nnp,
+        seccomp: p.seccomp,
+        filtmask: p.filtmask,
         is_compat: p.is_compat,
         gs_base: p.gs_base,
         tls: p.tls,
@@ -39124,6 +39181,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
     // Shared-mm child: one segment ref per copied shm VMA — balanced
     // by shm_drop_all at this task's teardown.
     shm_pin_all(&c);
+    secfilt_share(c.filtmask);
     tasks[slot] = Some(c);
     PROCS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     cpid
@@ -39779,6 +39837,479 @@ pub fn sysfs_name_i(name: &[u8]) -> i64 {
         }
     }
     -1
+}
+
+// --- seccomp ----------------------------------------------------
+// A per-task filter stack over the shared SECFILT table: filters
+// are immutable after install, fork shares them by users-count
+// (bump at the tasks[] insert, drop in release_secfilt).
+const SC_MAX_INSNS: usize = 512;
+const MAX_SECFILT: usize = 8;
+
+struct SecFilt {
+    /// raw 8-byte sock_filter insns, validated at install.
+    insns: [[u8; 8]; SC_MAX_INSNS],
+    n: u16,
+    users: u16,
+}
+
+static mut SECFILT: [Option<SecFilt>; MAX_SECFILT] =
+    [const { None }; MAX_SECFILT];
+
+fn secfilts() -> &'static mut [Option<SecFilt>; MAX_SECFILT] {
+    unsafe { &mut *core::ptr::addr_of_mut!(SECFILT) }
+}
+
+/// Bump users on every slot in a mask — fork's inherit share.
+fn secfilt_share(mask: u16) {
+    if mask == 0 {
+        return;
+    }
+    let fs = secfilts();
+    for i in 0..MAX_SECFILT {
+        if mask & (1 << i) != 0 {
+            if let Some(f) = fs[i].as_mut() {
+                f.users += 1;
+            }
+        }
+    }
+}
+
+/// cBPF insn fields.
+struct Insn {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+fn insn_at(raw: &[[u8; 8]], i: usize) -> Insn {
+    let b = &raw[i];
+    Insn {
+        code: u16::from_le_bytes([b[0], b[1]]),
+        jt: b[2],
+        jf: b[3],
+        k: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+    }
+}
+
+/// Install-time verifier — the classic-BPF checks Linux's
+/// bpf_check_classic does for seccomp: known opcodes only, last
+/// insn must be RET, jump targets inside the program, scratch
+/// stores < 16, packet loads bounded by seccomp_data (64 bytes).
+fn cbpf_validate(insns: &[[u8; 8]], n: usize) -> bool {
+    if n == 0 {
+        return false;
+    }
+    for pc in 0..n {
+        let i = insn_at(insns, pc);
+        let cls = i.code & 0x07;
+        match cls {
+            0 => {
+                // LD: size must be W; mode IMM/ABS/LEN/MEM —
+                // ABS over seccomp_data must read a full u32 word.
+                let mode = i.code & 0xe0;
+                if i.code & 0x18 != 0x00 {
+                    return false; // W only — seccomp_data is u32 cells
+                }
+                match mode {
+                    0x00 | 0x80 => {}
+                    0x20 => {
+                        if i.k as usize + 4 > 64 {
+                            return false;
+                        }
+                    }
+                    0x60 => {
+                        if i.k >= 16 {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            1 => {
+                // LDX: LEN/IMM/MEM/MSH
+                match i.code & 0xe0 {
+                    0x80 | 0x00 => {}
+                    0x60 => {
+                        if i.k >= 16 {
+                            return false;
+                        }
+                    }
+                    0xa0 => {
+                        if i.k as usize >= 64 {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            2 | 3 => {
+                if i.k >= 16 {
+                    return false; // ST/STX scratch bound
+                }
+            }
+            4 => {
+                // ALU: known ops, src K|X
+                let op = i.code & 0xf0;
+                if !matches!(
+                    op,
+                    0x00 | 0x10 | 0x20 | 0x30 | 0x40 | 0x50 | 0x60
+                        | 0x70 | 0x80 | 0x90 | 0xa0
+                ) {
+                    return false;
+                }
+                if i.code & 0x08 != 0 && i.code & 0xf0 == 0x80 {
+                    return false; // NEG has no src
+                }
+            }
+            5 => {
+                // JMP: op JA/JEQ/JGT/JGE/JSET, src K|X
+                let op = i.code & 0xf0;
+                if !matches!(op, 0x00 | 0x10 | 0x20 | 0x30 | 0x40) {
+                    return false;
+                }
+                if op == 0x00 {
+                    // JA k — target must stay inside the program.
+                    if pc + 1 + i.k as usize >= n {
+                        return false;
+                    }
+                } else {
+                    // jt/jf are relative to pc+1 and must land on
+                    // a real insn (Linux allows falling off the end
+                    // only via RET — bounded to n for safety).
+                    if pc + 1 + i.jt as usize >= n
+                        || pc + 1 + i.jf as usize >= n
+                    {
+                        return false;
+                    }
+                }
+            }
+            6 => {} // RET K|A — always legal
+            7 => {
+                // MISC: TAX (0x00) / TXA (0x80)
+                if i.code != 0x07 && i.code != 0x87 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    insn_at(insns, n - 1).code & 0x07 == 0x06
+}
+
+/// Run a validated program over the 64-byte seccomp_data; returns
+/// the u32 result word (action | data). Any malformed runtime
+/// condition answers KILL_PROCESS — the safe verdict.
+fn cbpf_run(insns: &[[u8; 8]], n: usize, d: &[u8; 64]) -> u32 {
+    const KILL_P: u32 = 0x8000_0000;
+    let rd = |o: usize| -> u32 {
+        u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+    };
+    let (mut a, mut x) = (0u32, 0u32);
+    let mut mem = [0u32; 16];
+    let mut pc = 0usize;
+    let mut steps = 0usize;
+    while pc < n {
+        steps += 1;
+        if steps > 100_000 {
+            return KILL_P; // validated code can't loop; belt & braces
+        }
+        let i = insn_at(insns, pc);
+        pc += 1;
+        match i.code & 0x07 {
+            0 => {
+                // LD
+                a = match i.code & 0xe0 {
+                    0x00 => i.k,
+                    0x80 => 64,
+                    0x20 => {
+                        if i.k as usize + 4 > 64 {
+                            return KILL_P;
+                        }
+                        rd(i.k as usize)
+                    }
+                    0x60 => mem[i.k as usize],
+                    _ => return KILL_P,
+                };
+            }
+            1 => {
+                x = match i.code & 0xe0 {
+                    0x80 => 64,
+                    0x00 => i.k,
+                    0x60 => mem[i.k as usize],
+                    0xa0 => {
+                        if i.k as usize >= 64 {
+                            return KILL_P;
+                        }
+                        (d[i.k as usize] as u32 & 0xf) * 4
+                    }
+                    _ => return KILL_P,
+                };
+            }
+            2 => mem[i.k as usize] = a,
+            3 => mem[i.k as usize] = x,
+            4 => {
+                // ALU — src X when bit3 set else K
+                let v = if i.code & 0x08 != 0 { x } else { i.k };
+                a = match i.code & 0xf0 {
+                    0x00 => a.wrapping_add(v),
+                    0x10 => a.wrapping_sub(v),
+                    0x20 => a.wrapping_mul(v),
+                    0x30 => {
+                        if v == 0 {
+                            return KILL_P;
+                        }
+                        a / v
+                    }
+                    0x40 => a | v,
+                    0x50 => a & v,
+                    0x60 => a << (v & 31),
+                    0x70 => a >> (v & 31),
+                    0x80 => a.wrapping_neg(),
+                    0x90 => {
+                        if v == 0 {
+                            return KILL_P;
+                        }
+                        a % v
+                    }
+                    0xa0 => a ^ v,
+                    _ => return KILL_P,
+                };
+            }
+            5 => {
+                let op = i.code & 0xf0;
+                if op == 0x00 {
+                    pc += i.k as usize;
+                    continue;
+                }
+                let v = if i.code & 0x08 != 0 { x } else { i.k };
+                let taken = match op {
+                    0x10 => a == v,
+                    0x20 => a > v,
+                    0x30 => a >= v,
+                    0x40 => a & v != 0,
+                    _ => return KILL_P,
+                };
+                pc += if taken { i.jt } else { i.jf } as usize;
+            }
+            6 => return if i.code & 0x08 != 0 { a } else { i.k },
+            7 => {
+                if i.code == 0x07 {
+                    x = a;
+                } else if i.code == 0x87 {
+                    a = x;
+                } else {
+                    return KILL_P;
+                }
+            }
+            _ => return KILL_P,
+        }
+    }
+    KILL_P // fell off the end (validation prevents this anyway)
+}
+
+/// seccomp(317): op 0 SET_MODE_STRICT, 1 SET_MODE_FILTER,
+/// 2 GET_ACTION_AVAIL, 3 GET_NOTIF_SIZES. Install needs
+/// no_new_privs or uid==0 unless a mode is already set (a filter
+/// can stack under itself); strict is terminal.
+pub fn sys_seccomp(op: u64, flags: u64, uargs: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    const EACCES_: u64 = (-13i64) as u64;
+    const EOPNOTSUPP_: u64 = (-95i64) as u64;
+    const ENOMEM_: u64 = (-12i64) as u64;
+    const ENOSPC_: u64 = (-28i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    match op {
+        0 => {
+            // SET_MODE_STRICT — uargs/flags must be 0.
+            if flags != 0 || uargs != 0 {
+                return EINVAL_;
+            }
+            if t.seccomp != 0 {
+                // Strict only ever installs from scratch — the
+                // ratchet can't go filter->strict either.
+                return EINVAL_;
+            }
+            if !t.nnp && t.uid != 0 {
+                return EACCES_;
+            }
+            t.seccomp = 1;
+            0
+        }
+        1 => {
+            // SET_MODE_FILTER — all flag bits need infra we lack
+            // (TSYNC siblings, LOG ring, NEW_LISTENER, SPEC_ALLOW,
+            // WAIT_KILLABLE_RECV): honest EINVAL like -EINVAL.
+            if flags != 0 {
+                return EINVAL_;
+            }
+            if t.seccomp == 1 {
+                return EINVAL_;
+            }
+            if t.seccomp == 0 && !t.nnp && t.uid != 0 {
+                return EACCES_;
+            }
+            if !range_ok(uargs, 16) {
+                return EFAULT_;
+            }
+            let (flen, fptr) = unsafe {
+                (
+                    (uargs as *const u16).read_unaligned() as usize,
+                    (uargs as *const u64).add(1).read_unaligned(),
+                )
+            };
+            if flen == 0 || flen > SC_MAX_INSNS {
+                return EINVAL_;
+            }
+            if !range_ok(fptr, flen as u64 * 8) {
+                return EFAULT_;
+            }
+            let mut f = SecFilt {
+                insns: [[0; 8]; SC_MAX_INSNS],
+                n: flen as u16,
+                users: 1,
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    fptr as *const u8,
+                    f.insns.as_mut_ptr().cast::<u8>(),
+                    flen * 8,
+                )
+            };
+            if !cbpf_validate(&f.insns, flen) {
+                return EINVAL_;
+            }
+            let fs = secfilts();
+            let Some(i) = fs.iter().position(Option::is_none) else {
+                return ENOSPC_;
+            };
+            fs[i] = Some(f);
+            t.filtmask |= 1 << i;
+            t.seccomp = 2;
+            let _ = ENOMEM_;
+            0
+        }
+        2 => {
+            // GET_ACTION_AVAIL — the actions we actually apply.
+            match flags {
+                0x00000000 | 0x80000000 | 0x00030000 | 0x00050000
+                | 0x7ffc0000 | 0x7fff0000 => 0,
+                _ => EOPNOTSUPP_, // TRACE / USER_NOTIF / unknown
+            }
+        }
+        3 => {
+            // GET_NOTIF_SIZES — real ABI sizes even without a
+            // listener path: {notif 80, resp 32, data 64}.
+            if !range_ok_w(uargs, 6) {
+                return EFAULT_;
+            }
+            unsafe {
+                (uargs as *mut u16).write_unaligned(80);
+                (uargs as *mut u16).add(1).write_unaligned(32);
+                (uargs as *mut u16).add(2).write_unaligned(64);
+            }
+            0
+        }
+        _ => EINVAL_,
+    }
+}
+
+/// The per-syscall gate — evaluated in the dispatch before any
+/// handler. Some(result) short-circuits the syscall entirely.
+/// `arch` is the AUDIT_ARCH_* word the data cell sees.
+#[allow(clippy::too_many_arguments)]
+pub fn seccomp_gate(
+    nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64,
+    ip: u64, arch: u32,
+) -> Option<u64> {
+    const ENOSYS_: u64 = (-38i64) as u64;
+    let Some(t) = cur_mut() else { return None };
+    let mode = t.seccomp;
+    if mode == 0 {
+        return None;
+    }
+    if mode == 1 {
+        // Strict: read/write/exit/exit_group/rt_sigreturn only —
+        // anything else is a SIGKILL death sentence.
+        if matches!(nr, 0 | 1 | 15 | 60 | 231) {
+            return None;
+        }
+        pend_one(t, SIGKILL as u64, SIGSRC_NONE);
+        return Some(0);
+    }
+    // Filter mode: build seccomp_data and run every stacked
+    // filter — the most severe verdict wins.
+    let mask = t.filtmask;
+    let tgid = t.tgid;
+    let mut d = [0u8; 64];
+    d[..4].copy_from_slice(&(nr as u32).to_le_bytes());
+    d[4..8].copy_from_slice(&arch.to_le_bytes());
+    d[8..16].copy_from_slice(&ip.to_le_bytes());
+    for (i, a) in [a1, a2, a3, a4, a5, a6].iter().enumerate() {
+        d[16 + i * 8..24 + i * 8].copy_from_slice(&a.to_le_bytes());
+    }
+    // Action severity for stacking — Linux's ordering.
+    fn sev(ret: u32) -> u8 {
+        match ret & 0x7fff_0000 {
+            0x8000_0000 => 7, // KILL_PROCESS
+            0x0000_0000 => 6, // KILL_THREAD
+            0x0003_0000 => 5, // TRAP
+            0x0005_0000 => 4, // ERRNO
+            0x7ff0_0000 => 3, // TRACE
+            0x7fc0_0000 => 2, // USER_NOTIF
+            0x7ffc_0000 => 1, // LOG
+            _ => 0,           // ALLOW / other
+        }
+    }
+    let mut ret = 0x7fff_0000u32; // ALLOW default
+    {
+        let fs = unsafe { &*core::ptr::addr_of!(SECFILT) };
+        for i in 0..MAX_SECFILT {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            if let Some(f) = fs[i].as_ref() {
+                let r = cbpf_run(&f.insns, f.n as usize, &d);
+                if sev(r) > sev(ret) {
+                    ret = r;
+                }
+            }
+        }
+    }
+    match ret & 0xffff_0000 {
+        0x8000_0000 => {
+            // KILL_PROCESS — SIGKILL every task in the group.
+            let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+            for s in tasks.iter_mut() {
+                if let Some(tt) = s.as_mut() {
+                    if tt.tgid == tgid {
+                        pend_one(tt, SIGKILL as u64, SIGSRC_NONE);
+                    }
+                }
+            }
+            Some(0)
+        }
+        0x0000_0000 => {
+            let t = cur_mut().unwrap();
+            pend_one(t, SIGKILL as u64, SIGSRC_NONE);
+            Some(0)
+        }
+        0x0003_0000 => {
+            // TRAP — pend SIGSYS, report ENOSYS to the caller.
+            let t = cur_mut().unwrap();
+            pend_one(t, 31, SIGSRC_NONE);
+            Some(ENOSYS_)
+        }
+        0x0005_0000 => {
+            // ERRNO — data is the positive errno (capped 4095).
+            let e = (ret & 0xffff).min(4095);
+            Some((-(e as i64)) as u64)
+        }
+        0x7ffc_0000 | 0x7fff_0000 => None, // LOG / ALLOW
+        _ => Some(ENOSYS_), // TRACE/NOTIFY have no listener path
+    }
 }
 
 /// End of the scheduling run: reap whatever tasks remain — the last
