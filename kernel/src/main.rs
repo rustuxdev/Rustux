@@ -1446,6 +1446,9 @@ pub(crate) fn rustux_main(
     // virtio-rng: the canonical guest entropy tap — feed the pool
     // a reseed after the one-shot rdrand seed.
     virtio::rng_init();
+    // virtio-console: a second console channel (/dev/hvc0) over its
+    // own virtqueue pair — the init proof writes the chardev backend.
+    virtio::console_init();
     // virtio-net: second NIC next to the e1000e — its own RX/TX
     // virtqueues, ARP round-trip proves the datapath (socket-layer
     // NIC dispatch is a later rung).

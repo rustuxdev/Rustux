@@ -14241,6 +14241,21 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                 // /dev/tty and /dev/console read the ldisc queue —
                 // the same path fd 0 takes, job-control gate and all.
                 0x500 | 0x501 => tty_input_read(t, ctx, buf, len),
+                // /dev/hvc0 — drained virtio-console bytes; a stream,
+                // so the OFD position is meaningless and untouched.
+                0xe500 => {
+                    if len > 0 && !range_ok_w(buf, len) {
+                        return EFAULT;
+                    }
+                    // SAFETY: validated user window under cur cr3.
+                    let dst = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            buf as *mut u8,
+                            len as usize,
+                        )
+                    };
+                    crate::virtio::console_read(dst) as u64
+                }
                 // /dev/sr0 does no sector I/O — ioctls only.
                 0xb00 => (-6i64) as u64, // ENXIO
                 // /dev/fb0 — read the framebuffer back at the OFD
@@ -14525,6 +14540,21 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
                 let w = crate::log::fb_write(o.pos, src);
                 o.pos += w;
                 w as u64
+            }
+            // /dev/hvc0 — bytes out the virtio-console TX queue to
+            // the chardev backend. Returns what the device accepted.
+            0xe500 => {
+                if len > 0 && !range_ok(buf, len) {
+                    return EFAULT;
+                }
+                // SAFETY: validated user window under cur cr3.
+                let src = unsafe {
+                    core::slice::from_raw_parts(
+                        buf as *const u8,
+                        len as usize,
+                    )
+                };
+                crate::virtio::console_write(src) as u64
             }
             // Everything else sinks the bytes: null/zero discard,
             // random/urandom fold them into the pool (Linux's
@@ -15583,6 +15613,18 @@ pub fn dev_init() {
             vfile_stamp(v, mode, 0);
             v.fmt = 0o20000; // S_IFCHR
             v.rdev = rdev;
+        }
+    }
+    // /dev/hvc0 — the virtio-console channel (Linux major 229).
+    // Minted only when the device probed, like the disk nodes.
+    if crate::virtio::console_present() {
+        let r = vfile_create(b"dev/hvc0");
+        if (r as i64) >= 0 {
+            if let Some(v) = vfile(r as usize) {
+                vfile_stamp(v, 0o666, 0);
+                v.fmt = 0o20000; // S_IFCHR
+                v.rdev = 229 << 8;
+            }
         }
     }
     // /dev/sda — the node only exists when the ATA probe found a
@@ -16788,6 +16830,10 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                         // same as a driverless node.
                         29 if crate::log::fb_geometry().is_some() => i,
                         29 => return ENXIO,
+                        // /dev/hvc0 — the virtio-console channel.
+                        // ENXIO on a crafted node with no device.
+                        229 if crate::virtio::console_present() => i,
+                        229 => return ENXIO,
                         // input core — evdev event nodes.
                         13 => i,
                         _ => return ENODEV,
@@ -18901,6 +18947,14 @@ fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
                 // evdev: readable when input_event records queue;
                 // writable always (ioctls, not a byte stream).
                 if crate::kbd::ev_len() > 0 {
+                    POLLIN | POLLOUT
+                } else {
+                    POLLOUT
+                }
+            } else if vfile(*i).is_some_and(|v| v.rdev == 0xe500) {
+                // hvc0: readable when console input has drained
+                // into the FIFO; writable always.
+                if crate::virtio::console_pending() > 0 {
                     POLLIN | POLLOUT
                 } else {
                     POLLOUT

@@ -298,10 +298,16 @@ impl Vq {
 /// Shared legacy handshake: reset -> ACK|DRIVER -> features=0 ->
 /// FEATURES_OK readback. Callers then set up queues and add DRIVER_OK.
 fn handshake(io: u16) -> bool {
+    handshake_feat(io, 0)
+}
+
+/// Shared legacy handshake with a caller-chosen feature subset —
+/// same sequence as handshake() but acks `feat` instead of none.
+fn handshake_feat(io: u16, feat: u32) -> bool {
     outb(io + R_STATUS, 0);
     outb(io + R_STATUS, S_ACK);
     outb(io + R_STATUS, S_ACK | S_DRV);
-    outl(io + R_GFEATURES, 0); // negotiate none: no offload paths
+    outl(io + R_GFEATURES, feat & inl(io + R_FEATURES));
     outb(io + R_STATUS, S_ACK | S_DRV | S_FEATOK);
     if inb(io + R_STATUS) & S_FEATOK == 0 {
         fail(io);
@@ -1219,4 +1225,280 @@ pub fn rng_init() -> u32 {
     ));
     ent.fill(0);
     fed as u32
+}
+
+// -------------------------------------------------------------------
+// virtio-console — a second console channel (Linux's /dev/hvc0).
+//
+// Without the multiport feature the device carries one port: queue
+// 0 is its receive queue (device fills posted buffers), queue 1 the
+// transmit queue (guest bytes out to the chardev backend).
+
+/// Transitional virtio-console (QEMU's `virtio-console`).
+const DEV_CON: u16 = 0x1003;
+/// Posted RX buffers, 128 bytes each — short lines flow, a flood
+/// just leaves buffers unconsumed until the next drain.
+const N_CON: usize = 8;
+const CON_BUFSZ: usize = 128;
+
+static mut CONRX: Option<Vq> = None;
+static mut CONTX: Option<Vq> = None;
+static mut CONRX_BUFS: u64 = 0;
+static mut CONTX_BUFS: u64 = 0;
+static mut CON_SEEN: u16 = 0;
+/// Drained-but-unread console bytes — a small in-kernel FIFO so a
+/// read() doesn't have to line up with a device completion.
+const CON_RXQ: usize = 2048;
+static mut CON_RXQ_BUF: [u8; CON_RXQ] = [0; CON_RXQ];
+static mut CON_RXQ_LEN: usize = 0;
+
+/// Drain completed RX buffers into the FIFO and re-post them.
+/// Returns bytes newly appended. Single-context discipline, same
+/// as the rest of the driver — callers serialize.
+fn con_drain() -> usize {
+    let Some(q) = (unsafe { (*core::ptr::addr_of_mut!(CONRX)).as_mut() }) else {
+        return 0;
+    };
+    let bufs = unsafe { *core::ptr::addr_of!(CONRX_BUFS) };
+    let mut got = 0usize;
+    let seen_start = unsafe { *core::ptr::addr_of!(CON_SEEN) };
+    let used = q.used_idx();
+    while unsafe { *core::ptr::addr_of!(CON_SEEN) } != used {
+        let seen = unsafe { *core::ptr::addr_of!(CON_SEEN) };
+        let (id, len) = q.used_entry(seen as usize);
+        unsafe {
+            *core::ptr::addr_of_mut!(CON_SEEN) = seen.wrapping_add(1)
+        };
+        let id = id as usize;
+        if id >= N_CON {
+            break; // bogus id — slot lost, never re-posted
+        }
+        let n = (len as usize).min(CON_BUFSZ);
+        let room = CON_RXQ - unsafe { *core::ptr::addr_of!(CON_RXQ_LEN) };
+        let take = n.min(room);
+        // SAFETY: our RX page and FIFO; bounds clamped above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (mm::pmap(bufs) + (id * CON_BUFSZ) as u64) as *const u8,
+                core::ptr::addr_of_mut!(CON_RXQ_BUF).cast::<u8>().add(*core::ptr::addr_of!(CON_RXQ_LEN)),
+                take,
+            );
+            *core::ptr::addr_of_mut!(CON_RXQ_LEN) += take;
+        }
+        got += take;
+        q.put_desc(id, bufs + (id * CON_BUFSZ) as u64, CON_BUFSZ as u32, DESC_WRITE, 0);
+        q.avail_push(id as u16);
+    }
+    // Re-posted buffers count even on a zero-length completion —
+    // without the kick the device may never notice them.
+    if unsafe { *core::ptr::addr_of!(CON_SEEN) } != seen_start {
+        q.notify();
+    }
+    got
+}
+
+/// Bytes waiting after a drain — the poll path calls this so
+/// POLLIN reflects the device, not just the leftover FIFO.
+pub fn console_pending() -> usize {
+    con_drain();
+    unsafe { *core::ptr::addr_of!(CON_RXQ_LEN) }
+}
+
+/// A live console channel (for the dev-node mint).
+pub fn console_present() -> bool {
+    unsafe { (*core::ptr::addr_of!(CONTX)).is_some() }
+}
+
+/// read() source for /dev/hvc0: drain, then copy out up to `len`
+/// bytes of queued console input. Returns bytes delivered — 0 on
+/// empty (the device node reports what's there; blocking tty
+/// semantics are the ldisc layer's job, not this channel's).
+pub fn console_read(out: &mut [u8]) -> usize {
+    con_drain();
+    let have = unsafe { *core::ptr::addr_of!(CON_RXQ_LEN) };
+    let n = have.min(out.len());
+    if n > 0 {
+        // SAFETY: our FIFO; shift the remainder down.
+        unsafe {
+            let p = core::ptr::addr_of_mut!(CON_RXQ_BUF).cast::<u8>();
+            core::ptr::copy_nonoverlapping(p, out.as_mut_ptr(), n);
+            core::ptr::copy(p.add(n), p, have - n);
+            *core::ptr::addr_of_mut!(CON_RXQ_LEN) = have - n;
+        }
+    }
+    n
+}
+
+/// write() sink for /dev/hvc0: stage the bytes into the TX page,
+/// post the chain, and spin for the completion — the same
+/// request/poll shape as virtio-blk's `request`.
+pub fn console_write(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let Some(q) = (unsafe { (*core::ptr::addr_of_mut!(CONTX)).as_mut() }) else {
+        return 0;
+    };
+    let bufs = unsafe { *core::ptr::addr_of!(CONTX_BUFS) };
+    let n = bytes.len().min(4096);
+    // SAFETY: our TX staging page; n <= page size.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            mm::pmap(bufs) as *mut u8,
+            n,
+        );
+    }
+    // Single readable descriptor — device reads `n` bytes out.
+    q.put_desc(0, bufs, n as u32, 0, 0);
+    if !q.poll_once(0) {
+        return 0;
+    }
+    n
+}
+
+/// Probe a transitional virtio-console function, set up both port-0
+/// queues, post the RX buffers, and run a TX datapath proof —
+/// "proof" bytes land in the chardev backend. Returns true when a
+/// console channel is live.
+pub fn console_init() -> bool {
+    let Some((io, _)) = probe_io(DEV_CON) else {
+        return false;
+    };
+    // VIRTIO_CONSOLE_F_MULTIPORT (bit 3) — the only feature this
+    // channel needs; QEMU's virtio-serial always offers it.
+    if !handshake_feat(io, 1 << 3) {
+        return false;
+    }
+    // Queue map (proven empirically): QEMU builds an ivq/ovq pair
+    // per existing port in id order — port 0 lands on sel 0,1 —
+    // then the CONTROL pair (qnum 32 vs the data queues' 128),
+    // then spare pairs. Ports start closed; only the control
+    // protocol opens them.
+    let max_ports = inl(io + R_CFG + 4).min(64);
+    let (Some(civq), Some(covq)) = (Vq::setup(io, 2), Vq::setup(io, 3)) else {
+        fail(io);
+        return false;
+    };
+    let Some(cpage) = kalloc::alloc_frames(0) else {
+        fail(io);
+        return false;
+    };
+    outb(io + R_STATUS, S_ACK | S_DRV | S_FEATOK | S_DRVOK);
+    // Post control-receive buffers: the device answers DEVICE_READY
+    // with PORT_ADD (+NAME/READY) events into them. Buffer 0..3 at
+    // cpage+0..255; sent messages stage at cpage+256.
+    for i in 0..4usize {
+        civq.put_desc(i, cpage + (i * 64) as u64, 64, DESC_WRITE, 0);
+        civq.avail_push(i as u16);
+    }
+    civq.notify();
+    // DEVICE_READY unlocks the control channel — the device holds
+    // all events until it arrives.
+    let cva = mm::pmap(cpage);
+    let put_ctl = |id: u32, ev: u16, val: u16| {
+        // SAFETY: cpage+256 is our staging slot, 8B message.
+        unsafe {
+            (cva as *mut u32).add(64).write_volatile(id);
+            (cva as *mut u16).add(130).write_volatile(ev);
+            (cva as *mut u16).add(131).write_volatile(val);
+        }
+        covq.put_desc(0, cpage + 256, 8, 0, 0);
+        covq.poll_once(0)
+    };
+    if !put_ctl(0, 0, 1) {
+        // DEVICE_READY
+        fail(io);
+        return false;
+    }
+    // Drain the event burst — PORT_ADD names the port id QEMU gave
+    // the virtconsole (auto-assigned, id 0 for the first port).
+    let mut port_id = u32::MAX;
+    let mut seen = 0u16;
+    let mut spins = 0u64;
+    while seen != civq.used_idx() || spins < 1_000_000 {
+        spins += 1;
+        core::hint::spin_loop();
+        while seen != civq.used_idx() {
+            let (id, _len) = civq.used_entry(seen as usize);
+            seen = seen.wrapping_add(1);
+            let slot = (id as usize).min(3);
+            // SAFETY: our ctrl page; the event record is 8B at
+            // slot*64.
+            let (pid, ev, _val) = unsafe {
+                let p = cva + (slot * 64) as u64;
+                (
+                    (p as *const u32).read_volatile(),
+                    (p as *const u16).add(2).read_volatile(),
+                    (p as *const u16).add(3).read_volatile(),
+                )
+            };
+            crate::log::printk(format_args!(
+                "rustux: virtio: console ctrl ev={ev} id={pid} len={_len}"
+            ));
+            if ev == 1 && port_id == u32::MAX {
+                // VIRTIO_CONSOLE_PORT_ADD
+                port_id = pid;
+            }
+            civq.put_desc(slot, cpage + (slot * 64) as u64, 64, DESC_WRITE, 0);
+            civq.avail_push(slot as u16);
+        }
+        if port_id != u32::MAX {
+            break;
+        }
+    }
+    if port_id == u32::MAX || port_id > max_ports {
+        crate::log::printk(format_args!(
+            "rustux: virtio: console no PORT_ADD"
+        ));
+        return false;
+    }
+    // Open the port — data only flows after PORT_OPEN.
+    if !put_ctl(port_id, 6, 1) {
+        fail(io);
+        return false;
+    }
+    // The port's own queue pair: sel 2*id in, sel 2*id+1 out —
+    // port 0 lands on sel 0/1, before the control pair.
+    let (Some(rx), Some(tx)) = (
+        Vq::setup(io, (2 * port_id) as u16),
+        Vq::setup(io, (2 * port_id + 1) as u16),
+    ) else {
+        fail(io);
+        return false;
+    };
+    let (Some(rx_bufs), Some(tx_bufs)) =
+        (kalloc::alloc_frames(0), kalloc::alloc_frames(0))
+    else {
+        fail(io);
+        return false;
+    };
+    let (rxsz, txsz) = (rx.size, tx.size);
+    outb(io + R_STATUS, S_ACK | S_DRV | S_FEATOK | S_DRVOK);
+    // SAFETY: init runs once, before tasks exist.
+    unsafe {
+        *core::ptr::addr_of_mut!(CONRX_BUFS) = rx_bufs;
+        *core::ptr::addr_of_mut!(CONTX_BUFS) = tx_bufs;
+        *core::ptr::addr_of_mut!(CON_SEEN) = 0;
+        *core::ptr::addr_of_mut!(CON_RXQ_LEN) = 0;
+        *core::ptr::addr_of_mut!(CONRX) = Some(rx);
+        *core::ptr::addr_of_mut!(CONTX) = Some(tx);
+    }
+    // Post all RX buffers — the device fills them as backend input
+    // arrives; con_drain consumes them at read time.
+    // SAFETY: CONRX just published.
+    let rx = unsafe { (*core::ptr::addr_of!(CONRX)).as_ref().unwrap() };
+    for i in 0..N_CON {
+        rx.put_desc(i, rx_bufs + (i * CON_BUFSZ) as u64, CON_BUFSZ as u32, DESC_WRITE, 0);
+        rx.avail_push(i as u16);
+    }
+    rx.notify();
+    // TX datapath proof: bytes flow out the chardev backend — with
+    // QEMU's file backend they land in the proof log verbatim.
+    let w = console_write(b"rustux: hvc0 console online\n");
+    crate::log::printk(format_args!(
+        "rustux: virtio: console {io:#x} rxq={} txq={} tx-proof {w}B",
+        rxsz, txsz
+    ));
+    true
 }
