@@ -8443,3 +8443,26 @@ pkey trio (329-331) is uniform EINVAL — no PKU. lstest floor
 same class as accttest last rung). Audit run-83: 0 confirmed —
 dissociation refcounting is the whole risk surface, and it's
 test-proven.
+
+run-325 lands the mount table — the groundwork everything else
+(quotactl, statmount, pivot_root) keys off. MOUNTS is 16 slots
+seeded rustux-root rw / proc ro+nosuid+nodev+noexec / devtmpfs;
+longest-prefix coverage decides who owns a path, mount_ro()
+gates every mutation under an MS_RDONLY mount (open-for-write,
+mkdir/rmdir, unlink, rename, linkat, truncate+ftruncate, the
+chmod/chown/utimens cores, xattr set+remove — fd-path arms
+check the inode's name, path cores check the resolved name).
+mount() is uid==0, tmpfs-only (ENODEV otherwise), target must
+be an existing dir, over-mount EBUSY, MS_REMOUNT re-sets flags;
+umount2 is exact-point EINVAL / root EBUSY. /proc/mounts +
+/proc/filesystems now generate from the table; statfs/fstatfs
+report the covering mount's magic + ST_*; name_to_handle_at's
+mount_id is the table's minted id. Divergences: umount doesn't
+busy-check open files (removes coverage like lazy umount);
+rmdir on a mount point is EROFS not EBUSY; mounts record
+ownership/flags only — covered dirs still show ramfs contents
+(no shadowing); non-remount mounts don't move the namespace.
+lstest floor 87->88, MAX_TASKS 114->115. Audit run-84: 0
+confirmed — CAP gate EPERM-proven, EROFS coverage test-proven
+on 14 mutation paths, the umount-UAF class is absent (statics,
+no superblock lifetimes).
