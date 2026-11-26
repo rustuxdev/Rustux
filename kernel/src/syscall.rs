@@ -803,6 +803,9 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         161 => sys_chroot(a1),
         163 => sys_acct(a1),
         155 => sys_pivot_root(a1, a2),
+        248 => sys_add_key(a1, a2, a3, a4, a5),
+        249 => sys_request_key(a1, a2, a3, a4),
+        250 => sys_keyctl(a1, a2, a3, a4, a5),
         165 => sys_mount(a1, a2, a3, a4),
         430 => sys_fsopen(a1, a2),
         431 => sys_fsconfig(a1, a2, a3, a4, a5),
@@ -1655,7 +1658,76 @@ fn sys_umount2(tgt: u64, flags: u64) -> u64 {
     user::sys_umount2(&tb[..tn], flags)
 }
 
-/// pivot_root(155): two canonicalized user path strings.
+/// add_key(248): type + desc strings, payload is a raw user
+/// buffer (copied under range_ok inside), ring is a KEY_SPEC_
+/// serial constant.
+fn sys_add_key(
+    typ: u64, desc: u64, payload: u64, plen: u64, ring: u64,
+) -> u64 {
+    let mut tb = [0u8; 257];
+    let mut db = [0u8; 257];
+    let tn = match copy_user_path(typ, &mut tb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let dn = match copy_user_path(desc, &mut db) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_add_key(&tb[..tn], &db[..dn], payload, plen, ring)
+}
+
+/// request_key(249): type + desc strings; callout info is read
+/// only on the instantiate path which doesn't exist.
+fn sys_request_key(typ: u64, desc: u64, info: u64, dest: u64) -> u64 {
+    let mut tb = [0u8; 257];
+    let mut db = [0u8; 257];
+    let tn = match copy_user_path(typ, &mut tb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let dn = match copy_user_path(desc, &mut db) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_request_key(&tb[..tn], &db[..dn], info, dest)
+}
+
+/// keyctl(250): string args are positional — cmd 1 name is a2,
+/// cmd 10 type/desc are a3/a4. Strings are copied only for the
+/// cmds that carry them; NULL stays None.
+fn sys_keyctl(
+    cmd: u64, a2: u64, a3: u64, a4: u64, a5: u64,
+) -> u64 {
+    let mut n2 = [0u8; 257];
+    let mut n3 = [0u8; 257];
+    let mut n4 = [0u8; 257];
+    let cpy = |p: u64, b: &mut [u8; 257]| -> Result<Option<usize>, u64> {
+        if p == 0 {
+            return Ok(None);
+        }
+        match copy_user_path(p, b) {
+            Ok(n) => Ok(Some(n)),
+            Err(e) => Err(e),
+        }
+    };
+    let (s2n, s3n, s4n) = match cmd {
+        1 => (match cpy(a2, &mut n2) { Ok(x) => x, Err(e) => return e },
+              None, None),
+        10 => (None,
+               match cpy(a3, &mut n3) { Ok(x) => x, Err(e) => return e },
+               match cpy(a4, &mut n4) { Ok(x) => x, Err(e) => return e }),
+        _ => (None, None, None),
+    };
+    user::sys_keyctl(
+        cmd, a2, a3, a4, a5,
+        s2n.map(|n| &n2[..n]),
+        s3n.map(|n| &n3[..n]),
+        s4n.map(|n| &n4[..n]),
+    )
+}
+
+/// pivot_root(155): two canonicalized user path strings./// pivot_root(155): two canonicalized user path strings.
 fn sys_pivot_root(new_root: u64, put_old: u64) -> u64 {
     let mut nb = [0u8; 257];
     let mut ob = [0u8; 257];

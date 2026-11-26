@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 115;
+const MAX_TASKS: usize = 116;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -2322,6 +2322,12 @@ pub struct Task {
     /// advisory: stored per task, inherited at fork, 0 (PER_LINUX)
     /// at spawn.
     persona: u32,
+    /// The task's joined session keyring — a KEYRINGS slot index,
+    /// u16::MAX = unset (falls back to the unnamed session ring).
+    /// Inherited across fork like Linux's keyring references.
+    session_ring: u16,
+    /// KEYCTL_SET_REQKEY_KEYRING default mode (0 = search all).
+    reqkey_mode: u8,
     /// ELFCLASS32 image: the task runs in IA-32e compatibility mode —
     /// entry on the GDT's 32-bit user CS, the whole address space in
     /// the low-4GiB compat window (private PDPT under PML4[0]), and
@@ -8082,6 +8088,8 @@ fn load(img: &[u8]) -> Option<Task> {
         did_exec: true,
         pers: PERS_LINUX,
         persona: 0,
+        session_ring: u16::MAX,
+        reqkey_mode: 0,
         is_compat: false,
         gs_base: 0,
         tls: [0; 4],
@@ -16790,6 +16798,614 @@ pub fn sys_quotactl_fd(fd: u64, cmd: u64, _id: u64, _addr: u64) -> u64 {
     ESRCH_
 }
 
+/// ---- keyrings (add_key 248 / request_key 249 / keyctl 250) ----
+///
+/// A compact model of the key retention API: KEYS hold the
+/// type/desc/payload, KEYRINGS hold membership as a bitmask of
+/// ring slots on each key (a key lives while any ring holds it).
+/// The five standard ring kinds resolve lazily against the
+/// caller: thread = tid, process = tgid, session = the task's
+/// joined ring (unnamed by default, named via JOIN_SESSION_
+/// KEYRING), user + user_session = uid. keyrings get serials from
+/// the same counter as keys — a serial names either.
+const KEY_DESC_MAX: usize = 255;
+const KEY_PL_MAX: usize = 1024;
+const MAX_KEYS: usize = 32;
+const MAX_KEYRINGS: usize = 16;
+
+struct Key {
+    serial: u32,
+    typ: [u8; 16],
+    typlen: u8,
+    desc: [u8; KEY_DESC_MAX],
+    dlen: u16,
+    payload: [u8; KEY_PL_MAX],
+    plen: u16,
+    rings: u16, // bitmask over KEYRINGS slots
+    owner: u32,
+    perm: u32,
+    revoked: bool,
+}
+
+struct Keyring {
+    serial: u32,
+    /// 0 thread / 1 process / 2 session / 3 user / 4 user_session /
+    /// 5 named session (joined via JOIN_SESSION_KEYRING).
+    kind: u8,
+    /// The identity this ring binds to: tid, tgid, sid, or uid.
+    owner: u32,
+    name: [u8; 32],
+    nlen: u8,
+}
+
+static mut KEYS: [Option<Key>; MAX_KEYS] = [const { None }; MAX_KEYS];
+static mut KEYRINGS: [Option<Keyring>; MAX_KEYRINGS] =
+    [const { None }; MAX_KEYRINGS];
+static mut KEY_SER: u32 = 0x100;
+
+fn keys() -> &'static mut [Option<Key>; MAX_KEYS] {
+    unsafe { &mut *core::ptr::addr_of_mut!(KEYS) }
+}
+fn keyrings() -> &'static mut [Option<Keyring>; MAX_KEYRINGS] {
+    unsafe { &mut *core::ptr::addr_of_mut!(KEYRINGS) }
+}
+fn key_ser() -> u32 {
+    unsafe {
+        let s = *core::ptr::addr_of!(KEY_SER);
+        *core::ptr::addr_of_mut!(KEY_SER) = s + 1;
+        s
+    }
+}
+fn key_i(serial: u32) -> Option<usize> {
+    keys().iter().position(|k| {
+        k.as_ref().is_some_and(|k| k.serial == serial)
+    })
+}
+fn ring_i(serial: u32) -> Option<usize> {
+    keyrings().iter().position(|r| {
+        r.as_ref().is_some_and(|r| r.serial == serial)
+    })
+}
+
+/// Resolve a KEY_SPEC_* (or a positive keyring serial) to a
+/// KEYRINGS slot for the caller, lazily minting spec rings when
+/// `create` is set — Linux creates the per-identity rings on
+/// first use.
+fn ring_resolve(t: &Task, spec: i64, create: bool) -> Result<usize, u64> {
+    const ENOKEY_: u64 = (-126i64) as u64;
+    const EINVAL_: u64 = (-22i64) as u64;
+    if spec >= 0 {
+        return match ring_i(spec as u32) {
+            Some(i) => Ok(i),
+            None => Err(ENOKEY_),
+        };
+    }
+    let (kind, owner): (u8, u32) = match spec {
+        -1 => (0, t.pid as u32),
+        -2 => (1, t.tgid as u32),
+        -3 => {
+            // The joined session ring if set, else the unnamed one.
+            if t.session_ring != u16::MAX
+                && keyrings()
+                    .get(t.session_ring as usize)
+                    .is_some_and(|s| s.is_some())
+            {
+                return Ok(t.session_ring as usize);
+            }
+            (2, t.sid as u32)
+        }
+        -4 => (3, t.uid as u32),
+        -5 => (4, t.uid as u32),
+        -6 => return Err(EINVAL_), // group keyrings never existed
+        _ => return Err(ENOKEY_), // REQKEY_AUTH/REQUESTOR need a ctx
+    };
+    if let Some(i) = keyrings().iter().position(|r| {
+        r.as_ref().is_some_and(|r| {
+            r.kind == kind && r.owner == owner && r.nlen == 0
+        })
+    }) {
+        return Ok(i);
+    }
+    if !create {
+        return Err(ENOKEY_);
+    }
+    let rs = keyrings();
+    let Some(i) = rs.iter().position(Option::is_none) else {
+        return Err((-28i64) as u64); // ENOSPC
+    };
+    rs[i] = Some(Keyring {
+        serial: key_ser(),
+        kind,
+        owner,
+        name: [0; 32],
+        nlen: 0,
+    });
+    Ok(i)
+}
+
+/// Is this serial a live key the caller may use? Search/read paths
+/// hide keys owned by another uid unless the OTHER perm nibble
+/// grants it — the single-uid model still proves the gate.
+fn key_usable(t: &Task, k: &Key, need: u32) -> bool {
+    if k.revoked {
+        return false;
+    }
+    if k.owner == t.uid {
+        return true;
+    }
+    k.perm & need != 0
+}
+
+/// add_key(248): type "user" only (anything else has no backend
+/// registered — ENODEV like a missing key type). A (type, desc)
+/// already present in the destination ring gets its payload
+/// replaced — the Linux update semantic. KEY_SPEC rings are
+/// minted lazily; a positive serial must name a keyring.
+pub fn sys_add_key(
+    typ: &[u8], desc: &[u8], payload: u64, plen: u64, ring: u64,
+) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENODEV_: u64 = (-19i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    if typ != b"user" {
+        return ENODEV_;
+    }
+    if desc.is_empty() || desc.len() > KEY_DESC_MAX {
+        return EINVAL_;
+    }
+    if plen > KEY_PL_MAX as u64 {
+        return EINVAL_;
+    }
+    if plen > 0 && !range_ok(payload, plen) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    let ri = match ring_resolve(t, ring as i64, true) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    // Update-in-place for a live (type, desc) already in the ring.
+    let ks = keys();
+    for k in ks.iter_mut().flatten() {
+        if k.rings & (1 << ri) != 0
+            && !k.revoked
+            && &k.desc[..k.dlen as usize] == desc
+        {
+            if plen > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        payload as *const u8,
+                        k.payload.as_mut_ptr(),
+                        plen as usize,
+                    )
+                };
+            }
+            k.plen = plen as u16;
+            return k.serial as u64;
+        }
+    }
+    let Some(i) = ks.iter().position(Option::is_none) else {
+        return (-28i64) as u64; // ENOSPC — the table quota
+    };
+    let mut k = Key {
+        serial: key_ser(),
+        typ: [0; 16],
+        typlen: 4,
+        desc: [0; KEY_DESC_MAX],
+        dlen: desc.len() as u16,
+        payload: [0; KEY_PL_MAX],
+        plen: plen as u16,
+        rings: 1 << ri,
+        owner: t.uid,
+        // KEY_POS_ALL | KEY_USR_VIEW|READ — the real default.
+        perm: 0x3f << 24 | 0x3 << 16,
+        revoked: false,
+    };
+    k.typ[..4].copy_from_slice(b"user");
+    k.desc[..desc.len()].copy_from_slice(desc);
+    if plen > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                payload as *const u8,
+                k.payload.as_mut_ptr(),
+                plen as usize,
+            )
+        };
+    }
+    ks[i] = Some(k);
+    ks[i].as_ref().unwrap().serial as u64
+}
+
+/// request_key(249): search the caller's rings for (type, desc) —
+/// the default chain is thread, process, session, user,
+/// user_session; SET_REQKEY_KEYRING narrows the starting ring.
+/// A hit optionally links into dest before returning the serial;
+/// a miss is ENOKEY — the /sbin/request-key callout has no
+/// usermode helper to run.
+pub fn sys_request_key(
+    typ: &[u8], desc: &[u8], _info: u64, dest: u64,
+) -> u64 {
+    const ENOKEY_: u64 = (-126i64) as u64;
+    const EINVAL_: u64 = (-22i64) as u64;
+    if typ != b"user" || desc.is_empty() || desc.len() > KEY_DESC_MAX {
+        return ENOKEY_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    // The search chain: the task's default mode picks one ring or
+    // the full identity ladder (thread first like Linux).
+    let specs: &[i64] = match t.reqkey_mode {
+        1 => &[-1],
+        2 => &[-2],
+        3 => &[-3],
+        4 => &[-4],
+        5 => &[-5],
+        _ => &[-1, -2, -3, -4, -5],
+    };
+    let mut hit: Option<usize> = None;
+    for &sp in specs {
+        let Ok(ri) = ring_resolve(t, sp, false) else { continue };
+        hit = keys().iter().position(|k| {
+            k.as_ref().is_some_and(|k| {
+                k.rings & (1 << ri) != 0
+                    && &k.desc[..k.dlen as usize] == desc
+                    && key_usable(t, k, 0x8)
+            })
+        });
+        if hit.is_some() {
+            break;
+        }
+    }
+    let Some(ki) = hit else { return ENOKEY_ };
+    if dest != 0 {
+        let ri = match ring_resolve(t, dest as i64, true) {
+            Ok(i) => i,
+            Err(e) => return e,
+        };
+        keys()[ki].as_mut().unwrap().rings |= 1 << ri;
+    }
+    keys()[ki].as_ref().unwrap().serial as u64
+}
+
+/// keyctl(250): the multiplexor. See the constant block for the
+/// covered ops; instantiate/negate/reject/watch/dh/pkey families
+/// need machinery that doesn't exist (auth keys, notifiers,
+/// asymmetric crypto) — those are EINVAL.
+pub fn sys_keyctl(
+    cmd: u64, a2: u64, a3: u64, a4: u64, a5: u64,
+    name2: Option<&[u8]>, name3: Option<&[u8]>, name4: Option<&[u8]>,
+) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENOKEY_: u64 = (-126i64) as u64;
+    const EEXIST_: u64 = (-17i64) as u64;
+    const EACCES_: u64 = (-13i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    match cmd {
+        0 => {
+            // GET_KEYRING_ID(spec_or_serial, create)
+            match ring_resolve(t, a2 as i64, a3 != 0) {
+                Ok(i) => keyrings()[i].as_ref().unwrap().serial as u64,
+                Err(e) => e,
+            }
+        }
+        1 => {
+            // JOIN_SESSION_KEYRING(name): mint-or-join a named
+            // session ring for this sid, bind the task to it.
+            let name = name2.unwrap_or(&[]);
+            if name.len() > 32 {
+                return EINVAL_;
+            }
+            let rs = keyrings();
+            if !name.is_empty() {
+                if let Some(i) = rs.iter().position(|r| {
+                    r.as_ref().is_some_and(|r| {
+                        r.kind == 5
+                            && r.owner == t.sid as u32
+                            && &r.name[..r.nlen as usize] == name
+                    })
+                }) {
+                    t.session_ring = i as u16;
+                    return rs[i].as_ref().unwrap().serial as u64;
+                }
+            } else {
+                // Empty name = the unnamed session ring.
+                if let Some(i) = rs.iter().position(|r| {
+                    r.as_ref().is_some_and(|r| {
+                        r.kind == 2 && r.owner == t.sid as u32
+                            && r.nlen == 0
+                    })
+                }) {
+                    t.session_ring = i as u16;
+                    return rs[i].as_ref().unwrap().serial as u64;
+                }
+            }
+            let Some(i) = rs.iter().position(Option::is_none) else {
+                return (-28i64) as u64;
+            };
+            let mut r = Keyring {
+                serial: key_ser(),
+                kind: if name.is_empty() { 2 } else { 5 },
+                owner: t.sid as u32,
+                name: [0; 32],
+                nlen: name.len() as u8,
+            };
+            r.name[..name.len()].copy_from_slice(name);
+            rs[i] = Some(r);
+            t.session_ring = i as u16;
+            rs[i].as_ref().unwrap().serial as u64
+        }
+        2 => {
+            // UPDATE(key, payload, plen)
+            let Some(ki) = key_i(a2 as u32) else { return ENOKEY_ };
+            {
+                let k = keys()[ki].as_ref().unwrap();
+                if k.revoked {
+                    return ENOKEY_;
+                }
+                if !key_usable(t, k, 0x4) {
+                    return EACCES_;
+                }
+            }
+            if a4 > KEY_PL_MAX as u64 {
+                return EINVAL_;
+            }
+            if a4 > 0 && !range_ok(a3, a4) {
+                return EFAULT_;
+            }
+            let k = keys()[ki].as_mut().unwrap();
+            if a4 > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        a3 as *const u8,
+                        k.payload.as_mut_ptr(),
+                        a4 as usize,
+                    )
+                };
+            }
+            k.plen = a4 as u16;
+            0
+        }
+        3 => {
+            // REVOKE(key)
+            let Some(ki) = key_i(a2 as u32) else { return ENOKEY_ };
+            let k = keys()[ki].as_mut().unwrap();
+            if k.revoked {
+                return ENOKEY_;
+            }
+            if !key_usable(t, k, 0x4) {
+                return EACCES_;
+            }
+            k.revoked = true;
+            k.plen = 0;
+            0
+        }
+        4 => {
+            // CHOWN(key, uid, gid) — root or current owner only;
+            // gid collapses (single-gid model like setfsgid).
+            let Some(ki) = key_i(a2 as u32) else { return ENOKEY_ };
+            let k = keys()[ki].as_mut().unwrap();
+            if t.uid != 0 && k.owner != t.uid {
+                return EPERM_;
+            }
+            if a3 != u64::MAX {
+                k.owner = a3 as u32;
+            }
+            0
+        }
+        5 => {
+            // SETPERM(key, perm)
+            let Some(ki) = key_i(a2 as u32) else { return ENOKEY_ };
+            let k = keys()[ki].as_mut().unwrap();
+            if t.uid != 0 && k.owner != t.uid
+                && k.perm & (0x20) == 0
+            {
+                return EACCES_;
+            }
+            if a3 & !0x3f3f3f3f != 0 {
+                return EINVAL_;
+            }
+            k.perm = a3 as u32;
+            0
+        }
+        6 => {
+            // DESCRIBE(key, buf, buflen) -> needed len incl NUL.
+            let Some(ki) = key_i(a2 as u32) else { return ENOKEY_ };
+            let k = keys()[ki].as_ref().unwrap();
+            if k.revoked {
+                return ENOKEY_;
+            }
+            let mut db = [0u8; 320];
+            let mut s = klib::seqbuf::SeqBuf::new(&mut db);
+            s.putmem(&k.typ[..k.typlen as usize]);
+            s.putc(b';');
+            s.printf(
+                b"%d;%d;%x;",
+                &[
+                    klib::fmt::Arg::I(k.owner as i64),
+                    klib::fmt::Arg::I(0),
+                    klib::fmt::Arg::U(k.perm as u64),
+                ],
+            );
+            s.putmem(&k.desc[..k.dlen as usize]);
+            s.putc(0);
+            let need = s.used();
+            if a3 != 0 {
+                let wr = need.min(a4 as usize);
+                if wr > 0 && !range_ok_w(a3, wr as u64) {
+                    return EFAULT_;
+                }
+                if wr > 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            db.as_ptr(),
+                            a3 as *mut u8,
+                            wr,
+                        )
+                    };
+                }
+            }
+            need as u64
+        }
+        7 => {
+            // CLEAR(ring) — drop every membership in that ring;
+            // a key no ring holds dies like Linux's GC.
+            let Some(ri) = ring_i(a2 as u32) else { return ENOKEY_ };
+            for k in keys().iter_mut() {
+                if let Some(k) = k.as_mut() {
+                    k.rings &= !(1u16 << ri);
+                }
+                if k.as_ref().is_some_and(|k| k.rings == 0) {
+                    *k = None;
+                }
+            }
+            0
+        }
+        8 => {
+            // LINK(key, ring)
+            let Some(ki) = key_i(a2 as u32) else { return ENOKEY_ };
+            let Some(ri) = ring_i(a3 as u32) else { return ENOKEY_ };
+            let k = keys()[ki].as_mut().unwrap();
+            if k.revoked {
+                return ENOKEY_;
+            }
+            if k.rings & (1 << ri) != 0 {
+                return EEXIST_;
+            }
+            k.rings |= 1 << ri;
+            0
+        }
+        9 => {
+            // UNLINK(key, ring)
+            let Some(ki) = key_i(a2 as u32) else { return ENOKEY_ };
+            let Some(ri) = ring_i(a3 as u32) else { return ENOKEY_ };
+            let k = keys()[ki].as_mut().unwrap();
+            if k.rings & (1 << ri) == 0 {
+                return ENOKEY_;
+            }
+            k.rings &= !(1 << ri);
+            if k.rings == 0 {
+                keys()[ki] = None; // GC: unlinked keys die
+            }
+            0
+        }
+        10 => {
+            // SEARCH(ring, type, desc, dest_ring)
+            let typ = name3.unwrap_or(&[]);
+            let desc = name4.unwrap_or(&[]);
+            let ri = match ring_resolve(t, a2 as i64, false) {
+                Ok(i) => i,
+                Err(e) => return e,
+            };
+            let Some(ki) = keys().iter().position(|k| {
+                k.as_ref().is_some_and(|k| {
+                    k.rings & (1 << ri) != 0
+                        && &k.typ[..k.typlen as usize] == typ
+                        && &k.desc[..k.dlen as usize] == desc
+                        && key_usable(t, k, 0x8)
+                })
+            }) else {
+                return ENOKEY_;
+            };
+            if a5 != 0 {
+                let dri = match ring_resolve(t, a5 as i64, true) {
+                    Ok(i) => i,
+                    Err(e) => return e,
+                };
+                keys()[ki].as_mut().unwrap().rings |= 1 << dri;
+            }
+            keys()[ki].as_ref().unwrap().serial as u64
+        }
+        11 => {
+            // READ(key_or_ring, buf, buflen) -> payload size.
+            if let Some(ri) = ring_i(a2 as u32) {
+                // Ring read: serials of member keys.
+                let need = 4 * keys().iter().flatten().filter(|k| {
+                    k.rings & (1 << ri) != 0
+                }).count() as u64;
+                if a3 != 0 {
+                    let wr = need.min(a4);
+                    if wr > 0 && !range_ok_w(a3, wr) {
+                        return EFAULT_;
+                    }
+                    let mut off = 0u64;
+                    for k in keys().iter().flatten() {
+                        if k.rings & (1 << ri) != 0
+                            && off < wr
+                        {
+                            unsafe {
+                                ((a3 + off) as *mut u32)
+                                    .write_unaligned(k.serial)
+                            };
+                            off += 4;
+                        }
+                    }
+                }
+                return need;
+            }
+            let Some(ki) = key_i(a2 as u32) else { return ENOKEY_ };
+            let k = keys()[ki].as_ref().unwrap();
+            if k.revoked || !key_usable(t, k, 0x2) {
+                return ENOKEY_;
+            }
+            let need = k.plen as u64;
+            if a3 != 0 {
+                let wr = need.min(a4);
+                if wr > 0 && !range_ok_w(a3, wr) {
+                    return EFAULT_;
+                }
+                if wr > 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            k.payload.as_ptr(),
+                            a3 as *mut u8,
+                            wr as usize,
+                        )
+                    };
+                }
+            }
+            need
+        }
+        14 => {
+            // SET_REQKEY_KEYRING(mode) — returns the old default.
+            let old = t.reqkey_mode;
+            if a2 > 7 {
+                return EINVAL_;
+            }
+            t.reqkey_mode = a2 as u8;
+            old as u64
+        }
+        21 => {
+            // INVALIDATE(key) — unlink everywhere + free.
+            let Some(ki) = key_i(a2 as u32) else { return ENOKEY_ };
+            keys()[ki] = None;
+            0
+        }
+        31 => {
+            // CAPABILITIES(buf, buflen): caps0 advertises only
+            // KEYCTL_CAPS0_CAPABILITIES — no persistent rings,
+            // dh/pkey/watch windows are 0.
+            if a3 < 8 && a2 != 0 {
+                if a2 == 0 {
+                    return 8;
+                }
+            }
+            if a2 != 0 {
+                if !range_ok_w(a2, 8) {
+                    return EFAULT_;
+                }
+                unsafe {
+                    (a2 as *mut u8).copy_from(
+                        [1u8, 0, 0, 0, 0, 0, 0, 0].as_ptr(), 8,
+                    )
+                };
+            }
+            8
+        }
+        _ => EINVAL_, // instantiate/negate/reject/dh/pkey/watch…
+    }
+}
+
 /// quotactl(179): no quota accounting exists anywhere — the honest
 /// surface a quota-less filesystem gives. cmd packs (subop<<8)|type:
 /// type > 2 (USR/GRP/PRJ) or an unknown subop is EINVAL; `special`
@@ -19684,6 +20300,8 @@ pub fn nt_thread_create(
         did_exec: false,
         pers: p.pers,
         persona: p.persona,
+        session_ring: p.session_ring,
+        reqkey_mode: p.reqkey_mode,
         is_compat: p.is_compat,
         gs_base: teb,
         tls: [0; 4],
@@ -38245,6 +38863,8 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         did_exec: false, // fork resets the child-exec'd flag
         pers: p.pers,
         persona: p.persona,
+        session_ring: p.session_ring,
+        reqkey_mode: p.reqkey_mode,
         is_compat: p.is_compat,
         gs_base: p.gs_base,
         tls: p.tls,
@@ -38441,6 +39061,8 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         did_exec: false,
         pers: p.pers,
         persona: p.persona,
+        session_ring: p.session_ring,
+        reqkey_mode: p.reqkey_mode,
         is_compat: p.is_compat,
         gs_base: p.gs_base,
         tls: p.tls,
