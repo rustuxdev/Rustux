@@ -7986,3 +7986,16 @@ dst aliased fresh pages), mincore OR'd over stale user bytes,
 round-up overflow panics on u64::MAX lens, and mincore is NR 27
 not 227. Audit run-59: 0 confirmed, 5 fixed in-run. mm3test 30
 checks green; exit 33, 90 tasks, zero leak. Ledger at 278 CVEs.
+
+The futex2 op block lands: futex_wait shares FUTEX_WAIT's
+compare-then-block with a collapsed bitset mask and an absolute
+clockid deadline; futex_wake rides the keyed scan; futex_requeue
+does CMP_REQUEUE in futex2 dress — cmpval gate, wake nr_wake, then
+rewrites nr_requeue waiters' keys A->B atomically in the syscall
+window. membarrier QUERY reports the uniprocessor-safe bitmask;
+supported cmds are honest no-ops. The shared futex2_flags_ok gate
+also tightened waitv to parse_waitv parity (__reserved==0,
+size==U32 exactly). Audit found two gates to add: requeue
+src==dst EINVAL (CVE-2014-3153 class) and identical waiter flags
+(CVE-2026-31554 class) — both landed. ft2test 28 checks green;
+exit 33, 91 tasks, zero leak. Ledger at 281 CVEs.
