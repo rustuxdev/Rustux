@@ -2708,6 +2708,22 @@ struct VFile {
     /// Minted by memfd_create — born unlinked (never path-reachable)
     /// and the only files F_ADD_SEALS/F_GET_SEALS accept.
     memfd: bool,
+    /// Handle generation — stamped at slot mint from VGEN. A
+    /// name_to_handle_at f_handle carries it; open_by_handle_at
+    /// rejects slot-reuse aliases (the ESTALE contract).
+    gen: u32,
+}
+
+/// Inode-generation sequence for file handles — bumped once per
+/// VFile mint. Never resets; wraparound after 2^32 inodes is the
+/// documented bound (handles are not persisted across boots).
+static mut VGEN: u32 = 0;
+fn vgen() -> u32 {
+    unsafe {
+        let g = &mut *core::ptr::addr_of_mut!(VGEN);
+        *g = g.wrapping_add(1);
+        *g
+    }
 }
 // SAFETY: VFILES slots own their buffers; single-CPU, IF-masked
 // context means no concurrent access. Raw ptr never escapes.
@@ -2821,6 +2837,7 @@ fn vfile_create(path: &[u8]) -> u64 {
         ctime_ns: 0,
         seals: 0,
         memfd: false,
+        gen: vgen(),
     };
     v.name[..path.len()].copy_from_slice(path);
     vs[i] = Some(v);
@@ -15219,6 +15236,300 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, typ: u64, idx1: u64, idx2: u64) -> u64 {
     }
 }
 
+// ---- file handles (name_to_handle_at 303 / open_by_handle_at 304)
+//
+// struct file_handle { handle_bytes u32 @0, handle_type i32 @4,
+// f_handle u8[128] @8 }. Our f_handle kinds:
+//   1 = vfile inode: [1, slot u16le, gen u32le, 0]          (8B)
+//   3 = the root dir (implicit, no slot)                  (1B)
+//   4 = initrd-archive file: [4, data ptr u64le]          (9B)
+//   5 = any other dir, canonical path bytes               (1+N B)
+// mount_id is always 1 — the flat archive is the only exported fs.
+// EOPNOTSUPP: /proc entries and dev/fifo nodes (no exportfs
+// equivalent exists); ESTALE: dead slot or generation mismatch.
+
+const FH_FILE: u8 = 1;
+const FH_ROOT: u8 = 3;
+const FH_ARCH: u8 = 4;
+const FH_DIR: u8 = 5;
+
+/// Encode the handle bytes for a canonical path, or the errno.
+/// `cap` is the caller's handle_bytes capacity — the caller must
+/// see the required size even when it doesn't fit (EOVERFLOW
+/// contract), so this returns (encoded, errno).
+fn handle_encode(path: &[u8]) -> Result<(usize, [u8; 129]), u64> {
+    const EOPNOTSUPP_: u64 = (-95i64) as u64;
+    let mut enc = [0u8; 129];
+    if path == b"proc" || path.starts_with(b"proc/") {
+        return Err(EOPNOTSUPP_); // procfs has no exportfs
+    }
+    if let Some(i) = vfile_find(path) {
+        let i = vfile_real(i);
+        let v = vfile(i).unwrap();
+        if !v.is_link && v.fmt & 0o170000 != 0o100000 {
+            return Err(EOPNOTSUPP_); // chr/blk/fifo node
+        }
+        enc[0] = FH_FILE;
+        enc[1..3].copy_from_slice(&(i as u16).to_le_bytes());
+        enc[3..7].copy_from_slice(&v.gen.to_le_bytes());
+        return Ok((8, enc));
+    }
+    let arc = unsafe { *core::ptr::addr_of!(INITRD) };
+    if arc.is_some_and(|a| crate::cpio::find(a, path).is_some())
+        && !dir_exists(path)
+    {
+        let d = crate::cpio::find(arc.unwrap(), path).unwrap();
+        enc[0] = FH_ARCH;
+        enc[1..9].copy_from_slice(&(d.as_ptr() as u64).to_le_bytes());
+        return Ok((9, enc));
+    }
+    if dir_exists(path) {
+        if path.is_empty() {
+            enc[0] = FH_ROOT;
+            return Ok((1, enc));
+        }
+        enc[0] = FH_DIR;
+        let n = path.len().min(128);
+        enc[1..1 + n].copy_from_slice(&path[..n]);
+        return Ok((1 + n, enc));
+    }
+    Err(ENOENT)
+}
+
+/// Encode a handle for the object an OFD names (AT_EMPTY_PATH's
+/// dirfd path) — same kind mapping as handle_encode.
+fn handle_encode_ofd(o: &OpenFile) -> Result<(usize, [u8; 129]), u64> {
+    const EOPNOTSUPP_: u64 = (-95i64) as u64;
+    let mut enc = [0u8; 129];
+    match &o.kind {
+        FdKind::Ram(i) => {
+            let v = vfile(*i).unwrap();
+            if !v.is_link && v.fmt & 0o170000 != 0o100000 {
+                return Err(EOPNOTSUPP_);
+            }
+            enc[0] = FH_FILE;
+            enc[1..3].copy_from_slice(&(*i as u16).to_le_bytes());
+            enc[3..7].copy_from_slice(&v.gen.to_le_bytes());
+            Ok((8, enc))
+        }
+        FdKind::Dir(dp) => handle_encode(dp.bytes()),
+        FdKind::File(d) => {
+            enc[0] = FH_ARCH;
+            enc[1..9].copy_from_slice(&(d.as_ptr() as u64).to_le_bytes());
+            Ok((9, enc))
+        }
+        _ => Err(EOPNOTSUPP_),
+    }
+}
+
+/// name_to_handle_at(dfd, path, handle, mount_id, flags): the
+/// handle-names-the-inode half. flags accept AT_SYMLINK_FOLLOW
+/// (0x400) and AT_EMPTY_PATH (0x1000); anything else EINVALs.
+/// handle->handle_bytes arrives as the caller's capacity; too
+/// small writes the needed size back and EOVERFLOWs like Linux.
+/// No privilege gate — Linux lets anyone name a handle (opening
+/// it is what CAP_DAC_READ_SEARCH gates).
+pub fn sys_name_to_handle_at(
+    dfd: u64, name: &[u8], handle: u64, mount_id: u64, flags: u64,
+) -> u64 {
+    const EOVERFLOW_: u64 = (-75i64) as u64;
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return EINVAL;
+    }
+    if !range_ok(handle, 8) || !range_ok_w(handle, 8) {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    // SAFETY: handle readable for 8 bytes (checked).
+    let cap = unsafe { (handle as *const u32).read_unaligned() } as usize;
+    let (need, enc) = if name.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return ENOENT;
+        }
+        // The dirfd itself — AT_FDCWD names the cwd.
+        if dfd == u64::MAX || (dfd as u32 as i32) == -100 {
+            let fst = unsafe {
+                &(*core::ptr::addr_of!(FSTABS))[t.fsi as usize]
+            };
+            match handle_encode(&fst.cwd[..fst.cwdlen as usize]) {
+                Ok(x) => x,
+                Err(e) => return e,
+            }
+        } else {
+            let Some(o) = ofd(t, dfd) else {
+                return EBADF;
+            };
+            match handle_encode_ofd(o) {
+                Ok(x) => x,
+                Err(e) => return e,
+            }
+        }
+    } else {
+        let (cb, cn) = match canon_path(dfd, name) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        let (rb, rn, _) =
+            match resolve_links(&cb[..cn], flags & AT_SYMLINK_FOLLOW != 0)
+            {
+                Ok(x) => x,
+                Err(e) => return e,
+            };
+        match handle_encode(&rb[..rn]) {
+            Ok(x) => x,
+            Err(e) => return e,
+        }
+    };
+    // mount_id first — Linux fills it even when the handle can't
+    // be fully written? It fills nothing on error; we write it only
+    // on the success and EOVERFLOW paths (it is a property of the
+    // fs, already known). EFAULT on a bad mount_id pointer.
+    if !range_ok_w(mount_id, 4) {
+        return EFAULT;
+    }
+    if cap < need {
+        // SAFETY: handle writable for 8 bytes (checked).
+        unsafe { (handle as *mut u32).write_unaligned(need as u32) };
+        unsafe { (mount_id as *mut u32).write_unaligned(1) };
+        return EOVERFLOW_;
+    }
+    if !range_ok_w(handle + 8, need as u64) {
+        return EFAULT;
+    }
+    // SAFETY: handle + mount_id writable for the emitted sizes.
+    unsafe {
+        (handle as *mut u32).write_unaligned(need as u32);
+        (handle as *mut u32).add(1).write_unaligned(1); // handle_type
+        let dst = (handle + 8) as *mut u8;
+        core::ptr::copy_nonoverlapping(enc.as_ptr().add(1), dst.add(1), need - 1);
+        *dst = enc[0];
+        (mount_id as *mut u32).write_unaligned(1);
+    }
+    0
+}
+
+/// open_by_handle_at(mount_fd, handle, flags): CAP_DAC_READ_SEARCH's
+/// stand-in is uid==0 (EPERM otherwise). mount_fd must name an fd
+/// on the exported fs (Ram/Dir/archive File) — anything else is the
+/// mount-mismatch EINVAL. Handles decode by kind: FH_FILE validates
+/// slot AND generation (slot reuse -> ESTALE), FH_DIR re-verifies
+/// the canonical path still names a dir, FH_ARCH re-finds the
+/// archive member by data pointer, FH_ROOT always opens "/".
+/// O_CREAT/O_EXCL/O_TRUNC EINVAL (no name exists to apply them to).
+pub fn sys_open_by_handle_at(mfd: u64, handle: u64, flags: u64) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const ESTALE_: u64 = (-116i64) as u64;
+    const EISDIR_: u64 = (-21i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF };
+    if t.uid != 0 {
+        return EPERM_;
+    }
+    let Some(mo) = ofd(t, mfd) else {
+        return EBADF;
+    };
+    if !matches!(
+        mo.kind,
+        FdKind::Ram(_) | FdKind::Dir(_) | FdKind::File(_)
+    ) {
+        return EINVAL; // fd not on the exported fs
+    }
+    const KNOWN: u64 = O_ACCMODE | O_CLOEXEC | O_DIRECTORY
+        | O_NOFOLLOW | O_PATH | O_APPEND | O_LARGEFILE | O_NONBLOCK
+        | O_NOCTTY;
+    if flags & !KNOWN != 0 {
+        return EINVAL;
+    }
+    if !range_ok(handle, 4) {
+        return EFAULT;
+    }
+    // SAFETY: handle readable for 4 bytes (checked).
+    let len = unsafe { (handle as *const u32).read_unaligned() } as usize;
+    if len == 0 || len > 128 || !range_ok(handle + 8, len as u64) {
+        return if len == 0 || len > 128 { EINVAL } else { EFAULT };
+    }
+    let mut fhbuf = [0u8; 129];
+    // SAFETY: f_handle readable for `len` bytes (checked).
+    unsafe {
+        ((handle + 8) as *const u8)
+            .copy_to_nonoverlapping(fhbuf.as_mut_ptr().add(1), len);
+    }
+    let fh = &fhbuf[1..1 + len];
+    let acc = flags & O_ACCMODE;
+    let kind = match fh[0] {
+        FH_FILE => {
+            if len != 8 {
+                return EINVAL;
+            }
+            let slot = u16::from_le_bytes([fh[1], fh[2]]) as usize;
+            let gen = u32::from_le_bytes([fh[3], fh[4], fh[5], fh[6]]);
+            let Some(v) = vfile(slot) else {
+                return ESTALE_;
+            };
+            if v.gen != gen {
+                return ESTALE_;
+            }
+            FdKind::Ram(vfile_real(slot))
+        }
+        FH_ROOT => {
+            if acc != 0 {
+                return EISDIR_;
+            }
+            FdKind::Dir(DirPath::of(b""))
+        }
+        FH_ARCH => {
+            if len != 9 {
+                return EINVAL;
+            }
+            let ptr = u64::from_le_bytes([
+                fh[1], fh[2], fh[3], fh[4], fh[5], fh[6], fh[7], fh[8],
+            ]) as *const u8;
+            let arc = unsafe { *core::ptr::addr_of!(INITRD) };
+            let Some(a) = arc else { return ESTALE_ };
+            let mut found = None;
+            for (_nm, data) in crate::cpio::entries(a) {
+                if data.as_ptr() == ptr {
+                    found = Some(data);
+                    break;
+                }
+            }
+            let Some(d) = found else { return ESTALE_ };
+            FdKind::File(d)
+        }
+        FH_DIR => {
+            if acc != 0 {
+                return EISDIR_;
+            }
+            let p = &fh[1..];
+            if !dir_exists(p) {
+                return ESTALE_;
+            }
+            FdKind::Dir(DirPath::of(p))
+        }
+        _ => return EINVAL,
+    };
+    // Mint the OFD + fd slot — the fd_open tail.
+    let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+    let Some(oi) = ofds.iter().position(Option::is_none) else {
+        return EMFILE;
+    };
+    let Some(fi) = fdt(t).fds.iter().position(Option::is_none) else {
+        return EMFILE;
+    };
+    ofds[oi] = Some(OpenFile {
+        kind,
+        pos: 0,
+        refs: 1,
+        append: flags & O_APPEND != 0,
+        nonblock: flags & O_NONBLOCK != 0,
+        accmode: acc as u8,
+    });
+    fdt(t).fds[fi] = Some(oi as u16);
+    cloexec_set(t, fi, flags & O_CLOEXEC != 0);
+    fi as u64
+}
+
 /// syslog(type, bufp, len): the kernel-log-ring reader (klogctl).
 /// Types <9 need uid==0 (CAP_SYSLOG/CAP_SYS_ADMIN upstream; uid is
 /// this model's privilege bit, same as chroot/setuid checks).
@@ -22933,6 +23244,8 @@ pub fn fs_linkat(old: &[u8], new: &[u8], flags: u64) -> u64 {
         ctime_ns: 0,
         seals: 0,
         memfd: false,
+        gen: vgen(), // aliases never mint handles (vfile_real wins)
+                       // — stamped anyway so the field is never 0
     };
     a.name[..new.len()].copy_from_slice(new);
     vs[j] = Some(a);

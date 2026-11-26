@@ -801,6 +801,8 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_CHDIR => sys_chdir(a1),
         NR_FCHDIR => user::sys_fchdir(a1),
         161 => sys_chroot(a1),
+        303 => sys_name_to_handle_at(a1, a2, a3, a4, a5),
+        304 => user::sys_open_by_handle_at(a1, a2, a3),
         312 => user::sys_kcmp(a1, a2, a3, a4, a5),
         NR_CHMOD => sys_chmod(a1, a2),
         NR_FCHMOD => user::fd_chmod(a1, a2),
@@ -1574,6 +1576,19 @@ fn sys_chroot(path: u64) -> u64 {
         Err(e) => return e,
     };
     user::sys_chroot(&name[..n])
+}
+
+/// name_to_handle_at(303): copy the path then delegate — the
+/// handle/mount_id pointers stay userspace-side.
+fn sys_name_to_handle_at(
+    dirfd: u64, path: u64, handle: u64, mount_id: u64, flags: u64,
+) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_name_to_handle_at(dirfd, &name[..n], handle, mount_id, flags)
 }
 
 /// mkdir/mkdirat(dirfd, path, mode): mode is the new dir's stored
