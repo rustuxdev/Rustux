@@ -701,6 +701,13 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         224 => user::sys_timer_gettime(a1, a2),
         225 => user::sys_timer_getoverrun(a1),
         226 => user::sys_timer_delete(a1),
+        // POSIX message queues.
+        240 => user::sys_mq_open(a1, a2, a3, a4),
+        241 => user::sys_mq_unlink(a1),
+        242 => user::sys_mq_timedsend(ctx, a1, a2, a3, a4, a5),
+        243 => user::sys_mq_timedreceive(ctx, a1, a2, a3, a4, a5),
+        244 => user::sys_mq_notify(a1, a2),
+        245 => user::sys_mq_getsetattr(a1, a2, a3),
         68 => user::sys_msgget(a1, a2),
         69 => user::sys_msgsnd(ctx, a1, a2, a3, a4),
         70 => user::sys_msgrcv(ctx, a1, a2, a3, a4, a5),

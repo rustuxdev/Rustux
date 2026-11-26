@@ -378,6 +378,16 @@ enum WaitOn {
     /// buf, wait_len nsops. Any val change on the set re-evaluates
     /// the whole array; EIDRM/EINTR/ETIME frees it.
     SemOp(usize),
+    /// mq_timedreceive() on an empty queue: wait_ptr is the user
+    /// msg buffer, wait_len its cap, wait_ptr2 the prio out VA —
+    /// the send waker delivers the highest-prio message through
+    /// the sleeper's pml4 like MsgRcv.
+    MqRcv(usize),
+    /// mq_timedsend() on a full queue: the message was staged at
+    /// arm — wait_ptr the kernel buf holding [prio][len][data],
+    /// wait_len the staged size. A receive waker links it when
+    /// room frees; ETIMEDOUT/EINTR/close frees it.
+    MqSnd(usize),
     /// poll(): `wait_ptr` is the user pollfd array, `wait_len` the
     /// fd count. Any pipe-state change re-scans it; wait_deadline
     /// ticks (0 = none) bounds the sleep.
@@ -582,6 +592,9 @@ enum FdKind {
     /// recycles, so a stale pid resolves to nothing (ESRCH /
     /// POLLIN) rather than aliasing a different task.
     Pidfd(u64),
+    /// A POSIX message queue descriptor — queue state lives in
+    /// MQUEUES[id]; the descriptor only carries accmode/nonblock.
+    MQueue(usize),
     /// A generated /proc file — contents are rendered into a
     /// kernel frame at open (Linux's seq_file snapshot model), so
     /// reads and stats see one consistent image even if the task
@@ -1800,11 +1813,12 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
             }
             t.frame_mask = u64::MAX;
         }
-        // A MsgSnd/SemOp waiter's staged kernel buffer dies with
-        // the wait — the queue never owned it. MsgSnd's wait_len
-        // is the payload bytes, SemOp's is nsops.
+        // A MsgSnd/SemOp/MqSnd waiter's staged kernel buffer dies
+        // with the wait — the queue never owned it. MsgSnd's
+        // wait_len is the payload bytes, SemOp's is nsops, MqSnd's
+        // the staged [prio][len][data] record.
         match t.wait_on {
-            WaitOn::MsgSnd(_) => unsafe {
+            WaitOn::MsgSnd(_) | WaitOn::MqSnd(_) => unsafe {
                 stage_free(t.wait_len as usize, t.wait_ptr as *mut u8)
             },
             WaitOn::SemOp(_) => unsafe {
@@ -3109,6 +3123,9 @@ impl Task {
         if last {
             ptimer_release_tgid(self.tgid);
         }
+        // mq_notify registrations are per-process state — a dying
+        // task can't hold one open (Linux clears on exit too).
+        mq_clear_notify(self.pid);
         if self.kstack_base != 0 {
             // SAFETY: kstack_base came from kmalloc, freed once here.
             unsafe { kalloc::kfree(self.kstack_base as *mut u8) };
@@ -14057,7 +14074,9 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 FdKind::Dir(_) => return EINVAL,
                 // An epoll fd has no readable stream — same EINVAL
                 // Linux gives read-side ioctls on it.
-                FdKind::Epoll(_) | FdKind::Pidfd(_) => return EINVAL,
+                FdKind::Epoll(_)
+                | FdKind::Pidfd(_)
+                | FdKind::MQueue(_) => return EINVAL,
                 // FIONREAD on eventfd/timerfd is sizeof(u64) once
                 // they're readable, 0 before (Linux's answer).
                 FdKind::Eventfd(i) => {
@@ -14804,6 +14823,8 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         | FdKind::Signalfd(_)
         | FdKind::Inotify(_)
         | FdKind::Pidfd(_) => (0o20600, 0, 0),
+        // mqds stat as fifos — the mqueue fs mints S_IFIFO inodes.
+        FdKind::MQueue(_) => (0o10600, 0, 0),
     }
 }
 
@@ -18965,6 +18986,8 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Epoll(_) => EINVAL,
         // pidfds are poll-only endpoints — same EINVAL.
         FdKind::Pidfd(_) => EINVAL,
+        // mqds move messages through the mq_* calls — no read.
+        FdKind::MQueue(_) => EINVAL,
         FdKind::Eventfd(i) => eventfd_read(ctx, *i, buf, len),
         FdKind::Timerfd(i) => timerfd_read(ctx, *i, buf, len),
         FdKind::Signalfd(i) => signalfd_read(ctx, *i, buf, len),
@@ -19230,6 +19253,9 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     }
     if let FdKind::Inotify(_) = &o.kind {
         return EINVAL;
+    }
+    if let FdKind::MQueue(_) = &o.kind {
+        return EINVAL; // mqds aren't byte-stream writable either
     }
     if let FdKind::Dev(i) = &o.kind {
         if o.accmode == 0 {
@@ -21591,6 +21617,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         }
         FdKind::Pidfd(_) => {
             s.puts(b"anon_inode:[pidfd]");
+        }
+        FdKind::MQueue(_) => {
+            s.puts(b"anon_inode:[mqueue]");
         }
         FdKind::Proc { .. } => {
             s.puts(b"anon_inode:[proc]");
@@ -24050,6 +24079,9 @@ fn ofd_release(oi: usize) {
     if let FdKind::Inotify(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(INOTIFY))[i] = None };
     }
+    if let FdKind::MQueue(i) = kind {
+        mq_release(i); // an unlinked queue dies at last close
+    }
     if let FdKind::Dev(i) = kind {
         // pty end closed: masters are rdev 128, slaves 136 — the
         // index rides the minor. A dead master gives slave reads/
@@ -24724,6 +24756,25 @@ fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
                 }
             }
         }
+        // mqd: readable while a message queues, writable while a
+        // slot is free — accmode gates each direction.
+        FdKind::MQueue(i) => {
+            let mqs = unsafe { &*core::ptr::addr_of!(MQUEUES) };
+            match mqs.get(*i).and_then(|s| s.as_ref()) {
+                None => POLLNVAL,
+                Some(q) => {
+                    let n = q.msgs.iter().take_while(|m| m.is_some()).count();
+                    let mut r = 0u16;
+                    if o.accmode != 1 && n > 0 {
+                        r |= POLLIN;
+                    }
+                    if o.accmode != 0 && n < q.maxmsg as usize {
+                        r |= POLLOUT;
+                    }
+                    r
+                }
+            }
+        }
         // pidfd: POLLIN once the named task is dead — a zombie or a
         // fully reaped slot both count, like Linux's exit notice.
         FdKind::Pidfd(pid) => {
@@ -25279,6 +25330,19 @@ fn poll_expire() {
                         )
                     };
                     t.ctx.rax = (-62i64) as u64; // ETIME
+                }
+                // mq_timed* deadline: ABSTIME like Linux — a staged
+                // send payload is freed with the wait; the answer
+                // is ETIMEDOUT (the ETIME of the mq API).
+                WaitOn::MqRcv(_) => t.ctx.rax = (-110i64) as u64,
+                WaitOn::MqSnd(_) => {
+                    unsafe {
+                        stage_free(
+                            t.wait_len as usize,
+                            t.wait_ptr as *mut u8,
+                        )
+                    };
+                    t.ctx.rax = (-110i64) as u64;
                 }
                 _ => continue,
             }
@@ -27271,6 +27335,756 @@ pub fn sys_timer_delete(id: u64) -> u64 {
     0
 }
 
+// --- POSIX message queues (mq_open..mq_getsetattr) --------------
+
+const MAX_MQUEUES: usize = 16;
+const MQ_MAXMSG: usize = 32;
+const MQ_MSGSIZE_MAX: u32 = 8192;
+const MQ_PRIO_MAX: u64 = 32768;
+/// si_code an mq notification carries — Linux's SI_MESGQ.
+const SI_MESGQ: i32 = -3;
+
+/// A queued message — a stage_alloc'd record holding
+/// [prio u32][len u32][payload]; queue-owned from link to pop.
+struct MqMsg {
+    rec: u64,
+    len: u32,
+}
+
+struct MQueue {
+    name: [u8; 255],
+    nlen: usize,
+    maxmsg: u32,
+    msgsize: u32,
+    /// Compacted, sorted prio-desc / FIFO within a prio — msgs[0]
+    /// is always the next message out like Linux's prio-heap head.
+    msgs: [Option<MqMsg>; MQ_MAXMSG],
+    /// Open mqd count — unlink only marks dead; the last close frees.
+    refs: u32,
+    dead: bool,
+    /// mq_notify registration: one task per queue, fires once on
+    /// the empty->nonempty edge like Linux's notify-once.
+    notify_pid: u64, // 0 = none
+    notify_signo: u32,
+    notify_val: i32,
+}
+
+static mut MQUEUES: [Option<MQueue>; MAX_MQUEUES] =
+    [const { None }; MAX_MQUEUES];
+
+/// Name lookup — unlinked queues already answer ENOENT.
+fn mq_named(name: &[u8]) -> Option<usize> {
+    let mqs = unsafe { &*core::ptr::addr_of!(MQUEUES) };
+    mqs.iter()
+        .flatten()
+        .position(|q| !q.dead && &q.name[..q.nlen] == name)
+}
+
+/// fd -> (ofd index, queue slot). EBADF for bad fds and every
+/// non-mqd kind like Linux (mqd_t is just an fd).
+fn mq_ofd(fd: u64) -> Result<(usize, usize), u64> {
+    const EBADF_: u64 = (-9i64) as u64;
+    let Some(t) = cur_mut() else { return Err(EBADF_) };
+    let Some(oi) = fdt(t).fds.get(fd as usize).copied().flatten() else {
+        return Err(EBADF_);
+    };
+    let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
+    match ofds.get(oi as usize).and_then(|s| s.as_ref()) {
+        Some(o) => match o.kind {
+            FdKind::MQueue(i) => Ok((oi as usize, i)),
+            _ => Err(EBADF_),
+        },
+        None => Err(EBADF_),
+    }
+}
+
+/// Queue depth — the compacted prefix.
+fn mq_nmsg(q: &MQueue) -> usize {
+    q.msgs.iter().take_while(|m| m.is_some()).count()
+}
+
+fn mq_prio(m: &MqMsg) -> u32 {
+    unsafe { (m.rec as *const u32).read_unaligned() }
+}
+
+/// Payload bytes of a staged record — m.len is the whole staged
+/// allocation ([prio][plen][data]) so the payload runs m.len - 8.
+fn mq_plen(m: &MqMsg) -> u32 {
+    unsafe { ((m.rec + 4) as *const u32).read_unaligned() }
+}
+
+/// Sorted insert of a staged record — descending prio, FIFO within
+/// one prio like Linux's prio-heap ordering.
+fn mq_link(q: &mut MQueue, rec: u64, len: u32) {
+    let prio = unsafe { (rec as *const u32).read_unaligned() };
+    let n = mq_nmsg(q);
+    let mut at = n;
+    for (i, s) in q.msgs.iter().take(n).enumerate() {
+        if mq_prio(s.as_ref().unwrap()) < prio {
+            at = i;
+            break;
+        }
+    }
+    let mut i = n;
+    while i > at {
+        q.msgs[i] = q.msgs[i - 1].take();
+        i -= 1;
+    }
+    q.msgs[at] = Some(MqMsg { rec, len });
+}
+
+/// Pop the head (highest prio, oldest within it).
+fn mq_pop(q: &mut MQueue) -> Option<MqMsg> {
+    let m = q.msgs[0].take()?;
+    let mut i = 0;
+    while q.msgs[i + 1].is_some() {
+        q.msgs[i] = q.msgs[i + 1].take();
+        i += 1;
+    }
+    Some(m)
+}
+
+/// Free every queued record — unlink-destroy and drop paths.
+fn mq_drain(q: &mut MQueue) {
+    for s in q.msgs.iter_mut() {
+        if let Some(m) = s.take() {
+            unsafe { stage_free(m.len as usize, m.rec as *mut u8) };
+        }
+    }
+}
+
+/// A message landed on qi — first feed a blocked receiver through
+/// its own pml4 (MsgRcv's discipline), else fire a pending
+/// mq_notify registration on the empty->nonempty edge.
+fn mq_after_link(qi: usize, was_empty: bool) {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(w) = s.as_mut() else { continue };
+        if w.state != TaskState::Blocked || w.wait_on != WaitOn::MqRcv(qi)
+        {
+            continue;
+        }
+        // Re-check the sleeper's buffer through ITS pml4 — pages
+        // can have been unmapped after the arm.
+        let (pml4, buf, cap, prio_va) =
+            (w.pml4, w.wait_ptr, w.wait_len, w.wait_ptr2);
+        let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+        let Some(q) = mqs[qi].as_mut() else { return };
+        let Some(m) = mq_pop(q) else { return };
+        let plen = mq_plen(&m);
+        let payload = unsafe {
+            core::slice::from_raw_parts(
+                (m.rec + 8) as *const u8,
+                plen as usize,
+            )
+        };
+        let ok = plen as u64 <= cap
+            && write_task_bytes(pml4, buf, payload)
+            && (prio_va == 0
+                || write_task_bytes(
+                    pml4,
+                    prio_va,
+                    &mq_prio(&m).to_ne_bytes(),
+                ));
+        unsafe { stage_free(m.len as usize, m.rec as *mut u8) };
+        if !ok {
+            // Buffer failed — the message is consumed anyway
+            // (Linux pops before copying too).
+            w.ctx.rax = EFAULT;
+        } else {
+            w.ctx.rax = plen as u64;
+        }
+        w.wait_on = WaitOn::None;
+        w.wait_deadline = 0;
+        w.state = TaskState::Runnable;
+        return;
+    }
+    if !was_empty {
+        return;
+    }
+    // empty->nonempty with nobody blocked: notify once, then
+    // clear the registration like Linux.
+    let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+    let Some(q) = mqs[qi].as_mut() else { return };
+    if q.notify_pid == 0 {
+        return;
+    }
+    let (pid, signo, val) = (q.notify_pid, q.notify_signo, q.notify_val);
+    q.notify_pid = 0;
+    if let Some(t) = tasks
+        .iter_mut()
+        .flatten()
+        .find(|t| t.pid == pid && t.state != TaskState::Exited)
+    {
+        let _ = pend_one(
+            t,
+            signo as u64,
+            SigSrc { code: SI_MESGQ, pid: 0, uid: 0, aux: val as u64 },
+        );
+    }
+}
+
+/// A slot freed on qi — let the first blocked sender link its
+/// staged record, then a receiver or notify can take it.
+fn mq_wake_snd(qi: usize) {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(w) = s.as_mut() else { continue };
+        if w.state != TaskState::Blocked || w.wait_on != WaitOn::MqSnd(qi)
+        {
+            continue;
+        }
+        let (rec, len) = (w.wait_ptr, w.wait_len as u32);
+        let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+        let Some(q) = mqs[qi].as_mut() else { return };
+        if mq_nmsg(q) >= q.maxmsg as usize {
+            return;
+        }
+        let was_empty = mq_nmsg(q) == 0;
+        mq_link(q, rec, len);
+        w.ctx.rax = 0;
+        w.wait_on = WaitOn::None;
+        w.wait_deadline = 0;
+        w.state = TaskState::Runnable;
+        mq_after_link(qi, was_empty);
+        return;
+    }
+}
+
+/// Task-exit: drop mq_notify registrations held by pid — Linux
+/// clears the registration when the registering process dies.
+fn mq_clear_notify(pid: u64) {
+    let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+    for q in mqs.iter_mut().flatten() {
+        if q.notify_pid == pid {
+            q.notify_pid = 0;
+        }
+    }
+}
+
+/// mqd close: refs down; an unlinked queue dies at last close.
+/// Blocked waiters can't exist then — each holds an mqd itself.
+fn mq_release(qi: usize) {
+    let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+    let Some(q) = mqs.get_mut(qi).and_then(|s| s.as_mut()) else {
+        return;
+    };
+    q.refs = q.refs.saturating_sub(1);
+    if q.refs == 0 && q.dead {
+        let mut q = mqs[qi].take().unwrap();
+        mq_drain(&mut q);
+    }
+}
+
+/// Read a mq name: glibc strips the leading '/', so the kernel sees
+/// the bare component — any '/' inside is EACCES (flat table).
+fn mq_read_name(va: u64) -> Result<([u8; 255], usize), u64> {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    if !range_ok(va, 1) {
+        return Err(EFAULT_);
+    }
+    let Some(t) = cur_mut() else { return Err(EINVAL) };
+    let mut out = [0u8; 255];
+    let n = read_task_str(t.pml4, va, &mut out);
+    if n == 0 {
+        return Err(ENOENT);
+    }
+    if n >= out.len() {
+        return Err(ENAMETOOLONG_);
+    }
+    // glibc strips the leading '/' client-side — the kernel only
+    // ever sees the bare name. An inner '/' can't resolve in the
+    // flat queue table: Linux reports EACCES, not EINVAL.
+    const EACCES_: u64 = (-13i64) as u64;
+    if out[..n].contains(&b'/') {
+        return Err(EACCES_);
+    }
+    Ok((out, n))
+}
+
+/// mq_open(name, oflag, mode, attr): find-or-create a named queue
+/// and mint an mqd fd. O_CREAT reads attr {flags,maxmsg,msgsize};
+/// defaults are Linux's (10 x 8192). mode is accepted, unused.
+pub fn sys_mq_open(name: u64, oflag: u64, _mode: u64, attr: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const EEXIST_: u64 = (-17i64) as u64;
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const O_CREAT_: u64 = 0o100;
+    const O_EXCL_: u64 = 0o200;
+    const O_NONBLOCK_: u64 = 0o4000;
+    const O_CLOEXEC_: u64 = 0o2000000;
+    const O_LARGEFILE_: u64 = 0o100000; // glibc adds it — inert 64-bit
+    let accmode = oflag & 3;
+    if accmode > 2 {
+        return EINVAL;
+    }
+    if oflag
+        & !(3 | O_CREAT_ | O_EXCL_ | O_NONBLOCK_ | O_CLOEXEC_
+            | O_LARGEFILE_)
+        != 0
+    {
+        return EINVAL;
+    }
+    let (nbuf, nlen) = match mq_read_name(name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let key = &nbuf[..nlen];
+    if let Some(i) = mq_named(key) {
+        if oflag & (O_CREAT_ | O_EXCL_) == (O_CREAT_ | O_EXCL_) {
+            return EEXIST_;
+        }
+        return mq_mint_fd(i, accmode, oflag);
+    }
+    if oflag & O_CREAT_ == 0 {
+        return ENOENT;
+    }
+    let (mut maxmsg, mut msgsize) = (10u32, 8192u32);
+    if attr != 0 {
+        // mq_attr {mq_flags, mq_maxmsg, mq_msgsize, mq_curmsgs} —
+        // 4 i64s; only maxmsg/msgsize matter at create.
+        if !range_ok(attr, 32) {
+            return EFAULT_;
+        }
+        let t = cur_mut().map(|t| t.pml4).unwrap_or(0);
+        maxmsg = read_task_u64(t, attr + 8).unwrap_or(0) as u32;
+        msgsize = read_task_u64(t, attr + 16).unwrap_or(0) as u32;
+        if maxmsg == 0
+            || maxmsg as usize > MQ_MAXMSG
+            || msgsize == 0
+            || msgsize > MQ_MSGSIZE_MAX
+        {
+            return EINVAL;
+        }
+    }
+    let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+    let Some(i) = mqs.iter().position(Option::is_none) else {
+        return EAGAIN_; // Linux's answer at the queue limit
+    };
+    let mut nm = [0u8; 255];
+    nm[..nlen].copy_from_slice(key);
+    mqs[i] = Some(MQueue {
+        name: nm,
+        nlen,
+        maxmsg,
+        msgsize,
+        msgs: [const { None }; MQ_MAXMSG],
+        refs: 0, // mq_mint_fd bumps — fd-table-full can't leak one
+        dead: false,
+        notify_pid: 0,
+        notify_signo: 0,
+        notify_val: 0,
+    });
+    mq_mint_fd(i, accmode, oflag)
+}
+
+/// Mint the mqd fd for queue i and stamp accmode/nonblock — refs
+/// count opens, not minted fds (dup shares one ref like Linux).
+fn mq_mint_fd(i: usize, accmode: u64, oflag: u64) -> u64 {
+    const O_NONBLOCK_: u64 = 0o4000;
+    const O_CLOEXEC_: u64 = 0o2000000;
+    {
+        let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+        let Some(q) = mqs[i].as_mut() else { return EINVAL };
+        q.refs += 1;
+    }
+    let fd = anon_fd(FdKind::MQueue(i), oflag & O_CLOEXEC_ != 0);
+    if (fd as i64) < 0 {
+        mq_release(i); // fd table full — drop the ref just taken
+        return fd;
+    }
+    let Some(t) = cur_mut() else { return fd };
+    let Some(oi) = fdt(t).fds.get(fd as usize).copied().flatten() else {
+        return fd;
+    };
+    let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+    if let Some(o) = ofds.get_mut(oi as usize).and_then(|s| s.as_mut()) {
+        o.accmode = accmode as u8;
+        o.nonblock = oflag & O_NONBLOCK_ != 0;
+    }
+    fd
+}
+
+/// mq_unlink(name): the name dies now, the queue at last close.
+pub fn sys_mq_unlink(name: u64) -> u64 {
+    let (nbuf, nlen) = match mq_read_name(name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let Some(i) = mq_named(&nbuf[..nlen]) else {
+        return ENOENT;
+    };
+    let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+    if let Some(q) = mqs[i].as_mut() {
+        q.dead = true;
+        q.nlen = 0;
+        if q.refs == 0 {
+            let mut q = mqs[i].take().unwrap();
+            mq_drain(&mut q);
+        }
+    }
+    0
+}
+
+/// ABSTIME timespec -> a TICKS deadline. The mq API's abstime is
+/// CLOCK_REALTIME, so convert by delta from wall_now — a past
+/// deadline lands "now" (one tick to ETIMEDOUT; 0 means infinite).
+fn mq_abstime(va: u64) -> Result<u64, u64> {
+    const EFAULT_: u64 = (-14i64) as u64;
+    if va == 0 {
+        return Ok(0);
+    }
+    if !range_ok(va, 16) {
+        return Err(EFAULT_);
+    }
+    let t = cur_mut().map(|t| t.pml4).unwrap_or(0);
+    let sec = read_task_u64(t, va).unwrap_or(0) as i64;
+    let nsec = read_task_u64(t, va + 8).unwrap_or(0) as i64;
+    if !(0..1_000_000_000).contains(&nsec) {
+        return Err(EINVAL);
+    }
+    let (ws, wns) = crate::rtc::wall_now();
+    let dns = (sec - ws as i64) * 1_000_000_000 + (nsec - wns as i64);
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    if dns <= 0 {
+        return Ok(now);
+    }
+    Ok(now.saturating_add((dns as u64).div_ceil(10_000_000)))
+}
+
+/// mq_timedsend(mqd, msg, len, prio, abstime): stage the payload
+/// to kernel memory up front — a blocked send never re-reads the
+/// caller's VA (the msgsnd lesson).
+pub fn sys_mq_timedsend(
+    ctx: &mut UCtx,
+    fd: u64,
+    msg: u64,
+    len: u64,
+    prio: u64,
+    abstime: u64,
+) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const EBADF_: u64 = (-9i64) as u64;
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EMSGSIZE_: u64 = (-90i64) as u64;
+    const ENOMEM_: u64 = (-12i64) as u64;
+    const EINTR_: u64 = (-4i64) as u64;
+    if prio >= MQ_PRIO_MAX {
+        return EINVAL;
+    }
+    let (oi, qi) = match mq_ofd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let deadline = match mq_abstime(abstime) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+    let Some(q) = mqs[qi].as_mut() else { return EBADF_ };
+    if len > q.msgsize as u64 {
+        return EMSGSIZE_;
+    }
+    let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
+    let o = ofds[oi].as_ref().unwrap();
+    if o.accmode == 0 {
+        return EBADF_; // O_RDONLY
+    }
+    let nonblock = o.nonblock;
+    if !range_ok(msg, len) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    // Stage [prio][len][payload] — one record the queue owns after
+    // link, or the free hook owns on EINTR/timeout.
+    let rec = stage_alloc(8 + len as usize);
+    if rec.is_null() {
+        return ENOMEM_;
+    }
+    unsafe {
+        (rec as *mut u32).write_unaligned(prio as u32);
+        (rec.add(4) as *mut u32).write_unaligned(len as u32);
+        let mut tmp = [0u8; 8192];
+        let n = read_task_bytes(
+            t.pml4,
+            msg,
+            &mut tmp[..len as usize],
+        );
+        if !n {
+            stage_free(8 + len as usize, rec);
+            return EFAULT_;
+        }
+        core::ptr::copy_nonoverlapping(
+            tmp.as_ptr(),
+            rec.add(8),
+            len as usize,
+        );
+    }
+    loop {
+        let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+        let Some(q) = mqs[qi].as_mut() else {
+            unsafe { stage_free(8 + len as usize, rec) };
+            return EBADF_;
+        };
+        if mq_nmsg(q) < q.maxmsg as usize {
+            let was_empty = mq_nmsg(q) == 0;
+            mq_link(q, rec as u64, (8 + len) as u32);
+            mq_after_link(qi, was_empty);
+            return 0;
+        }
+        if nonblock {
+            unsafe { stage_free(8 + len as usize, rec) };
+            return EAGAIN_;
+        }
+        if deliverable(t) {
+            unsafe { stage_free(8 + len as usize, rec) };
+            return EINTR_;
+        }
+        // Sleep until a receive frees a slot — the waker links the
+        // staged record; EINTR/ETIMEDOUT hooks free it.
+        t.wait_on = WaitOn::MqSnd(qi);
+        t.wait_ptr = rec as u64;
+        t.wait_len = 8 + len;
+        t.wait_deadline = deadline;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+        // Armed recheck — the queue must STILL be full before we
+        // really sleep (MsgSnd's race-window shape).
+        if mq_nmsg(q) >= q.maxmsg as usize {
+            block_switch();
+        }
+        if t.wait_on == WaitOn::None {
+            return t.ctx.rax;
+        }
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
+        t.wait_ptr = 0;
+        t.wait_len = 0;
+        t.wait_deadline = 0;
+    }
+}
+
+/// mq_timedreceive(mqd, msg, len, prio, abstime): take the highest-
+/// prio oldest message; len must fit mq_msgsize like Linux.
+pub fn sys_mq_timedreceive(
+    ctx: &mut UCtx,
+    fd: u64,
+    msg: u64,
+    len: u64,
+    prio: u64,
+    abstime: u64,
+) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const EBADF_: u64 = (-9i64) as u64;
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EMSGSIZE_: u64 = (-90i64) as u64;
+    const EINTR_: u64 = (-4i64) as u64;
+    let (oi, qi) = match mq_ofd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let deadline = match mq_abstime(abstime) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+    let Some(q) = mqs[qi].as_mut() else { return EBADF_ };
+    if len < q.msgsize as u64 {
+        return EMSGSIZE_;
+    }
+    let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
+    let o = ofds[oi].as_ref().unwrap();
+    if o.accmode == 1 {
+        return EBADF_; // O_WRONLY
+    }
+    let nonblock = o.nonblock;
+    if prio != 0 && !range_ok_w(prio, 4) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    loop {
+        let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+        let Some(q) = mqs[qi].as_mut() else { return EBADF_ };
+        if let Some(m) = mq_pop(q) {
+            let plen = mq_plen(&m);
+            let payload = unsafe {
+                core::slice::from_raw_parts(
+                    (m.rec + 8) as *const u8,
+                    plen as usize,
+                )
+            };
+            let mut tmp = [0u8; 8192];
+            tmp[..plen as usize].copy_from_slice(payload);
+            let p = mq_prio(&m);
+            unsafe { stage_free(m.len as usize, m.rec as *mut u8) };
+            // Linux pops before copying — EFAULT consumes the msg.
+            if !write_task_bytes(t.pml4, msg, &tmp[..plen as usize]) {
+                return EFAULT_;
+            }
+            if prio != 0 {
+                write_task_u32(t.pml4, prio, p);
+            }
+            // A slot freed — let a blocked sender land its record.
+            mq_wake_snd(qi);
+            return plen as u64;
+        }
+        if nonblock {
+            return EAGAIN_;
+        }
+        if !range_ok_w(msg, len) {
+            return EFAULT_;
+        }
+        if deliverable(t) {
+            return EINTR_;
+        }
+        // Sleep until a send lands — the waker writes the message
+        // through our pml4 and deposits its length in ctx.rax.
+        t.wait_on = WaitOn::MqRcv(qi);
+        t.wait_ptr = msg;
+        t.wait_len = len;
+        t.wait_ptr2 = prio;
+        t.wait_deadline = deadline;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+        if mq_nmsg(q) == 0 {
+            block_switch();
+        }
+        if t.wait_on == WaitOn::None {
+            return t.ctx.rax;
+        }
+        t.wait_on = WaitOn::None;
+        t.state = TaskState::Runnable;
+        t.wait_ptr = 0;
+        t.wait_len = 0;
+        t.wait_ptr2 = 0;
+        t.wait_deadline = 0;
+    }
+}
+
+/// mq_notify(mqd, sevp): one registration per queue, fires once on
+/// the empty->nonempty edge while nobody is blocked receiving.
+/// NULL sevp clears OUR registration like Linux.
+pub fn sys_mq_notify(fd: u64, sevp: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const EBUSY_: u64 = (-16i64) as u64;
+    let (_oi, qi) = match mq_ofd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let Some(t) = cur_mut() else { return EINVAL };
+    let mqs = unsafe { &mut *core::ptr::addr_of_mut!(MQUEUES) };
+    let Some(q) = mqs[qi].as_mut() else { return EINVAL };
+    if sevp == 0 {
+        if q.notify_pid == t.pid {
+            q.notify_pid = 0;
+        }
+        return 0;
+    }
+    if !range_ok(sevp, 20) {
+        return EFAULT_;
+    }
+    let signo = unsafe { ((sevp + 8) as *const u32).read_unaligned() };
+    let notify =
+        unsafe { ((sevp + 12) as *const u32).read_unaligned() } as u64;
+    let val = unsafe { (sevp as *const i32).read_unaligned() };
+    // uapi: SIGNAL=0, NONE=1, THREAD=2 (glibc-emulated, EINVAL
+    // kernel-side), THREAD_ID=4 — Linux's mq_notify accept-set.
+    const SIGEV_NONE_: u64 = 1;
+    const SIGEV_THREAD_ID_: u64 = 4;
+    if notify != 0 && notify != SIGEV_NONE_ && notify != SIGEV_THREAD_ID_
+    {
+        return EINVAL;
+    }
+    if notify == SIGEV_NONE_ {
+        if q.notify_pid == t.pid {
+            q.notify_pid = 0;
+        }
+        return 0;
+    }
+    if !(1..32).contains(&signo) {
+        return EINVAL;
+    }
+    // Only one registration may pend — Linux answers EBUSY when a
+    // DIFFERENT process holds it; same-process or dead holders get
+    // replaced silently.
+    if q.notify_pid != 0 {
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        let foreign = tasks
+            .iter()
+            .flatten()
+            .find(|o| o.pid == q.notify_pid)
+            .is_some_and(|o| {
+                o.tgid != t.tgid && o.state != TaskState::Exited
+            });
+        if foreign {
+            return EBUSY_;
+        }
+    }
+    // THREAD_ID aims the edge at sigev_notify_thread_id — Linux
+    // EINVALs a tid outside the caller's group (or a dead one).
+    let target = if notify == SIGEV_THREAD_ID_ {
+        let tid =
+            unsafe { ((sevp + 16) as *const u32).read_unaligned() } as u64;
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        let ok = tasks.iter().flatten().any(|o| {
+            o.pid == tid && o.tgid == t.tgid && o.state != TaskState::Exited
+        });
+        if !ok {
+            return EINVAL;
+        }
+        tid
+    } else {
+        t.pid
+    };
+    q.notify_pid = target;
+    q.notify_signo = signo;
+    q.notify_val = val;
+    0
+}
+
+/// mq_getsetattr(mqd, new, old): mq_attr {mq_flags, mq_maxmsg,
+/// mq_msgsize, mq_curmsgs} — 4 i64s. Only O_NONBLOCK moves (the
+/// descriptor's flag, like Linux — attr fields are create-time).
+pub fn sys_mq_getsetattr(fd: u64, new: u64, old: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const O_NONBLOCK_: u64 = 0o4000;
+    let (oi, qi) = match mq_ofd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if old == 0 && new == 0 {
+        return 0;
+    }
+    let mqs = unsafe { &*core::ptr::addr_of!(MQUEUES) };
+    let Some(q) = mqs[qi].as_ref() else { return EINVAL };
+    let Some(t) = cur_mut() else { return EINVAL };
+    if old != 0 {
+        if !range_ok_w(old, 32) {
+            return EFAULT_;
+        }
+        let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
+        let nb = ofds[oi].as_ref().map(|o| o.nonblock).unwrap_or(false);
+        write_task_u64(t.pml4, old, if nb { O_NONBLOCK_ } else { 0 });
+        write_task_u64(t.pml4, old + 8, q.maxmsg as u64);
+        write_task_u64(t.pml4, old + 16, q.msgsize as u64);
+        write_task_u64(t.pml4, old + 24, mq_nmsg(q) as u64);
+    }
+    if new != 0 {
+        if !range_ok(new, 32) {
+            return EFAULT_;
+        }
+        let flags = read_task_u64(t.pml4, new).unwrap_or(0);
+        let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+        if let Some(o) =
+            ofds.get_mut(oi).and_then(|s| s.as_mut())
+        {
+            o.nonblock = flags & O_NONBLOCK_ != 0;
+        }
+    }
+    0
+}
+
 pub fn timerfd_expire() {
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     {
@@ -27283,7 +28097,9 @@ pub fn timerfd_expire() {
                 tf.expirations = tf.expirations.saturating_add(1);
                 tf.armed = false;
             } else {
-                let missed = 1 + (now - tf.deadline) / tf.interval;
+                let missed = (now - tf.deadline)
+                    .checked_div(tf.interval)
+                    .map_or(1, |m| m + 1);
                 tf.expirations = tf.expirations.saturating_add(missed);
                 tf.deadline += tf.interval * missed;
             }
@@ -27433,7 +28249,7 @@ pub fn fd_pselect(
                 (ts as *const i64).add(1).read_unaligned(),
             )
         };
-        if nsec < 0 || nsec >= 1_000_000_000 {
+        if !(0..1_000_000_000).contains(&nsec) {
             return EINVAL;
         }
         deadline = crate::apic::TICKS
@@ -27729,7 +28545,7 @@ fn ts_deadline(ts: u64) -> Option<u64> {
             (ts as *const i64).add(1).read_unaligned(),
         )
     };
-    if nsec < 0 || nsec >= 1_000_000_000 {
+    if !(0..1_000_000_000).contains(&nsec) {
         return None;
     }
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
