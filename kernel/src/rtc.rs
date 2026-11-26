@@ -126,6 +126,15 @@ fn epoch_base() -> u64 {
     EPOCH_BASE.load(Ordering::Relaxed)
 }
 
+/// clock_settime's write side: replace the epoch base so wall_now
+/// reports the requested unix second forward — the tick delta keeps
+/// time monotonic from there. No RTC hardware write: the base is
+/// the wall clock here.
+pub fn set_wall(sec: u64) {
+    let t = crate::apic::TICKS.load(Ordering::Relaxed);
+    EPOCH_BASE.store(sec.saturating_sub(t / 100), Ordering::Relaxed);
+}
+
 /// Wall time as (sec, nsec): epoch base + the 100 Hz tick. Without
 /// an RTC this is the previous boot-relative behaviour — honest
 /// fallback, not a fabricated date.

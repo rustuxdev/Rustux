@@ -634,6 +634,14 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         30 => user::sys_shmat(a1, a2, a3),
         31 => user::sys_shmctl(a1, a2, a3),
         67 => user::sys_shmdt(a1),
+        // small classics II: cross-mm iovec copy, kernel-side file
+        // copy, wall clock write, inert hints + affinity gate.
+        310 => user::sys_process_vm_readv(a1, a2, a3, a4, a5, a6),
+        311 => user::sys_process_vm_writev(a1, a2, a3, a4, a5, a6),
+        326 => user::sys_copy_file_range(a1, a2, a3, a4, a5, a6),
+        227 => user::sys_clock_settime(a1, a2),
+        221 => user::sys_fadvise64(a1, a2, a3, a4),
+        203 => user::sys_sched_setaffinity(a1, a2, a3),
 
         NR_FUTEX_WAKE => user::sys_futex_wake(a1, a2, a3, a4),
         NR_FUTEX_WAIT => user::sys_futex_wait(ctx, a1, a2, a3, a4, a5, a6),

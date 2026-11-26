@@ -8965,6 +8965,334 @@ pub fn sys_shmctl(id: u64, cmd: u64, buf: u64) -> u64 {
     }
 }
 
+// --- small classics II: process_vm / copy_file_range / clock_settime
+// / fadvise64 / sched_setaffinity -----------------------------------
+
+/// clock_settime(clk, ts): REALTIME is the only settable clock —
+/// replace the epoch base so wall_now reports the requested second
+/// forward; the tick delta keeps it monotonic from there.
+pub fn sys_clock_settime(clk: u64, ts: u64) -> u64 {
+    const EFAULT_: u64 = EFAULT;
+    if clk != 0 {
+        return EINVAL;
+    }
+    if !range_ok(ts, 16) {
+        return EFAULT_;
+    }
+    // SAFETY: validated user timespec under cur cr3.
+    let (sec, nsec) = unsafe {
+        (
+            (ts as *const i64).read_unaligned(),
+            (ts as *const i64).add(1).read_unaligned(),
+        )
+    };
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return EINVAL;
+    }
+    crate::rtc::set_wall(sec as u64);
+    0
+}
+
+/// process_vm_readv/writev shared walk: copy between the caller's
+/// local iovec list and a live task's remote list, byte-wise under
+/// each side's own pml4. Remote writes use the force variant —
+/// FOLL_FORCE semantics (ptrace-class access skips the writable
+/// check); ptrace_may_access itself stays collapsed like pidfd.
+/// Partial progress is real: the first fault stops the copy and
+/// the caller sees the moved count, EFAULT only when nothing moved.
+fn process_vm(
+    pid: u64,
+    liov: u64,
+    lcnt: u64,
+    riov: u64,
+    rcnt: u64,
+    flags: u64,
+    write: bool,
+) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if flags != 0
+        || lcnt == 0
+        || rcnt == 0
+        || lcnt > 1024
+        || rcnt > 1024
+    {
+        return EINVAL;
+    }
+    if !range_ok(liov, lcnt.saturating_mul(16))
+        || !range_ok(riov, rcnt.saturating_mul(16))
+    {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    let local = t.pml4;
+    let remote = {
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        let Some(i) = task_slot_by_pid(pid) else { return ESRCH_ };
+        tasks[i].as_ref().map(|r| r.pml4).unwrap_or(0)
+    };
+    let iov = |base: u64, i: u64| -> (u64, u64) {
+        // SAFETY: array window validated above.
+        unsafe {
+            (
+                *((base + i * 16) as *const u64),
+                *((base + i * 16 + 8) as *const u64),
+            )
+        }
+    };
+    let mut done = 0u64;
+    let mut li = 0u64;
+    let mut lva = 0u64;
+    let mut lrem = 0u64;
+    let mut fault = false;
+    for ri in 0..rcnt {
+        let (mut rva, mut rrem) = iov(riov, ri);
+        while rrem > 0 && !fault {
+            if lrem == 0 {
+                if li >= lcnt {
+                    return done;
+                }
+                let (b, l) = iov(liov, li);
+                lva = b;
+                lrem = l;
+                li += 1;
+                continue;
+            }
+            let n = rrem.min(lrem).min(4096) as usize;
+            let mut buf = [0u8; 4096];
+            let ok = if write {
+                read_task_bytes(local, lva, &mut buf[..n])
+                    && write_task_bytes(remote, rva, &buf[..n])
+            } else {
+                read_task_bytes(remote, rva, &mut buf[..n])
+                    && write_task_bytes(local, lva, &buf[..n])
+            };
+            if !ok {
+                fault = true;
+                break;
+            }
+            rva += n as u64;
+            rrem -= n as u64;
+            lva += n as u64;
+            lrem -= n as u64;
+            done += n as u64;
+        }
+        if fault {
+            break;
+        }
+    }
+    if done == 0 && fault {
+        EFAULT
+    } else {
+        done
+    }
+}
+
+/// process_vm_readv(pid, liov, lcnt, riov, rcnt, flags): read from
+/// the remote task's memory into the caller's local iovec list.
+pub fn sys_process_vm_readv(
+    pid: u64,
+    liov: u64,
+    lcnt: u64,
+    riov: u64,
+    rcnt: u64,
+    flags: u64,
+) -> u64 {
+    process_vm(pid, liov, lcnt, riov, rcnt, flags, false)
+}
+
+/// process_vm_writev(pid, liov, lcnt, riov, rcnt, flags): write the
+/// caller's local iovec contents into the remote task's memory.
+pub fn sys_process_vm_writev(
+    pid: u64,
+    liov: u64,
+    lcnt: u64,
+    riov: u64,
+    rcnt: u64,
+    flags: u64,
+) -> u64 {
+    process_vm(pid, liov, lcnt, riov, rcnt, flags, true)
+}
+
+/// copy_file_range src tag: File data is stable initrd storage, Ram
+/// re-resolves per chunk because dst growth can reallocate it.
+enum CfrSrc {
+    File(*const u8),
+    Ram(usize),
+}
+
+/// copy_file_range(fd_in, off_in, fd_out, off_out, len, flags):
+/// kernel-side copy between Ram vfiles through a 4KiB bounce —
+/// no user buffers touched like Linux's promise. A NULL off uses
+/// and advances the OFD's own position; a non-NULL off is used
+/// and written back. Src File/Ram both readable; dst must be Ram
+/// writable accmode (fd_pwrite's gate verbatim) — initrd File
+/// data is immutable so writing one EBADFs.
+pub fn sys_copy_file_range(
+    fd_in: u64,
+    off_in: u64,
+    fd_out: u64,
+    off_out: u64,
+    len: u64,
+    flags: u64,
+) -> u64 {
+    const ESPIPE_: u64 = (-29i64) as u64;
+    const EOVERFLOW_: u64 = (-75i64) as u64;
+    if flags != 0 {
+        return EINVAL;
+    }
+    if off_in != 0 && !range_ok_w(off_in, 8) {
+        return EFAULT;
+    }
+    if off_out != 0 && !range_ok_w(off_out, 8) {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let (src, slen, ipos) = {
+        let Some(o) = ofd(t, fd_in) else { return EBADF };
+        let pos = if off_in != 0 {
+            // SAFETY: off_in validated readable above.
+            unsafe { *(off_in as *const u64) }
+        } else {
+            o.pos as u64
+        };
+        match &o.kind {
+            FdKind::File(d) => (CfrSrc::File(d.as_ptr()), d.len() as u64, pos),
+            FdKind::Ram(i) => {
+                let Some(v) = vfile(*i) else { return EBADF };
+                (CfrSrc::Ram(*i), v.len as u64, pos)
+            }
+            _ => return ESPIPE_,
+        }
+    };
+    let (dst_i, mut opos) = {
+        let Some(o) = ofd(t, fd_out) else { return EBADF };
+        if o.accmode == 0 {
+            return EBADF;
+        }
+        let pos = if off_out != 0 {
+            // SAFETY: off_out validated readable above.
+            unsafe { *(off_out as *const u64) }
+        } else {
+            o.pos as u64
+        };
+        match &o.kind {
+            FdKind::Ram(i) => (*i, pos),
+            _ => return ESPIPE_,
+        }
+    };
+    const EPERM_: u64 = (-1i64) as u64;
+    let Some(dv) = vfile(dst_i) else { return EBADF };
+    if dv.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+        return EPERM_; // fd_pwrite's seal gate
+    }
+    if ipos > slen {
+        return 0; // past EOF — nothing to copy
+    }
+    let mut done = 0u64;
+    while done < len {
+        let n = (len - done)
+            .min(slen.saturating_sub(ipos + done))
+            .min(8192);
+        if n == 0 {
+            break;
+        }
+        let need = match opos.checked_add(n) {
+            Some(v) => v,
+            None => {
+                if done > 0 { break } else { return EOVERFLOW_ }
+            }
+        };
+        let r = vfile_grow(dv, need as usize);
+        if r != 0 {
+            if done > 0 { break } else { return r }
+        }
+        // Re-resolve per chunk: a same-vfile copy grows dv, which can
+        // reallocate the very buffer the src pointer aliases.
+        let sptr = match src {
+            CfrSrc::File(p) => p,
+            CfrSrc::Ram(i) => match vfile(i) {
+                Some(v) => v.data as *const u8,
+                None => {
+                    if done > 0 { break } else { return EBADF }
+                }
+            },
+        };
+        // SAFETY: sptr covers slen bytes of live file/Ram data;
+        // dv.data owns `need` bytes after grow.
+        unsafe {
+            core::ptr::copy(
+                sptr.add((ipos + done) as usize),
+                dv.data.add(opos as usize),
+                n as usize,
+            );
+        }
+        dv.len = dv.len.max(need as usize);
+        opos += n;
+        done += n;
+    }
+    if off_in != 0 {
+        // SAFETY: validated writable above.
+        unsafe { *(off_in as *mut u64) = ipos + done };
+    } else if let Some(o) = ofd(t, fd_in) {
+        o.pos = (ipos + done) as usize;
+    }
+    if off_out != 0 {
+        // SAFETY: validated writable above.
+        unsafe { *(off_out as *mut u64) = opos };
+    } else if let Some(o) = ofd(t, fd_out) {
+        o.pos = opos as usize;
+    }
+    if done > 0 {
+        let (ts, tns) = now();
+        dv.mtime = ts;
+        dv.mtime_ns = tns;
+        dv.ctime = ts;
+        dv.ctime_ns = tns;
+        let mut nm = [0u8; 128];
+        nm[..dv.nlen].copy_from_slice(&dv.name[..dv.nlen]);
+        ino_report(&nm[..dv.nlen], IN_MODIFY, 0);
+    }
+    done
+}
+
+/// fadvise64(fd, off, len, advice): validation is the ABI — the
+/// kernel has no readahead policy to steer. Pipe/socket fds get
+/// ESPIPE like Linux; advice outside POSIX_FADV_* EINVALs.
+pub fn sys_fadvise64(fd: u64, _off: u64, _len: u64, advice: u64) -> u64 {
+    const ESPIPE_: u64 = (-29i64) as u64;
+    if advice > 5 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    match &o.kind {
+        FdKind::File(_) | FdKind::Ram(_) => 0,
+        _ => ESPIPE_,
+    }
+}
+
+/// sched_setaffinity(pid, size, mask): the single-CPU scheduler
+/// accepts exactly one mask — bit 0 must be set; empty masks and
+/// masks naming only foreign CPUs EINVAL like Linux.
+pub fn sys_sched_setaffinity(pid: u64, size: u64, mask: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if size < 8 {
+        return EINVAL;
+    }
+    if !range_ok(mask, 8) {
+        return EFAULT;
+    }
+    if pid != 0 && task_slot_by_pid(pid).is_none() {
+        return ESRCH_;
+    }
+    // SAFETY: mask validated readable above.
+    let m = unsafe { *(mask as *const u64) };
+    if m & 1 == 0 {
+        return EINVAL;
+    }
+    0
+}
+
 /// munmap(addr, len): Linux never fails on an aligned range — holes
 /// and foreign areas are silent no-ops. Pages are freed, range
 /// entries clipped/split, one TLB flush at the end.
