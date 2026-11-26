@@ -4,6 +4,18 @@
   <img src="docs/logo.png" alt="Rustux logo" width="220">
 </p>
 
+<p align="center">
+  <video src="https://github.com/rustuxdev/Rustux/raw/main/docs/assets/rustux-v2.mp4"
+    controls muted loop autoplay playsinline width="880"
+    title="Rustux in 52 seconds — boot, the record/port/diff/gate method, real userspace, a self-installing Debian disk, DOOM, the NT personality, the driver/IPC shelf, IPv8"></video>
+</p>
+
+*Fifty-two seconds of Rustux: OVMF boot footage, the
+record→port→diff→gate method, real bash/BusyBox/apt, the
+self-installing ext2 disk with `apt install -y nginx` at exit 0,
+DOOM on `/dev/fb0`, the native NT `.exe` personality, the
+Nov 26 driver + IPC shelf, and IPv8 on the wire.*
+
 An incremental reimplementation of the Linux kernel in Rust, verified against
 the original C kernel's recorded behavior — the first kernel to speak
 IPv8 on the wire, and already running native Windows `.exe` binaries
@@ -14,17 +26,6 @@ The C kernel source is the reference and stays untouched in a separate tree
 [rust-anything](https://github.com/erkamyaman/rust-anything): the original's
 behavior is recorded to `cases.jsonl`, the Rust port must match every recorded
 case (`diff`) and pass `gate` before it is adopted.
-
-<p align="center">
-  <video src="docs/assets/rustux.mp4" controls muted loop autoplay playsinline
-    title="Rustux in 52 seconds — boot, the record/port/diff/gate method, real userspace, a self-installing Debian disk, DOOM, the NT personality, the driver/IPC shelf, IPv8"></video>
-</p>
-
-*Fifty-two seconds of Rustux: OVMF boot footage, the
-record→port→diff→gate method, real bash/BusyBox/apt, the
-self-installing ext2 disk with `apt install -y nginx` at exit 0,
-DOOM on `/dev/fb0`, the native NT `.exe` personality, the
-Nov 26 driver + IPC shelf, and IPv8 on the wire.*
 
 <p align="center">
   <img src="docs/assets/rustux-boot.gif" alt="Rustux booting under OVMF/QEMU — GOP framebuffer console: memory map, APIC, PCI, e1000 DHCP, then the 61-task userspace suite including a real static BusyBox, GNU bash, and native PE .exe tasks">
