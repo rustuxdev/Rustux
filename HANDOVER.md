@@ -7615,3 +7615,29 @@ STATUS64 offset/limit, CLR_FD, rebind, EINVAL/ENOTTY gates.
 Exit 33, 80 tasks, zero leak.
 
 Audit run-46: 0 confirmed, 2 fixed in-run. Ledger at 220 CVEs.
+
+## run-288 — CDROM ioctl family via AHCI ATAPI
+
+`/dev/sr0` grows real CD-ROM ioctls. Key discovery: on q35 the
+`media=cdrom` drive is an **AHCI ATAPI device on SATA port 2**,
+not the legacy 0x170 channel (OVMF shows `Sata(0x2) DVD-ROM`).
+So the transport lives in ahci.rs: `SIG_ATAPI` (0xeb140101)
+recorded during the port scan, `ATAPI_MEM` lazy scratch with a
+4KiB buffer, `issue_packet` — PACKET (0xa0) H2D FIS with the
+byte count in LBA mid/high, the CDB in the ACMD area, PRDT only
+for data commands — sharing the disk path's stop/program/start
+sequence.
+
+Ioctls on the sr node: `GET_CAPABILITY` (fixed honest mask),
+`LOCKDOOR` (arg-as-value PREVENT ALLOW — Linux takes the flag
+by value, not pointer), `READTOCHDR`/`READTOCENTRY` via READ
+TOC (descriptor walk double-bounded), `READMODE1` (msf at
+arg+0 -> lba -> ATAPI READ(10) 2048B into the same buffer).
+
+QEMU: `mkisofs` generates the test ISO at build time, attached
+`if=ide,index=2,media=cdrom`.
+
+Proof: blktest +11 sr0 checks, 0 failures — PVD `CD001` read
+back through READMODE1. Exit 33, 80 tasks, zero leak.
+
+Audit run-47: 0 confirmed. Ledger at 226 CVEs.
