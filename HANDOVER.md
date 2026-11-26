@@ -7669,6 +7669,8 @@ leak.
 
 Audit run-48: 0 confirmed, 1 fixed in-run. Ledger at 231 CVEs.
 
+## run-290 — AF_UNIX sockets + socketpair
+
 `socket(AF_UNIX, SOCK_STREAM|SOCK_DGRAM)` + `socketpair(2)` (NR 53
 was absent — wired through the syscall table). `UNIXSOCKS` holds
 endpoints, `UNIXCONNS` connected pairs (two 4KiB byte rings,
@@ -7726,3 +7728,37 @@ MSG_CTRUNC drop+flag, two-iovec scatter, blocked recvmsg waker
 delivers rights cross-task. Exit 33, 82 tasks, zero leak.
 
 Audit run-50: 0 confirmed, 1 fixed in-run. Ledger at 243 CVEs.
+
+## run-292 — AF_NETLINK + NETLINK_ROUTE
+
+socket(AF_NETLINK=16, SOCK_RAW|SOCK_DGRAM, proto=0) — the family
+was entirely absent, so `busybox ip` and glibc getifaddrs (wget's
+resolver path) had nothing to talk to. NLSOCKS[8] holds endpoint
+state {pid, groups, raw}; a flat NlGram queue per sock carries
+reply blobs. bind() auto-assigns pid = task pid with a collision
+scan -> EADDRINUSE; getsockname answers sockaddr_nl. Requests
+arrive via write/send/sendto/sendmsg (all staged through one
+bounded parser): nlmsg walk requires len >= 16 and off+len in
+bounds; RTM_GETLINK/GETADDR/GETROUTE build fixed-shape dumps
+(lo + eth0, 127/8 + 10.0.2.15/24, link-subnet + default-gw +
+loopback routes) followed by NLMSG_DONE, all queued as one blob;
+unknown types answer NLMSG_ERROR(-EOPNOTSUPP). recv/recvfrom/
+recvmsg deliver name+payload (+iovec scatter + msg_flags for
+recvmsg); empty queues park on NlRecv/NlRecvM with the waker
+delivering through the sleeper's tables. sendmsg's MSG_DONTWAIT,
+poll POLLIN and FIONREAD all honour the queue.
+
+Three in-run findings: sock_name wrote 8 bytes into getsockname's
+4-byte socklen_t* -> OOB kernel->user stack write (the source of
+the mysterious `ip` hang — it clobbered busybox's rtnl_handle);
+reply nlmsg_pid was stamped 0 instead of the destination port id
+— busybox rtnl_listen and glibc getifaddrs filter replies by
+portid and skipped the whole dump -> blocked recvmsg forever
+(wget hung the same way); and RTA_GATEWAY went out at attr type 2
+(RTA_SRC) instead of 5.
+
+Proof: nltest 33 checks 0 failures, including real-binary
+`busybox ip link|addr|route` all parsing our dumps end to end.
+Exit 33, 83 tasks, zero leak.
+
+Audit run-51: 0 confirmed, 1 fixed in-run. Ledger at 249 CVEs.
