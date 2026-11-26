@@ -4,6 +4,20 @@
   <img src="docs/logo.png" alt="Rustux logo" width="220">
 </p>
 
+<p align="center">
+  <a href="https://youtu.be/2G_8bwKKcFk">
+    <img src="https://img.youtube.com/vi/2G_8bwKKcFk/maxresdefault.jpg" width="880"
+      alt="Rustux in 52 seconds — watch on YouTube">
+  </a>
+</p>
+
+*▶ [Watch Rustux in 52 seconds](https://youtu.be/2G_8bwKKcFk): OVMF
+boot footage, the record→port→diff→gate method, real
+bash/BusyBox/apt, the self-installing ext2 disk with
+`apt install -y nginx` at exit 0, DOOM on `/dev/fb0`, the native NT
+`.exe` personality, the Nov 26 driver + IPC shelf, and IPv8 on the
+wire.*
+
 An incremental reimplementation of the Linux kernel in Rust, verified against
 the original C kernel's recorded behavior — the first kernel to speak
 IPv8 on the wire, and already running native Windows `.exe` binaries
