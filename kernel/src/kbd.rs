@@ -55,9 +55,19 @@ fn ev_push(code: u16, val: u8) {
     }
 }
 
+/// External key events — the virtio-input driver feeds the same
+/// ring the PS/2 decoder does (Linux merges every keyboard into
+/// the evdev stream the same way).
+pub fn ev_push_ext(code: u16, val: u8) {
+    ev_push(code, val);
+}
+
 /// Queued evdev records — the blocking read checks this before
 /// sleeping so a key that arrives mid-check can't strand it.
+/// Drains the virtio-input eventq first so callers see device
+/// events without a separate pump hook.
 pub fn ev_len() -> usize {
+    crate::virtio::vinput_drain();
     unsafe { EVR_LEN }
 }
 

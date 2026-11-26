@@ -1502,3 +1502,181 @@ pub fn console_init() -> bool {
     ));
     true
 }
+
+// -------------------------------------------------------------------
+// virtio-input — QEMU's virtio-keyboard-pci.
+//
+// Queue 0 is the eventq: the device fills posted buffers with
+// virtio_input_event records {u16 type, u16 code, u32 value}. Queue
+// 1 is the statusq (guest -> device LED/status reports — unused).
+// EV_KEY records fold into the shared kbd evdev ring; EV_SYN and
+// friends carry no payload the ring can express and are dropped.
+
+/// Transitional virtio-input / modern-only id (QEMU resolves
+/// `virtio-keyboard-pci` to the non-transitional variant on q35 —
+/// 0x1052 has no legacy I/O BAR).
+const DEV_VINPUT: u16 = 0x1012;
+const DEV_VINPUT_MODERN: u16 = 0x1052;
+/// Posted eventq buffers — one 8-byte virtio_input_event each.
+const N_VIN: usize = 16;
+const VIN_BUFSZ: usize = 8;
+const EV_KEY: u16 = 1;
+
+static mut VINQ: Option<Vq> = None;
+static mut VIN_BUFS: u64 = 0;
+static mut VIN_SEEN: u16 = 0;
+/// Drained EV_KEY events — the boot proof counts these.
+static VIN_EVENTS: AtomicU32 = AtomicU32::new(0);
+
+/// Drain completed eventq buffers into the kbd evdev ring and
+/// re-post them. Returns EV_KEY events pushed. Same single-context
+/// discipline as con_drain — callers run in syscall/idle context.
+pub fn vinput_drain() -> usize {
+    let Some(q) = (unsafe { (*core::ptr::addr_of_mut!(VINQ)).as_mut() }) else {
+        return 0;
+    };
+    let bufs = unsafe { *core::ptr::addr_of!(VIN_BUFS) };
+    let mut got = 0usize;
+    let seen_start = unsafe { *core::ptr::addr_of!(VIN_SEEN) };
+    let used = q.used_idx();
+    while unsafe { *core::ptr::addr_of!(VIN_SEEN) } != used {
+        let seen = unsafe { *core::ptr::addr_of!(VIN_SEEN) };
+        let (id, _len) = q.used_entry(seen as usize);
+        unsafe {
+            *core::ptr::addr_of_mut!(VIN_SEEN) = seen.wrapping_add(1)
+        };
+        let id = id as usize;
+        if id >= N_VIN {
+            break; // bogus id — slot lost, never re-posted
+        }
+        // SAFETY: our event page; the record is 8B at id*8.
+        let (ty, code, val) = unsafe {
+            let p = mm::pmap(bufs) + (id * VIN_BUFSZ) as u64;
+            (
+                (p as *const u16).read_volatile(),
+                (p as *const u16).add(1).read_volatile(),
+                (p as *const u32).add(1).read_volatile(),
+            )
+        };
+        if ty == EV_KEY {
+            crate::kbd::ev_push_ext(code, val.min(2) as u8);
+            VIN_EVENTS.fetch_add(1, Ordering::Relaxed);
+            got += 1;
+        }
+        q.put_desc(id, bufs + (id * VIN_BUFSZ) as u64, VIN_BUFSZ as u32, DESC_WRITE, 0);
+        q.avail_push(id as u16);
+    }
+    // Re-posted buffers count even when nothing useful arrived.
+    if unsafe { *core::ptr::addr_of!(VIN_SEEN) } != seen_start {
+        q.notify();
+    }
+    got
+}
+
+/// Live virtio-input channel (drained events counted).
+pub fn vinput_present() -> bool {
+    unsafe { (*core::ptr::addr_of!(VINQ)).is_some() }
+}
+
+/// Probe a virtio-input function — modern transport first (QEMU's
+/// q35 `virtio-keyboard-pci` resolves non-transitional), then the
+/// legacy fallback. Sets up eventq + statusq, posts the event
+/// buffers, logs the device name from the config space
+/// (select VIRTIO_INPUT_CFG_DEV_NAME = 0x08; layout select@0,
+/// subsel@1, size@2, u@8).
+pub fn vinput_init() -> bool {
+    const CFG_NAME: u8 = 0x08;
+    let mut name = [0u8; 32];
+    let nsz: usize;
+    let (evq, _stq);
+    if let Some((bus, dev, f)) = pci::find(VENDOR, DEV_VINPUT_MODERN) {
+        pci::command_or(bus, dev, f, pci::CMD_MEM_SPACE | pci::CMD_BUS_MASTER);
+        let Some(vc) = virtio_caps(bus, dev, f) else {
+            crate::log::printk(format_args!(
+                "rustux: virtio: modern input lacks a full cap set — skipped"
+            ));
+            return false;
+        };
+        if !handshake_modern(vc.common) || cr16(vc.common + C_NQ) < 2 {
+            cw8(vc.common + C_STATUS, cr8(vc.common + C_STATUS) | S_FAIL);
+            return false;
+        }
+        let (Some(e), Some(s)) = (
+            Vq::setup_modern(vc.common, vc.notify, vc.notify_mult, vc.isr, 0),
+            Vq::setup_modern(vc.common, vc.notify, vc.notify_mult, vc.isr, 1),
+        ) else {
+            cw8(vc.common + C_STATUS, cr8(vc.common + C_STATUS) | S_FAIL);
+            return false;
+        };
+        cw8(vc.dev, CFG_NAME);
+        nsz = (cr8(vc.dev + 2) as usize).min(32);
+        for (i, b) in name.iter_mut().enumerate().take(nsz) {
+            *b = cr8(vc.dev + 8 + i as u64);
+        }
+        cw8(vc.common + C_STATUS, S_ACK | S_DRV | S_FEATOK | S_DRVOK);
+        evq = e;
+        _stq = s;
+    } else {
+        let Some((io, _)) = probe_io(DEV_VINPUT) else {
+            return false;
+        };
+        if !handshake(io) {
+            return false;
+        }
+        outb(io + R_CFG, CFG_NAME);
+        outb(io + R_CFG + 1, 0);
+        nsz = (inb(io + R_CFG + 2) as usize).min(32);
+        for (i, b) in name.iter_mut().enumerate().take(nsz) {
+            *b = inb(io + R_CFG + 8 + i as u16);
+        }
+        let (Some(e), Some(s)) = (Vq::setup(io, 0), Vq::setup(io, 1)) else {
+            fail(io);
+            return false;
+        };
+        outb(io + R_STATUS, S_ACK | S_DRV | S_FEATOK | S_DRVOK);
+        evq = e;
+        _stq = s;
+    }
+    let Some(bufs) = kalloc::alloc_frames(0) else {
+        return false;
+    };
+    let qsz = evq.size;
+    // SAFETY: init runs once, before tasks exist.
+    unsafe {
+        *core::ptr::addr_of_mut!(VIN_BUFS) = bufs;
+        *core::ptr::addr_of_mut!(VIN_SEEN) = 0;
+        *core::ptr::addr_of_mut!(VINQ) = Some(evq);
+    }
+    // Post all event buffers — device fills one record each.
+    let q = unsafe { (*core::ptr::addr_of!(VINQ)).as_ref().unwrap() };
+    for i in 0..N_VIN {
+        q.put_desc(i, bufs + (i * VIN_BUFSZ) as u64, VIN_BUFSZ as u32, DESC_WRITE, 0);
+        q.avail_push(i as u16);
+    }
+    q.notify();
+    let nstr = core::str::from_utf8(&name[..nsz]).unwrap_or("?");
+    crate::log::printk(format_args!(
+        "rustux: virtio: input '{nstr}' evq={qsz}"
+    ));
+    true
+}
+
+/// Post-sti proof: kbdfeed.py injects shift taps via QMP — a
+/// bounded wait must drain at least one EV_KEY through the queue
+/// (the PS/2 path can't fill this counter).
+pub fn vinput_selftest() -> bool {
+    let mut spins = 0u64;
+    while spins < 60_000_000 {
+        if VIN_EVENTS.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        vinput_drain();
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    let n = VIN_EVENTS.load(Ordering::Relaxed);
+    crate::log::printk(format_args!(
+        "rustux: virtio: input {n} evdev event(s) through virtio-input"
+    ));
+    n > 0
+}

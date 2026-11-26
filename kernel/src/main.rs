@@ -1449,6 +1449,9 @@ pub(crate) fn rustux_main(
     // virtio-console: a second console channel (/dev/hvc0) over its
     // own virtqueue pair — the init proof writes the chardev backend.
     virtio::console_init();
+    // virtio-input: QEMU's virtio-keyboard — events fold into the
+    // shared evdev ring behind /dev/input/event0.
+    virtio::vinput_init();
     // virtio-net: second NIC next to the e1000e — its own RX/TX
     // virtqueues, ARP round-trip proves the datapath (socket-layer
     // NIC dispatch is a later rung).
@@ -1682,6 +1685,13 @@ pub(crate) fn rustux_main(
         if nvme::disks() > 0 {
             let nirq = nvme::irq_selftest();
             kprintln!(con, "rustux: nvme: I/O-CQ MSI receive path {nirq}");
+        }
+        // virtio-input's eventq path: QMP send-key taps must drain
+        // as EV_KEY records — counted on the virtio queue itself so
+        // the PS/2 keyboard can't satisfy the proof.
+        if virtio::vinput_present() {
+            let vin = virtio::vinput_selftest();
+            kprintln!(con, "rustux: virtio: input evdev receive path {vin}");
         }
         // A virtio-only boot never ran DHCP — seed the static slirp
         // lease so the socket layer considers the NIC usable. No-op
