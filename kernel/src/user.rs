@@ -237,8 +237,10 @@ fn shm_pin_all(t: &Task) {
 
 /// Max resident tasks — a hard bound so spawn can't exhaust the
 /// kernel heap by enqueueing forever. 48 was fork-EAGAIN-tight
-/// for the 39-task suite + concurrent children (observed on VM).
-const MAX_TASKS: usize = 88;
+/// for the 39-task suite + concurrent children (observed on VM);
+/// 88 went resident-slot-tight once the initrd member count hit
+/// 85+daemons (pidfdtest was the refused 86th spawn).
+const MAX_TASKS: usize = 96;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -529,6 +531,10 @@ enum FdKind {
     Inotify(usize),
     /// A timerfd — arming/expiry state lives in TIMERFDS[id].
     Timerfd(usize),
+    /// A pidfd — the target pid rides inline: next_pid never
+    /// recycles, so a stale pid resolves to nothing (ESRCH /
+    /// POLLIN) rather than aliasing a different task.
+    Pidfd(u64),
     /// A generated /proc file — contents are rendered into a
     /// kernel frame at open (Linux's seq_file snapshot model), so
     /// reads and stats see one consistent image even if the task
@@ -808,7 +814,7 @@ const MAX_EPOLL_FDS: usize = 16;
 #[derive(Clone, Copy)]
 struct EpollEnt {
     fd: i32,
-    ofd: u8,
+    ofd: u16,
     events: u32,
     data: u64,
 }
@@ -2216,7 +2222,7 @@ struct FdTab {
     /// fits a u16.
     cloexec: u16,
     /// fd slots -> GLOBAL OFD indices; 0/1/2 pre-seeded std streams.
-    fds: [Option<u8>; MAX_FDS],
+    fds: [Option<u16>; MAX_FDS],
 }
 const FDT_EMPTY: FdTab = FdTab { users: 0, cloexec: 0, fds: [None; MAX_FDS] };
 /// Task-slot parity plus CLONE_FILES slack (threads share the
@@ -2426,7 +2432,11 @@ fn fstab_release(i: u8) {
 /// each (192 worst case) before a single pipe/socket exists — 64
 /// and 192 were both real transient-ENOMEMs under
 /// scheduling-dependent occupancy.
-const MAX_OFDS: usize = 256;
+/// 256 was spawn-tight: each initrd member's task eats 3 fresh
+/// std-stream OFDs, so member 86 died at 255/256 — the spawn
+/// FAILED, not the suite. 512 covers 96 tasks' streams plus the
+/// runtime open/pipe/socket churn.
+const MAX_OFDS: usize = 512;
 
 /// RAM-backed scratch files — the writable half of the flat
 /// namespace. Linux mounts a tmpfs; our tmpfs is this table:
@@ -7841,7 +7851,7 @@ fn load(img: &[u8]) -> Option<Task> {
                 nonblock: false,
                 accmode: if i == 0 { 0 } else { 1 },
             });
-            fdt(&t).fds[i] = Some(oi as u8);
+            fdt(&t).fds[i] = Some(oi as u16);
         }
     }
     let ok = if let Some(p) = &pe_img {
@@ -10526,7 +10536,7 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 nonblock: arg & 0o4000 != 0,
                 accmode: 2,
             });
-            fdt(t).fds[fi] = Some(oi as u8);
+            fdt(t).fds[fi] = Some(oi as u16);
             cloexec_set(t, fi, arg & 0x80000 != 0); // O_CLOEXEC bit
             fi as u64
         }
@@ -10674,7 +10684,7 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 FdKind::Dir(_) => return EINVAL,
                 // An epoll fd has no readable stream — same EINVAL
                 // Linux gives read-side ioctls on it.
-                FdKind::Epoll(_) => return EINVAL,
+                FdKind::Epoll(_) | FdKind::Pidfd(_) => return EINVAL,
                 // FIONREAD on eventfd/timerfd is sizeof(u64) once
                 // they're readable, 0 before (Linux's answer).
                 FdKind::Eventfd(i) => {
@@ -11306,7 +11316,8 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         | FdKind::Eventfd(_)
         | FdKind::Timerfd(_)
         | FdKind::Signalfd(_)
-        | FdKind::Inotify(_) => (0o20600, 0, 0),
+        | FdKind::Inotify(_)
+        | FdKind::Pidfd(_) => (0o20600, 0, 0),
     }
 }
 
@@ -15246,6 +15257,8 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         // read() on an epoll fd has no stream to read — EINVAL like
         // Linux, not EBADF (the fd is real).
         FdKind::Epoll(_) => EINVAL,
+        // pidfds are poll-only endpoints — same EINVAL.
+        FdKind::Pidfd(_) => EINVAL,
         FdKind::Eventfd(i) => eventfd_read(ctx, *i, buf, len),
         FdKind::Timerfd(i) => timerfd_read(ctx, *i, buf, len),
         FdKind::Signalfd(i) => signalfd_read(ctx, *i, buf, len),
@@ -15505,6 +15518,9 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     }
     if let FdKind::Signalfd(_) = &o.kind {
         return EINVAL; // signalfds aren't writable either
+    }
+    if let FdKind::Pidfd(_) = &o.kind {
+        return EINVAL; // pidfds aren't writable either
     }
     if let FdKind::Inotify(_) = &o.kind {
         return EINVAL;
@@ -15878,8 +15894,8 @@ pub fn fd_pipe(fdptr: u64, flags: u64) -> u64 {
         nonblock: nb,
         accmode: 1,
     });
-    fdt(t).fds[rf] = Some(ro as u8);
-    fdt(t).fds[wf] = Some(wo as u8);
+    fdt(t).fds[rf] = Some(ro as u16);
+    fdt(t).fds[wf] = Some(wo as u16);
     let ce = flags & O_CLOEXEC != 0;
     cloexec_set(t, rf, ce);
     cloexec_set(t, wf, ce);
@@ -17726,6 +17742,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         FdKind::Inotify(_) => {
             s.puts(b"anon_inode:[inotify]");
         }
+        FdKind::Pidfd(_) => {
+            s.puts(b"anon_inode:[pidfd]");
+        }
         FdKind::Proc { .. } => {
             s.puts(b"anon_inode:[proc]");
         }
@@ -17864,7 +17883,7 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
             o.refs -= 1;
             return EMFILE;
         };
-        fdt(t).fds[fi] = Some(oi as u8);
+        fdt(t).fds[fi] = Some(oi);
         cloexec_set(t, fi, flags & O_CLOEXEC != 0);
         return fi as u64;
     }
@@ -18118,7 +18137,7 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         nonblock: flags & O_NONBLOCK != 0,
         accmode: acc as u8,
     });
-    fdt(t).fds[fi] = Some(oi as u8);
+    fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, flags & O_CLOEXEC != 0);
     ino_report(path, IN_OPEN, 0);
     fi as u64
@@ -18204,7 +18223,7 @@ pub fn fd_memfd_create(name: u64, flags: u64) -> u64 {
         nonblock: false,
         accmode: 2, // memfd fds are always O_RDWR
     });
-    fdt(t).fds[fi] = Some(oi as u8);
+    fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, flags & MFD_CLOEXEC != 0);
     fi as u64
 }
@@ -19843,7 +19862,7 @@ fn ofd_release(oi: usize) {
         let eps = unsafe { &mut *core::ptr::addr_of_mut!(EPOLLS) };
         for inst in eps.iter_mut().flatten() {
             for e in inst.ents.iter_mut() {
-                if e.is_some_and(|x| x.ofd == oi as u8) {
+                if e.is_some_and(|x| x.ofd == oi as u16) {
                     *e = None;
                 }
             }
@@ -20233,7 +20252,7 @@ fn poll_revents(t: &Task, fd: i32, events: u16) -> u16 {
 /// pins the OFD, so its scan evaluates this directly — the fd
 /// number only matters at ctl time. `pend` is the polling task's
 /// signal mask (signalfd readiness is per-reader).
-fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
+fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
     let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
     let Some(o) = ofds.get(oi as usize).and_then(|s| s.as_ref()) else {
         return POLLNVAL;
@@ -20537,6 +20556,11 @@ fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
                     }
                 }
             }
+        }
+        // pidfd: POLLIN once the named task is dead — a zombie or a
+        // fully reaped slot both count, like Linux's exit notice.
+        FdKind::Pidfd(pid) => {
+            if pidfd_alive(*pid) { 0 } else { POLLIN }
         }
     };
     (r & events) | (r & (POLLERR | POLLHUP | POLLNVAL))
@@ -21530,7 +21554,7 @@ pub fn fd_epoll_create(flags: u64, legacy_size: bool) -> u64 {
         nonblock: false,
         accmode: 2,
     });
-    fdt(t).fds[fi] = Some(oi as u8);
+    fdt(t).fds[fi] = Some(oi as u16);
     if !legacy_size {
         cloexec_set(t, fi, flags != 0);
     }
@@ -21748,8 +21772,103 @@ fn anon_fd(kind: FdKind, cloexec: bool) -> u64 {
         nonblock: false,
         accmode: 2,
     });
-    fdt(t).fds[fi] = Some(oi as u8);
+    fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, cloexec);
+    fi as u64
+}
+
+/// pidfd_open(pid, flags): an anon-inode fd that names a task —
+/// poll fires POLLIN at its death, send_signal/getfd act on it.
+/// flags must be 0 (PIDFD_NONBLOCK only tunes waitid-on-pidfd,
+/// which doesn't exist); pid <= 0 is EINVAL, a missing task ESRCH.
+/// Zombies still name the task — poll already reports them dead.
+pub fn fd_pidfd_open(pid: i64, flags: u64) -> u64 {
+    const ESRCH: u64 = (-3i64) as u64;
+    if flags != 0 || pid <= 0 {
+        return EINVAL;
+    }
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    if !tasks.iter().flatten().any(|t| t.pid == pid as u64) {
+        return ESRCH;
+    }
+    anon_fd(FdKind::Pidfd(pid as u64), false)
+}
+
+/// The pidfd's target still counts as alive — present and not
+/// Exited. Zombies are dead for this ABI (send/getfd ESRCH) but
+/// already count for poll's POLLIN.
+fn pidfd_alive(pid: u64) -> bool {
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    tasks
+        .iter()
+        .flatten()
+        .any(|t| t.pid == pid && t.state != TaskState::Exited)
+}
+
+/// pidfd_send_signal(pidfd, sig, info, flags): sig 0 probes
+/// liveness. info must be NULL — a foreign siginfo carries codes
+/// we would not honor, so it is EINVAL not silently ignored.
+/// A dead target is ESRCH; otherwise kill() does the delivery
+/// (sig bounds EINVAL there).
+pub fn fd_pidfd_send_signal(fd: u64, sig: u64, info: u64, flags: u64) -> u64 {
+    const ESRCH: u64 = (-3i64) as u64;
+    if flags != 0 || info != 0 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let FdKind::Pidfd(pid) = o.kind else { return EBADF };
+    if !pidfd_alive(pid) {
+        return ESRCH;
+    }
+    kill(pid as i64, sig)
+}
+
+/// pidfd_getfd(pidfd, targetfd, flags): clone the target's fd out
+/// of its table into ours — the same OFD with refs bumped, so
+/// seals/position/socket state all ride along. Linux gates this
+/// on ptrace_may_access; no creds model exists here (kill is just
+/// as open) — documented divergence. A dead target has no table
+/// (release_fds ran at exit) — ESRCH; an empty slot is EBADF.
+pub fn fd_pidfd_getfd(fd: u64, targetfd: u64, flags: u64) -> u64 {
+    const ESRCH: u64 = (-3i64) as u64;
+    if flags != 0 {
+        return EINVAL;
+    }
+    if targetfd as usize >= MAX_FDS {
+        return EBADF;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let FdKind::Pidfd(pid) = o.kind else { return EBADF };
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
+    let Some(tgt) = tasks
+        .iter_mut()
+        .flatten()
+        .find(|tt| tt.pid == pid && tt.state != TaskState::Exited)
+    else {
+        return ESRCH;
+    };
+    let Some(oi) = fdt(tgt).fds[targetfd as usize] else {
+        return EBADF;
+    };
+    let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+    let Some(of) = ofds.get_mut(oi as usize).and_then(|s| s.as_mut())
+    else {
+        return EBADF;
+    };
+    of.refs += 1;
+    let Some(me) = tasks.get_mut(cur).and_then(|s| s.as_mut()) else {
+        of.refs -= 1;
+        return EBADF;
+    };
+    let Some(fi) = fdt(me).fds.iter().position(Option::is_none) else {
+        of.refs -= 1; // roll back — no room in our table
+        return EMFILE;
+    };
+    fdt(me).fds[fi] = Some(oi);
+    cloexec_set(me, fi, false); // a getfd'd fd is never CLOEXEC
     fi as u64
 }
 
@@ -22934,7 +23053,7 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
         nonblock: ty & SOCK_NONBLOCK != 0,
         accmode: 2,
     });
-    fdt(t).fds[fi] = Some(oi as u8);
+    fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, ty & SOCK_CLOEXEC != 0);
     fi as u64
 }
@@ -24503,7 +24622,7 @@ fn scm_emit(
             ctrunc = true;
             break;
         };
-        fdt(t).fds[fi] = Some(oi as u8);
+        fdt(t).fds[fi] = Some(oi);
         cloexec_set(t, fi, cloexec);
         write_task_bytes(
             t.pml4,
@@ -25091,7 +25210,7 @@ fn unix_mint_fd(
         nonblock: false,
         accmode: 2,
     });
-    fdt(t).fds[fi] = Some(oi as u8);
+    fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, ce);
     Ok(fi as u64)
 }
@@ -27174,7 +27293,7 @@ fn tcp_mint_fd(t: &mut Task, ci: usize, ce: bool) -> Result<u64, u64> {
         nonblock: false,
         accmode: 2,
     });
-    fdt(t).fds[fi] = Some(oi as u8);
+    fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, ce);
     Ok(fi as u64)
 }
@@ -29142,6 +29261,8 @@ fn exit_bookkeeping(n: usize) {
             // tgid member's death releases every record it owned.
             flock_sweep(true, ctgid);
         }
+        // A dead member fires any pidfd's POLLIN — rescan pollers.
+        wake_pollers();
         return;
     }
     // NT module ledger: a dead leader's entries are inert — its
@@ -29232,6 +29353,9 @@ fn exit_bookkeeping(n: usize) {
             );
         }
     }
+    // A dead task fires every pidfd's POLLIN — rescan pollers whose
+    // fd sets just became ready (wait4 wakes already ran direct).
+    wake_pollers();
 }
 
 /// Map a child wstatus to (CLD_* si_code, si_status): a low byte of
