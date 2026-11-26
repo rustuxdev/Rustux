@@ -7973,3 +7973,16 @@ EMPTY_PATH (fchmod-on-dirfd). Audit run-58: 0 confirmed, 1 fixed
 in-run; all futex CVE classes are robust/PI/privhash machinery we
 don't implement. fxvtest 30 checks green; exit 33, 89 tasks, zero
 leak. Ledger at 271 CVEs.
+## run-300 — mremap (25) + madvise (28) + mincore (27)
+
+The mm trio lands: mremap does two-pass atomic moves (map+copy
+before unmap — shortage rolls back whole), shrink-in-place,
+FIXED honoring, and EINVALs a shared-mm move (per-task ledgers).
+madvise DONTNEED zeroes present pages (file-private divergence
+documented); the rest of the known advice set is accepted-inert.
+mincore reports leaf-presence bits with full-byte vec writes.
+Findings: the grow pass read src leaves beyond old_end (adjacent
+dst aliased fresh pages), mincore OR'd over stale user bytes,
+round-up overflow panics on u64::MAX lens, and mincore is NR 27
+not 227. Audit run-59: 0 confirmed, 5 fixed in-run. mm3test 30
+checks green; exit 33, 90 tasks, zero leak. Ledger at 278 CVEs.
