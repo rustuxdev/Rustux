@@ -366,6 +366,11 @@ enum WaitOn {
     /// payload in kernel staging (KSEND[conn][side]) — the user
     /// VA is gone by then.
     UnixSendK(usize, u8),
+    /// recv on an empty netlink reply queue — wait_ptr/wait_len
+    /// buf, wait_ptr2 name.
+    NlRecv(usize),
+    /// recvmsg on an empty netlink queue — wait_ptr msghdr.
+    NlRecvM(usize),
     /// nanosleep(): pure deadline wait — wait_deadline bounds it,
     /// the return is always 0.
     Timer,
@@ -503,6 +508,9 @@ enum FdKind {
     /// An AF_UNIX socket — SOCK_DGRAM endpoint or SOCK_STREAM
     /// side; the state lives in UNIXSOCKS[id].
     Unix(usize),
+    /// An AF_NETLINK socket — NETLINK_ROUTE endpoint; state in
+    /// NLSOCKS[id], replies queued in NLQ.
+    Nl(usize),
     /// An epoll instance — the interest set lives in EPOLLS[id];
     /// dup'd fds share it like socket endpoints.
     Epoll(usize),
@@ -2677,6 +2685,13 @@ pub fn fd_getsockopt(
                 .and_then(|k| k.as_ref())
                 .is_some_and(|k| matches!(k.kind, UnixKind::Dgram { .. }));
             (if dgram { 2 } else { 1 }, false)
+        }
+        Some(FdKind::Nl(i)) => {
+            let raw = unsafe { &*core::ptr::addr_of!(NLSOCKS) }
+                .get(*i)
+                .and_then(|k| k.as_ref())
+                .is_some_and(|k| k.raw);
+            (if raw { 3 } else { 2 }, false)
         }
         Some(FdKind::Tcp(i)) => {
             let dead = unsafe { &*core::ptr::addr_of!(TCPSOCKS) }
@@ -10493,6 +10508,12 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 // AF_UNIX: stream reports ring bytes; a datagram
                 // socket the next queued datagram's size (Linux
                 // FIONREAD semantics on both).
+                FdKind::Nl(i) => nl_q(*i)
+                    .iter()
+                    .flatten()
+                    .map(|g| g.len as u64)
+                    .next()
+                    .unwrap_or(0),
                 FdKind::Unix(i) => {
                     let socks = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) };
                     socks
@@ -11142,7 +11163,8 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         FdKind::Udp(_)
         | FdKind::Tcp(_)
         | FdKind::Packet(_)
-        | FdKind::Unix(_) => (0o140777, 0, 0), // S_IFSOCK
+        | FdKind::Unix(_)
+        | FdKind::Nl(_) => (0o140777, 0, 0), // S_IFSOCK
         // anon_inodefs objects stat as a chrdev — Linux shows
         // S_IFCHR|0600 for epoll/eventfd/timerfd alike.
         FdKind::Epoll(_)
@@ -15093,6 +15115,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Packet(i) => {
             pkt_recv_or_block(ctx, *i, buf, len, 0, o.nonblock)
         }
+        FdKind::Nl(i) => nl_recv_buf(ctx, *i, buf, len, 0, o.nonblock),
         FdKind::Unix(i) => {
             let kind = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
                 .get(*i)
@@ -15284,6 +15307,25 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         // write() on a raw packet socket sends the frame verbatim;
         // a cooked one needs a dest the write form can't carry.
         return fd_sendto(ctx, fd, buf, len, 0, 0, 0);
+    }
+    if let FdKind::Nl(i) = &o.kind {
+        // write() on netlink = a bare request datagram.
+        let mut pay = [0u8; NL_BLOB];
+        if len as usize > pay.len() {
+            return (-90i64) as u64; // EMSGSIZE
+        }
+        if len > 0 && !range_ok(buf, len) {
+            return EFAULT;
+        }
+        // SAFETY: buf validated readable under the current cr3.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf as *const u8,
+                pay.as_mut_ptr(),
+                len as usize,
+            );
+        }
+        return nl_route_req(*i, &pay[..len as usize]);
     }
     if let FdKind::Unix(i) = &o.kind {
         let ui = *i;
@@ -17476,7 +17518,8 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         FdKind::Udp(id)
         | FdKind::Tcp(id)
         | FdKind::Packet(id)
-        | FdKind::Unix(id) => {
+        | FdKind::Unix(id)
+        | FdKind::Nl(id) => {
             s.printf(b"socket:[%u]", &[klib::fmt::Arg::U(*id as u64)]);
         }
         FdKind::Epoll(_) => {
@@ -17615,6 +17658,7 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                 | FdKind::Tcp(_)
                 | FdKind::Packet(_)
                 | FdKind::Unix(_)
+                | FdKind::Nl(_)
         ) {
             return (-6i64) as u64; // ENXIO
         }
@@ -19556,6 +19600,14 @@ fn ofd_release(oi: usize) {
     if let FdKind::Unix(i) = kind {
         unix_sock_close(i);
     }
+    if let FdKind::Nl(i) = kind {
+        // Replies queued for the endpoint die with it; a blocked
+        // recv can't exist (its fd pins the sock).
+        unsafe { (*core::ptr::addr_of_mut!(NLSOCKS))[i] = None };
+        for slot in nl_q(i).iter_mut() {
+            *slot = None;
+        }
+    }
     if let FdKind::Tcp(i) = kind {
         tcp_sock_close(i);
     }
@@ -19836,6 +19888,13 @@ fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
         // reports POLLIN at tty EOF too).
         FdKind::Stdin => {
             if stdin_ready() > 0 {
+                POLLIN
+            } else {
+                0
+            }
+        }
+        FdKind::Nl(i) => {
+            if nl_q(*i).iter().any(|g| g.is_some()) {
                 POLLIN
             } else {
                 0
@@ -22393,6 +22452,17 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
         if _proto > 0xffff {
             return EINVAL;
         }
+    } else if domain == 16 {
+        const ESOCKTNOSUPPORT__: u64 = (-94i64) as u64;
+        const EPROTONOSUPPORT_: u64 = (-93i64) as u64;
+        if base != 2 && base != 3 {
+            // netlink is SOCK_DGRAM or SOCK_RAW.
+            return ESOCKTNOSUPPORT__;
+        }
+        if _proto != 0 {
+            // NETLINK_ROUTE only.
+            return EPROTONOSUPPORT_;
+        }
     } else if domain == 1 {
         const ESOCKTNOSUPPORT_: u64 = (-94i64) as u64;
         const EPROTONOSUPPORT: u64 = (-93i64) as u64;
@@ -22428,6 +22498,17 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
             },
         });
         FdKind::Unix(si)
+    } else if domain == 16 {
+        let socks = unsafe { &mut *core::ptr::addr_of_mut!(NLSOCKS) };
+        let Some(si) = socks.iter().position(Option::is_none) else {
+            return ENFILE_;
+        };
+        socks[si] = Some(NlSock {
+            pid: 0,
+            groups: 0,
+            raw: base == 3,
+        });
+        FdKind::Nl(si)
     } else if domain == 17 {
         let socks = unsafe { &mut *core::ptr::addr_of_mut!(PKTSOCKS) };
         let Some(si) = socks.iter().position(Option::is_none) else {
@@ -22599,16 +22680,45 @@ pub fn fd_bind(fd: u64, sa: u64, len: u64) -> u64 {
         T(usize),
         P(usize),
         X(usize),
+        N(usize),
     }
     let Some(sid) = (match ofd(t, fd).map(|o| &o.kind) {
         Some(FdKind::Udp(i)) => Some(SockId::U(*i)),
         Some(FdKind::Tcp(i)) => Some(SockId::T(*i)),
         Some(FdKind::Packet(i)) => Some(SockId::P(*i)),
         Some(FdKind::Unix(i)) => Some(SockId::X(*i)),
+        Some(FdKind::Nl(i)) => Some(SockId::N(*i)),
         _ => None,
     }) else {
         return EBADF;
     };
+    if let SockId::N(si) = sid {
+        // sockaddr_nl: family 16 + nl_pid + nl_groups, 12 bytes.
+        if len < 12 || !range_ok(sa, 12) {
+            return EINVAL;
+        }
+        let fam = read_task_u(t.pml4, sa, 2).unwrap_or(0);
+        if fam != 16 {
+            return EAFNOSUPPORT;
+        }
+        let pid = read_task_u(t.pml4, sa + 4, 4).unwrap_or(0);
+        let groups = read_task_u(t.pml4, sa + 8, 4).unwrap_or(0);
+        let socks = unsafe { &mut *core::ptr::addr_of_mut!(NLSOCKS) };
+        let want = if pid == 0 { t.pid } else { pid };
+        if socks.iter().enumerate().any(|(j, o)| {
+            j != si
+                && o.as_ref().is_some_and(|o| o.pid as u64 == want)
+        }) {
+            return EADDRINUSE;
+        }
+        let Some(k) = socks[si].as_mut() else { return EBADF };
+        if k.pid != 0 {
+            return EINVAL; // already bound
+        }
+        k.pid = want as u32;
+        k.groups = groups as u32;
+        return 0;
+    }
     if let SockId::X(si) = sid {
         // sockaddr_un: family 1 + sun_path (path or \0-abstract).
         // addrlen can be as small as 3 (abstract names carry no
@@ -22675,6 +22785,8 @@ pub fn fd_bind(fd: u64, sa: u64, len: u64) -> u64 {
         return EAFNOSUPPORT;
     };
     match sid {
+        // Netlink returned from its own arm above.
+        SockId::N(_) => {}
         SockId::U(si) => {
             let socks = unsafe { &mut *core::ptr::addr_of_mut!(UDPSOCKS) };
             if socks[si].as_ref().is_none_or(|k| k.port != 0) {
@@ -22740,6 +22852,36 @@ fn sock_name(fd: u64, sa: u64, alen: u64, peer: bool) -> u64 {
     let ulen = unsafe { (alen as *const u32).read_unaligned() };
     // AF_UNIX answers sockaddr_un — the bound name (or a bare
     // family for unnamed); getpeername is the connected peer's.
+    if let Some(FdKind::Nl(i)) = ofd(t, fd).map(|o| &o.kind) {
+        // Netlink: our bound pid as the local name; getpeername
+        // answers the kernel (pid 0).
+        let pid = if peer {
+            0
+        } else {
+            unsafe { &*core::ptr::addr_of!(NLSOCKS) }
+                .get(*i)
+                .and_then(|k| k.as_ref())
+                .map(|k| k.pid)
+                .unwrap_or(0)
+        };
+        let u = sockaddr_nl(pid, 0);
+        let cp = core::cmp::min(ulen as usize, 12);
+        if cp > 0 {
+            if !range_ok_w(sa, cp as u64) {
+                return EFAULT;
+            }
+            // SAFETY: sa validated writable for cp bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    u.as_ptr(),
+                    sa as *mut u8,
+                    cp,
+                );
+            }
+        }
+        write_task_bytes(t.pml4, alen, &12u32.to_le_bytes());
+        return 0;
+    }
     if let Some(FdKind::Unix(i)) = ofd(t, fd).map(|o| &o.kind) {
         let ui = *i;
         let socks = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) };
@@ -22913,6 +23055,24 @@ pub fn fd_sendto(
         Some(FdKind::Packet(i)) => {
             return pkt_send(t, *i, buf, len, sa, alen)
         }
+        Some(FdKind::Nl(i)) => {
+            let mut pay = [0u8; NL_BLOB];
+            if len as usize > pay.len() {
+                return (-90i64) as u64; // EMSGSIZE
+            }
+            if len > 0 && !range_ok(buf, len) {
+                return EFAULT;
+            }
+            // SAFETY: buf validated readable under the current cr3.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf as *const u8,
+                    pay.as_mut_ptr(),
+                    len as usize,
+                );
+            }
+            return nl_route_req(*i, &pay[..len as usize]);
+        }
         Some(FdKind::Unix(i)) => {
             let stream = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
                 .get(*i)
@@ -23071,6 +23231,30 @@ pub fn fd_recvmsg(ctx: &mut UCtx, fd: u64, msg: u64, flags: u64) -> u64 {
     let dw = flags & 0x40 != 0
         || ofd(t, fd).map(|o| o.nonblock).unwrap_or(false);
     match ofd(t, fd).map(|o| &o.kind) {
+        Some(&FdKind::Nl(ni)) => {
+            let take = nl_q(ni)
+                .iter_mut()
+                .find(|s| s.is_some())
+                .and_then(Option::take);
+            if let Some(g) = take {
+                return nl_msg_deliver(
+                    t, msg, flags, &g.data[..g.len as usize],
+                );
+            }
+            if dw {
+                return EAGAIN_;
+            }
+            if deliverable(t) {
+                return EINTR_;
+            }
+            t.wait_on = WaitOn::NlRecvM(ni);
+            t.wait_ptr = msg;
+            t.wait_len = flags;
+            t.wait_deadline = 0;
+            t.ctx = *ctx;
+            t.state = TaskState::Blocked;
+            block_switch()
+        }
         Some(&FdKind::Unix(ui)) => {
             let kind = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
                 .get(ui)
@@ -23282,6 +23466,42 @@ pub fn fd_sendmsg(ctx: &mut UCtx, fd: u64, msg: u64, flags: u64) -> u64 {
             }
             udp_send_core(t, *i, &pay[..n], name, namelen)
         }
+        Some(&FdKind::Nl(ni)) => {
+            // Same gather shape as UDP; the staged datagram is a
+            // netlink request stream.
+            let mut pay = [0u8; NL_BLOB];
+            let mut n = 0usize;
+            for e in 0..iovlen {
+                let Some(base) = read_task_u(t.pml4, iov + e * 16, 8)
+                else {
+                    return EFAULT;
+                };
+                let Some(l) =
+                    read_task_u(t.pml4, iov + e * 16 + 8, 8)
+                else {
+                    return EFAULT;
+                };
+                if l == 0 {
+                    continue;
+                }
+                if !range_ok(base, l) {
+                    return EFAULT;
+                }
+                if n + l as usize > pay.len() {
+                    return (-90i64) as u64; // EMSGSIZE
+                }
+                // SAFETY: base validated; n+l fits staging.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        base as *const u8,
+                        pay.as_mut_ptr().add(n),
+                        l as usize,
+                    );
+                }
+                n += l as usize;
+            }
+            nl_route_req(ni, &pay[..n])
+        }
         Some(&FdKind::Unix(ui)) => {
             // SCM_RIGHTS rides the ancillary buffer; the payload
             // gathers through the same iovec walk as UDP.
@@ -23448,7 +23668,8 @@ pub fn fd_setsockopt(
         Some(FdKind::Udp(_))
         | Some(FdKind::Tcp(_))
         | Some(FdKind::Packet(_))
-        | Some(FdKind::Unix(_)) => {}
+        | Some(FdKind::Unix(_))
+        | Some(FdKind::Nl(_)) => {}
         Some(_) => return ENOTSOCK,
         None => return EBADF,
     }
@@ -23478,6 +23699,7 @@ pub fn fd_recvfrom(
     match &o.kind {
         FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, sa, dw),
         FdKind::Packet(i) => pkt_recv_or_block(ctx, *i, buf, len, sa, dw),
+        FdKind::Nl(i) => nl_recv_buf(ctx, *i, buf, len, sa, dw),
         FdKind::Unix(i) => {
             let k = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
                 .get(*i)
@@ -24718,9 +24940,445 @@ fn unix_send_stream_slice(
     n as u64
 }
 
+/// ---------------- AF_NETLINK ----------------
+///
+/// NETLINK_ROUTE (proto 0) only: bind takes sockaddr_nl{pid,
+/// groups}; a sendmsg of nlmsghdrs gets parsed in place — the
+/// RTM_GET{LINK,ADDR,ROUTE} dump requests answer a multipart blob
+/// (NLM_F_MULTI members + NLMSG_DONE); unknown types answer
+/// NLMSG_ERROR(-EOPNOTSUPP). Replies deliver to a blocked receiver
+/// first, else queue per-sock.
+const MAX_NL: usize = 8;
+const NL_QCAP: usize = 4;
+const NL_BLOB: usize = 4096;
+
+/// One netlink endpoint: bound port id (task pid by default) and
+/// the multicast group mask (accept-all — we emit no multicasts).
+#[derive(Clone, Copy)]
+struct NlSock {
+    pid: u32,
+    groups: u32,
+    raw: bool,
+}
+
+/// A queued reply datagram — one producer blob.
+#[derive(Clone, Copy)]
+struct NlGram {
+    len: u16,
+    data: [u8; NL_BLOB],
+}
+
+static mut NLSOCKS: [Option<NlSock>; MAX_NL] =
+    [const { None }; MAX_NL];
+/// Flat per-sock queues — sock si owns rows si*NL_QCAP..+NL_QCAP.
+static mut NLQ: [Option<NlGram>; MAX_NL * NL_QCAP] =
+    [const { None }; MAX_NL * NL_QCAP];
+
+fn nl_q(si: usize) -> &'static mut [Option<NlGram>] {
+    unsafe {
+        let q = &mut *core::ptr::addr_of_mut!(NLQ);
+        &mut q[si * NL_QCAP..si * NL_QCAP + NL_QCAP]
+    }
+}
+
+/// sockaddr_nl: {family, pad, nl_pid, nl_groups} — 12 bytes.
+fn sockaddr_nl(pid: u32, groups: u32) -> [u8; 12] {
+    let mut u = [0u8; 12];
+    u[0..2].copy_from_slice(&16u16.to_le_bytes());
+    u[4..8].copy_from_slice(&pid.to_le_bytes());
+    u[8..12].copy_from_slice(&groups.to_le_bytes());
+    u
+}
+
+/// One RTA: {len,type} + payload, zero-padded to 4.
+fn nl_put_rta(out: &mut [u8], off: usize, ty: u16, pay: &[u8]) -> usize {
+    let len = 4 + pay.len();
+    out[off..off + 2].copy_from_slice(&(len as u16).to_le_bytes());
+    out[off + 2..off + 4].copy_from_slice(&ty.to_le_bytes());
+    out[off + 4..off + 4 + pay.len()].copy_from_slice(pay);
+    (len + 3) & !3
+}
+
+/// Open an nlmsghdr into `out` — returns the payload offset; the
+/// caller patches len after attrs.
+fn nl_put_hdr(
+    out: &mut [u8],
+    ty: u16,
+    flags: u16,
+    seq: u32,
+) -> usize {
+    out[4..6].copy_from_slice(&ty.to_le_bytes());
+    out[6..8].copy_from_slice(&flags.to_le_bytes());
+    out[8..12].copy_from_slice(&seq.to_le_bytes());
+    out[12..16].copy_from_slice(&0u32.to_le_bytes()); // kernel pid
+    16
+}
+
+fn nl_patch_len(out: &mut [u8], n: usize) {
+    out[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+}
+
+/// Interface table: lo (ifindex 1) + eth0 (ifindex 2), the same
+/// pair AF_PACKET exposes.
+fn nl_put_link(out: &mut [u8], seq: u32, idx: usize) -> usize {
+    // NLM_F_MULTI — every dump member but the DONE terminator.
+    let p = nl_put_hdr(out, 16, 2, seq); // RTM_NEWLINK
+    let (name, index, flags, mtu, mac): (&[u8], u32, u32, u32, [u8; 6]) =
+        if idx == 0 {
+            (b"lo", 1, 0x1 | 0x8 | 0x40 | 0x10000, 65536, [0; 6])
+        } else {
+            (
+                b"eth0",
+                2,
+                0x1 | 0x2 | 0x40 | 0x1000 | 0x10000,
+                1500,
+                crate::e1000::our_mac(),
+            )
+        };
+    // ifinfomsg: family, pad, type, index, flags, change.
+    out[p] = 0; // family AF_UNSPEC
+    out[p + 1] = 0;
+    out[p + 2..p + 4].copy_from_slice(&0u16.to_le_bytes());
+    out[p + 4..p + 8].copy_from_slice(&index.to_le_bytes());
+    out[p + 8..p + 12].copy_from_slice(&flags.to_le_bytes());
+    out[p + 12..p + 16].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+    let mut a = p + 16;
+    let mut nm = [0u8; 8];
+    nm[..name.len()].copy_from_slice(name);
+    a += nl_put_rta(out, a, 3, &nm[..name.len() + 1]); // IFLA_IFNAME
+    a += nl_put_rta(out, a, 4, &mtu.to_le_bytes()); // IFLA_MTU
+    a += nl_put_rta(out, a, 1, &mac); // IFLA_ADDRESS
+    a += nl_put_rta(out, a, 2, &mac); // IFLA_BROADCAST
+    a += nl_put_rta(out, a, 16, &[6u8]); // IFLA_OPERSTATE=UP
+    a += nl_put_rta(out, a, 13, &1000u32.to_le_bytes()); // TXQLEN
+    nl_patch_len(out, a);
+    (a + 3) & !3
+}
+
+/// RTM_NEWADDR for one address: {ifa, IFA_ADDRESS, IFA_LOCAL,
+/// IFA_LABEL}.
+fn nl_put_addr(
+    out: &mut [u8],
+    seq: u32,
+    index: u32,
+    name: &[u8],
+    ip: [u8; 4],
+    plen: u8,
+    scope: u8,
+) -> usize {
+    let p = nl_put_hdr(out, 20, 2, seq); // RTM_NEWADDR
+    out[p] = 2; // AF_INET
+    out[p + 1] = plen;
+    out[p + 2] = 0; // flags
+    out[p + 3] = scope;
+    out[p + 4..p + 8].copy_from_slice(&index.to_le_bytes());
+    let mut a = p + 8;
+    a += nl_put_rta(out, a, 1, &ip); // IFA_ADDRESS
+    a += nl_put_rta(out, a, 2, &ip); // IFA_LOCAL
+    let mut nm = [0u8; 8];
+    nm[..name.len()].copy_from_slice(name);
+    a += nl_put_rta(out, a, 3, &nm[..name.len() + 1]); // IFA_LABEL
+    nl_patch_len(out, a);
+    (a + 3) & !3
+}
+
+/// RTM_NEWROUTE: dst/plen via gw on oif — scope 253 link /
+/// 0 global / 254 host.
+#[allow(clippy::too_many_arguments)]
+fn nl_put_route(
+    out: &mut [u8],
+    seq: u32,
+    dst: [u8; 4],
+    plen: u8,
+    gw: Option<[u8; 4]>,
+    oif: u32,
+    scope: u8,
+    proto: u8,
+) -> usize {
+    let p = nl_put_hdr(out, 24, 2, seq); // RTM_NEWROUTE
+    out[p] = 2; // family
+    out[p + 1] = plen; // dst_len
+    out[p + 2] = 0; // src_len
+    out[p + 3] = 0; // tos
+    out[p + 4] = 254; // table main
+    out[p + 5] = proto;
+    out[p + 6] = scope;
+    out[p + 7] = 1; // type unicast
+    out[p + 8..p + 12].copy_from_slice(&0u32.to_le_bytes());
+    let mut a = p + 12;
+    if plen > 0 {
+        a += nl_put_rta(out, a, 1, &dst); // RTA_DST
+    }
+    if let Some(g) = gw {
+        a += nl_put_rta(out, a, 5, &g); // RTA_GATEWAY
+    }
+    a += nl_put_rta(out, a, 4, &oif.to_le_bytes()); // RTA_OIF
+    a += nl_put_rta(out, a, 6, &0u32.to_le_bytes()); // RTA_PRIORITY
+    nl_patch_len(out, a);
+    (a + 3) & !3
+}
+
+/// NLMSG_DONE terminator for a dump (error field 0).
+fn nl_put_done(out: &mut [u8], seq: u32) -> usize {
+    let p = nl_put_hdr(out, 3, 0, seq);
+    out[p..p + 4].copy_from_slice(&0i32.to_le_bytes());
+    nl_patch_len(out, p + 4);
+    p + 4
+}
+
+/// NLMSG_ERROR — `err` 0 is a plain ACK; the original request
+/// header echoes after the error code.
+fn nl_put_error(
+    out: &mut [u8],
+    seq: u32,
+    err: i32,
+    req: &[u8],
+) -> usize {
+    let p = nl_put_hdr(out, 2, 0, seq);
+    out[p..p + 4].copy_from_slice(&err.to_le_bytes());
+    let h = core::cmp::min(req.len(), 16);
+    out[p + 4..p + 4 + h].copy_from_slice(&req[..h]);
+    nl_patch_len(out, p + 4 + h);
+    p + 4 + h
+}
+
+/// Build the reply blob for one request nlmsghdr into `out`;
+/// returns its length. Handles the three dump types + ACK +
+/// unknown-type EOPNOTSUPP.
+fn nl_route_reply(out: &mut [u8], req: &[u8]) -> usize {
+    let ty = u16::from_le_bytes([req[4], req[5]]);
+    let flags = u16::from_le_bytes([req[6], req[7]]);
+    let seq = u32::from_le_bytes([req[8], req[9], req[10], req[11]]);
+    let mut n = 0usize;
+    match ty {
+        18 => {
+            // RTM_GETLINK
+            for i in 0..2 {
+                n += nl_put_link(&mut out[n..], seq, i);
+            }
+            n += nl_put_done(&mut out[n..], seq);
+        }
+        22 => {
+            // RTM_GETADDR
+            n += nl_put_addr(
+                &mut out[n..], seq, 1, b"lo", [127, 0, 0, 1], 8, 0xfe,
+            );
+            n += nl_put_addr(
+                &mut out[n..], seq, 2, b"eth0",
+                [10, 0, 2, 15], 24, 0,
+            );
+            n += nl_put_done(&mut out[n..], seq);
+        }
+        26 => {
+            // RTM_GETROUTE — main table: link subnet, default,
+            // loopback.
+            n += nl_put_route(
+                &mut out[n..], seq, [10, 0, 2, 0], 24, None, 2,
+                253, 2,
+            );
+            n += nl_put_route(
+                &mut out[n..], seq, [0; 4], 0,
+                Some([10, 0, 2, 2]), 2, 0, 3,
+            );
+            n += nl_put_route(
+                &mut out[n..], seq, [127, 0, 0, 0], 8, None, 1,
+                254, 2,
+            );
+            n += nl_put_done(&mut out[n..], seq);
+        }
+        _ => {
+            n += nl_put_error(&mut out[n..], seq, -95, req);
+        }
+    }
+    if flags & 4 != 0 && !matches!(ty, 18 | 22 | 26) {
+        // NLM_F_ACK wants a trailing NLMSG_ERROR{0} — dumps
+        // terminate on DONE, so only non-dump requests get it.
+        n += nl_put_error(&mut out[n..], seq, 0, req);
+    }
+    n
+}
+
+/// Deliver a reply blob: a blocked receiver takes it straight
+/// through its tables; otherwise the sock queue holds it.
+fn nl_deliver(si: usize, blob: &[u8]) -> bool {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for t in tasks.iter_mut().flatten() {
+        if t.state == TaskState::Blocked
+            && t.wait_on == WaitOn::NlRecv(si)
+        {
+            let n = core::cmp::min(blob.len(), t.wait_len as usize);
+            write_task_bytes(t.pml4, t.wait_ptr, &blob[..n]);
+            if t.wait_ptr2 != 0 {
+                write_task_bytes(
+                    t.pml4,
+                    t.wait_ptr2,
+                    &sockaddr_nl(0, 0),
+                );
+            }
+            t.ctx.rax = n as u64;
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            t.wait_ptr2 = 0;
+            t.state = TaskState::Runnable;
+            return true;
+        }
+        if t.state == TaskState::Blocked
+            && t.wait_on == WaitOn::NlRecvM(si)
+        {
+            t.ctx.rax =
+                nl_msg_deliver(t, t.wait_ptr, t.wait_len, blob);
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            t.state = TaskState::Runnable;
+            return true;
+        }
+    }
+    let Some(slot) = nl_q(si).iter_mut().find(|s| s.is_none()) else {
+        return false;
+    };
+    let mut g = NlGram { len: 0, data: [0u8; NL_BLOB] };
+    let n = core::cmp::min(blob.len(), NL_BLOB);
+    g.data[..n].copy_from_slice(&blob[..n]);
+    g.len = n as u16;
+    *slot = Some(g);
+    true
+}
+
+/// Parse the request datagram: walk nlmsghdrs, build each reply,
+/// deliver/queue it. Returns bytes consumed or an errno.
+fn nl_route_req(si: usize, pay: &[u8]) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    let mut off = 0usize;
+    let mut out = [0u8; NL_BLOB];
+    while off + 16 <= pay.len() {
+        let len = u32::from_le_bytes(
+            [pay[off], pay[off + 1], pay[off + 2], pay[off + 3]],
+        ) as usize;
+        if len < 16 || off + len > pay.len() {
+            return EINVAL_;
+        }
+        let n = nl_route_reply(&mut out, &pay[off..off + len]);
+        // Kernel semantics: each reply's nlmsg_pid is the
+        // destination port id — the receiver's bound pid — not
+        // the request's own pid field. Consumers (busybox
+        // rtnl_listen, glibc getifaddrs) skip replies whose pid
+        // mismatches their portid, so a wrong stamp reads as an
+        // empty dump and blocks them forever.
+        let port = unsafe { &*core::ptr::addr_of!(NLSOCKS) }
+            .get(si)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.pid)
+            .unwrap_or(0);
+        let mut w = 0usize;
+        while w + 16 <= n {
+            out[w + 12..w + 16].copy_from_slice(&port.to_le_bytes());
+            let l = u32::from_le_bytes(
+                [out[w], out[w + 1], out[w + 2], out[w + 3]],
+            ) as usize;
+            if l < 16 {
+                break;
+            }
+            w += (l + 3) & !3;
+        }
+        nl_deliver(si, &out[..n]);
+        off += (len + 3) & !3;
+    }
+    if off != pay.len() {
+        return EINVAL_; // trailing partial header
+    }
+    pay.len() as u64
+}
+
+/// recvmsg delivery for netlink — scatter + sockaddr_nl writeback
+/// + msg_flags (no cmsgs on this proto).
+fn nl_msg_deliver(
+    t: &mut Task,
+    msg: u64,
+    _flags: u64,
+    blob: &[u8],
+) -> u64 {
+    let Some(m) = umsg_read(t.pml4, msg) else {
+        return EFAULT;
+    };
+    let done = umsg_scatter(t.pml4, &m, blob);
+    let mut mf = 0u32;
+    if done < blob.len() {
+        mf |= 0x20; // MSG_TRUNC
+    }
+    if m.name != 0 {
+        let u = sockaddr_nl(0, 0);
+        let cp = core::cmp::min(m.namelen as usize, 12);
+        write_task_bytes(t.pml4, m.name, &u[..cp]);
+        write_task_u64(t.pml4, msg + 8, 12);
+    }
+    umsg_set_flags(t.pml4, msg, mf);
+    done as u64
+}
+
+/// Pop + copy one reply datagram (recv/recvfrom shape); empty
+/// parks on NlRecv like UdpRecv.
+fn nl_recv_buf(
+    ctx: &mut UCtx,
+    si: usize,
+    buf: u64,
+    len: u64,
+    sa: u64,
+    dw: bool,
+) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EINTR_: u64 = (-4i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF };
+    let take = nl_q(si)
+        .iter_mut()
+        .find(|s| s.is_some())
+        .and_then(Option::take);
+    if let Some(g) = take {
+        let n = core::cmp::min(len as usize, g.len as usize);
+        if n > 0 && !range_ok_w(buf, n as u64) {
+            return EFAULT;
+        }
+        if sa != 0 && !range_ok_w(sa, 12) {
+            return EFAULT;
+        }
+        // SAFETY: ranges validated under the current cr3.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                g.data.as_ptr(),
+                buf as *mut u8,
+                n,
+            );
+        }
+        if sa != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    sockaddr_nl(0, 0).as_ptr(),
+                    sa as *mut u8,
+                    12,
+                );
+            }
+        }
+        return n as u64;
+    }
+    if dw {
+        return EAGAIN_;
+    }
+    if deliverable(t) {
+        return EINTR_;
+    }
+    t.wait_on = WaitOn::NlRecv(si);
+    t.wait_ptr = buf;
+    t.wait_len = len;
+    t.wait_ptr2 = sa;
+    t.wait_deadline = 0;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
 /// Datagram recv shared by read/recvfrom — the queue gives back
 /// sender name + payload; empty blocks like UdpRecv.
 fn unix_recv_dgram(
+
     ctx: &mut UCtx,
     si: usize,
     buf: u64,
@@ -25867,6 +26525,15 @@ pub fn fd_connect(ctx: &mut UCtx, fd: u64, sa: u64, len: u64) -> u64 {
     if let Some(o) = ofd(t, fd) {
         if let FdKind::Unix(ui) = &o.kind {
             return unix_connect(ctx, *ui, sa, len, o.nonblock);
+        }
+        if let FdKind::Nl(_) = &o.kind {
+            // Netlink connect = naming the kernel peer (pid 0):
+            // check the family and answer ready.
+            if len < 12 || !range_ok(sa, 12) {
+                return EINVAL;
+            }
+            let fam = read_task_u(t.pml4, sa, 2).unwrap_or(0);
+            return if fam == 16 { 0 } else { EAFNOSUPPORT };
         }
     }
     if len < 8 || !range_ok(sa, 8) {
