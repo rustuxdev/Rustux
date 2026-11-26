@@ -8500,3 +8500,21 @@ statmount reporting but no group mechanics. mnttest extended in
 place (no new task, no MAX_TASKS bump). Audit run-86:
 0 confirmed — detached-dissolution/idmap/propagation CVE classes
 all absent by construction; stale-fd alias killed by id-not-slot.
+
+run-328 lands pivot_root(155) + the fs-context trio + quotactl_fd:
+pivot_root relabels mount records (new mount -> "", old root ->
+put_old under it; new must be a non-root mount point, put_old
+strictly inside its coverage) — the root-guard everywhere keys on
+empty path, not slot 0, since the role travels. fsopen(430) makes
+an fs_context fd (tmpfs only, CAP_SYS_ADMIN), fsconfig(431) takes
+"source" strings + ro/nosuid/nodev/noexec flag params +
+CMD_CREATE (repeat EBUSY, RECONFIGURE EINVAL), fsmount(432) mints
+a detached mount + mount fd from a created ctx. quotactl_fd(443)
+is the fd-shaped quota-less surface (ESRCH/Q_SYNC/EBADF/EINVAL).
+Divergences: pivot is a mount-record relabel — vdirs stay flat-
+addressed so covered dirs still show their ramfs contents; cwd/
+root strings keep resolving (no dentry pinning); sibling tasks
+see the new tree too (their root string covers all); fs_context
+has no log output fd side. mnttest extended (same task). Audit
+run-87: 0 confirmed — the pivot parent-UAF class needs parent
+pointers we don't have; NEWNS class needs namespaces we reject.

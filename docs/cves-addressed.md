@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**408 unique CVEs recorded.**
+**410 unique CVEs recorded.**
 
 ## klib ports
 
@@ -482,6 +482,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-43075 | process_vm+cfr+clock+affinity rung (310/311/326/227/221/203): process_vm — shared engine… | kernel/src/user.rs (process_vm + sys_process_vm_readv/writev + CfrSrc + sys_copy_file_range + sys_clock_settime + sys_fadvise64 + sys_sched_setaffinity), kernel/src/rtc.rs (set_wa… |
 | CVE-2026-43075 | process_vm+cfr+clock+affinity rung (310/311/326/227/221/203): process_vm — shared engine… | kernel/src/user.rs (process_vm + sys_process_vm_readv/writev + CfrSrc + sys_copy_file_range + sys_clock_settime + sys_fadvise64 + sys_sched_setaffinity), kernel/src/rtc.rs (set_wa… |
 | CVE-2026-43445 | `e1000` TX | **design note** — no multi-buffer skb mapping yet; when TX gains error paths, unmap exactly the buffers mapped |
+| CVE-2026-43472 | pivot_root(155) + fsopen(430)/fsconfig(431)/fsmount(432) + quotactl_fd(443): pivot_root r… | audit run-87 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-98985, CVE-2026-43472 — absent-subsystem classes (no parent pointers, no CLONE_NEWNS). Ver… |
+| CVE-2026-43472 | pivot_root(155) + fsopen(430)/fsconfig(431)/fsmount(432) + quotactl_fd(443): pivot_root r… | audit run-87 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-98985, CVE-2026-43472 — absent-subsystem classes (no parent pointers, no CLONE_NEWNS). Ver… |
 | CVE-2026-43499 | futex2-ops+membarrier rung (454/455/456/324): sys_futex_wait — compare-then-block like FU… | kernel/src/user.rs (futex2_flags_ok + sys_futex_wait + sys_futex_wake + sys_futex_requeue + sys_membarrier + waitv res/size tightening), kernel/src/syscall.rs (NR 454/455/456/324)… |
 | CVE-2026-43499 | futex2-ops+membarrier rung (454/455/456/324): sys_futex_wait — compare-then-block like FU… | kernel/src/user.rs (futex2_flags_ok + sys_futex_wait + sys_futex_wake + sys_futex_requeue + sys_membarrier + waitv res/size tightening), kernel/src/syscall.rs (NR 454/455/456/324)… |
 | CVE-2026-45536 | recvmsg+SCM_RIGHTS rung (fd passing): recvmsg NR 47 (was a silent =>0 stub in the uid-fam… | audit run-50 scoped quick (security-audit skill): 0 confirmed, 1 fixed in-run; cve-now checked: CVE-2024-26923, CVE-2026-53005, CVE-2024-35970, CVE-2025-38236, CVE-2026-52928, CVE… |
@@ -659,6 +661,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-98866 | CLONE_VM threads: shared address space via MM_REFS (pml4,users) ledger, exec_mmap-style d… | SELF-REVIEW CAUGHT two refcount-safety bugs pre-commit: mm_share silently dropped the ref when the (provably-unreachable) table was full — a shared pml4 would have freed under a l… |
 | CVE-2026-98983 | credentials block + execveat (102/104-108/113-120/125/126/322): Task gains a real uid — s… | audit run-72 scoped quick: 0 confirmed, 1 in-run fix (uid inheritance across fork/clone/thread); cve-now checked: CVE-2026-82474, CVE-2026-79918, CVE-2026-68187, CVE-2025-38260, C… |
 | CVE-2026-98983 | credentials block + execveat (102/104-108/113-120/125/126/322): Task gains a real uid — s… | audit run-72 scoped quick: 0 confirmed, 1 in-run fix (uid inheritance across fork/clone/thread); cve-now checked: CVE-2026-82474, CVE-2026-79918, CVE-2026-68187, CVE-2025-38260, C… |
+| CVE-2026-98985 | pivot_root(155) + fsopen(430)/fsconfig(431)/fsmount(432) + quotactl_fd(443): pivot_root r… | audit run-87 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-98985, CVE-2026-43472 — absent-subsystem classes (no parent pointers, no CLONE_NEWNS). Ver… |
+| CVE-2026-98985 | pivot_root(155) + fsopen(430)/fsconfig(431)/fsmount(432) + quotactl_fd(443): pivot_root r… | audit run-87 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-98985, CVE-2026-43472 — absent-subsystem classes (no parent pointers, no CLONE_NEWNS). Ver… |
 | CVE-2026-98989 | pidfd rung (process-handle fds): pidfd_open NR 434 -> FdKind::Pidfd(pid) anon-fd (next_pi… | fd-confusion class (fixed in-run: Option<u8> OFD index would truncate >=256 -> aliased OFD 0 — every task past the cap got bogus std streams; u16 widen); abi-number class (fixed i… |
 | CVE-2026-98992 | pidfd rung (process-handle fds): pidfd_open NR 434 -> FdKind::Pidfd(pid) anon-fd (next_pi… | fd-confusion class (fixed in-run: Option<u8> OFD index would truncate >=256 -> aliased OFD 0 — every task past the cap got bogus std streams; u16 widen); abi-number class (fixed i… |
 | CVE-2026-98992 | pidfd rung (process-handle fds): pidfd_open NR 434 -> FdKind::Pidfd(pid) anon-fd (next_pi… | fd-confusion class (fixed in-run: Option<u8> OFD index would truncate >=256 -> aliased OFD 0 — every task past the cap got bogus std streams; u16 widen); abi-number class (fixed i… |
