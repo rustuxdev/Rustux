@@ -7999,3 +7999,13 @@ size==U32 exactly). Audit found two gates to add: requeue
 src==dst EINVAL (CVE-2014-3153 class) and identical waiter flags
 (CVE-2026-31554 class) — both landed. ft2test 28 checks green;
 exit 33, 91 tasks, zero leak. Ledger at 281 CVEs.
+
+process_madvise(440) composes with the pidfd family: iovec ranges
+validated then per-iov committed-overlap byte counting (holes
+advise nothing, like Linux's VMA walk); advice set restricted to
+COLD/PAGEOUT/COLLAPSE — all inert here. The mlock family validates
+vs the committed ledger and returns — pinning is honest-noop where
+nothing evicts; mlock2/mlockall flag-mask EINVALs, and MUNLOCKALL
+got its own =>0 arm after the audit caught a garbage-a1 EINVAL on
+a no-arg syscall. pmtvtest 27 checks green; exit 33, 92 tasks,
+zero leak. Ledger at 285 CVEs.
