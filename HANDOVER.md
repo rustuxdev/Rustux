@@ -6915,3 +6915,43 @@ first virtio device only, transitional transport only (modern-only
 1042 needs the cap-list interface), /dev/vdN not minted in the OFD
 block layer, no journal replay, no metadata checksum verify, virtio-net
 not written.
+
+---
+
+## run-266 — virtio-net datapath (RX/TX over the shared Vq)
+
+virtio.rs refactored: the split-ring machinery (setup, put_desc,
+avail_push, notify, used_idx/entry, poll_once) extracted into a shared
+`Vq` type used by both blk and net. net_init probes transitional
+virtio-net-pci (1af4:1000) on the same legacy I/O interface — RX/TX
+queues at device qsize, 16 pre-posted 2KiB device-writable RX buffers,
+8 TX slots, 10-byte legacy net header with ZERO negotiated features
+(no mergeg_bufs/GSO — the device cannot split frames). net_rx polls
+used-ring via wrapping_sub vs our own rx_seen; id bounded <N_RX; len
+>=NET_HDR required; copy clamped to slot capacity AND caller buf.
+net_tx pads to 60B, single-descriptor. net_selftest ARP-requests the
+slirp gateway and drains RX — proven: `virtio: net ARP round-trip
+true` alongside the e1000e's own round-trip.
+
+REGRESSION CAUGHT: naming any `-netdev` suppresses QEMU's implicit
+default NIC — the whole socket suite had silently been riding it
+(udptest's sendto->EHOSTUNREACH e6, tcptest exit(1), wiotest flake).
+Restored explicitly: `-netdev user,id=n0 -device e1000e,netdev=n0`
+beside virtio-net on n1. Makefile run now names both NICs; sockets
+still gate on e1000::net_up only (virtio-net is NOT wired into the
+socket layer — net_rx/net_tx are driver-level; the NIC-abstraction
+that would let user.rs pick a NIC is the documented next step).
+
+Audit: scoped quick, security-audit skill, run-25 — 0 confirmed;
+in-run hardening (rx len clamp lacked the slot-cap term). cve-now:
+CVE-2025-40292 (host len>buffer overread — clamped), CVE-2025-38551
+(ANNOUNCE probe race — n/a, no config irqs), CVE-2010-0741 (TSO
+whitelist — n/a, zero features), CVE-2025-38314 class (used.len —
+never consumed). Verified: make run exit 33, 75 tasks, frames equal,
+udptest/tcptest/nettest/wgettest exit(0), ext4-over-virtio mount ok.
+
+Known limits (documented, next-rung candidates): virtio-net not wired
+into sockets (net_up/net_mac/net_rx/net_tx ready; the socket layer's
+NIC abstraction is the next step — then route egress by NIC and demux
+ingress from both rings), no IRQ-driven rx (polling only), virtio
+modern-only transport (cap-list) absent, NVMe absent, /dev/vdN absent.
