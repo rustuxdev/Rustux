@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**206 unique CVEs recorded.**
+**208 unique CVEs recorded.**
 
 ## klib ports
 
@@ -124,6 +124,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-0847 | rseq(334) registration + sendfile(40): per-task rseq_va (not fork-inherited, exec-cleared… | 0847 architecturally absent: Dirty Pipe was uninit flags in pipe_buffer letting partial writes merge into shared page-cache pages; Rustux pipes are private kernel rings and sendfi… |
 | CVE-2022-1304 | installed-apt rung: glibc DNS/NSS chain shipped (libnss_dns/libnss_files/libresolv + etc/… | audit run-259 scoped quick (security-audit skill): cve-now e2fsprogs class — CVE-2022-1304, CVE-2019-5188, CVE-2019-5094, CVE-2015-0247, CVE-2015-1572, CVE-2007-5497 all crafted-i… |
 | CVE-2022-4378 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
+| CVE-2022-48853 | virtio-scsi rung (fourth storage transport): virtio.rs gains the scsi driver — DEV_SCSI 0… | audit run-43 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2024-8612, CVE-2022-48853 — QEMU-side/swiotlb classes, n/a. Verified: make run exit 33, 78 task… |
 | CVE-2022-48864 | virtio-net-ctrlq rung: handshake_modern generalised to handshake_modern_feat(common, acce… | audit run-39 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2022-48864 — n/a. Verified: make run exit 33, 78 tasks, frames equal; virtio: net ctrlq promisc… |
 | CVE-2022-48864 | virtio-net-ctrlq rung: handshake_modern generalised to handshake_modern_feat(common, acce… | audit run-39 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2022-48864 — n/a. Verified: make run exit 33, 78 tasks, frames equal; virtio: net ctrlq promisc… |
 | CVE-2022-49073 | install prompt/eject + read-cap split + ATA recovery: demomenu verifies, ATAPI-ejects /de… | audit run-113 manual scoped + cve.now over HTTP JSON-RPC (entities.search — analogs above; no mapped sr/cdrom-ioctl CVE): verified every fd_read arm bounds n by source availabilit… |
@@ -188,6 +189,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2024-56642 | UDP sockets: socket/bind/sendto/recvfrom + live RX path | sockaddr_in is fully zeroed before fields (47597 uninit-struct class structurally absent); synchronous endpoint teardown at last-fd-close — no deferred-cleanup UAF (56642 n/a); rx… |
 | CVE-2024-58090 | fork/wait4/getpid + full-ctx syscall stub | eager deep copy of user space — no COW, so the 5195 COW-breakage race class is structurally absent; child ctx = parent syscall UCtx with rax=0, parent gets pid (user-only regs, no… |
 | CVE-2024-58090 | preemptive round-robin scheduler | every switch is a UCtx resume (15 GPRs + iret frame) — launch/preemption/exit share one path; dedicated 0xf0 stub saves the FULL register file; cs&3==0 ticks never switch (58090 c… |
+| CVE-2024-8612 | virtio-scsi rung (fourth storage transport): virtio.rs gains the scsi driver — DEV_SCSI 0… | audit run-43 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2024-8612, CVE-2022-48853 — QEMU-side/swiotlb classes, n/a. Verified: make run exit 33, 78 task… |
 | CVE-2025-21887 | writable file layer: VFile/Ram OFDs (O_CREAT/O_EXCL/O_TRUNC/O_APPEND), write/read/pread/l… | self-review catches FIXED pre-commit: write(fd,buf,0) at pos>len allocated+extended the file (now early-0 like Linux); fd_pread on an empty VFile took null.add(0) (now n==0 early… |
 | CVE-2025-21927 | NVMe storage rung: nvme.rs — PCI MMIO probe (1b36:0010, QEMU's newer id; 0004 fallback),… | audit run-27 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6238, CVE-2025-21927, CVE-2023-6535/6536/6356, CVE-2026-89972, CVE-2024-45013, CVE-2026-99… |
 | CVE-2025-21927 | NVMe write rung: nvme.rs gains write_range — OP_WRITE (0x01) NVM command mirroring the au… | audit run-28 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6536/6535/6356, CVE-2024-51566/51562, CVE-2024-45013, CVE-2025-68756, CVE-2023-6238 — n/a… |

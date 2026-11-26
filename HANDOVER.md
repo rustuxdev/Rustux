@@ -7494,3 +7494,40 @@ EOPNOTSUPP on /dev/sda; ENOTTY on /dev/null. blktest 55 checks
 
 Audit run-42: 0 confirmed. Ledger at 206 CVEs.
 
+## run-284 — virtio-scsi storage transport
+
+Fourth block transport: QEMU `virtio-scsi-pci` (1af4:1004
+transitional, legacy I/O BAR) + `scsi-hd` on the same
+$(VIRTIO_DISK) image. Driver lives in virtio.rs: `scsi_cmd` issues
+one request = cmd_req 51B header (8B flat LUN `{1,target,
+0x40|hi,lo,...}`, u64 tag, task_attr/prio/crn, 32B CDB slot) OUT,
+optional dataout OUT, resp IN, optional datain IN — descriptor
+chain must put every OUT before every IN and terminate the last.
+`S_RESP` is 128B because QEMU requires the resp iovec to cover
+`sizeof(resp)+sense_size` (10+96); a short chain hits
+`virtio_scsi_bad_req` -> `virtio_error` -> `vdev->broken` and the
+device never completes another kick (debugged via
+x-query-virtio-queue-status: broken=true, last-avail-idx stuck).
+LUN field is at header offset 0, not 1.
+
+Disks: `SDisk{vq,ctrl,data,sectors,lun}` in SDISKS[2], bound on
+TUR+INQUIRY+READ CAPACITY(10); scsi_read/write batch S_BATCH=8
+sectors through an 8KiB staging block; scsi_flush = SYNCHRONIZE
+CACHE(10). Init does the standard datapath selftest (sector0 sig,
+write/verify/restore at LBA64, flush).
+
+Block layer: SCSI disks ride Linux's extended sd major **65**
+(minor 16*drv), so partition minors and dev_part_add work like
+vd/nvme — ext2::transport index 4 after nvme, DiskIo len/read
+arms, main.rs scan tmajor `_ => 65`, six `8 | 254 | 259` dispatch
+sites widened to `8 | 65 | 254 | 259`, partition-name match gets
+a 65 arm (letters continue past ahci -> sdb/sdb1).
+
+Proof: `virtio: scsi inquiry 'QEMU' 'QEMU HARDDISK' last_lba
+32767`, `scsi write datapath true verify true restore true flush
+true`, `ext4: disk5p0 MOUNTED` (through transport-4 reads),
+blktest +10 checks incl. sdb/sdb1 open/fstat 65:0/65:1/
+BLKGETSIZE64/MBR sig/ext4 magic/pwrite-verify-restore. Exit 33,
+78 tasks, zero leak.
+
+Audit run-43: 0 confirmed. Ledger at 208 CVEs.
