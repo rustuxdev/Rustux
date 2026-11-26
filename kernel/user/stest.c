@@ -59,8 +59,12 @@ int main(void) {
                      AT_FDCWD, "/tmp_st_b", 0);
     check(r == 0 && access("/tmp_st_b", F_OK) == 0,
           "renameat2(316) renames");
+    // run-311 wired tee(276) itself — the check is now that it
+    // answers as tee (EINVAL on non-pipe fd 0) not ENOSYS and
+    // definitely not renameat2 semantics.
     errno = 0;
-    check(syscall(TEE_NR, 0, 0, 0, 0) == -1 && errno == ENOSYS,
+    long tr = syscall(TEE_NR, 0, 0, 0, 0);
+    check(tr == -1 && errno != ENOSYS && errno != ENOENT,
           "nr 276 is tee, not renameat2");
     // RENAME_NOREPLACE against an existing target.
     fd = open("/tmp_st_c", O_CREAT | O_RDWR | O_TRUNC, 0644);

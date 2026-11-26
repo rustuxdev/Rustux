@@ -9523,6 +9523,487 @@ pub fn fd_preadv(fd: u64, iov: u64, cnt: u64, pos: i64) -> u64 {
     fd_pxvec(fd, iov, cnt, pos, false)
 }
 
+/// preadv2(327)/pwritev2(328): the flagged pair — pos==-1 means
+/// "use and advance the file position" like Linux; other negative
+/// EINVALs. Flags ⊆ RWF_{SYNC,DSYNC,HIPRI,NOWAIT,APPEND}: all are
+/// inert on Ram vfiles (sync is a no-op without a page cache;
+/// NOWAIT never blocks a Ram read anyway; APPEND maps to writing
+/// at EOF like pwritev2 does).
+fn fd_pxvec2(fd: u64, iov: u64, cnt: u64, pos: i64, flags: u64, write: bool) -> u64 {
+    const RWF_: u64 = 0x1f; // SYNC|DSYNC|HIPRI|NOWAIT|APPEND
+    if flags & !RWF_ != 0 {
+        return EINVAL;
+    }
+    if pos == -1 {
+        let Some(t) = cur_mut() else { return EBADF };
+        let Some(o) = ofd(t, fd) else { return EBADF };
+        let p = o.pos as i64;
+        let r = fd_pxvec(fd, iov, cnt, p, write);
+        if (r as i64) > 0 {
+            if let Some(o) = ofd(t, fd) {
+                o.pos += r as usize;
+            }
+        }
+        return r;
+    }
+    if pos < 0 {
+        return EINVAL;
+    }
+    let p = if flags & 0x10 != 0 {
+        // RWF_APPEND: writes at EOF like Linux (reads ignore it).
+        if !write {
+            return EINVAL;
+        }
+        let Some(t) = cur_mut() else { return EBADF };
+        let Some(o) = ofd(t, fd) else { return EBADF };
+        let FdKind::Ram(i) = &o.kind else { return EBADF };
+        vfile(*i).map(|v| v.len as i64).unwrap_or(0)
+    } else {
+        pos
+    };
+    fd_pxvec(fd, iov, cnt, p, write)
+}
+
+/// preadv2(327): flagged positioned scatter-read.
+pub fn fd_preadv2(fd: u64, iov: u64, cnt: u64, pos: i64, flags: u64) -> u64 {
+    fd_pxvec2(fd, iov, cnt, pos, flags, false)
+}
+
+/// pwritev2(328): flagged positioned gather-write.
+pub fn fd_pwritev2(fd: u64, iov: u64, cnt: u64, pos: i64, flags: u64) -> u64 {
+    fd_pxvec2(fd, iov, cnt, pos, flags, true)
+}
+
+/// One side of splice/tee: a pipe end with its direction, or a
+/// regular file (File/Ram). Anything else EINVALs like Linux.
+#[derive(Clone, Copy)]
+enum SpliceEnd {
+    Pipe { id: usize, write: bool },
+    File,
+    Other,
+}
+
+fn splice_end(t: &mut Task, fd: u64) -> Option<(SpliceEnd, bool)> {
+    let o = ofd(t, fd)?;
+    let nb = o.nonblock;
+    Some((
+        match &o.kind {
+            FdKind::Pipe { id, write } => SpliceEnd::Pipe { id: *id, write: *write },
+            FdKind::File(_) | FdKind::Ram(_) => SpliceEnd::File,
+            _ => SpliceEnd::Other,
+        },
+        nb,
+    ))
+}
+
+/// splice(fd_in, off_in, fd_out, off_out, len, flags): move bytes
+/// between a pipe and a file (or pipe to pipe) without a user
+/// bounce — same synchronous ring copy as sendfile, documented
+/// divergence: a mid-copy block can't resume, so a full output
+/// ring answers short or EAGAIN (with NONBLOCK or a nonblock fd).
+/// Offsets must be NULL on the pipe side (ESPIPE); on the file
+/// side NULL uses/advances the OFD pos, non-NULL uses and writes
+/// back *off like Linux.
+pub fn sys_splice(
+    fd_in: u64,
+    off_in: u64,
+    fd_out: u64,
+    off_out: u64,
+    len: u64,
+    flags: u64,
+) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    const EPIPE_: u64 = (-32i64) as u64;
+    const ESPIPE_: u64 = (-29i64) as u64;
+    if flags & !0xf != 0 {
+        return EINVAL;
+    }
+    let nonblock = flags & 2 != 0;
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some((ins, nb_in)) = splice_end(t, fd_in) else { return EBADF };
+    let Some((outs, nb_out)) = splice_end(t, fd_out) else { return EBADF };
+    let eagain = nonblock || nb_in || nb_out;
+    // The pipe side rejects an offset pointer outright.
+    let (ip, op) = (
+        matches!(ins, SpliceEnd::Pipe { write: false, .. }),
+        matches!(outs, SpliceEnd::Pipe { write: true, .. }),
+    );
+    if ip && off_in != 0 {
+        return ESPIPE_;
+    }
+    if op && off_out != 0 {
+        return ESPIPE_;
+    }
+    // Direction: in-pipe->out-pipe (tee-like copy), in-file->out-
+    // pipe, or in-pipe->out-file. Anything else EINVALs — Linux
+    // requires at least one pipe and matching directions.
+    if !ip && !op {
+        return EINVAL;
+    }
+    // Resolve the file-side source/dest + starting offset.
+    // For file->pipe we read `len` bytes from src at pos; for
+    // pipe->file we write `len` bytes into dst at pos.
+    struct FileSide {
+        ptr: *const u8,
+        len: usize,
+        pos: usize,
+        vi: usize,
+    }
+    let mut fside: Option<FileSide> = None;
+    if !ip {
+        // in is the file side.
+        let Some(o) = ofd(t, fd_in) else { return EBADF };
+        if o.accmode == 1 {
+            return EBADF;
+        }
+        let (p, l) = match &o.kind {
+            FdKind::File(d) => (d.as_ptr(), d.len()),
+            FdKind::Ram(i) => match vfile(*i) {
+                Some(v) => (v.data as *const u8, v.len),
+                None => return EBADF,
+            },
+            _ => return EINVAL,
+        };
+        let pos = if off_in != 0 {
+            if !range_ok(off_in, 8) {
+                return EFAULT_;
+            }
+            // SAFETY: validated user range under current cr3.
+            let v = unsafe { (off_in as *const i64).read_unaligned() };
+            if v < 0 {
+                return EINVAL;
+            }
+            v as usize
+        } else {
+            o.pos
+        };
+        fside = Some(FileSide { ptr: p, len: l, pos, vi: usize::MAX });
+    } else if !op {
+        // out is the file side — must be a writable Ram vfile.
+        let Some(o) = ofd(t, fd_out) else { return EBADF };
+        if o.accmode == 0 {
+            return EBADF;
+        }
+        let FdKind::Ram(i) = &o.kind else { return EINVAL };
+        let vi = *i;
+        let pos = if off_out != 0 {
+            if !range_ok(off_out, 8) {
+                return EFAULT_;
+            }
+            let v = unsafe { (off_out as *const i64).read_unaligned() };
+            if v < 0 {
+                return EINVAL;
+            }
+            v as usize
+        } else {
+            o.pos
+        };
+        fside = Some(FileSide {
+            ptr: core::ptr::null(),
+            len: 0,
+            pos,
+            vi,
+        });
+    } else {
+        // pipe->pipe: splice requires distinct pipes.
+        let (SpliceEnd::Pipe { id: i1, .. }, SpliceEnd::Pipe { id: i2, .. }) =
+            (ins, outs)
+        else {
+            return EINVAL;
+        };
+        if i1 == i2 {
+            return EINVAL;
+        }
+    }
+    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
+    match (ins, outs) {
+        (SpliceEnd::File, SpliceEnd::Pipe { id, .. }) => {
+            let f = fside.unwrap();
+            let want = core::cmp::min(len as usize, f.len.saturating_sub(f.pos));
+            if want == 0 {
+                return 0; // EOF
+            }
+            let Some(p) = pipes.get_mut(id).and_then(|s| s.as_mut()) else {
+                return EBADF;
+            };
+            if p.readers == 0 {
+                return EPIPE_;
+            }
+            let room = PIPE_SIZE - (p.tail - p.head);
+            let n = core::cmp::min(want, room);
+            if n == 0 {
+                return if eagain { EAGAIN_ } else { 0 };
+            }
+            for i in 0..n {
+                // SAFETY: src names f.len bytes of kernel-visible
+                // storage; ring index wraps inside the pipe frame.
+                unsafe {
+                    let b = f.ptr.add(f.pos + i).read();
+                    ((crate::mm::pmap(p.buf) + ((p.tail + i) % PIPE_SIZE) as u64)
+                        as *mut u8)
+                        .write(b);
+                }
+            }
+            p.tail += n;
+            pipe_wake(id);
+            if off_in != 0 {
+                if !range_ok_w(off_in, 8) {
+                    return EFAULT_;
+                }
+                unsafe {
+                    (off_in as *mut i64).write_unaligned((f.pos + n) as i64)
+                };
+            } else if let Some(o) = ofd(t, fd_in) {
+                o.pos += n;
+            }
+            n as u64
+        }
+        (SpliceEnd::Pipe { id, .. }, SpliceEnd::File) => {
+            let f = fside.unwrap();
+            let Some(p) = pipes.get_mut(id).and_then(|s| s.as_mut()) else {
+                return EBADF;
+            };
+            let avail = p.tail - p.head;
+            let want = core::cmp::min(len as usize, avail);
+            if want == 0 {
+                // Empty ring: writers gone is EOF, else block-or-
+                // EAGAIN like fd_read's pipe path.
+                return if p.writers == 0 {
+                    0
+                } else if eagain {
+                    EAGAIN_
+                } else {
+                    0
+                };
+            }
+            let Some(v) = vfile(f.vi) else { return EBADF };
+            const EPERM_: u64 = (-1i64) as u64;
+            if v.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+                return EPERM_;
+            }
+            let Some(need) = f.pos.checked_add(want) else {
+                return EINVAL;
+            };
+            if need > v.len && v.seals & F_SEAL_GROW != 0 {
+                return EPERM_;
+            }
+            let r = vfile_grow(v, need);
+            if r != 0 {
+                return r;
+            }
+            // Re-resolve the ring — vfile_grow may alloc (no task
+            // switch possible, but the borrow discipline is cheap).
+            let Some(p) = pipes.get_mut(id).and_then(|s| s.as_mut()) else {
+                return EBADF;
+            };
+            for i in 0..want {
+                // SAFETY: ring index wraps inside the pipe frame;
+                // v.data owns `need` bytes post-grow.
+                unsafe {
+                    let b = ((crate::mm::pmap(p.buf)
+                        + ((p.head + i) % PIPE_SIZE) as u64)
+                        as *const u8)
+                        .read();
+                    v.data.add(f.pos + i).write(b);
+                }
+            }
+            p.head += want;
+            v.len = v.len.max(need);
+            pipe_wake(id);
+            if off_out != 0 {
+                if !range_ok_w(off_out, 8) {
+                    return EFAULT_;
+                }
+                unsafe {
+                    (off_out as *mut i64).write_unaligned((f.pos + want) as i64)
+                };
+            } else if let Some(o) = ofd(t, fd_out) {
+                o.pos += want;
+            }
+            want as u64
+        }
+        (SpliceEnd::Pipe { id: i1, .. }, SpliceEnd::Pipe { id: i2, .. }) => {
+            // Move = read from i1, write to i2 — the same short-
+            // copy discipline as the file paths.
+            let (pr, pw) = if i1 < i2 {
+                let (a, b) = pipes.split_at_mut(i2);
+                (a[i1].as_mut(), b[0].as_mut())
+            } else {
+                let (a, b) = pipes.split_at_mut(i1);
+                (b[0].as_mut(), a[i2].as_mut())
+            };
+            let (Some(pr), Some(pw)) = (pr, pw) else { return EBADF };
+            if pw.readers == 0 {
+                return EPIPE_;
+            }
+            let avail = pr.tail - pr.head;
+            let room = PIPE_SIZE - (pw.tail - pw.head);
+            let n = core::cmp::min(len as usize, core::cmp::min(avail, room));
+            if n == 0 {
+                return if avail == 0 && pr.writers == 0 {
+                    0
+                } else if eagain {
+                    EAGAIN_
+                } else {
+                    0
+                };
+            }
+            for i in 0..n {
+                // SAFETY: distinct pipe frames, both bounded.
+                unsafe {
+                    let b = ((crate::mm::pmap(pr.buf)
+                        + ((pr.head + i) % PIPE_SIZE) as u64)
+                        as *const u8)
+                        .read();
+                    ((crate::mm::pmap(pw.buf) + ((pw.tail + i) % PIPE_SIZE) as u64)
+                        as *mut u8)
+                        .write(b);
+                }
+            }
+            pr.head += n;
+            pw.tail += n;
+            pipe_wake(i1);
+            pipe_wake(i2);
+            n as u64
+        }
+        _ => EINVAL,
+    }
+}
+
+/// tee(fd_in, fd_out, len, flags): pipe->pipe copy that does NOT
+/// consume the source — peek the ring and duplicate into the
+/// destination like Linux's buffer sharing (a copy, but the
+/// semantics are identical for a byte ring).
+pub fn sys_tee(fd_in: u64, fd_out: u64, len: u64, flags: u64) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EPIPE_: u64 = (-32i64) as u64;
+    if flags & !0xf != 0 {
+        return EINVAL;
+    }
+    let nonblock = flags & 2 != 0;
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some((ins, nb_in)) = splice_end(t, fd_in) else { return EBADF };
+    let Some((outs, nb_out)) = splice_end(t, fd_out) else { return EBADF };
+    let SpliceEnd::Pipe { id: i1, write: false } = ins else {
+        return EINVAL;
+    };
+    let SpliceEnd::Pipe { id: i2, write: true } = outs else {
+        return EINVAL;
+    };
+    if i1 == i2 {
+        return EINVAL;
+    }
+    let eagain = nonblock || nb_in || nb_out;
+    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
+    let (pr, pw) = if i1 < i2 {
+        let (a, b) = pipes.split_at_mut(i2);
+        (a[i1].as_mut(), b[0].as_mut())
+    } else {
+        let (a, b) = pipes.split_at_mut(i1);
+        (b[0].as_mut(), a[i2].as_mut())
+    };
+    let (Some(pr), Some(pw)) = (pr, pw) else { return EBADF };
+    if pw.readers == 0 {
+        return EPIPE_;
+    }
+    let avail = pr.tail - pr.head;
+    let room = PIPE_SIZE - (pw.tail - pw.head);
+    let n = core::cmp::min(len as usize, core::cmp::min(avail, room));
+    if n == 0 {
+        return if eagain { EAGAIN_ } else { 0 };
+    }
+    for i in 0..n {
+        // SAFETY: peek — pr.head untouched; distinct pipe frames.
+        unsafe {
+            let b = ((crate::mm::pmap(pr.buf)
+                + ((pr.head + i) % PIPE_SIZE) as u64) as *const u8)
+                .read();
+            ((crate::mm::pmap(pw.buf) + ((pw.tail + i) % PIPE_SIZE) as u64)
+                as *mut u8)
+                .write(b);
+        }
+    }
+    pw.tail += n;
+    pipe_wake(i2);
+    n as u64
+}
+
+/// vmsplice(fd, iov, cnt, flags): user memory into a pipe's write
+/// end — without SPLICE_F_GIFT the iovecs are copied into the
+/// ring (same byte-copy discipline as splice; GIFT is inert since
+/// our rings own their frames outright, so it behaves as a copy
+/// anyway — Linux allows that).
+pub fn sys_vmsplice(fd: u64, iov: u64, cnt: u64, flags: u64) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    const EPIPE_: u64 = (-32i64) as u64;
+    if flags & !0xf != 0 {
+        return EINVAL;
+    }
+    if cnt == 0 {
+        return 0;
+    }
+    if cnt > 32 || !range_ok(iov, cnt * 16) {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let FdKind::Pipe { id, write: true } = o.kind else {
+        return EBADF;
+    };
+    let nonblock = flags & 2 != 0 || o.nonblock;
+    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
+    let Some(p) = pipes.get_mut(id).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    if p.readers == 0 {
+        return EPIPE_;
+    }
+    let mut done = 0u64;
+    for i in 0..cnt {
+        let (base, l) = unsafe {
+            (
+                ((iov + i * 16) as *const u64).read_unaligned(),
+                ((iov + i * 16 + 8) as *const u64).read_unaligned(),
+            )
+        };
+        if l == 0 {
+            continue;
+        }
+        if !range_ok(base, l) {
+            return if done > 0 { done } else { EFAULT_ };
+        }
+        let room = PIPE_SIZE - (p.tail - p.head);
+        let n = core::cmp::min(l as usize, room);
+        if n == 0 {
+            return if done > 0 {
+                done
+            } else if nonblock {
+                EAGAIN_
+            } else {
+                0
+            };
+        }
+        for j in 0..n {
+            // SAFETY: base is validated user memory; ring wraps.
+            unsafe {
+                let b = ((base + j as u64) as *const u8).read();
+                ((crate::mm::pmap(p.buf) + ((p.tail + j) % PIPE_SIZE) as u64)
+                    as *mut u8)
+                    .write(b);
+            }
+        }
+        p.tail += n;
+        done += n as u64;
+        if (n as u64) < l {
+            break; // ring full mid-iovec — short answer
+        }
+    }
+    pipe_wake(id);
+    done
+}
+
 /// pwritev(296): positioned gather-write.
 pub fn fd_pwritev(fd: u64, iov: u64, cnt: u64, pos: i64) -> u64 {
     fd_pxvec(fd, iov, cnt, pos, true)

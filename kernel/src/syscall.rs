@@ -653,6 +653,11 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         285 => user::sys_fallocate(a1, a2, a3 as i64, a4 as i64),
         295 => user::fd_preadv(a1, a2, a3, a4 as i64),
         296 => user::fd_pwritev(a1, a2, a3, a4 as i64),
+        275 => user::sys_splice(a1, a2, a3, a4, a5, a6),
+        276 => user::sys_tee(a1, a2, a3, a4),
+        278 => user::sys_vmsplice(a1, a2, a3, a4),
+        327 => user::fd_preadv2(a1, a2, a3, a4 as i64, a5),
+        328 => user::fd_pwritev2(a1, a2, a3, a4 as i64, a5),
 
         NR_FUTEX_WAKE => user::sys_futex_wake(a1, a2, a3, a4),
         NR_FUTEX_WAIT => user::sys_futex_wait(ctx, a1, a2, a3, a4, a5, a6),

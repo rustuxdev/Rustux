@@ -39,7 +39,7 @@ _start:
     inc %r15d
 3:
     mov %rax, %r13              # bytes returned
-    # walk the reclen chain — the archive guarantees 73 root
+    # walk the reclen chain — the archive guarantees 74 root
     # records: "\.", "..", "proc", every flat member, plus the
     # implicit lib64/lib dirs. Other tasks can only ADD records
     # (VFiles/VDIRS are global) — so a >= floor, never ==.
@@ -53,7 +53,7 @@ _start:
     add %r13, %rax              # buf end
     cmp %rax, %rbx
     jb 4b
-    cmp $73, %ebp
+    cmp $74, %ebp
     jae 5f
     inc %r15d
 5:
