@@ -8605,3 +8605,31 @@ queued). aiotest.c new task -> MAX_TASKS 118->119, lstest floor
 91->92. Audit run-91: 0 confirmed — the whole fs/aio.c CVE
 cluster needs kiocbs, armed wakes, or a user-visible ring, none
 of which exist.
+
+run-333: ioperm(173)/iopl(172) — real I/O privilege. The TSS grew
+legs: TssBlock = Tss + 8KB deny bitmap + mandatory 0xFF tail, one
+static so iopb's TSS-relative offset stays contiguous; descriptor
+limit widened to cover the block (bitmap now live, 0xFF-filled =
+deny-all, identical to the old iopb-past-limit default). IOPS[8]
+tgid-keyed slots match Linux's io_context shape — CLONE_THREAD
+members share the group map, fork copies it (iop_inherit at the
+three secfilt_share insert points), last member's reap frees it.
+load_iomap runs unconditional at all three switch sites
+(launch/switch_to/resume_ctx) — no cache, no staleness window.
+sys_ioperm: uid==0 (CAP_SYS_RAWIO), from+num must land in (0,65536]
+else EINVAL (Linux's from+num<=from check), bits clear->allow /
+set->deny, TSS refreshed in place so the grant applies before the
+next switch. sys_iopl: level>3 EINVAL, raising past current needs
+uid==0, lowering free; the level rides ctx.rflags IOPL which lands
+via sysret's R11 mask (0x3C7FD7 keeps bits 13:12). Audit catch:
+rt_sigreturn32 restored frame rflags *including* IOPL — a compat
+task could forge IOPL=3 and open every port, a latent escalation
+that predates the bitmap; 64-bit sigreturn cleared IOPL outright
+(functional regression for legit iopl'd tasks). Both now carry the
+task's own IOPL like Linux's FIX_EFLAGS. ioptest.c new task ->
+MAX_TASKS 119->120, lstest floor 92->93. Audit run-92: 0 confirmed
+beyond the sigreturn fix — no ioperm/iopl CVE classes exist in the
+catalog; gate classes reviewed: CAP gate present, bitmap can't
+alias (static slots freed only at group death), deny-all default,
+exec keeps the tgid map (Linux-true) but drops IOPL via the fresh
+ctx — matches rflags semantics.
