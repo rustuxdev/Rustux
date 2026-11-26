@@ -8100,3 +8100,26 @@ sees child's writes), not just errno shapes. MAX_TASKS 96->112 —
 shmtest was the refused 97th spawn (pidfdtest hit 88 the same way).
 shmtest 30 checks green; exit 33, 97 tasks, zero leak. Audit
 run-66: 0 confirmed, 1 fixed in-run. Ledger at 305 CVEs.
+run-308 lands a five-classics pack: process_vm_readv/writev
+(310/311), copy_file_range(326), clock_settime(227),
+fadvise64(221), sched_setaffinity(203). process_vm shares one
+engine for both directions — iovec arrays range_ok'd then walked
+pairwise through a 4KiB bounce, byte-wise translate_r/translate
+on the remote pml4 so unmapped windows EFAULT (only when zero
+bytes moved — partial moves return the count like Linux). The
+audit self-review caught three real gates: the remote write used
+write_task_bytes_force which skips the victim's PTE writable bit
+(a peer could scribble another task's read-only pages — now
+write_task_bytes, Linux's FOLL_WRITE shape); copy_file_range
+validated off_in readable but wrote it back (now range_ok_w);
+sched_setaffinity folded a bad mask pointer into EINVAL (now
+EFAULT). copy_file_range's self-copy case also got a real fix —
+a same-vfile copy's dst growth reallocs the src buffer, so the
+Ram src re-resolves per chunk and the copy is memmove.
+clock_settime is REALTIME-only writing EPOCH_BASE through a new
+rtc::set_wall — wall clock stays monotonic-forward from the
+tick. pmvtest proves the real path: a fork'd child arms a pipe,
+parent reads its buffer cross-mm, writes through it, child
+verifies on exit. pmvtest 28 checks green; exit 33, 98 tasks,
+zero leak. Audit run-67: 0 confirmed, 3 fixed in-run. Ledger at
+313 CVEs.
