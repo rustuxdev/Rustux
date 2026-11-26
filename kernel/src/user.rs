@@ -10089,6 +10089,214 @@ pub fn sys_setpriority(which: u64, who: u64, prio: i64) -> u64 {
     0
 }
 
+/// sched_setparam(pid, param): only SCHED_OTHER exists (priority
+/// must be 0 in it — anything else EINVALs like Linux), so this
+/// validates pid + pointer and stores nothing.
+pub fn sys_sched_setparam(pid: u64, param: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if !range_ok(param, 4) {
+        return EFAULT;
+    }
+    if pid != 0 && task_slot_by_pid(pid).is_none() {
+        return ESRCH_;
+    }
+    // SAFETY: validated readable user range; sched_param is a
+    // lone i32 priority.
+    let pri = unsafe { (param as *const i32).read_unaligned() };
+    if pri != 0 {
+        return EINVAL;
+    }
+    0
+}
+
+/// sched_getparam(pid, param): writes {sched_priority:0}.
+pub fn sys_sched_getparam(pid: u64, param: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if !range_ok_w(param, 4) {
+        return EFAULT;
+    }
+    if pid != 0 && task_slot_by_pid(pid).is_none() {
+        return ESRCH_;
+    }
+    // SAFETY: validated writable user range.
+    unsafe { (param as *mut i32).write_unaligned(0) };
+    0
+}
+
+/// sched_setscheduler(pid, policy, param): policy must be
+/// SCHED_OTHER(0) — FIFO/RR would need real priorities the
+/// scheduler doesn't have, so they EINVAL honestly rather than
+/// silently degrade. param's priority must be 0 to match.
+pub fn sys_sched_setscheduler(pid: u64, policy: i64, param: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if policy != 0 {
+        return EINVAL;
+    }
+    if !range_ok(param, 4) {
+        return EFAULT;
+    }
+    if pid != 0 && task_slot_by_pid(pid).is_none() {
+        return ESRCH_;
+    }
+    let pri = unsafe { (param as *const i32).read_unaligned() };
+    if pri != 0 {
+        return EINVAL;
+    }
+    0
+}
+
+/// sched_getscheduler(pid): always SCHED_OTHER(0) — the only
+/// policy this kernel implements.
+pub fn sys_sched_getscheduler(pid: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if pid != 0 && task_slot_by_pid(pid).is_none() {
+        return ESRCH_;
+    }
+    0
+}
+
+/// sched_get_priority_max/min(policy): the ABI answers for the
+/// real policies — FIFO/RR span [1,99], the others are always 0.
+/// Unknown policies EINVAL.
+fn sched_pri_bound(policy: i64, lo: bool) -> u64 {
+    match policy {
+        1 | 2 => if lo { 1 } else { 99 }, // FIFO | RR
+        0 | 3 | 5 | 6 => 0,               // OTHER|BATCH|IDLE|DEADLINE
+        _ => EINVAL,
+    }
+}
+
+pub fn sys_sched_get_priority_max(policy: i64) -> u64 {
+    sched_pri_bound(policy, false)
+}
+
+pub fn sys_sched_get_priority_min(policy: i64) -> u64 {
+    sched_pri_bound(policy, true)
+}
+
+/// sched_rr_get_interval(pid, ts): there's no round-robin
+/// quantum — the honest interval is zero (a non-RR process).
+pub fn sys_sched_rr_get_interval(pid: u64, ts: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if !range_ok_w(ts, 16) {
+        return EFAULT;
+    }
+    if pid != 0 && task_slot_by_pid(pid).is_none() {
+        return ESRCH_;
+    }
+    // SAFETY: validated writable user range.
+    unsafe {
+        (ts as *mut u64).write_unaligned(0);
+        ((ts + 8) as *mut u64).write_unaligned(0);
+    }
+    0
+}
+
+/// ioprio_set(which, who, ioprio)/ioprio_get(which, who): the
+/// IO-priority pair — the packed (class<<13)|data ABI validates
+/// (class<=3, data<=7), who checks like getpriority; the value
+/// itself is inert (single elevator, no classes). get reports
+/// the ABI default IOPRIO_CLASS_BE | data 4 = (2<<13)|4.
+fn ioprio_check(which: u64, who: u64) -> Option<u64> {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if which == 0 || which > 3 {
+        return Some(EINVAL);
+    }
+    // IPRIO_WHO_PROCESS=1 names a pid; PGID/USER collapse in the
+    // no-creds model but still validate existence for pids.
+    if which == 1 && who != 0 && task_slot_by_pid(who).is_none() {
+        return Some(ESRCH_);
+    }
+    None
+}
+
+pub fn sys_ioprio_set(which: u64, who: u64, ioprio: u64) -> u64 {
+    if let Some(e) = ioprio_check(which, who) {
+        return e;
+    }
+    if ioprio >> 13 > 3 || ioprio & 0x1fff > 7 {
+        return EINVAL;
+    }
+    0
+}
+
+pub fn sys_ioprio_get(which: u64, who: u64) -> u64 {
+    if let Some(e) = ioprio_check(which, who) {
+        return e;
+    }
+    (2 << 13) | 4
+}
+
+/// readahead(fd, offset, count): a pure hint — Linux never fails
+/// it for bad ranges, only for a bad fd (EBADF for unreadable
+/// or non-regular descriptors). No page cache exists to warm.
+pub fn sys_readahead(fd: u64, _off: i64, _len: u64) -> u64 {
+    let Some(t) = cur_mut() else { return EBADF };
+    match ofd(t, fd).map(|o| (&o.kind, o.accmode)) {
+        Some((FdKind::File(_), a)) | Some((FdKind::Ram(_), a)) => {
+            if a == 1 { EBADF } else { 0 }
+        }
+        Some(_) => EBADF,
+        None => EBADF,
+    }
+}
+
+/// tkill(tid, sig): the pre-tgid form — routes straight to kill
+/// like Linux's deprecated single-thread signal.
+pub fn sys_tkill(tid: u64, sig: u64) -> u64 {
+    kill(tid as i64, sig)
+}
+
+/// mbind(addr, len, mode, nmask, maxnode, flags): memory-policy
+/// binding — no NUMA topology exists, so the only policy is the
+/// default. mode>4 EINVALs (MPOL_MAX) like Linux; everything
+/// else validates and inerts.
+pub fn sys_mbind(_a: u64, _l: u64, mode: u64, _n: u64, _mn: u64, _f: u64) -> u64 {
+    if mode > 4 { EINVAL } else { 0 }
+}
+
+/// set_mempolicy(mode, nmask, maxnode): same inert-policy gate.
+pub fn sys_set_mempolicy(mode: u64, _nmask: u64, maxnode: u64) -> u64 {
+    if mode > 4 || maxnode > 4096 {
+        return EINVAL;
+    }
+    0
+}
+
+/// get_mempolicy(policy, nmask, maxnode, addr, flags): reports
+/// MPOL_DEFAULT(0) with an empty nodemask — the only policy.
+/// Flags ⊆ {MPOL_F_NODE,MPOL_F_ADDR,MPOL_F_MEMS_ALLOWED} gated
+/// to legal combinations like Linux (ADDR requires NODE).
+pub fn sys_get_mempolicy(pol: u64, nmask: u64, maxnode: u64, _a: u64, flags: u64) -> u64 {
+    const MPOL_F_NODE: u64 = 1;
+    const MPOL_F_ADDR: u64 = 2;
+    const MPOL_F_MEMS_ALLOWED: u64 = 4;
+    if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0
+        || (flags & MPOL_F_ADDR != 0 && flags & MPOL_F_NODE == 0)
+        || (flags & MPOL_F_MEMS_ALLOWED != 0
+            && flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0)
+    {
+        return EINVAL;
+    }
+    if pol != 0 && !range_ok_w(pol, 4) {
+        return EFAULT;
+    }
+    let bits = maxnode.min(4096);
+    if nmask != 0 && bits != 0 && !range_ok_w(nmask, bits.div_ceil(8)) {
+        return EFAULT;
+    }
+    if pol != 0 {
+        // SAFETY: validated writable user range.
+        unsafe { (pol as *mut u32).write_unaligned(0) };
+    }
+    if nmask != 0 && bits != 0 {
+        // SAFETY: validated writable user range; zeroed mask =
+        // "no nodes" which is honest for MPOL_DEFAULT.
+        unsafe { core::ptr::write_bytes(nmask as *mut u8, 0, (bits.div_ceil(8)) as usize) };
+    }
+    0
+}
+
 /// munmap(addr, len): Linux never fails on an aligned range — holes
 /// and foreign areas are silent no-ops. Pages are freed, range
 /// entries clipped/split, one TLB flush at the end.
