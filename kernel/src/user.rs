@@ -9531,6 +9531,42 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             0
         }
+        0x1260 | 0x1268 | 0x8008_1272 => {
+            // BLKGETSIZE / BLKSSZGET / BLKGETSIZE64 — the size trio
+            // every partitioning tool opens with. The fd must be a
+            // block node with hardware behind it: anything else is
+            // ENOTTY like a mistyped ioctl, no device is ENXIO.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            let Some(v) = vfile(*i) else { return ENOTTY_ };
+            if v.fmt != 0o60000 {
+                return ENOTTY_;
+            }
+            let cap = blk_capacity(v.rdev);
+            if cap == 0 {
+                return (-6i64) as u64; // ENXIO — node without hardware
+            }
+            if req == 0x8008_1272 {
+                // BLKGETSIZE64 — u64 byte capacity.
+                if !range_ok_w(arg, 8) {
+                    return EFAULT;
+                }
+                // SAFETY: validated user window under cur cr3.
+                unsafe { (arg as *mut u64).write(cap) };
+            } else {
+                if !range_ok_w(arg, 4) {
+                    return EFAULT;
+                }
+                let v32 = if req == 0x1268 {
+                    512u32 // BLKSSZGET — logical block size
+                } else {
+                    // BLKGETSIZE — u32 sector count (saturates over 2TiB).
+                    (cap / 512).min(u32::MAX as u64) as u32
+                };
+                // SAFETY: validated user window under cur cr3.
+                unsafe { (arg as *mut u32).write(v32) };
+            }
+            0
+        }
         0x5309 => {
             // CDROMEJECT — the ATAPI START STOP UNIT packet on the
             // secondary-channel CD drive. The fd must be an sr
@@ -10445,16 +10481,19 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
             (mode, len as u64, (arc_n + vidx) as u64 + 1)
         }
         FdKind::Dev(i) => {
-            // A device node stats S_IFCHR|mode with a vfile-space
-            // ino — the rdev slot is filled by sys_fstat's meta arm.
+            // A device node stats with its stored S_IFMT|mode — the
+            // node's own fmt carries chr/block/fifo; a vfile-space
+            // ino. The rdev slot is filled by sys_fstat's meta arm.
             let arc_n = (unsafe { *core::ptr::addr_of!(INITRD) })
                 .map_or(0, |a| crate::cpio::entries(a).count());
             let vidx = unsafe { &*core::ptr::addr_of!(VFILES) }[..*i]
                 .iter()
                 .filter(|s| s.as_ref().is_some_and(|v| !v.unlinked))
                 .count();
-            let mode = vfile(*i)
-                .map_or(0o20644u64, |v| 0o20000 | v.mode as u64);
+            let mode = vfile(*i).map_or(0o20644u64, |v| {
+                (if v.fmt != 0 { v.fmt as u64 } else { 0o20000 })
+                    | v.mode as u64
+            });
             (mode, 0, (arc_n + vidx) as u64 + 1)
         }
         // proc files stat as read-only regulars; the rendered
@@ -14000,6 +14039,158 @@ fn ahci_write(o: &mut OpenFile, drv: usize, buf: u64, len: u64) -> u64 {
     done as u64
 }
 
+/// Capacity in bytes of the block device `rdev` names, 0 when no
+/// hardware backs it — the SEEK_END base and open-gate check for
+/// every block transport (sd major 8, vd major 254, nvme major 259).
+fn blk_capacity(rdev: u32) -> u64 {
+    match rdev >> 8 {
+        8 => {
+            // Whichever transport actually has this disk: the PIIX
+            // capacity is 0 on AHCI machines, which made SEEK_END
+            // answer 0 and left the installer unable to size the
+            // space after its first partition.
+            let drv = ((rdev & 0xff) / 16) as usize;
+            let c = crate::ata::capacity_d(drv);
+            if c > 0 {
+                c
+            } else {
+                crate::ahci::disk_capacity(drv)
+            }
+        }
+        254 => crate::virtio::disk_capacity(((rdev & 0xff) / 16) as usize),
+        259 => crate::nvme::disk_capacity((rdev & 0xff) as usize),
+        _ => 0,
+    }
+}
+
+/// Which transport+drive `rdev` names: (drive, major) when a driver
+/// actually backs the node. vd minors are 16/disk like sd; nvme
+/// minors are one per namespace.
+fn blk_transport(rdev: u32) -> Option<(usize, u32)> {
+    let major = rdev >> 8;
+    let drv = if major == 254 {
+        ((rdev & 0xff) / 16) as usize
+    } else {
+        (rdev & 0xff) as usize
+    };
+    match major {
+        254 if crate::virtio::disk_capacity(drv) > 0 => Some((drv, major)),
+        259 if crate::nvme::disk_capacity(drv) > 0 => Some((drv, major)),
+        _ => None,
+    }
+}
+
+fn blk_rd(t: u32, d: usize, lba: u64, n: usize, b: &mut [u8]) -> bool {
+    if t == 254 {
+        crate::virtio::read_range(d, lba, n, b)
+    } else {
+        crate::nvme::read_range(d, lba, n, b)
+    }
+}
+
+fn blk_wr(t: u32, d: usize, lba: u64, n: usize, b: &[u8]) -> bool {
+    if t == 254 {
+        crate::virtio::write_range(d, lba, n, b)
+    } else {
+        crate::nvme::write_range(d, lba, n, b)
+    }
+}
+
+/// /dev/vdN + /dev/nvmeXnY read at the OFD position — the same
+/// bounce-buffered byte contract as the sd path: 512B-granular
+/// drivers, unaligned edges through a kernel sector buffer, reads
+/// clip at the device end.
+fn blk_read(o: &mut OpenFile, rdev: u32, buf: u64, len: u64) -> u64 {
+    let Some((d, t)) = blk_transport(rdev) else {
+        return (-6i64) as u64; // ENXIO — node outlived its driver
+    };
+    let cap = blk_capacity(rdev);
+    if o.pos as u64 >= cap {
+        return 0;
+    }
+    let n = len.min(cap - o.pos as u64) as usize;
+    if !range_ok_w(buf, n as u64) {
+        return EFAULT;
+    }
+    let mut done = 0usize;
+    let mut bounce = [0u8; 4096];
+    while done < n {
+        let off = o.pos as u64 + done as u64;
+        let lba = off / 512;
+        let in_sector = (off % 512) as usize;
+        let want = n - done;
+        let take = if in_sector == 0 && want >= 4096 {
+            4096
+        } else {
+            (512 - in_sector).min(want)
+        };
+        let secs = take.div_ceil(512).max(1);
+        if !blk_rd(t, d, lba, secs, &mut bounce[..secs * 512]) {
+            return if done > 0 { done as u64 } else { (-5i64) as u64 };
+        }
+        // SAFETY: buf validated writable for n bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bounce.as_ptr().add(in_sector),
+                (buf + done as u64) as *mut u8,
+                take,
+            );
+        }
+        done += take;
+    }
+    o.pos += done;
+    done as u64
+}
+
+/// Matching write: partial-sector edges read-modify-write through
+/// the bounce buffer; a write clipped at the device end is Linux's
+/// short write, a write starting past it is ENOSPC.
+fn blk_write(o: &mut OpenFile, rdev: u32, buf: u64, len: u64) -> u64 {
+    let Some((d, t)) = blk_transport(rdev) else {
+        return (-6i64) as u64; // ENXIO
+    };
+    let cap = blk_capacity(rdev);
+    if o.pos as u64 >= cap {
+        return (-28i64) as u64; // ENOSPC
+    }
+    let n = len.min(cap - o.pos as u64) as usize;
+    if !range_ok(buf, n as u64) {
+        return EFAULT;
+    }
+    let mut done = 0usize;
+    let mut bounce = [0u8; 4096];
+    while done < n {
+        let off = o.pos as u64 + done as u64;
+        let lba = off / 512;
+        let in_sector = (off % 512) as usize;
+        let want = n - done;
+        let take = if in_sector == 0 && want >= 4096 {
+            4096
+        } else {
+            (512 - in_sector).min(want)
+        };
+        let secs = take.div_ceil(512).max(1);
+        let whole = in_sector == 0 && take == secs * 512;
+        if !whole && !blk_rd(t, d, lba, secs, &mut bounce[..secs * 512]) {
+            return if done > 0 { done as u64 } else { (-5i64) as u64 };
+        }
+        // SAFETY: buf validated readable for n bytes; bounce holds secs*512.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (buf + done as u64) as *const u8,
+                bounce.as_mut_ptr().add(in_sector),
+                take,
+            );
+        }
+        if !blk_wr(t, d, lba, secs, &bounce[..secs * 512]) {
+            return if done > 0 { done as u64 } else { (-5i64) as u64 };
+        }
+        done += take;
+    }
+    o.pos += done;
+    done as u64
+}
+
 /// Which ATA drive backs this OFD: Linux's /dev/sda is minor 0,
 /// /dev/sdb minor 16 on major 8.
 fn sd_drive(o: &OpenFile) -> usize {
@@ -14144,8 +14335,10 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             v.atime_ns = tns;
             // Block devices read at the OFD position — sector I/O
             // through a kernel bounce buffer.
-            if v.rdev >> 8 == 8 {
-                return sd_read(o, buf, len);
+            match v.rdev >> 8 {
+                8 => return sd_read(o, buf, len),
+                254 | 259 => return blk_read(o, v.rdev, buf, len),
+                _ => {}
             }
             match v.rdev {
                 // /dev/null reads EOF.
@@ -14453,8 +14646,10 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         let Some(v) = vfile(*i) else { return EBADF };
         // Block devices write at the OFD position; partial sectors
         // read-modify-write through a kernel bounce buffer.
-        if v.rdev >> 8 == 8 {
-            return sd_write(o, buf, len);
+        match v.rdev >> 8 {
+            8 => return sd_write(o, buf, len),
+            254 | 259 => return blk_write(o, v.rdev, buf, len),
+            _ => {}
         }
         const ENOSPC_: u64 = (-28i64) as u64;
         return match v.rdev {
@@ -15589,6 +15784,43 @@ pub fn dev_init() {
             v.rdev = 11 << 8;
         }
     }
+    // virtio-blk disks — Linux's vd family: major 254, minor 16*i,
+    // nodes minted only for probed disks like sd.
+    for i in 0..(crate::virtio::disks() as usize).min(4) {
+        let name: &[u8] = match i {
+            0 => b"dev/vda",
+            1 => b"dev/vdb",
+            2 => b"dev/vdc",
+            _ => b"dev/vdd",
+        };
+        let r = vfile_create(name);
+        if (r as i64) >= 0 {
+            if let Some(v) = vfile(r as usize) {
+                vfile_stamp(v, 0o660, 0);
+                v.fmt = 0o60000; // S_IFBLK
+                v.rdev = (254 << 8) | ((i as u32) * 16);
+            }
+        }
+    }
+    // NVMe namespaces — major 259, minor = namespace index; whole-
+    // disk nodes only (partition minors come with the scan that
+    // names them, like sda1 on real udev).
+    for i in 0..(crate::nvme::disks() as usize).min(4) {
+        let name: &[u8] = match i {
+            0 => b"dev/nvme0n1",
+            1 => b"dev/nvme0n2",
+            2 => b"dev/nvme0n3",
+            _ => b"dev/nvme0n4",
+        };
+        let r = vfile_create(name);
+        if (r as i64) >= 0 {
+            if let Some(v) = vfile(r as usize) {
+                vfile_stamp(v, 0o660, 0);
+                v.fmt = 0o60000; // S_IFBLK
+                v.rdev = (259 << 8) | (i as u32);
+            }
+        }
+    }
     // The /dev convenience links real Linux images carry.
     for (link, tgt) in [
         (b"dev/fd" as &[u8], b"/proc/self/fd" as &[u8]),
@@ -16599,6 +16831,11 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                     // (read/write are ENXIO below); it exists for
                     // the CDROM* ioctl family like eject.
                     11 => i,
+                    // virtio-blk (vd, minor 16/disk) and NVMe
+                    // (namespace per minor) — same no-hardware
+                    // ENXIO answer as sd.
+                    254 | 259 if blk_capacity(v.rdev) > 0 => i,
+                    254 | 259 => return ENXIO,
                     _ => return ENODEV,
                 },
                 // A fifo node exists but no fifo semantics live
@@ -17548,22 +17785,11 @@ pub fn fd_lseek(fd: u64, off: i64, whence: u64) -> u64 {
     // device capacity.
     if let FdKind::Dev(i) = &o.kind {
         match vfile(*i) {
-            Some(v) if v.rdev >> 8 == 8 || v.rdev >> 8 == 29 => {
+            Some(v) if v.fmt == 0o60000 || v.rdev >> 8 == 29 => {
                 let cap = if v.rdev >> 8 == 29 {
                     crate::log::fb_byte_len() as i64
                 } else {
-                    // Whichever transport actually has this disk: the
-                    // PIIX capacity is 0 on AHCI machines, which made
-                    // SEEK_END answer 0 and left the installer unable to
-                    // size the space after its first partition.
-                    let drv = ((v.rdev & 0xff) / 16) as usize;
-                    let c = crate::ata::capacity_d(drv);
-                    let c = if c > 0 {
-                        c
-                    } else {
-                        crate::ahci::disk_capacity(drv)
-                    };
-                    c as i64
+                    blk_capacity(v.rdev) as i64
                 };
                 let base = match whence {
                     0 => 0i64,
@@ -17594,16 +17820,7 @@ pub fn fd_lseek(fd: u64, off: i64, whence: u64) -> u64 {
         // SEEK_END reports the device capacity, which is how an
         // installer sizes the space left after its first partition.
         FdKind::Dev(i) => match vfile(*i) {
-            Some(v) if v.fmt == 0o60000 => {
-                let drv = ((v.rdev & 0xff) / 16) as usize;
-                let cap = crate::ata::capacity_d(drv);
-                let cap = if cap > 0 {
-                    cap
-                } else {
-                    crate::ahci::disk_capacity(drv)
-                };
-                cap as usize
-            }
+            Some(v) if v.fmt == 0o60000 => blk_capacity(v.rdev) as usize,
             Some(v) => v.len,
             None => return EBADF,
         },
@@ -17639,6 +17856,29 @@ pub fn fd_pread(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
     if o.accmode == 1 {
         return EBADF; // O_WRONLY — fmode check precedes kind checks
     }
+    if let FdKind::Dev(i) = &o.kind {
+        let i = *i;
+        // Block devices are positioned-readable like files — run
+        // the sector read at `pos` without moving the shared OFD
+        // position, which is pread's whole contract. Everything
+        // else falls through to ESPIPE below.
+        let Some(v) = vfile(i) else { return EBADF };
+        if v.fmt == 0o60000 {
+            let rdev = v.rdev;
+            let saved = o.pos;
+            o.pos = pos as usize;
+            let r = match rdev >> 8 {
+                8 => sd_read(o, buf, len),
+                254 | 259 => blk_read(o, rdev, buf, len),
+                _ => {
+                    o.pos = saved;
+                    return ESPIPE_;
+                }
+            };
+            o.pos = saved;
+            return r;
+        }
+    }
     let (data, dlen) = match &o.kind {
         FdKind::File(d) => (d.as_ptr(), d.len()),
         FdKind::Proc { buf, len } => (*buf as *const u8, *len),
@@ -17660,6 +17900,83 @@ pub fn fd_pread(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
     // live cpio slice or a kmalloc'd VFile buffer of dlen bytes.
     unsafe { (buf as *mut u8).copy_from(data.add(p), n) };
     n as u64
+}
+
+/// pwrite(fd, buf, len, pos): the write half — positioned I/O that
+/// leaves the shared OFD position alone. Same kind gates write()
+/// has: Ram files extend through vfile_grow at `pos`, block Dev
+/// OFDs run the sector write at `pos`, File OFDs are always
+/// O_RDONLY so EBADF like write(), pipes and char devices ESPIPE.
+pub fn fd_pwrite(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
+    const ESPIPE_: u64 = (-29i64) as u64;
+    if pos < 0 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    if o.accmode == 0 {
+        return EBADF; // O_RDONLY — fmode check precedes kind checks
+    }
+    match &o.kind {
+        FdKind::File(_) => EBADF,
+        FdKind::Ram(i) => {
+            let i = *i;
+            if len == 0 {
+                return 0;
+            }
+            let Some(v) = vfile(i) else { return EBADF };
+            let Some(need) = (pos as usize).checked_add(len as usize)
+            else {
+                return EINVAL;
+            };
+            if len > 0 && !range_ok(buf, len) {
+                return EFAULT;
+            }
+            let r = vfile_grow(v, need);
+            if r != 0 {
+                return r;
+            }
+            // SAFETY: v.data owns `need` bytes; buf is the validated
+            // user window. Gap bytes are zero — grow zero-fills.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf as *const u8,
+                    v.data.add(pos as usize),
+                    len as usize,
+                )
+            };
+            v.len = v.len.max(need);
+            let (ts, tns) = now();
+            v.mtime = ts;
+            v.mtime_ns = tns;
+            v.ctime = ts;
+            v.ctime_ns = tns;
+            let mut nm = [0u8; 128];
+            nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+            ino_report(&nm[..v.nlen], IN_MODIFY, 0);
+            len
+        }
+        FdKind::Dev(i) => {
+            let Some(v) = vfile(*i) else { return EBADF };
+            if v.fmt != 0o60000 {
+                return ESPIPE_;
+            }
+            let rdev = v.rdev;
+            let saved = o.pos;
+            o.pos = pos as usize;
+            let r = match rdev >> 8 {
+                8 => sd_write(o, buf, len),
+                254 | 259 => blk_write(o, rdev, buf, len),
+                _ => {
+                    o.pos = saved;
+                    return ESPIPE_;
+                }
+            };
+            o.pos = saved;
+            r
+        }
+        _ => ESPIPE_,
+    }
 }
 
 /// fcntl(fd, cmd, arg): the fd-metadata surface. F_GETFD/F_SETFD own

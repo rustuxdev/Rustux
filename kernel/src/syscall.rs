@@ -339,6 +339,7 @@ const NR_SYMLINKAT: u64 = 266;
 const NR_READLINKAT: u64 = 267;
 const NR_FACCESSAT: u64 = 269;
 const NR_PREAD64: u64 = 17;
+const NR_PWRITE64: u64 = 18;
 const NR_FCNTL: u64 = 72;
 const NR_FLOCK: u64 = 73;
 const NR_LINK: u64 = 86;
@@ -503,6 +504,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_OPEN => sys_open(a1, a2, a3),
         NR_OPENAT => sys_openat(a1, a2, a3, a4),
         NR_PREAD64 => user::fd_pread(a1, a2, a3, a4 as i64),
+        NR_PWRITE64 => user::fd_pwrite(a1, a2, a3, a4 as i64),
         NR_FCNTL => user::sys_fcntl(a1, a2, a3),
         NR_FLOCK => user::sys_flock(a1, a2),
         NR_LINK => sys_linkat(u64::MAX, a1, u64::MAX, a2, 0),

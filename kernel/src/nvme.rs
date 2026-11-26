@@ -161,7 +161,10 @@ impl NvmeQ {
         }
         core::sync::atomic::fence(Ordering::SeqCst);
         self.tail = self.tail.wrapping_add(1);
-        w32(dbl(qid, false, dstrd), self.tail as u32);
+        // The doorbell is a RING INDEX, not a counter — QEMU rejects
+        // writes >= qsize as malformed, so a monotonic tail wedges
+        // the queue permanently after `size` submissions.
+        w32(dbl(qid, false, dstrd), (self.tail % self.size) as u32);
         // Completion poll: DW3 = {status<<16|phase, cid} — the phase
         // bit is status-field bit0 = DW3 bit16; CID is the low half.
         for _ in 0..SPIN {
