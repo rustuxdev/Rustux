@@ -238,7 +238,7 @@ fn shm_pin_all(t: &Task) {
 /// Max resident tasks — a hard bound so spawn can't exhaust the
 /// kernel heap by enqueueing forever. 48 was fork-EAGAIN-tight
 /// for the 39-task suite + concurrent children (observed on VM).
-const MAX_TASKS: usize = 80;
+const MAX_TASKS: usize = 88;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -341,6 +341,9 @@ enum WaitOn {
     /// recvfrom() on an empty UDP socket: `wait_ptr` is the user
     /// buffer, `wait_len` its cap, `wait_ptr2` the sockaddr out ptr.
     UdpRecv(usize),
+    /// recvfrom() on an empty packet-capture socket — same
+    /// buffer/sockaddr-out shape as UdpRecv.
+    PktRecv(usize),
     /// nanosleep(): pure deadline wait — wait_deadline bounds it,
     /// the return is always 0.
     Timer,
@@ -472,6 +475,9 @@ enum FdKind {
     /// An AF_INET/SOCK_STREAM endpoint — listener or connection —
     /// the state machine lives in TCPSOCKS[id].
     Tcp(usize),
+    /// An AF_PACKET capture socket — SOCK_RAW frames or SOCK_DGRAM
+    /// cooked; the ring lives in PKTSOCKS[id].
+    Packet(usize),
     /// An epoll instance — the interest set lives in EPOLLS[id];
     /// dup'd fds share it like socket endpoints.
     Epoll(usize),
@@ -2620,6 +2626,13 @@ pub fn fd_getsockopt(
     }
     let (v, is_tcp) = match ofd(t, fd).map(|o| &o.kind) {
         Some(FdKind::Udp(_)) => (2i64, false), // SOCK_DGRAM
+        Some(FdKind::Packet(i)) => {
+            let cooked = unsafe { &*core::ptr::addr_of!(PKTSOCKS) }
+                .get(*i)
+                .and_then(|k| k.as_ref())
+                .is_some_and(|k| k.cooked);
+            (if cooked { 2 } else { 3 }, false)
+        }
         Some(FdKind::Tcp(i)) => {
             let dead = unsafe { &*core::ptr::addr_of!(TCPSOCKS) }
                 .get(*i)
@@ -10416,6 +10429,22 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                             k.q.as_ref().map_or(0, |d| d.len as u64)
                         })
                 }
+                // Next pending frame's deliverable size — cooked
+                // drops the 14-byte L2 header at the boundary.
+                FdKind::Packet(i) => {
+                    let socks = unsafe { &*core::ptr::addr_of!(PKTSOCKS) };
+                    socks
+                        .get(*i)
+                        .and_then(|s| s.as_ref())
+                        .map_or(0, |k| {
+                            if k.n == 0 {
+                                0
+                            } else {
+                                (k.q[k.rd].len as u64)
+                                    .saturating_sub(if k.cooked { 14 } else { 0 })
+                            }
+                        })
+                }
                 FdKind::Dir(_) => return EINVAL,
                 // An epoll fd has no readable stream — same EINVAL
                 // Linux gives read-side ioctls on it.
@@ -11038,7 +11067,9 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
             (0o100444, *len as u64, buf / 4096)
         }
         FdKind::Pipe { .. } => (0o10644, 0, 0), // S_IFIFO
-        FdKind::Udp(_) | FdKind::Tcp(_) => (0o140777, 0, 0), // S_IFSOCK
+        FdKind::Udp(_) | FdKind::Tcp(_) | FdKind::Packet(_) => {
+            (0o140777, 0, 0) // S_IFSOCK
+        }
         // anon_inodefs objects stat as a chrdev — Linux shows
         // S_IFCHR|0600 for epoll/eventfd/timerfd alike.
         FdKind::Epoll(_)
@@ -14986,6 +15017,9 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Signalfd(i) => signalfd_read(ctx, *i, buf, len),
         FdKind::Inotify(i) => inotify_read(ctx, *i, buf, len),
         FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, 0, o.nonblock),
+        FdKind::Packet(i) => {
+            pkt_recv_or_block(ctx, *i, buf, len, 0, o.nonblock)
+        }
         FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, 0, o.nonblock),
         FdKind::File(data) => {
             if o.accmode == 1 {
@@ -15148,6 +15182,11 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     if let FdKind::Udp(_) = &o.kind {
         // write() on a datagram socket = send() — needs a
         // connect()ed peer, same path as sendto with no addr.
+        return fd_sendto(fd, buf, len, 0, 0, 0);
+    }
+    if let FdKind::Packet(_) = &o.kind {
+        // write() on a raw packet socket sends the frame verbatim;
+        // a cooked one needs a dest the write form can't carry.
         return fd_sendto(fd, buf, len, 0, 0, 0);
     }
     if let FdKind::Eventfd(i) = &o.kind {
@@ -17320,7 +17359,7 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         FdKind::Pipe { id, .. } => {
             s.printf(b"pipe:[%u]", &[klib::fmt::Arg::U(*id as u64)]);
         }
-        FdKind::Udp(id) | FdKind::Tcp(id) => {
+        FdKind::Udp(id) | FdKind::Tcp(id) | FdKind::Packet(id) => {
             s.printf(b"socket:[%u]", &[klib::fmt::Arg::U(*id as u64)]);
         }
         FdKind::Epoll(_) => {
@@ -17453,7 +17492,10 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         else {
             return ENOENT;
         };
-        if matches!(o.kind, FdKind::Udp(_) | FdKind::Tcp(_)) {
+        if matches!(
+            o.kind,
+            FdKind::Udp(_) | FdKind::Tcp(_) | FdKind::Packet(_)
+        ) {
             return (-6i64) as u64; // ENXIO
         }
         if acc != 0
@@ -19386,6 +19428,11 @@ fn ofd_release(oi: usize) {
         // the blocker's own fd pins the endpoint alive.
         unsafe { (*core::ptr::addr_of_mut!(UDPSOCKS))[i] = None };
     }
+    if let FdKind::Packet(i) = kind {
+        // The capture dies with its last fd — queued frames free
+        // with it; a blocked recv can't exist (its fd pins us).
+        unsafe { (*core::ptr::addr_of_mut!(PKTSOCKS))[i] = None };
+    }
     if let FdKind::Tcp(i) = kind {
         tcp_sock_close(i);
     }
@@ -19744,6 +19791,19 @@ fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
             let socks = unsafe { &*core::ptr::addr_of!(UDPSOCKS) };
             let mut r = POLLOUT;
             if socks.get(*i).and_then(|s| s.as_ref()).is_some_and(|k| k.q.is_some()) {
+                r |= POLLIN;
+            }
+            r
+        }
+        // AF_PACKET: readable while frames queue; TX never blocks.
+        FdKind::Packet(i) => {
+            let socks = unsafe { &*core::ptr::addr_of!(PKTSOCKS) };
+            let mut r = POLLOUT;
+            if socks
+                .get(*i)
+                .and_then(|s| s.as_ref())
+                .is_some_and(|k| k.n > 0)
+            {
                 r |= POLLIN;
             }
             r
@@ -22152,7 +22212,16 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
         return EINVAL;
     }
     let base = ty & 0x7;
-    if domain != 2 || !(base == 1 || base == 2) {
+    if domain == 17 {
+        const ESOCKTNOSUPPORT: u64 = (-94i64) as u64;
+        if base != 2 && base != 3 {
+            // packet sockets are SOCK_RAW or SOCK_DGRAM only.
+            return ESOCKTNOSUPPORT;
+        }
+        if _proto > 0xffff {
+            return EINVAL;
+        }
+    } else if domain != 2 || !(base == 1 || base == 2) {
         return EAFNOSUPPORT;
     }
     let Some(t) = cur_mut() else { return EBADF };
@@ -22163,7 +22232,22 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
     ) else {
         return EMFILE;
     };
-    let kind = if base == 2 {
+    let kind = if domain == 17 {
+        let socks = unsafe { &mut *core::ptr::addr_of_mut!(PKTSOCKS) };
+        let Some(si) = socks.iter().position(Option::is_none) else {
+            return ENFILE_;
+        };
+        socks[si] = Some(PktSock {
+            // The proto arg arrives htons'd — host order here.
+            proto: (_proto as u16).swap_bytes(),
+            ifindex: 0,
+            cooked: base == 2,
+            rd: 0,
+            n: 0,
+            q: [PKT_EMPTY; PKT_QCAP],
+        });
+        FdKind::Packet(si)
+    } else if base == 2 {
         let socks = unsafe { &mut *core::ptr::addr_of_mut!(UDPSOCKS) };
         let Some(si) = socks.iter().position(Option::is_none) else {
             return ENFILE_;
@@ -22226,14 +22310,43 @@ pub fn fd_bind(fd: u64, sa: u64, len: u64) -> u64 {
     enum SockId {
         U(usize),
         T(usize),
+        P(usize),
     }
     let Some(sid) = (match ofd(t, fd).map(|o| &o.kind) {
         Some(FdKind::Udp(i)) => Some(SockId::U(*i)),
         Some(FdKind::Tcp(i)) => Some(SockId::T(*i)),
+        Some(FdKind::Packet(i)) => Some(SockId::P(*i)),
         _ => None,
     }) else {
         return EBADF;
     };
+    if let SockId::P(si) = sid {
+        // sockaddr_ll: family@0, proto(BE)@2, ifindex@4 — sll_addr
+        // etc. follow but the capture filter needs only these.
+        const ENODEV_: u64 = (-19i64) as u64;
+        if len < SLL_LEN as u64 {
+            return EINVAL;
+        }
+        if !range_ok(sa, SLL_LEN as u64) {
+            return EFAULT;
+        }
+        let Some(h) = read_task_u(t.pml4, sa, 8) else {
+            return EFAULT;
+        };
+        if h & 0xffff != 17 {
+            return EAFNOSUPPORT;
+        }
+        let ifindex = (h >> 32) as i32;
+        if !(0..=2).contains(&ifindex) {
+            return ENODEV_; // 0=any, 1=lo, 2=nic — nothing else
+        }
+        let socks = unsafe { &mut *core::ptr::addr_of_mut!(PKTSOCKS) };
+        let Some(k) = socks[si].as_mut() else { return EBADF };
+        k.proto = ((h >> 16) & 0xffff) as u16;
+        k.proto = k.proto.swap_bytes();
+        k.ifindex = ifindex;
+        return 0;
+    }
     let Some((port, _ip)) = parse_sockaddr(t.pml4, sa) else {
         return EAFNOSUPPORT;
     };
@@ -22280,6 +22393,7 @@ pub fn fd_bind(fd: u64, sa: u64, len: u64) -> u64 {
                 k.port = p;
             }
         }
+        SockId::P(_) => {} // handled above — unreachable
     }
     0
 }
@@ -22300,6 +22414,39 @@ fn sock_name(fd: u64, sa: u64, alen: u64, peer: bool) -> u64 {
     }
     // SAFETY: alen validated writable under this task's page table.
     let ulen = unsafe { (alen as *const u32).read_unaligned() };
+    // AF_PACKET answers sockaddr_ll — proto/ifindex are the bound
+    // filter, hatype is always ARPHRD_ETHER. getpeername ENOTCONNs:
+    // capture sockets have no peer.
+    if let Some(FdKind::Packet(i)) = ofd(t, fd).map(|o| &o.kind) {
+        if peer {
+            return ENOTCONN;
+        }
+        let socks = unsafe { &*core::ptr::addr_of!(PKTSOCKS) };
+        let Some(k) = socks[*i].as_ref() else { return EBADF };
+        let mut s = [0u8; SLL_LEN];
+        s[0..2].copy_from_slice(&17u16.to_ne_bytes());
+        s[2..4].copy_from_slice(&k.proto.to_be_bytes());
+        s[4..8].copy_from_slice(&k.ifindex.to_ne_bytes());
+        s[8..10].copy_from_slice(&1u16.to_ne_bytes());
+        let n = core::cmp::min(ulen as usize, SLL_LEN);
+        if n > 0 {
+            if !range_ok_w(sa, n as u64) {
+                return EFAULT;
+            }
+            // SAFETY: sa validated writable for n under this task's
+            // page table; s is a fully-initialized local.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    s.as_ptr(),
+                    sa as *mut u8,
+                    n,
+                );
+            }
+        }
+        // SAFETY: same validated alen slot — report the real length.
+        unsafe { (alen as *mut u32).write_unaligned(SLL_LEN as u32) };
+        return 0;
+    }
     // The endpoint this socket is attached to, if it has one.
     // port/ip are already wire-order for sockaddr_in.
     let ep: Option<(u16, [u8; 4])> = match ofd(t, fd).map(|o| &o.kind) {
@@ -22385,6 +22532,9 @@ pub fn fd_sendto(
             return if sa == 0 { tcp_send(*i, buf, len) } else { EISCONN };
         }
         Some(FdKind::Udp(i)) => Some(*i),
+        Some(FdKind::Packet(i)) => {
+            return pkt_send(t, *i, buf, len, sa, alen)
+        }
         _ => None,
     }) else {
         return EBADF;
@@ -22614,7 +22764,9 @@ pub fn fd_setsockopt(
     const ENOTSOCK: u64 = (-88i64) as u64;
     let Some(t) = cur_mut() else { return EBADF };
     match ofd(t, fd).map(|o| &o.kind) {
-        Some(FdKind::Udp(_)) | Some(FdKind::Tcp(_)) => {}
+        Some(FdKind::Udp(_))
+        | Some(FdKind::Tcp(_))
+        | Some(FdKind::Packet(_)) => {}
         Some(_) => return ENOTSOCK,
         None => return EBADF,
     }
@@ -22643,9 +22795,340 @@ pub fn fd_recvfrom(
     let dw = o.nonblock || flags & MSG_DONTWAIT != 0;
     match &o.kind {
         FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, sa, dw),
+        FdKind::Packet(i) => pkt_recv_or_block(ctx, *i, buf, len, sa, dw),
         FdKind::Tcp(i) => tcp_recv_or_block(ctx, *i, buf, len, sa, dw),
         _ => EBADF,
     }
+}
+
+// ---- AF_PACKET capture sockets (SOCK_RAW / SOCK_DGRAM) ----
+//
+// socket(AF_PACKET, SOCK_RAW, htons(proto)): every link frame the
+// stack sees fan-outs here — RX at each drain site, TX at tx_eth —
+// when it passes the socket's protocol + ifindex filters, like a
+// registered ptype under Linux's packet_rcv. SOCK_DGRAM is the
+// cooked variant: delivery skips the 14-byte L2 header and sendto
+// composes one from the sockaddr_ll. The ring drops on overflow —
+// capture loss, like Linux without PACKET_RX_RING.
+const MAX_PKTS: usize = 4;
+const PKT_QCAP: usize = 8;
+/// Staging ceiling for one captured frame (mtu + l2 hdr + slack).
+const PKT_FRAME: usize = 1600;
+/// ETH_P_ALL in host order — the wildcard socket protocol.
+const ETH_P_ALL: u16 = 0x0003;
+/// sockaddr_ll length — the recvfrom/bind/getsockname ABI struct.
+const SLL_LEN: usize = 20;
+
+/// One captured frame + its sockaddr_ll metadata.
+#[derive(Clone, Copy)]
+struct PktFrame {
+    /// On-wire length — data is truncated to PKT_FRAME past it.
+    len: u16,
+    /// 1 = loopback, 2 = external nic.
+    ifindex: u8,
+    /// PACKET_HOST/BROADCAST/MULTICAST/OTHERHOST/OUTGOING.
+    pkttype: u8,
+    /// Ethertype, host order.
+    proto: u16,
+    /// sll_addr — the frame's source link address.
+    mac: [u8; 6],
+    data: [u8; PKT_FRAME],
+}
+
+const PKT_EMPTY: PktFrame = PktFrame {
+    len: 0,
+    ifindex: 0,
+    pkttype: 0,
+    proto: 0,
+    mac: [0; 6],
+    data: [0; PKT_FRAME],
+};
+
+struct PktSock {
+    /// Socket/bind protocol — host-order ethertype, ETH_P_ALL wild.
+    proto: u16,
+    /// bind()ed sll_ifindex — 0 captures every interface.
+    ifindex: i32,
+    /// SOCK_DGRAM: strip/compose the L2 header at the boundary.
+    cooked: bool,
+    rd: usize,
+    n: usize,
+    q: [PktFrame; PKT_QCAP],
+}
+
+static mut PKTSOCKS: [Option<PktSock>; MAX_PKTS] =
+    [const { None }; MAX_PKTS];
+
+/// Re-entrancy guard for pkt_tap: the tap runs from syscall paths
+/// (recv's pre-drain) and from the timer tick — an IRQ landing mid
+/// push would re-enter the same rings and interleave rd/n updates.
+/// A nested tap drops the frame (capture loss), like LO_DRAIN.
+static mut PKT_TAP_BUSY: bool = false;
+
+/// sockaddr_ll layout from one frame's metadata — all 20 bytes
+/// initialized (the CVE-2021-47597 uninit-struct class).
+fn sockaddr_ll(ifindex: u8, pkttype: u8, proto: u16, mac: [u8; 6])
+    -> [u8; SLL_LEN]
+{
+    let mut s = [0u8; SLL_LEN];
+    s[0..2].copy_from_slice(&17u16.to_ne_bytes()); // AF_PACKET
+    s[2..4].copy_from_slice(&proto.to_be_bytes());
+    s[4..8].copy_from_slice(&(ifindex as i32).to_ne_bytes());
+    s[8..10].copy_from_slice(&1u16.to_ne_bytes()); // ARPHRD_ETHER
+    s[10] = pkttype;
+    s[11] = 6;
+    s[12..18].copy_from_slice(&mac);
+    s
+}
+
+/// Capture fan-out, called with the full L2 frame at each drain
+/// site (ifindex 1 = lo, 2 = nic) and at tx_eth (outgoing →
+/// PACKET_OUTGOING). Mirrors udp_rx's wake shape: a blocked
+/// receiver gets the frame through ITS tables straight into rax,
+/// else the per-socket ring takes it and overflow drops.
+pub fn pkt_tap(fr: &[u8], ifindex: u8, outgoing: bool) {
+    if fr.len() < 14 {
+        return;
+    }
+    unsafe {
+        if *core::ptr::addr_of!(PKT_TAP_BUSY) {
+            return;
+        }
+        *core::ptr::addr_of_mut!(PKT_TAP_BUSY) = true;
+    }
+    let proto = u16::from_be_bytes([fr[12], fr[13]]);
+    let pkttype = if outgoing {
+        4 // PACKET_OUTGOING
+    } else if fr[..6] == [0xff; 6] {
+        1 // PACKET_BROADCAST
+    } else if fr[..6] == crate::e1000::our_mac() {
+        0 // PACKET_HOST
+    } else if fr[0] & 1 != 0 {
+        2 // PACKET_MULTICAST
+    } else {
+        3 // PACKET_OTHERHOST
+    };
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&fr[6..12]);
+    let socks = unsafe { &mut *core::ptr::addr_of_mut!(PKTSOCKS) };
+    for (si, s) in socks.iter_mut().enumerate() {
+        let Some(k) = s.as_mut() else { continue };
+        if (k.proto != ETH_P_ALL && k.proto != proto)
+            || (k.ifindex != 0 && k.ifindex != ifindex as i32)
+        {
+            continue;
+        }
+        let cooked = k.cooked;
+        // A blocked receiver first — same fast path as udp_rx.
+        let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+        let mut woke = false;
+        for t in tasks.iter_mut().flatten() {
+            if t.state == TaskState::Blocked
+                && t.wait_on == WaitOn::PktRecv(si)
+            {
+                let body = if cooked { &fr[14..] } else { fr };
+                let n =
+                    core::cmp::min(body.len(), t.wait_len as usize);
+                write_task_bytes(t.pml4, t.wait_ptr, &body[..n]);
+                if t.wait_ptr2 != 0 {
+                    write_task_bytes(
+                        t.pml4,
+                        t.wait_ptr2,
+                        &sockaddr_ll(ifindex, pkttype, proto, mac),
+                    );
+                }
+                t.ctx.rax = n as u64;
+                t.wait_on = WaitOn::None;
+                t.wait_deadline = 0;
+                t.wait_ptr2 = 0;
+                t.state = TaskState::Runnable;
+                woke = true;
+                break;
+            }
+        }
+        if woke || k.n == PKT_QCAP {
+            continue; // delivered — or capture loss on a full ring
+        }
+        let wr = (k.rd + k.n) % PKT_QCAP;
+        let n = fr.len().min(PKT_FRAME);
+        k.q[wr].data[..n].copy_from_slice(&fr[..n]);
+        k.q[wr].len = fr.len() as u16;
+        k.q[wr].ifindex = ifindex;
+        k.q[wr].pkttype = pkttype;
+        k.q[wr].proto = proto;
+        k.q[wr].mac = mac;
+        k.n += 1;
+    }
+    unsafe { *core::ptr::addr_of_mut!(PKT_TAP_BUSY) = false };
+}
+
+/// recvfrom/read on a packet socket: the next captured frame, or
+/// block until the tap wakes us — udp_recv_or_block's shape with a
+/// ring instead of a one-deep queue.
+fn pkt_recv_or_block(
+    ctx: &mut UCtx,
+    si: usize,
+    buf: u64,
+    len: u64,
+    sa: u64,
+    dontwait: bool,
+) -> u64 {
+    const EINTR_: u64 = (-4i64) as u64;
+    const EAGAIN_: u64 = (-11i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF };
+    crate::e1000::rx_drain();
+    let take = {
+        let socks = unsafe { &mut *core::ptr::addr_of_mut!(PKTSOCKS) };
+        socks
+            .get_mut(si)
+            .and_then(|s| s.as_mut())
+            .and_then(|k| {
+                (k.n > 0).then(|| {
+                    let f = k.q[k.rd];
+                    k.rd = (k.rd + 1) % PKT_QCAP;
+                    k.n -= 1;
+                    (f, k.cooked)
+                })
+            })
+    };
+    if let Some((f, cooked)) = take {
+        let end = (f.len as usize).min(PKT_FRAME);
+        let body = &f.data[..end];
+        let body = if cooked {
+            &body[core::cmp::min(14, body.len())..]
+        } else {
+            body
+        };
+        let n = core::cmp::min(len as usize, body.len());
+        if n > 0 && !range_ok_w(buf, n as u64) {
+            return EFAULT;
+        }
+        if sa != 0 && !range_ok_w(sa, SLL_LEN as u64) {
+            return EFAULT;
+        }
+        // SAFETY: both ranges validated writable under the current
+        // (this task's) page table.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                body.as_ptr(),
+                buf as *mut u8,
+                n,
+            );
+        }
+        if sa != 0 {
+            let s = sockaddr_ll(f.ifindex, f.pkttype, f.proto, f.mac);
+            // SAFETY: sa validated writable for SLL_LEN above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    s.as_ptr(),
+                    sa as *mut u8,
+                    SLL_LEN,
+                );
+            }
+        }
+        return n as u64;
+    }
+    // Empty ring — validate the targets BEFORE sleeping.
+    if !range_ok_w(buf, len.min(PKT_FRAME as u64).max(1)) {
+        return EFAULT;
+    }
+    if sa != 0 && !range_ok_w(sa, SLL_LEN as u64) {
+        return EFAULT;
+    }
+    if dontwait {
+        return EAGAIN_;
+    }
+    if deliverable(t) {
+        return EINTR_;
+    }
+    t.wait_on = WaitOn::PktRecv(si);
+    t.wait_ptr = buf;
+    t.wait_len = len.min(PKT_FRAME as u64);
+    t.wait_ptr2 = sa;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
+/// sendto/write on a packet socket: raw sockets transmit the frame
+/// verbatim; cooked sockets compose the 14-byte L2 header from the
+/// sockaddr_ll destination (Linux's packet_snd).
+fn pkt_send(t: &mut Task, si: usize, buf: u64, len: u64, sa: u64, alen: u64) -> u64 {
+    const ENETDOWN: u64 = (-100i64) as u64;
+    const EAFNOSUPPORT_: u64 = (-97i64) as u64;
+    const EMSGSIZE_: u64 = (-90i64) as u64;
+    const EDESTADDRREQ_: u64 = (-89i64) as u64;
+    if len == 0 || len > PKT_FRAME as u64 {
+        return if len == 0 { EINVAL } else { EMSGSIZE_ };
+    }
+    if !range_ok(buf, len) {
+        return EFAULT;
+    }
+    let cooked = unsafe { &*core::ptr::addr_of!(PKTSOCKS) }
+        .get(si)
+        .and_then(|s| s.as_ref())
+        .is_some_and(|k| k.cooked);
+    let mut f = [0u8; PKT_FRAME];
+    let n = if cooked {
+        // sll: family@0, proto(BE)@2, ifindex@4, hatype@8, pkttype
+        // @10, halen@11, addr@12 — dst mac + wire protocol.
+        if sa == 0 {
+            return EDESTADDRREQ_;
+        }
+        if alen < SLL_LEN as u64 {
+            return EINVAL;
+        }
+        if !range_ok(sa, SLL_LEN as u64) {
+            return EFAULT;
+        }
+        let (Some(h), Some(a)) = (
+            read_task_u(t.pml4, sa, 8),
+            read_task_u(t.pml4, sa + 12, 6),
+        ) else {
+            return EFAULT;
+        };
+        if h & 0xffff != 17 {
+            return EAFNOSUPPORT_;
+        }
+        f[..6].copy_from_slice(&a.to_le_bytes()[..6]);
+        f[6..12].copy_from_slice(&crate::e1000::our_mac());
+        f[12..14].copy_from_slice(
+            &(((h >> 16) & 0xffff) as u16).to_be_bytes(),
+        );
+        let body = (len as usize).min(PKT_FRAME - 14);
+        if !range_ok(buf, body as u64) {
+            return EFAULT;
+        }
+        // SAFETY: buf validated readable for body above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf as *const u8,
+                f[14..].as_mut_ptr(),
+                body,
+            );
+        }
+        14 + body
+    } else {
+        if len < 14 {
+            return EINVAL;
+        }
+        // SAFETY: buf validated readable for len above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf as *const u8,
+                f.as_mut_ptr(),
+                len as usize,
+            );
+        }
+        len as usize
+    };
+    if !crate::e1000::net_up() {
+        return ENETDOWN;
+    }
+    if !crate::e1000::tx_eth(&mut f[..n.max(60)]) {
+        return (-5i64) as u64; // EIO — tx ring rejected
+    }
+    n as u64
 }
 
 // ---- TCP sockets (SOCK_STREAM) ----

@@ -333,6 +333,21 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
         let sig = r32(port_reg(p, PXSIG));
         if sig == SIG_ATAPI {
             ATAPI_PORT.store(p as u32, Ordering::Relaxed);
+            // Port memory now, not lazily at first atapi_cmd — same
+            // lifetime as the disk MEM[] slots so the frames fall
+            // inside the leak-check baseline.
+            let slot = unsafe { &mut *core::ptr::addr_of_mut!(ATAPI_MEM) };
+            *slot = match (
+                kalloc::alloc_frame(),
+                kalloc::alloc_frame(),
+                kalloc::alloc_frame(),
+                kalloc::alloc_frames(1),
+            ) {
+                (Some(cl), Some(fis), Some(ct), Some(buf)) => {
+                    Some(PortMem { cl, fis, ct, buf })
+                }
+                _ => None,
+            };
             continue; // packet device — atapi_cmd drives it
         }
         if sig != SIG_ATA {
@@ -455,19 +470,8 @@ pub fn write_sector(i: usize, lba: u64, buf: &[u8; 512]) -> bool {
 }
 
 fn atapi_mem() -> Option<&'static PortMem> {
-    // SAFETY: single-threaded syscall context, like the disk statics.
-    unsafe {
-        let slot = &mut *core::ptr::addr_of_mut!(ATAPI_MEM);
-        if slot.is_none() {
-            *slot = Some(PortMem {
-                cl: kalloc::alloc_frame()?,
-                fis: kalloc::alloc_frame()?,
-                ct: kalloc::alloc_frame()?,
-                buf: kalloc::alloc_frames(1)?,
-            });
-        }
-        slot.as_ref()
-    }
+    // SAFETY: populated during the init port scan, read-only after.
+    unsafe { (*core::ptr::addr_of!(ATAPI_MEM)).as_ref() }
 }
 
 /// Issue one ATAPI PACKET command (0xa0): the 12-byte CDB rides in

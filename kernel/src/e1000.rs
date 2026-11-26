@@ -1872,6 +1872,15 @@ pub fn net_up() -> bool {
         && OUR_IP.load(Ordering::Relaxed) != 0
 }
 
+/// This NIC's link address — the packet-capture layer classifies
+/// incoming frames against it (PACKET_HOST vs OTHERHOST).
+pub fn our_mac() -> [u8; 6] {
+    let m = OUR_MAC.load(Ordering::Relaxed).to_be_bytes();
+    let mut out = [0u8; 6];
+    out.copy_from_slice(&m[2..8]);
+    out
+}
+
 /// Seed the socket-layer identity for a virtio-only boot — no e1000
 /// ran DHCP, so the static slirp lease every user-net instance hands
 /// out is programmed directly. No-op once any identity exists.
@@ -1938,6 +1947,11 @@ fn drain_desc(d: usize) -> Option<([u8; 4], [u8; 6])> {
     let mut out = None;
     if sta & RXD_STA_EOP != 0 && len >= 14 && len as usize <= RX_BUF {
         let p = unsafe { bufs.add(d * RX_BUF) };
+        crate::user::pkt_tap(
+            unsafe { core::slice::from_raw_parts(p, len as usize) },
+            2,
+            false,
+        );
         let et = unsafe { u16::from_be_bytes([*p.add(12), *p.add(13)]) };
         if et == 0x0806 && len >= 42 {
             // SAFETY: bounds checked — the ARP body spans eth+14..42.
@@ -1997,9 +2011,10 @@ fn drain_desc(d: usize) -> Option<([u8; 4], [u8; 6])> {
 /// NIC otherwise. When egressing via virtio the frame's source MAC —
 /// and the ARP body's sender hardware address — must be the virtio
 /// NIC's, or slirp's replies go to a MAC the device filters out.
-fn tx_eth(f: &mut [u8]) -> bool {
+pub fn tx_eth(f: &mut [u8]) -> bool {
     let base = LIVE_BASE.load(Ordering::Relaxed);
     if base != 0 {
+        crate::user::pkt_tap(f, 2, true);
         return tx_once(base, f);
     }
     if !crate::virtio::net_up() {
@@ -2011,6 +2026,7 @@ fn tx_eth(f: &mut [u8]) -> bool {
             f[22..28].copy_from_slice(&mac);
         }
     }
+    crate::user::pkt_tap(f, 2, true);
     crate::virtio::net_tx(f)
 }
 
@@ -2028,6 +2044,7 @@ fn virtio_rx_one() -> Option<([u8; 4], [u8; 6])> {
     if n < 14 {
         return None;
     }
+    crate::user::pkt_tap(&fr[..n], 2, false);
     let et = u16::from_be_bytes([fr[12], fr[13]]);
     if et == 0x0806 && n >= 42 {
         let op = u16::from_be_bytes([fr[20], fr[21]]);
@@ -2172,6 +2189,7 @@ fn lo_drain() {
     while let Some(l) = lo_pop(fr) {
         let l = l as usize;
         if l >= 14 {
+            crate::user::pkt_tap(&fr[..l], 1, false);
             let mut m = [0u8; 6];
             m.copy_from_slice(&fr[6..12]);
             ip_demux(&fr[14..l], m);
