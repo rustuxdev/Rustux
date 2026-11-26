@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**200 unique CVEs recorded.**
+**202 unique CVEs recorded.**
 
 ## klib ports
 
@@ -227,6 +227,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-13216 | legacy BIOS boot rung: Multiboot2 front end — kernel also builds for x86_64-unknown-none… | audit run-120 quick scoped via safe-anything MCP (kernel/ 119 files clean; security-audit skill still absent on disk — limitation recorded) + cve.now entities.search (parsing clas… |
 | CVE-2026-13216 | modern-virtio-transport rung (non-transitional virtio-net): virtio.rs gains a second tran… | cap-parse class (CVE-2026-13216 device cap data -> OOB access — hardened in-run: no cap_len-driven copies exist, vendor caps parsed only at off<=0xe8 keeping field reads inside th… |
 | CVE-2026-13216 | modern-virtio-transport rung (non-transitional virtio-net): virtio.rs gains a second tran… | cap-parse class (CVE-2026-13216 device cap data -> OOB access — hardened in-run: no cap_len-driven copies exist, vendor caps parsed only at off<=0xe8 keeping field reads inside th… |
+| CVE-2026-13216 | virtio-input rung (/dev/input/event0 device events): virtio.rs gains virtio-input — DEV_V… | audit run-38 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-97986, CVE-2026-97987, CVE-2026-13216 — handled or n/a. Verified: make run exit 33, 78 tas… |
+| CVE-2026-13216 | virtio-input rung (/dev/input/event0 device events): virtio.rs gains virtio-input — DEV_V… | audit run-38 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-97986, CVE-2026-97987, CVE-2026-13216 — handled or n/a. Verified: make run exit 33, 78 tas… |
 | CVE-2026-13478 | installed-root pivot rung: the mounted ext2 root is copied whole into the RAM fs at boot… | audit run-258 scoped quick (security-audit skill): verified the walk bounds, the callback re-entrancy claim, the exact-name gate, and the underlay ordering. No findings. needs_val… |
 | CVE-2026-23115 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
 | CVE-2026-23127 | shm-anon rung: MAP_SHARED\ | refcount-lifecycle class (double-free in shm_mmap rollback — unmap_page freed mapped frames then s.frames freed again; fixed by single-free-path); ownership-attribution class (ran… |
@@ -288,6 +290,9 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-89972 | NVMe storage rung: nvme.rs — PCI MMIO probe (1b36:0010, QEMU's newer id; 0004 fallback),… | audit run-27 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6238, CVE-2025-21927, CVE-2023-6535/6536/6356, CVE-2026-89972, CVE-2024-45013, CVE-2026-99… |
 | CVE-2026-90003 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
 | CVE-2026-90138 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
+| CVE-2026-97986 | virtio-input rung (/dev/input/event0 device events): virtio.rs gains virtio-input — DEV_V… | audit run-38 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-97986, CVE-2026-97987, CVE-2026-13216 — handled or n/a. Verified: make run exit 33, 78 tas… |
+| CVE-2026-97986 | virtio-input rung (/dev/input/event0 device events): virtio.rs gains virtio-input — DEV_V… | audit run-38 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-97986, CVE-2026-97987, CVE-2026-13216 — handled or n/a. Verified: make run exit 33, 78 tas… |
+| CVE-2026-97987 | virtio-input rung (/dev/input/event0 device events): virtio.rs gains virtio-input — DEV_V… | audit run-38 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-97986, CVE-2026-97987, CVE-2026-13216 — handled or n/a. Verified: make run exit 33, 78 tas… |
 | CVE-2026-98059 | real Debian dynamic userspace: dash 0.5.12 under bin/dash (dynamic PT_INTERP consumer) dr… | REAL-BINARY-CAUGHT ABI BUG: glibc wait wrappers zero-extend mov edi,-1 to 0xffffffff in rdi; dispatching it raw made wait4(-1) search pid 4294967295 -> ECHILD -> dash exited 255 o… |
 | CVE-2026-98163 | CLONE_SIGHAND+CLONE_THREAD: SIGTABS shared-disposition ledger (users refcount, sighand_st… | cgroup dying-task iteration UAF class — structurally absent: no cgroups, no resurrect-able task refs, slot free is synchronous under the IF-masked sweep; DEAD_THREADS flag + cur-g… |
 | CVE-2026-98205 | /dev/input/event0 evdev + DOOM keyboard input: PS/2 decoder now emits Linux keycode press… | audit run-118 quick scoped + cve.now MCP live (entities.search on evdev/input classes — analogs above): verified ev_push bounded to EVR_SIZE with drop-on-full; ev_pop memmove stay… |

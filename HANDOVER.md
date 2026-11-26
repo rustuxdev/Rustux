@@ -7324,3 +7324,43 @@ rx-proof-line. Exit 33, 77 tasks, zero leak.
 Audit run-37: 0 confirmed — used-ring id/len trust and
 port-id/queue-sel trust bounded by design; CVE-2025-38064 /
 CVE-2022-49100 n/a. Commits pushed origin main.
+
+## run-279 — virtio-input evdev events
+
+virtio.rs gains virtio-input. GOTCHA: QEMU's q35
+`virtio-keyboard-pci` resolves to the NON-transitional variant
+(1af4:1052 — MMIO cap-list, no legacy I/O BAR), unlike
+virtio-serial-pci which stayed transitional. The first probe on
+the legacy id (0x1012) found nothing; the driver now tries the
+modern path (virtio_caps + handshake_modern + Vq::setup_modern
+from run-273) and falls back to legacy — both converge on the
+same transport-agnostic Vq.
+
+Queues: sel 0 = eventq (device fills 8B virtio_input_event
+{type,code,value} into posted buffers), sel 1 = statusq
+(guest->device LED reports, unused). vinput_drain: used id<N_VIN
+gate, len ignored (fixed-offset parse), EV_KEY only, val<=2,
+push via kbd::ev_push_ext into the shared evdev ring — merged
+with the PS/2 stream exactly like Linux feeding multiple
+keyboards into evdev. kbd::ev_len drains the queue first, which
+reaches every consumer (read arm, evdev_wake inside stdin_pump,
+poll arm) — all syscall/idle context; on_irq never calls ev_len.
+New pairing to know: EVR now has IRQ-side (PS/2) AND
+syscall-side (virtio) producers — writes stay index-bounded,
+loss-only, same as the ring's existing drop policy.
+
+Proof chain: tools/kbdfeed.py drives QMP send-key 'shift' every
+300ms (shift = evdev records, zero tty bytes — can't pollute
+console readers). QEMU drops taps sent before the guest posts
+eventq buffers, so the feed runs 18s. Kernel-side transport
+proof: VIN_EVENTS counts drained EV_KEY on the virtio queue —
+the PS/2 path cannot fill it. `virtio: input '' evq=64` (name
+read comes back empty from this QEMU — cosmetic) -> `input 5
+evdev event(s) through virtio-input` -> `receive path true`.
+vintest: 9 checks, 0 failures — open/fstat/S_IFCHR/rdev 13:64/
+short-read EINVAL/poll POLLIN/press+release. Exit 33, 78 tasks,
+zero leak.
+
+Audit run-38: 0 confirmed — device-field/used-ring/config-size
+trust all bounded; teardown CVEs n/a. Ledger at 202 CVEs.
+Commits pushed origin main.
