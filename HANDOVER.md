@@ -7696,3 +7696,33 @@ EOF/EPIPE, both name kinds, FIONREAD, poll, recvfrom source
 name, a fork()'d cross-task read. Exit 33, 82 tasks, zero leak.
 
 Audit run-49: 0 confirmed, 3 fixed in-run. Ledger at 239 CVEs.
+
+## run-291 — recvmsg (NR 47) + SCM_RIGHTS fd-passing over AF_UNIX
+
+recvmsg was entirely absent (caught by a `=>0` stub group); sendmsg
+parsed `control`/`controllen` and ignored them. Now: scm_parse walks
+the cmsg list for SOL_SOCKET/SCM_RIGHTS, refs each OFD (+1) into a
+UnixFds batch, and scm_emit mints them as fresh fds in the RECEIVER's
+fdt (MSG_CMSG_CLOEXEC honoured). Stream rights position-attach —
+FdAttach{at,fds} lands on the peer's consume list at the send's
+first-byte ring position and delivers with the read that crosses it;
+dgram rights ride the UDgram row. Blocked recvmsg arms wait_ptr=
+msghdr VA; the UnixDgramM/UnixRecvM wakers re-parse under the
+sleeper's pml4 and deliver fully (scatter + name + cmsg + flags).
+A blocked sendmsg parks its gather in KSEND[conn][side] kernel
+staging — the UnixSendK waker pushes it since the caller's stack
+VA is gone.
+
+Two in-run findings: scm_parse's `fdt.fds[fd]` used the user fd
+unbounded — fd>=16 panicked the kernel (now .get -> EBADF); and
+every post-parse error path held +1 OFD refs forever (bail! macro
+releases at all of them, plus queue-full/conn-dead/plain-recv/
+full-attach drops). No unix GC needed — refs are explicit, queue
+death releases them.
+
+Proof: unixtest 70 checks 0 failures — fd pass over stream +
+dgram socketpairs (the received fd really works), cmsg shape,
+MSG_CTRUNC drop+flag, two-iovec scatter, blocked recvmsg waker
+delivers rights cross-task. Exit 33, 82 tasks, zero leak.
+
+Audit run-50: 0 confirmed, 1 fixed in-run. Ledger at 243 CVEs.
