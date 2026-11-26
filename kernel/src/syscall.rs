@@ -567,7 +567,14 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         247 => user::waitid(ctx, a1 as u32 as u64, a2 as u32 as u64, a3, a4),
         NR_KILL => user::kill(a1 as i32 as i64, a2),
         NR_GETPPID => user::getppid(),
-        NR_GETDENTS => user::fd_getdents(a1, a2, a3),
+        NR_GETDENTS => user::fd_getdents(a1, a2, a3, false),
+        // getdents (legacy 78): linux_dirent — same header but the
+        // name starts at 18 and d_type rides the record's last byte.
+        78 => user::fd_getdents(a1, a2, a3, true),
+        // syslog/klogctl: the kernel-log-ring reader.
+        103 => user::sys_syslog(ctx, a1, a2, a3),
+        // setrlimit is prlimit64's pid-0/no-old subset.
+        160 => user::sys_setrlimit(a1, a2),
         // newfstatat(dirfd, path, buf, flags): dirfd is ABI-shape
         // only; flags carry AT_SYMLINK_NOFOLLOW (0x100).
         NR_NEWFSTATAT => sys_newfstatat(a1, a2, a3, a4),
@@ -888,7 +895,7 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
             None => (-12i64) as u64, // ENOMEM
         },
         // getdents64: linux_dirent64 keeps u64 fields on both ABIs.
-        220 => user::fd_getdents(a1, a2, a3),
+        220 => user::fd_getdents(a1, a2, a3, false),
         // i386 signal surface: sigaction(67), sigprocmask(126),
         // sigreturn(119), rt_sigaction(174), rt_sigprocmask(175),
         // rt_sigreturn(173). Struct sigaction is 16 bytes and the

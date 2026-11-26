@@ -265,3 +265,104 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         }
     }
 }
+
+/// — syslog(2)/klogctl reader side —
+/// The syslog READ cursor: next record a type-2 read returns, shared
+/// across callers like Linux's global `syslog_seq`. Independent of
+/// NEXT_SEQ (the console drain position) — records stay in the ring
+/// until wraparound evicts them either way.
+static SYSLOG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One past the newest committed record (0 when no ring yet).
+pub fn kmsg_next() -> u64 {
+    let f = irq_save();
+    // SAFETY: IRQs masked — sequential-model ring.
+    let s = unsafe {
+        (*core::ptr::addr_of_mut!(PRB))
+            .as_mut()
+            .and_then(|prb| prb.next_reserve_seq())
+            .unwrap_or_default()
+    };
+    unsafe { irq_restore(f) };
+    s
+}
+
+/// The shared syslog read cursor.
+pub fn syslog_seq() -> u64 {
+    SYSLOG_SEQ.load(Ordering::Relaxed)
+}
+
+/// CLEAR/READ_CLEAR advance the read cursor past everything committed.
+pub fn syslog_clear() {
+    SYSLOG_SEQ.store(kmsg_next(), Ordering::Relaxed);
+}
+
+/// Render records `seq .. newest` as `text\n` lines through `push`,
+/// stopping before the first record that no longer fits `cap` bytes.
+/// Returns (bytes pushed, one past the last emitted seq). seq is
+/// clamped up to the oldest live record — asking for long-evicted
+/// records yields the readable tail, like Linux.
+pub fn kmsg_render(seq: u64, cap: usize, push: &mut dyn FnMut(&[u8])) -> (usize, u64) {
+    let f = irq_save();
+    // SAFETY: IRQs masked — sequential-model ring, sole-reader shape
+    // matches drain(). The mask is held across the render so `push`
+    // sees a stable seq range; records are line-bounded and the ring
+    // is 16 deep, so the critical section stays short.
+    let (used, q) = unsafe {
+        let prb = match (*core::ptr::addr_of_mut!(PRB)).as_mut() {
+            Some(p) => p,
+            None => {
+                irq_restore(f);
+                return (0, seq);
+            }
+        };
+        let mut q = seq.max(prb.first_seq());
+        let end = prb.next_reserve_seq().unwrap_or(q);
+        let mut used = 0usize;
+        let mut info = PrintkInfo::default();
+        let mut buf = [0u8; MAX_LINE];
+        while q < end {
+            if !prb.read_valid(q, Some(&mut info), Some(&mut buf[..])) {
+                break;
+            }
+            let n = info.text_len as usize;
+            // Linux never splits a record: the whole text+'\n' must
+            // fit the remaining budget or reading stops here.
+            if n + 1 > cap - used {
+                break;
+            }
+            push(&buf[..n]);
+            push(b"\n");
+            used += n + 1;
+            q = info.seq + 1;
+        }
+        (used, q)
+    };
+    unsafe { irq_restore(f) };
+    (used, q)
+}
+
+/// Advance the shared read cursor — done by READ (to just past the
+/// last emitted record) and CLEAR/READ_CLEAR (to the newest seq).
+/// READ_ALL does NOT move it, matching Linux's syslog_seq semantics.
+pub fn syslog_set_seq(s: u64) {
+    SYSLOG_SEQ.store(s, Ordering::Relaxed);
+}
+
+/// Byte count of records pending at the syslog cursor (type-9 probe).
+pub fn kmsg_unread() -> usize {
+    let mut n = 0usize;
+    kmsg_render(
+        SYSLOG_SEQ.load(Ordering::Relaxed),
+        usize::MAX,
+        &mut |line| {
+            n += line.len();
+        },
+    )
+    .0
+}
+
+/// Ring text capacity (type-10 probe).
+pub fn kmsg_size() -> usize {
+    1 << TEXT_BITS
+}

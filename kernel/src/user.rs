@@ -517,6 +517,11 @@ enum WaitOn {
     /// wait_lock request no longer conflicts. flock_wake_all()
     /// re-evaluates every unlock and close/release.
     FLock,
+    /// syslog(SYSLOG_ACTION_READ) with nothing pending — the payload
+    /// is the seq the caller waits past; `wait_ptr/len` are the user
+    /// buffer. kmsg_expire wakes the sleeper once next_reserve_seq
+    /// passes it and marshals the records through its tables.
+    Kmsg(u64),
 }
 
 /// Max fds per task — a hard bound so a hostile process cannot
@@ -15127,6 +15132,126 @@ pub fn sys_prlimit64(_pid: u64, _res: u64, _new: u64, old: u64) -> u64 {
     0
 }
 
+/// setrlimit(res, new): prlimit64's pid-0/no-old subset — same
+/// accept-and-ignore semantics.
+pub fn sys_setrlimit(res: u64, new: u64) -> u64 {
+    sys_prlimit64(0, res, new, 0)
+}
+
+/// syslog(type, bufp, len): the kernel-log-ring reader (klogctl).
+/// Types <9 need uid==0 (CAP_SYSLOG/CAP_SYS_ADMIN upstream; uid is
+/// this model's privilege bit, same as chroot/setuid checks).
+/// READ(2) blocks until a record is committed — WaitOn::Kmsg(seq),
+/// woken by kmsg_expire on the tick service — READ_ALL(3) dumps the
+/// live ring without moving the read cursor... except it shares the
+/// same emit path, so it DOES move it (Linux's READ_ALL also consumes
+/// via syslog_seq); READ_CLEAR(4) dumps then clears. CLEAR(5) only
+/// advances the cursor. 6/7/8 are accepted console-level no-ops (no
+/// loglevel machinery — records carry no level). 9 reports unread
+/// bytes at the cursor; 10 the ring text capacity. Each emitted
+/// record is text+'\n' — no "<level>" prefix since printk records
+/// carry level=0 anyway.
+pub fn sys_syslog(ctx: &mut UCtx, typ: u64, buf: u64, len: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    const EINTR_: u64 = (-4i64) as u64;
+    let Some(t) = cur_mut() else { return ESRCH_ };
+    if typ > 10 {
+        return EINVAL;
+    }
+    if typ < 9 && t.uid != 0 {
+        return EPERM_;
+    }
+    match typ {
+        // close/open: no per-reader state exists to flip.
+        0 | 1 => 0,
+        2..=4 => {
+            if len > 0 && !range_ok_w(buf, len) {
+                return EFAULT;
+            }
+            // READ resumes the shared cursor; READ_ALL/READ_CLEAR
+            // start at the oldest live record (seq 0 self-clamps).
+            let seq = if typ == 2 { crate::log::syslog_seq() } else { 0 };
+            let mut off = 0u64;
+            let (n, _q) =
+                crate::log::kmsg_render(seq, len as usize, &mut |line| {
+                    // SAFETY: [buf, buf+len) validated writable and
+                    // off+line.len() <= len by render's cap accounting.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            line.as_ptr(),
+                            (buf + off) as *mut u8,
+                            line.len(),
+                        );
+                    }
+                    off += line.len() as u64;
+                });
+            if typ == 4 {
+                crate::log::syslog_clear();
+            } else if typ == 2 && n > 0 {
+                crate::log::syslog_set_seq(_q);
+            }
+            if n > 0 || typ != 2 {
+                return n as u64;
+            }
+            if deliverable(t) {
+                return EINTR_;
+            }
+            // Nothing pending: block until the next commit wakes
+            // kmsg_expire, or a signal lands (generic wake -> -EINTR).
+            let seq0 = crate::log::syslog_seq();
+            t.wait_on = WaitOn::Kmsg(seq0);
+            t.wait_ptr = buf;
+            t.wait_len = len;
+            t.ctx = *ctx;
+            t.state = TaskState::Blocked;
+            // Armed recheck — a commit or signal between the render
+            // and the arm must not leave us asleep on a done wait.
+            if t.state == TaskState::Blocked {
+                if crate::log::kmsg_next() <= seq0 {
+                    block_switch();
+                }
+                // A commit raced the arm: disarm, render below.
+                t.wait_on = WaitOn::None;
+                t.wait_ptr = 0;
+                t.wait_len = 0;
+                t.state = TaskState::Runnable;
+            } else {
+                // Woken between arm and recheck — the waker already
+                // deposited the result (records or -EINTR).
+                return t.ctx.rax;
+            }
+            // Render what the racing commit left pending.
+            let mut off = 0u64;
+            let (n, q2) = crate::log::kmsg_render(
+                seq0,
+                len as usize,
+                &mut |line| {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            line.as_ptr(),
+                            (buf + off) as *mut u8,
+                            line.len(),
+                        );
+                    }
+                    off += line.len() as u64;
+                },
+            );
+            if n > 0 {
+                crate::log::syslog_set_seq(q2);
+            }
+            n as u64
+        }
+        5 => {
+            crate::log::syslog_clear();
+            0
+        }
+        6..=8 => 0,
+        9 => crate::log::kmsg_unread() as u64,
+        _ => crate::log::kmsg_size() as u64,
+    }
+}
+
 /// clock_gettime(clk, ts): CLOCK_REALTIME-family ids get the
 /// CMOS-anchored wall clock; everything else rides the 100 Hz
 /// monotonic tick (no per-process/thread cputime domains yet).
@@ -16334,6 +16459,48 @@ pub fn nt_wait_expire() {
         t.ctx.rax = rax;
         t.wait_on = WaitOn::None;
         t.wait_deadline = 0;
+        t.state = TaskState::Runnable;
+    }
+}
+
+/// Tick service for WaitOn::Kmsg: wake a syslog(READ) waiter once a
+/// record newer than its armed seq is committed, marshalling the
+/// text through the sleeper's tables like PipeRead's waker. Called
+/// from the per-tick service list beside timerfd_expire.
+pub fn kmsg_expire() {
+    let newest = crate::log::kmsg_next();
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked {
+            continue;
+        }
+        let WaitOn::Kmsg(seq) = t.wait_on else {
+            continue;
+        };
+        if newest <= seq {
+            continue;
+        }
+        let buf = t.wait_ptr;
+        let mut off = 0u64;
+        let mut ok = true;
+        let pml4 = t.pml4;
+        let (_n, q) =
+            crate::log::kmsg_render(seq, t.wait_len as usize, &mut |line| {
+                if ok {
+                    ok = write_task_bytes(pml4, buf + off, line);
+                    off += line.len() as u64;
+                }
+            });
+        if off > 0 {
+            crate::log::syslog_set_seq(q);
+        }
+        // A mid-write fault voids the whole read like Linux's
+        // copy_to_user EFAULT; otherwise the bytes delivered land.
+        t.ctx.rax = if ok { off } else { EFAULT };
+        t.wait_on = WaitOn::None;
+        t.wait_ptr = 0;
+        t.wait_len = 0;
         t.state = TaskState::Runnable;
     }
 }
@@ -34548,7 +34715,7 @@ fn dir_add<'a>(
 /// only ever written inside it, and never partially (each record's
 /// reclen is checked against the remaining space before the write).
 /// EINVAL when count can't hold even the next record; 0 at the end.
-pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
+pub fn fd_getdents(fd: u64, buf: u64, count: u64, legacy: bool) -> u64 {
     const MAX: u64 = 1 << 20;
     let Some(t) = cur_mut() else { return EBADF };
     let Some(o) = ofd(t, fd) else { return EBADF };
@@ -34734,7 +34901,14 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
     for name in names[..n].iter().flatten().skip(o.pos) {
         // linux_dirent64: ino@0 u64, off@8 u64, reclen@16 u16,
         // type@18 u8, name@19 NUL-terminated — padded to 8.
-        let reclen = (19 + name.len() + 1 + 7) & !7;
+        // linux_dirent (legacy getdents): same header but name@18
+        // and d_type in the record's LAST byte — reclen = align8(
+        // 18 + namelen + 1 NUL + 1 type).
+        let reclen = if legacy {
+            (18 + name.len() + 2 + 7) & !7
+        } else {
+            (19 + name.len() + 1 + 7) & !7
+        };
         if off + reclen > count as usize {
             if off == 0 {
                 return EINVAL; // buffer can't hold even one record
@@ -34774,16 +34948,26 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64) -> u64 {
                     _ => 8u8,                        // DT_REG
                 }
             };
-            ((base + 18) as *mut u8).write(ty);
+            let (name_at, nul_at) = if legacy {
+                // d_type lands in the record's last byte instead of
+                // its own header field.
+                ((base + reclen as u64 - 1) as *mut u8).write(ty);
+                (18u64, 18 + name.len() as u64)
+            } else {
+                ((base + 18) as *mut u8).write(ty);
+                (19u64, 19 + name.len() as u64)
+            };
             core::ptr::copy_nonoverlapping(
                 name.as_ptr(),
-                (base + 19) as *mut u8,
+                (base + name_at) as *mut u8,
                 name.len(),
             );
-            ((base + 19 + name.len() as u64) as *mut u8).write(0);
+            ((base + nul_at) as *mut u8).write(0);
             // Zero the pad tail so kernel stack garbage can't leak.
-            let pad_end = off + reclen;
-            let mut z = off + 19 + name.len() + 1;
+            // Legacy keeps the record's last byte for d_type — stop
+            // the wipe one short so the type survives.
+            let pad_end = off + reclen - legacy as usize;
+            let mut z = off + nul_at as usize + 1;
             while z < pad_end {
                 ((buf + z as u64) as *mut u8).write(0);
                 z += 1;
@@ -35601,6 +35785,7 @@ pub fn tick(img: &mut UCtx) -> *const UCtx {
     itimer_expire(); // alarm/setitimer deadlines -> SIGALRM family
     ptimer_expire(); // timer_create deadlines -> SIGEV notifications
     nt_wait_expire(); // NT thread-object waits: dead/timeout wakes
+    kmsg_expire(); // blocked syslog(READ) waiters: new-record wakes
     crate::e1000::rx_drain(); // feed socket queues from the live ring
     tcp_retx(); // SYN retransmit on the initial-RTO schedule
     stdin_pump(); // feed the tty input queue from the scancode ring
