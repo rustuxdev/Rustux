@@ -8388,3 +8388,20 @@ needs uid==both targets' uid else EPERM. lstest floor 83->84.
 Audit run-80: 0 confirmed — the missing-access-check class is the
 only kcmp security class; gate modelled + EPERM-proven by test;
 cve-now has no kcmp-class CVEs.
+run-322 lands the file-handle pair: name_to_handle_at(303) +
+open_by_handle_at(304). f_handle kinds: 1=vfile inode carrying
+(slot,gen) — gen minted from a new VGEN sequence on every VFile
+create so a dead or reused slot ESTALEs instead of aliasing;
+3=root; 4=initrd-archive file by data pointer; 5=dir by canonical
+path. name_to_handle_at is ungated like Linux (AT_SYMLINK_FOLLOW +
+AT_EMPTY_PATH; cap<need -> needed size + EOVERFLOW);
+open_by_handle_at enforces uid==0 as the CAP_DAC_READ_SEARCH
+stand-in, requires an fs-fd mount fd, and decodes strictly — a
+handle that survives rename/unlink still opens the inode, while a
+mutated or dead one ESTALEs. proc/* and chr/blk/fifo nodes are
+EOPNOTSUPP; symlinks take handles on the link inode itself.
+lstest floor 84->85. Audit run-81: 0 confirmed — the
+mutated-handle class (CVE-2026-99616) is absent by construction,
+the access gate is test-proven; no kcmp/handle-ABI kernel CVEs
+exist in the catalog. In-run fixes: AT_FDCWD 0xffffff9c form,
+proc/self EOPNOTSUPP gap, S_IFLNK node-gate exclusion.
