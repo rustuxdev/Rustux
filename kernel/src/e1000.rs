@@ -2012,6 +2012,12 @@ fn drain_desc(d: usize) -> Option<([u8; 4], [u8; 6])> {
 /// and the ARP body's sender hardware address — must be the virtio
 /// NIC's, or slirp's replies go to a MAC the device filters out.
 pub fn tx_eth(f: &mut [u8]) -> bool {
+    // A configured /dev/net/tun iface owns the 10.200.i.0/24
+    // subnets — IPv4 frames bound there queue to the tun fd
+    // instead of the wire.
+    if crate::user::tun_route(f) {
+        return true;
+    }
     let base = LIVE_BASE.load(Ordering::Relaxed);
     if base != 0 {
         crate::user::pkt_tap(f, 2, true);
@@ -2105,7 +2111,7 @@ pub fn rx_drain() {
 /// `pkt` is the IP packet (eth already stripped), `src_mac` the
 /// sender's link address — replies and accepted children keep it
 /// as their peer MAC.
-fn ip_demux(pkt: &[u8], src_mac: [u8; 6]) {
+pub fn ip_demux(pkt: &[u8], src_mac: [u8; 6]) {
     let Some(ip) = crate::net::parse_ipv4(pkt) else { return };
     let our = our_ip();
     if ip.proto == crate::net::NH_UDP && for_us(ip.dst, our, our_mask()) {

@@ -371,6 +371,9 @@ enum WaitOn {
     NlRecv(usize),
     /// recvmsg on an empty netlink queue — wait_ptr msghdr.
     NlRecvM(usize),
+    /// read() on an empty tun/tap queue — wait_ptr/wait_len is
+    /// the user buffer like PipeRead.
+    TunRecv(usize),
     /// nanosleep(): pure deadline wait — wait_deadline bounds it,
     /// the return is always 0.
     Timer,
@@ -511,6 +514,9 @@ enum FdKind {
     /// An AF_NETLINK socket — NETLINK_ROUTE endpoint; state in
     /// NLSOCKS[id], replies queued in NLQ.
     Nl(usize),
+    /// A /dev/net/tun endpoint — TUN/TAP virtual packet fd; the
+    /// iface state lives in TUNS[id], packets in TUNQ.
+    Tun(usize),
     /// An epoll instance — the interest set lives in EPOLLS[id];
     /// dup'd fds share it like socket endpoints.
     Epoll(usize),
@@ -9906,6 +9912,87 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 sf as u64
             }
         }
+        0x400454CA => {
+            // TUNSETIFF — ifreq {ifr_name[16], ifr_flags}: attach
+            // this fd to its (fixed) iface, selecting TUN vs TAP
+            // and the packet-info header. Already attached is
+            // EBUSY like Linux.
+            let FdKind::Tun(ti) = &o.kind else { return ENOTTY_ };
+            if !range_ok(arg, 40) || !range_ok_w(arg, 40) {
+                return EFAULT;
+            }
+            let flags = unsafe {
+                u16::from_le_bytes([
+                    *((arg + 16) as *const u8),
+                    *((arg + 17) as *const u8),
+                ])
+            };
+            let tun_req = flags & 1 != 0; // IFF_TUN
+            let tap_req = flags & 2 != 0; // IFF_TAP
+            if tun_req == tap_req {
+                return EINVAL; // exactly one of TUN/TAP
+            }
+            let tuns = unsafe { &mut *core::ptr::addr_of_mut!(TUNS) };
+            let Some(tn) = tuns[*ti].as_mut() else { return ENOTTY_ };
+            if tn.used {
+                return (-16i64) as u64; // EBUSY
+            }
+            tn.tap = tap_req;
+            tn.no_pi = flags & 0x1000 != 0; // IFF_NO_PI
+            tn.used = true;
+            // An empty requested name gets the kernel's assignment
+            // echoed back ("tun0"/"tap1"); a supplied name stands
+            // (we don't store it — nothing names ifaces here).
+            if unsafe { *((arg) as *const u8) } == 0 {
+                let nm = if tap_req { b"tap0" } else { b"tun0" };
+                let mut b = *nm;
+                b[3] = b'0' + *ti as u8;
+                // SAFETY: validated user window.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        b.as_ptr(),
+                        arg as *mut u8,
+                        4,
+                    )
+                };
+            }
+            0
+        }
+        0x800454D2 => {
+            // TUNGETIFF — report the iface's name + flags back
+            // through the same ifreq layout.
+            let FdKind::Tun(ti) = &o.kind else { return ENOTTY_ };
+            if !range_ok_w(arg, 40) {
+                return EFAULT;
+            }
+            let Some((tap, no_pi)) = tun_cfg(*ti) else {
+                return (-22i64) as u64; // EINVAL — not attached
+            };
+            let nm = if tap { b"tap0" } else { b"tun0" };
+            let mut b = *nm;
+            b[3] = b'0' + *ti as u8;
+            let flags = if tap { 2u16 } else { 1u16 }
+                | if no_pi { 0x1000 } else { 0 };
+            let fl = flags.to_le_bytes();
+            // SAFETY: validated user window.
+            unsafe {
+                core::ptr::write_bytes(arg as *mut u8, 0, 40);
+                core::ptr::copy_nonoverlapping(
+                    b.as_ptr(),
+                    arg as *mut u8,
+                    4,
+                );
+                *((arg + 16) as *mut u8) = fl[0];
+                *((arg + 17) as *mut u8) = fl[1];
+            }
+            0
+        }
+        0x400454C8 => {
+            // TUNSETNOCSUM — no checksum offload exists to toggle;
+            // Linux accepts this silently.
+            let FdKind::Tun(_) = &o.kind else { return ENOTTY_ };
+            0
+        }
         0x4C82 => {
             // LOOP_CTL_GET_FREE — the allocator front door on
             // /dev/loop-control; answers the first unbound index.
@@ -10515,6 +10602,21 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                     .map(|g| g.len as u64)
                     .next()
                     .unwrap_or(0),
+                // tun: the next queued packet's framed len (the PI
+                // header counts unless IFF_NO_PI).
+                FdKind::Tun(i) => {
+                    let tuns = unsafe { &*core::ptr::addr_of!(TUNS) };
+                    tuns.get(*i)
+                        .and_then(|s| s.as_ref())
+                        .filter(|tn| tn.n > 0)
+                        .map_or(0, |tn| {
+                            let rl = unsafe {
+                                *core::ptr::addr_of!(TUNQL)
+                            }[*i * TUN_QD + tn.hd as usize]
+                                as u64;
+                            rl + if tn.no_pi { 0 } else { 4 }
+                        })
+                }
                 FdKind::Unix(i) => {
                     let socks = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) };
                     socks
@@ -11179,6 +11281,8 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         | FdKind::Packet(_)
         | FdKind::Unix(_)
         | FdKind::Nl(_) => (0o140777, 0, 0), // S_IFSOCK
+        // The tun endpoint stats as its char node (10:200).
+        FdKind::Tun(i) => (0o20600, 0, *i as u64 + 1),
         // anon_inodefs objects stat as a chrdev — Linux shows
         // S_IFCHR|0600 for epoll/eventfd/timerfd alike.
         FdKind::Epoll(_)
@@ -11221,6 +11325,10 @@ pub fn fill_fstat(fd: u64) -> Result<[u64; 18], u64> {
                     (v.ctime, v.ctime_ns),
                 );
             }
+        }
+        // The tun endpoint reports its char node's rdev.
+        FdKind::Tun(_) => {
+            st[5] = (10 << 8 | 200) as u64;
         }
         FdKind::Dev(i) => {
             if let Some(v) = vfile(*i) {
@@ -15130,6 +15238,13 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             pkt_recv_or_block(ctx, *i, buf, len, 0, o.nonblock)
         }
         FdKind::Nl(i) => nl_recv_buf(ctx, *i, buf, len, 0, o.nonblock),
+        FdKind::Tun(i) => {
+            if o.accmode == 1 {
+                return EBADF; // O_WRONLY
+            }
+            let (i, nb) = (*i, o.nonblock);
+            tun_read(ctx, t, i, buf, len, nb)
+        }
         FdKind::Unix(i) => {
             let kind = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
                 .get(*i)
@@ -15321,6 +15436,12 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         // write() on a raw packet socket sends the frame verbatim;
         // a cooked one needs a dest the write form can't carry.
         return fd_sendto(ctx, fd, buf, len, 0, 0, 0);
+    }
+    if let FdKind::Tun(i) = &o.kind {
+        if o.accmode == 0 {
+            return EBADF; // O_RDONLY
+        }
+        return tun_write(*i, buf, len);
     }
     if let FdKind::Nl(i) = &o.kind {
         // write() on netlink = a bare request datagram.
@@ -16447,6 +16568,25 @@ pub fn dev_init() {
         d.path[..7].copy_from_slice(b"dev/pts");
         ds[i] = Some(d);
     }
+    // /dev/net — tun/tap packet fds live beneath it.
+    if let Some(i) = ds.iter().position(Option::is_none) {
+        let (s, ns) = now();
+        let mut d = VDir {
+            path: [0; 128],
+            nlen: 7,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: s,
+            atime_ns: ns,
+            mtime: s,
+            mtime_ns: ns,
+            ctime: s,
+            ctime_ns: ns,
+        };
+        d.path[..7].copy_from_slice(b"dev/net");
+        ds[i] = Some(d);
+    }
     // /dev/input — the evdev dir (major-13 nodes live beneath it).
     if let Some(i) = ds.iter().position(Option::is_none) {
         let (s, ns) = now();
@@ -16478,6 +16618,7 @@ pub fn dev_init() {
         (b"dev/ptmx", 0x502, 0o666),
         (b"dev/fb0", 0x1d00, 0o660),
         (b"dev/input/event0", 0xd40, 0o660),
+        (b"dev/net/tun", 0xac8, 0o600),
     ] {
         let r = vfile_create(name);
         if (r as i64) < 0 {
@@ -17536,6 +17677,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         | FdKind::Nl(id) => {
             s.printf(b"socket:[%u]", &[klib::fmt::Arg::U(*id as u64)]);
         }
+        FdKind::Tun(_) => {
+            s.puts(b"/dev/net/tun");
+        }
         FdKind::Epoll(_) => {
             s.puts(b"anon_inode:[eventpoll]");
         }
@@ -17823,7 +17967,19 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                 }
                 _ => return ENODEV,
             };
-            FdKind::Dev(dev_idx)
+            // /dev/net/tun (misc 10:200) opens mint a private tun
+            // slot — each open is a distinct iface like Linux's
+            // file->private_data.
+            if vfile(dev_idx)
+                .is_some_and(|v| v.rdev == (10 << 8 | 200))
+            {
+                match tun_alloc() {
+                    Some(ti) => FdKind::Tun(ti),
+                    None => return EMFILE,
+                }
+            } else {
+                FdKind::Dev(dev_idx)
+            }
         } else {
             FdKind::Ram(i)
         }
@@ -17899,6 +18055,9 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         if let FdKind::Proc { buf, .. } = kind {
             kalloc::free_frame(buf);
         }
+        if let FdKind::Tun(ti) = kind {
+            unsafe { (*core::ptr::addr_of_mut!(TUNS))[ti] = None };
+        }
         return ENOTDIR;
     }
     let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
@@ -17906,11 +18065,17 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         if let FdKind::Proc { buf, .. } = kind {
             kalloc::free_frame(buf);
         }
+        if let FdKind::Tun(ti) = kind {
+            unsafe { (*core::ptr::addr_of_mut!(TUNS))[ti] = None };
+        }
         return EMFILE;
     };
     let Some(fi) = fdt(t).fds.iter().position(Option::is_none) else {
         if let FdKind::Proc { buf, .. } = kind {
             kalloc::free_frame(buf);
+        }
+        if let FdKind::Tun(ti) = kind {
+            unsafe { (*core::ptr::addr_of_mut!(TUNS))[ti] = None };
         }
         return EMFILE;
     };
@@ -19622,6 +19787,22 @@ fn ofd_release(oi: usize) {
             *slot = None;
         }
     }
+    if let FdKind::Tun(i) = kind {
+        unsafe { (*core::ptr::addr_of_mut!(TUNS))[i] = None };
+        // A parked reader sharing this OFD wakes to EIO — its
+        // iface is gone.
+        let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+        for t in tasks.iter_mut().flatten() {
+            if t.state == TaskState::Blocked
+                && t.wait_on == WaitOn::TunRecv(i)
+            {
+                t.ctx.rax = (-5i64) as u64;
+                t.wait_on = WaitOn::None;
+                t.wait_deadline = 0;
+                t.state = TaskState::Runnable;
+            }
+        }
+    }
     if let FdKind::Tcp(i) = kind {
         tcp_sock_close(i);
     }
@@ -19913,6 +20094,16 @@ fn ofd_revents(pend: u32, oi: u8, events: u16) -> u16 {
             } else {
                 0
             }
+        }
+        // tun: readable when a packet is queued; writes never
+        // block so the fd is always writable once configured.
+        FdKind::Tun(i) => {
+            let n = unsafe { &*core::ptr::addr_of!(TUNS) }
+                .get(*i)
+                .and_then(|s| s.as_ref())
+                .map_or(0, |x| x.n);
+            (if n > 0 { POLLIN } else { 0 })
+                | if tun_cfg(*i).is_some() { POLLOUT } else { 0 }
         }
         FdKind::Dev(i) => {
             if let Some((id, master)) = ofd_pty(o) {
@@ -25751,6 +25942,275 @@ fn nl_recv_buf(
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
+}
+
+// ---------------- /dev/net/tun ----------------
+//
+// open("/dev/net/tun") (char 10:200) mints FdKind::Tun(i) over
+// TUNS[i]; TUNSETIFF configures IFF_TUN (L3 IP packets) / IFF_TAP
+// (L2 eth frames) and IFF_NO_PI (skip the 4B packet-info header).
+// Slot i owns the fixed subnet 10.200.i.0/24 — outbound IPv4 to
+// it detours from tx_eth into the tun's read queue instead of the
+// wire (Linux routes by the iface's netmask; ours is fixed since
+// there is no SIOCSIFADDR). write() injects: TUN payloads feed
+// ip_demux as inbound packets; TAP frames cross the eth ingress
+// (capture tap + demux) like a wire frame.
+
+const TUNS_N: usize = 4;
+const TUN_QD: usize = 4;
+const TUN_PKT: usize = 1600;
+/// Locally-administered src MAC reported for L3-injected packets.
+const TUN_MAC: [u8; 6] = [0x02, 0x54, 0x55, 0x4e, 0x00, 0x00];
+
+struct Tun {
+    /// TUNSETIFF has run — unconfigured fds take no traffic.
+    used: bool,
+    /// IFF_TAP — whole eth frames; else IP packets.
+    tap: bool,
+    /// IFF_NO_PI — skip the 4B packet-info header.
+    no_pi: bool,
+    hd: u8,
+    n: u8,
+}
+static mut TUNS: [Option<Tun>; TUNS_N] = [None, None, None, None];
+/// Flat per-tun packet queue — slot ti*QD+k like the unix table.
+static mut TUNQ: [[u8; TUN_PKT]; TUNS_N * TUN_QD] =
+    [[0; TUN_PKT]; TUNS_N * TUN_QD];
+static mut TUNQL: [u16; TUNS_N * TUN_QD] = [0; TUNS_N * TUN_QD];
+/// IRQ-vs-syscall reentry guard — a tick-timed drain can preempt
+/// a syscall-context tun_route mid-push.
+static mut TUNBUSY: bool = false;
+
+/// Claim a free tun slot, unconfigured until TUNSETIFF.
+fn tun_alloc() -> Option<usize> {
+    let tuns = unsafe { &mut *core::ptr::addr_of_mut!(TUNS) };
+    let i = tuns.iter().position(Option::is_none)?;
+    tuns[i] = Some(Tun {
+        used: false,
+        tap: false,
+        no_pi: false,
+        hd: 0,
+        n: 0,
+    });
+    Some(i)
+}
+
+/// Snapshot of one slot's config (used, tap, no_pi) — the queue
+/// ops all key off it.
+fn tun_cfg(ti: usize) -> Option<(bool, bool)> {
+    unsafe { &*core::ptr::addr_of!(TUNS) }
+        .get(ti)
+        .and_then(|s| s.as_ref())
+        .filter(|t| t.used)
+        .map(|t| (t.tap, t.no_pi))
+}
+
+/// tx_eth's detour: an IPv4 frame bound for a configured tun's
+/// fixed subnet queues there instead of hitting the wire. The
+/// eth dst the builder resolved (gateway MAC) is meaningless on
+//  the tun segment — TUN readers get the bare IP packet, TAP
+/// readers get the frame as-built.
+pub fn tun_route(f: &[u8]) -> bool {
+    if f.len() < 34 || f[12] != 8 || f[13] != 0 {
+        return false;
+    }
+    let ti = f[32] as usize;
+    if f[30] != 10 || f[31] != 200 || ti >= TUNS_N {
+        return false;
+    }
+    match tun_cfg(ti) {
+        Some((tap, _)) => {
+            if tap {
+                // TAP readers get the frame as-built — wire padding
+                // is part of the L2 record.
+                tun_push(ti, f)
+            } else {
+                // TUN readers get the bare IP datagram — strip the
+                // wire's 60B minimum-frame padding to ip total_len.
+                let tot = u16::from_be_bytes([f[16], f[17]]) as usize;
+                let end = if (20..=f.len() - 14).contains(&tot) {
+                    14 + tot
+                } else {
+                    f.len()
+                };
+                tun_push(ti, &f[14..end])
+            }
+        }
+        None => false,
+    }
+}
+
+/// Queue one record; a parked reader takes it straight through
+/// its tables, else the flat queue holds it. Reentry-safe under
+/// the TUNBUSY guard (honest loss on an IRQ race, like pkt_tap).
+fn tun_push(ti: usize, rec: &[u8]) -> bool {
+    unsafe {
+        if *core::ptr::addr_of!(TUNBUSY) {
+            return false;
+        }
+        *core::ptr::addr_of_mut!(TUNBUSY) = true;
+    }
+    let ok = tun_push_g(ti, rec);
+    unsafe { *core::ptr::addr_of_mut!(TUNBUSY) = false };
+    ok
+}
+
+fn tun_push_g(ti: usize, rec: &[u8]) -> bool {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for t in tasks.iter_mut().flatten() {
+        if t.state == TaskState::Blocked
+            && t.wait_on == WaitOn::TunRecv(ti)
+        {
+            t.ctx.rax =
+                tun_emit(t.pml4, ti, t.wait_ptr, t.wait_len, rec);
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            t.state = TaskState::Runnable;
+            return true;
+        }
+    }
+    let tuns = unsafe { &mut *core::ptr::addr_of_mut!(TUNS) };
+    let Some(tn) = tuns[ti].as_mut() else { return false };
+    if tn.n as usize >= TUN_QD || rec.len() > TUN_PKT {
+        return false; // a full tun queue drops, like a full ring
+    }
+    let slot = ti * TUN_QD + ((tn.hd + tn.n) % TUN_QD as u8) as usize;
+    let q = unsafe { &mut *core::ptr::addr_of_mut!(TUNQ) };
+    let ql = unsafe { &mut *core::ptr::addr_of_mut!(TUNQL) };
+    q[slot][..rec.len()].copy_from_slice(rec);
+    ql[slot] = rec.len() as u16;
+    tn.n += 1;
+    true
+}
+
+/// Frame one record for a reader — the PI header {flags, proto}
+/// unless IFF_NO_PI — and copy it into `buf` under `pml4`,
+/// truncating to `cap` like Linux's read.
+fn tun_emit(pml4: u64, ti: usize, buf: u64, cap: u64, rec: &[u8]) -> u64 {
+    let (tap, no_pi) = tun_cfg(ti).unwrap_or((false, true));
+    let proto: u16 = if tap && rec.len() >= 14 {
+        u16::from_be_bytes([rec[12], rec[13]])
+    } else if tap {
+        0
+    } else {
+        0x0800
+    };
+    let mut off = 0usize;
+    if !no_pi {
+        let hdr = [0u8, 0, (proto >> 8) as u8, proto as u8];
+        let h = core::cmp::min(4, cap as usize);
+        if h > 0 && !write_task_bytes(pml4, buf, &hdr[..h]) {
+            return EFAULT;
+        }
+        off = h;
+        if h < 4 {
+            return h as u64;
+        }
+    }
+    let n = core::cmp::min(rec.len(), cap as usize - off);
+    if n > 0 && !write_task_bytes(pml4, buf + off as u64, &rec[..n]) {
+        return EFAULT;
+    }
+    (off + n) as u64
+}
+
+/// Pop the oldest queued record into `rec`, returning its len.
+fn tun_pop(ti: usize, rec: &mut [u8]) -> Option<usize> {
+    let tuns = unsafe { &mut *core::ptr::addr_of_mut!(TUNS) };
+    let tn = tuns.get_mut(ti)?.as_mut()?;
+    if tn.n == 0 {
+        return None;
+    }
+    let slot = ti * TUN_QD + tn.hd as usize;
+    let n = unsafe { *core::ptr::addr_of!(TUNQL) }[slot] as usize;
+    let q = unsafe { &*core::ptr::addr_of!(TUNQ) };
+    rec[..n].copy_from_slice(&q[slot][..n]);
+    tn.hd = (tn.hd + 1) % TUN_QD as u8;
+    tn.n -= 1;
+    Some(n)
+}
+
+/// fd_read on a tun fd — pop a queued packet, or park on TunRecv
+/// with the user buffer in wait_ptr/len like PipeRead.
+fn tun_read(
+    ctx: &mut UCtx,
+    t: &mut Task,
+    ti: usize,
+    buf: u64,
+    len: u64,
+    nb: bool,
+) -> u64 {
+    if tun_cfg(ti).is_none() {
+        return (-5i64) as u64; // EIO — no iface (pre-TUNSETIFF)
+    }
+    if len > 0 && !range_ok_w(buf, len.min(4 + TUN_PKT as u64)) {
+        return EFAULT;
+    }
+    let mut rec = [0u8; TUN_PKT];
+    if let Some(n) = tun_pop(ti, &mut rec) {
+        return tun_emit(t.pml4, ti, buf, len, &rec[..n]);
+    }
+    if nb {
+        return EAGAIN;
+    }
+    if deliverable(t) {
+        return (-4i64) as u64; // EINTR
+    }
+    t.wait_on = WaitOn::TunRecv(ti);
+    t.wait_ptr = buf;
+    t.wait_len = len;
+    t.wait_deadline = 0;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
+/// fd_write on a tun fd — inject a packet as inbound traffic.
+/// TUN payloads feed ip_demux directly; TAP frames cross the
+/// eth ingress (capture tap + IPv4 demux) like a wire frame.
+fn tun_write(ti: usize, buf: u64, len: u64) -> u64 {
+    let Some((tap, no_pi)) = tun_cfg(ti) else {
+        return (-5i64) as u64; // EIO — no iface (pre-TUNSETIFF)
+    };
+    if len == 0 || len > TUN_PKT as u64 || !range_ok(buf, len) {
+        return if range_ok(buf, len.max(1)) { EINVAL } else { EFAULT };
+    }
+    let mut f = [0u8; TUN_PKT];
+    // SAFETY: validated user window under cur cr3.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            buf as *const u8,
+            f.as_mut_ptr(),
+            len as usize,
+        )
+    };
+    let mut pay = &f[..len as usize];
+    if !no_pi {
+        if pay.len() < 4 {
+            return EINVAL;
+        }
+        let proto = u16::from_be_bytes([f[2], f[3]]);
+        if !tap && proto != 0x0800 {
+            return EINVAL; // TUN PI proto must name a v4 packet
+        }
+        pay = &pay[4..];
+    }
+    if tap {
+        if pay.len() < 14 {
+            return EINVAL;
+        }
+        let mut m = [0u8; 6];
+        m.copy_from_slice(&pay[6..12]);
+        pkt_tap(pay, 3, false);
+        if pay[12] == 8 && pay[13] == 0 && pay.len() >= 34 {
+            crate::e1000::ip_demux(&pay[14..], m);
+        }
+    } else if pay.len() >= 20 && pay[0] >> 4 == 4 {
+        crate::e1000::ip_demux(pay, TUN_MAC);
+    } else {
+        return EINVAL;
+    }
+    len
 }
 
 /// Datagram recv shared by read/recvfrom — the queue gives back
