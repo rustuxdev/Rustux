@@ -8583,3 +8583,25 @@ unavailable (GET_NOTIF_SIZES still reports real ABI sizes),
 the filter-leak class needs a post-refcount failure path we
 don't have; verifier/malformed-prog classes are closed by the
 install-time checks + KILL-safe-verdict convention.
+
+run-332 lands Linux AIO (206-210 + 333) — synchronous by
+construction. AIOCTXS[8] holds tgid-scoped contexts whose
+completion rings live kernel-side (io_getevents is the only
+drain — no user-mmap'd ring, which is the documented ABI
+divergence; libaio's mmap path would need the ring page).
+io_submit runs iocbs inline through the fd layer and posts
+io_events; ring-full returns the partial count (EAGAIN when
+zero — Linux blocks on its kiocb pool, unresumable past a
+block_switch divergence). getevents/pgetevents block on
+WaitOn::Aio until min_nr or a relative-timespec deadline;
+pgetevents' usig is the {mask,sz} indirection, validated
+up-front, installed psel-style so every resume path restores.
+RESFD bumps a real eventfd. Divergences: synchronous (no
+kiocbs, nothing in-flight — cancel answers EAGAIN for queued
+completions, EINVAL for unknown); ring capacity 64; destroy
+drops undrained completions; EINTR before min_nr reports -EINTR
+(Linux would return a partial count if some events were already
+queued). aiotest.c new task -> MAX_TASKS 118->119, lstest floor
+91->92. Audit run-91: 0 confirmed — the whole fs/aio.c CVE
+cluster needs kiocbs, armed wakes, or a user-visible ring, none
+of which exist.
