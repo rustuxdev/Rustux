@@ -8644,6 +8644,262 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     0
 }
 
+/// mremap(old, old_len, new_len, flags, new_addr): the VMA mover —
+/// MREMAP_MAYMOVE relocates, MREMAP_FIXED pins the destination
+/// (EINVAL without MAYMOVE like Linux). Shrinks unmap the tail in
+/// place; same-size is a no-op; grows always relocate (Linux's
+/// expand-in-place collapses into move-or-ENOMEM — MAYMOVE-less
+/// grows ENOMEM). The old range must be committed VMA (EFAULT on
+/// holes/reservations). Move is two-pass: map+copy every new page
+/// first — a frame shortage unmaps the new half and ENOMEMs with
+/// the old mapping untouched — then unmap the old and rewrite the
+/// ledger. Shared mm EINVALs: ranges are per-task here, so a move
+/// would leave siblings' ledgers stale (deny-side approximation).
+/// Returns the new base in rax like Linux.
+pub fn sys_mremap(
+    old_addr: u64,
+    old_len: u64,
+    new_len: u64,
+    flags: u64,
+    new_addr: u64,
+) -> u64 {
+    const ENOMEM_: u64 = (-12i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    const MAYMOVE: u64 = 1;
+    const FIXED: u64 = 2;
+    if flags & !(MAYMOVE | FIXED) != 0
+        || flags & (MAYMOVE | FIXED) == FIXED
+    {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return ENOMEM_ };
+    if old_addr & (PAGE - 1) != 0 || new_len == 0 || mm_is_shared(t.pml4)
+    {
+        return EINVAL;
+    }
+    let old_len = old_len.max(1).saturating_add(PAGE - 1) & !(PAGE - 1);
+    let new_len = new_len.saturating_add(PAGE - 1) & !(PAGE - 1);
+    let Some(old_end) = old_addr.checked_add(old_len) else {
+        return EFAULT_;
+    };
+    let (ulo, uhi) = user_window(t);
+    if old_addr < ulo || old_end > uhi || !range_committed(t, old_addr, old_end)
+    {
+        return EFAULT_;
+    }
+    // Same size without MAYMOVE is a trivial no-op.
+    if new_len == old_len && flags & MAYMOVE == 0 {
+        return old_addr;
+    }
+    // Shrink: zap the tail, clip the ledger, keep the base.
+    if new_len < old_len {
+        let hi = old_addr + new_len;
+        let mut v = hi;
+        while v < old_end {
+            unmap_page(t, v);
+            v += PAGE;
+        }
+        shm_unmap_range(t, hi, old_end);
+        range_clip(t, hi, old_end);
+        flush_tlb();
+        return old_addr;
+    }
+    if flags & MAYMOVE == 0 {
+        return ENOMEM_;
+    }
+    // One new entry plus old splits — capacity pre-flight keeps the
+    // ledger rewrite atomic.
+    if t.nranges + 1 > MAX_RANGES {
+        return ENOMEM_;
+    }
+    let old_fl = t
+        .ranges[..t.nranges]
+        .iter()
+        .find(|&&(lo, hi, _)| lo <= old_addr && hi >= old_end)
+        .map(|&(_, _, fl)| fl)
+        .unwrap_or(RNG_R | RNG_W);
+    let dst = if flags & FIXED != 0 {
+        if new_addr & (PAGE - 1) != 0 || new_addr < ulo {
+            return EINVAL;
+        }
+        let Some(dend) = new_addr.checked_add(new_len) else {
+            return EFAULT_;
+        };
+        if dend > uhi
+            || (new_addr < old_end && dend > old_addr)
+        {
+            return EFAULT_;
+        }
+        // FIXED unmaps whatever the destination held.
+        let mut v = new_addr;
+        while v < dend {
+            unmap_page(t, v);
+            v += PAGE;
+        }
+        shm_unmap_range(t, new_addr, dend);
+        range_clip(t, new_addr, dend);
+        new_addr
+    } else {
+        match mmap_find(t, new_len) {
+            Some(v) => v,
+            None => return ENOMEM_,
+        }
+    };
+    // Pass 1: map every new page — copies for v < old_len, fresh
+    // zero frames for the grown tail. Only the source range's own
+    // leaves may be read: an adjacent dst must never alias into the
+    // src lookup. A shortage rolls the new pages back — the old
+    // mapping is still whole.
+    let base_flags = leaf_ent(t, old_addr)
+        .map(|e| rd64(e) & !PHYS_MASK & !IDENT)
+        .unwrap_or(PRESENT | USER);
+    let mut v = 0u64;
+    while v < new_len {
+        let sv = old_addr + v;
+        let dv = dst + v;
+        let grown = v >= old_len;
+        let e = if grown {
+            None
+        } else {
+            let Some(ent) = leaf_ent(t, sv) else {
+                // Committed-but-unmapped — the invariant broke.
+                let mut r = 0u64;
+                while r < v {
+                    unmap_page(t, dst + r);
+                    r += PAGE;
+                }
+                return EFAULT_;
+            };
+            Some(rd64(ent))
+        };
+        let leaf_flags = match e {
+            Some(e) => e & !PHYS_MASK & !IDENT,
+            None => base_flags,
+        };
+        let Some(npa) = map_page(t, dv, leaf_flags) else {
+            let mut r = 0u64;
+            while r < v {
+                unmap_page(t, dst + r);
+                r += PAGE;
+            }
+            return ENOMEM_;
+        };
+        if !grown {
+            let e = e.unwrap_or(0);
+            // SAFETY: both are live user frames; pmap is the
+            // physmap base — PAGE bytes each side.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    crate::mm::pmap(e & PHYS_MASK) as *const u8,
+                    crate::mm::pmap(npa) as *mut u8,
+                    PAGE as usize,
+                )
+            };
+        }
+        v += PAGE;
+    }
+    // Pass 2: unmap the old, rewrite the ledger, return the base.
+    let mut w = old_addr;
+    while w < old_end {
+        unmap_page(t, w);
+        w += PAGE;
+    }
+    shm_unmap_range(t, old_addr, old_end);
+    range_clip(t, old_addr, old_end);
+    let _ = range_add(t, dst, dst + new_len, old_fl);
+    flush_tlb();
+    dst
+}
+
+/// madvise(addr, len, advice): hints we can honor — DONTNEED zeroes
+/// the present pages (anon-DONTNEED semantics: file-private pages
+/// are eager copies, so zeros it is — documented divergence from
+/// Linux's refault-from-file); the rest of the known advice set is
+/// accepted-inert (hints a kernel may legally ignore). Unknown
+/// advice EINVALs; the range must be committed VMA or ENOMEM like
+/// Linux's unmapped-region answer.
+pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
+    const ENOMEM_: u64 = (-12i64) as u64;
+    let Some(t) = cur_mut() else { return ENOMEM_ };
+    if addr & (PAGE - 1) != 0 {
+        return EINVAL;
+    }
+    // MADV_* set accepted: NORMAL/RANDOM/SEQUENTIAL/WILLNEED/
+    // DONTNEED/FREE/DONTDUMP/DODUMP/HUGEPAGE/NOHUGEPAGE/DONTFORK/
+    // DOFORK/WIPEONFORK/KEEPONFORK/COLD/PAGEOUT/POPULATE_READ/
+    // POPULATE_WRITE. DONTNEED is the only one that acts.
+    if advice > 23 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = addr.checked_add(len) else { return ENOMEM_ };
+    let (ulo, uhi) = user_window(t);
+    let hi = end.saturating_add(PAGE - 1) & !(PAGE - 1);
+    if addr < ulo || hi > uhi || !range_committed(t, addr, hi) {
+        return ENOMEM_;
+    }
+    if advice == 4 {
+        // DONTNEED — zero each present page through its leaf.
+        let mut v = addr;
+        while v < hi {
+            if let Some(ent) = leaf_ent(t, v) {
+                let pa = rd64(ent) & PHYS_MASK;
+                // SAFETY: pa is a live user frame in physmap.
+                unsafe {
+                    core::ptr::write_bytes(
+                        crate::mm::pmap(pa) as *mut u8,
+                        0,
+                        PAGE as usize,
+                    )
+                };
+            }
+            v += PAGE;
+        }
+    }
+    0
+}
+
+/// mincore(addr, len, vec): per-page residency bits — everything a
+/// leaf maps is resident (no swap). vec gets one bit per page.
+/// EINVAL unaligned addr; EFAULT bad vec; ENOMEM when the range
+/// isn't committed VMA, like Linux's unmapped-memory answer.
+pub fn sys_mincore(addr: u64, len: u64, vec: u64) -> u64 {
+    const ENOMEM_: u64 = (-12i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    let Some(t) = cur_mut() else { return ENOMEM_ };
+    if addr & (PAGE - 1) != 0 || len == 0 {
+        return EINVAL;
+    }
+    let npages = len.div_ceil(PAGE);
+    if !range_ok_w(vec, npages.div_ceil(8)) {
+        return EFAULT_;
+    }
+    let Some(end) = addr.checked_add(len) else { return ENOMEM_ };
+    let (ulo, uhi) = user_window(t);
+    let hi = end.saturating_add(PAGE - 1) & !(PAGE - 1);
+    if addr < ulo || hi > uhi || !range_committed(t, addr, hi) {
+        return ENOMEM_;
+    }
+    // Linux writes every vec byte — never an OR over stale user
+    // bytes: unseen pages report 0, not whatever the buffer held.
+    let mut i = 0u64;
+    while i < npages {
+        let mut b = 0u8;
+        for bit in 0..8u64 {
+            let pg = i + bit;
+            if pg < npages && leaf_ent(t, addr + pg * PAGE).is_some() {
+                b |= 1 << bit;
+            }
+        }
+        // SAFETY: vec range validated writable above.
+        unsafe { ((vec + i / 8) as *mut u8).write_unaligned(b) };
+        i += 8;
+    }
+    0
+}
+
 // --- process image: exec stack, arch_prctl, misc ABI ----------------
 //
 // Real binaries need the Linux initial-stack contract: argc at [rsp],
