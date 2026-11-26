@@ -58,6 +58,11 @@ before.
   `MAX_OFDS` = 128, `MAX_VFILES` = 16, `VFILE_MAX` = 1MiB.
 - `translate`/`translate_r` are bounded to [USER_VA_LO, USER_VA_HI) —
   never call raw `translate` for user memory.
+- Mixed line endings: some kernel/src files are CRLF (acpi, kalloc,
+  log, logo_data, mm, pci, pio, rtc, uart) — a python full-file
+  rewrite silently normalizes them to LF and turns a small diff into
+  a whole-file rewrite (happened to apic.rs, run-277). Prefer the
+  edit tool or preserve endings in scripts.
 
 ## The QEMU hdd is a test artifact — fix the media, not the disk
 
