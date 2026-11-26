@@ -575,7 +575,10 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_NANOSLEEP => user::sys_nanosleep(ctx, a1, a2),
         NR_UNAME => user::sys_uname(a1),
         NR_GETTIMEOFDAY => user::sys_gettimeofday(a1, a2),
-        NR_GETUID | NR_GETGID | NR_GETEUID | NR_GETEGID => 0,
+        NR_GETUID => user::sys_getuid(),
+        NR_GETGID => user::sys_getgid(),
+        NR_GETEUID => user::sys_geteuid(),
+        NR_GETEGID => user::sys_getegid(),
         NR_ARCH_PRCTL => user::sys_arch_prctl(a1, a2),
         NR_GETTID => user::sys_gettid(),
         NR_FUTEX => user::sys_futex(ctx, a1, a2, a3, a4, a5, a6),
@@ -672,6 +675,20 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         239 => user::sys_get_mempolicy(a1, a2, a3, a4, a5),
         251 => user::sys_ioprio_set(a1, a2, a3),
         252 => user::sys_ioprio_get(a1, a2),
+        // The credentials block — uid stores to t.uid, gid and
+        // groups collapse to the single-user root model.
+        105 => user::sys_setuid(a1),
+        106 => user::sys_setgid(a1),
+        113 => user::sys_setreuid(a1, a2),
+        114 => user::sys_setregid(a1, a2),
+        116 => user::sys_setgroups(a1, a2),
+        117 => user::sys_setresuid(a1, a2, a3),
+        118 => user::sys_getresuid(a1, a2, a3),
+        119 => user::sys_setresgid(a1, a2, a3),
+        120 => user::sys_getresgid(a1, a2, a3),
+        125 => user::sys_capget(a1, a2),
+        126 => user::sys_capset(a1, a2),
+        322 => sys_execveat(ctx, a1, a2, a3, a4, a5),
 
         NR_FUTEX_WAKE => user::sys_futex_wake(a1, a2, a3, a4),
         NR_FUTEX_WAIT => user::sys_futex_wait(ctx, a1, a2, a3, a4, a5, a6),
@@ -1116,20 +1133,73 @@ fn sys_openat2(dirfd: u64, path: u64, how: u64, size: u64) -> u64 {
 /// (CVE-2022-49264's argv==NULL discipline: argc=0 gets the binary
 /// name as argv0, matching what glibc launchers always produce).
 fn sys_execve(ctx: &mut user::UCtx, path: u64, argv: u64, envp: u64) -> u64 {
+    sys_execveat(ctx, u64::MAX, path, argv, envp, 0)
+}
+
+/// execveat(dirfd, path, argv, envp, flags): dirfd resolves a
+/// relative path exactly like openat (canon_path's Dir-OFD base).
+/// AT_EMPTY_PATH + an empty path execs the file dirfd names —
+/// resolved through the fd's /proc link target (real path for
+/// file OFDs, anonymous names → ENOENT). AT_SYMLINK_NOFOLLOW skips the
+/// link-follow step — a flat-VFS link body then fails ELF parse
+/// and reports ENOEXEC, matching Linux's refuse-to-follow.
+fn sys_execveat(
+    ctx: &mut user::UCtx,
+    dirfd: u64,
+    path: u64,
+    argv: u64,
+    envp: u64,
+    flags: u64,
+) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const EBADF_: u64 = (-9i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return EINVAL_;
+    }
     let mut name = [0u8; 257];
     let n = match copy_user_path(path, &mut name) {
         Ok(n) => n,
         Err(e) => return e,
     };
-    let (cb, cn) = match user::canon_path(u64::MAX, &name[..n]) {
-        Ok(x) => x,
-        Err(e) => return e,
+    let mut fdname = [0u8; 160];
+    let (cb, cn) = if n == 0 {
+        if flags & AT_EMPTY_PATH == 0 {
+            return ENOENT_;
+        }
+        let d = dirfd as u32 as i32;
+        if d < 0 || !user::fd_is_open(d as u64) {
+            return EBADF_;
+        }
+        // The fd's own link target — the real path for File/Ram
+        // OFDs (stats with the real mode, so the EACCES exec-bit
+        // check below sees the file's own bits); anonymous kinds
+        // ("pipe:[0]") miss at fs_lookup → ENOENT.
+        let Some(pl) = user::fd_link_target(d, &mut fdname) else {
+            return EBADF_;
+        };
+        match user::canon_path(u64::MAX, &fdname[..pl]) {
+            Ok(x) => x,
+            Err(e) => return e,
+        }
+    } else {
+        match user::canon_path(dirfd, &name[..n]) {
+            Ok(x) => x,
+            Err(e) => return e,
+        }
     };
     // execve follows links — the image under the resolved name is
     // what runs; an unresolvable chain reports its error (ELOOP/...).
-    let (rb, rn, _) = match user::resolve_links(&cb[..cn], true) {
-        Ok(x) => x,
-        Err(e) => return e,
+    // AT_SYMLINK_NOFOLLOW takes the literal canonical name.
+    let (rb, rn, _) = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        (cb, cn, false)
+    } else {
+        match user::resolve_links(&cb[..cn], true) {
+            Ok(x) => x,
+            Err(e) => return e,
+        }
     };
     let name = &rb[..rn];
     // A regular file with no exec bit is EACCES even for root —

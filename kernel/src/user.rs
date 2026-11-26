@@ -2158,6 +2158,10 @@ pub struct Task {
     sig_sp: u64,
     sig_size: u64,
     sig_sflags: u64,
+    /// The task's uid — spawn mints 0 (root), the setuid family
+    /// stores a new one. Single-slot model: real/effective/saved
+    /// collapse to this, and gid rides along unmodelled.
+    uid: u32,
 
     /// apic::TICKS deadline for a timed Poll wait — 0 means none.
     wait_deadline: u64,
@@ -7880,6 +7884,7 @@ fn load(img: &[u8]) -> Option<Task> {
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        uid: 0,
         sig_sp: 0,
         sig_size: 0,
         sig_sflags: 0,
@@ -14271,6 +14276,220 @@ pub fn sys_getgroups(_n: u64, _list: u64) -> u64 {
     0
 }
 
+/// getuid(102)/geteuid(107): the task's uid — spawn mints 0
+/// (root), the setuid family stores a new one. Single-slot
+/// model: real/effective/saved collapse to t.uid, so both
+/// callers read the same value.
+pub fn sys_getuid() -> u64 {
+    cur_mut().map(|t| t.uid as u64).unwrap_or(0)
+}
+/// geteuid(107): effective uid — the same slot as the real one.
+pub fn sys_geteuid() -> u64 {
+    sys_getuid()
+}
+/// getgid(104)/getegid(108): no gid field exists — the single-
+/// user model runs as group 0, like a never-switched root.
+pub fn sys_getgid() -> u64 {
+    0
+}
+/// getegid(108): effective gid — same answer.
+pub fn sys_getegid() -> u64 {
+    0
+}
+
+/// setuid(105): every task runs with CAP_SETUID (the uid-0
+/// model), so any uid is permitted and stored — getuid then
+/// reports it. Linux uid_valid rejects (uid_t)-1.
+pub fn sys_setuid(uid: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    if uid >= u32::MAX as u64 {
+        return EINVAL_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    t.uid = uid as u32;
+    0
+}
+/// setgid(106): same permission collapse; no gid field receives
+/// the value, so the gate returns root's success 0.
+pub fn sys_setgid(gid: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    if gid >= u32::MAX as u64 {
+        return EINVAL_;
+    }
+    0
+}
+
+/// setreuid(113): -1 keeps a slot; the effective uid becomes the
+/// last specified of (ruid, euid) — Linux applies ruid then
+/// euid, so euid wins the collapse.
+pub fn sys_setreuid(ruid: u64, euid: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    let v = [euid, ruid]
+        .iter()
+        .map(|&x| x as u32 as i32)
+        .find(|&x| x != -1);
+    if let Some(v) = v {
+        let Some(t) = cur_mut() else { return EINVAL_ };
+        t.uid = v as u32;
+    }
+    0
+}
+/// setregid(114): same collapse — no gid field to store into.
+pub fn sys_setregid(_rgid: u64, _egid: u64) -> u64 {
+    0
+}
+
+/// setresuid(117): three -1-means-keep slots; the effective
+/// result collapses like setreuid (euid, then ruid, then suid).
+pub fn sys_setresuid(ruid: u64, euid: u64, suid: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    let v = [euid, ruid, suid]
+        .iter()
+        .map(|&x| x as u32 as i32)
+        .find(|&x| x != -1);
+    if let Some(v) = v {
+        let Some(t) = cur_mut() else { return EINVAL_ };
+        t.uid = v as u32;
+    }
+    0
+}
+/// setresgid(119): same collapse, nothing stored.
+pub fn sys_setresgid(_rgid: u64, _egid: u64, _sgid: u64) -> u64 {
+    0
+}
+
+/// getresuid(118)/getresgid(120): write the r/e/s triple to
+/// three user u32s — EFAULT on ANY bad pointer (Linux validates
+/// all three before storing, so a partial write never lands).
+/// uid reports t.uid thrice; gid reports the group-0 triple.
+pub fn sys_getresuid(ruid: u64, euid: u64, suid: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const ESRCH_: u64 = (-3i64) as u64;
+    if !range_ok_w(ruid, 4) || !range_ok_w(euid, 4) || !range_ok_w(suid, 4) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return ESRCH_ };
+    let u = t.uid;
+    write_task_u32(t.pml4, ruid, u);
+    write_task_u32(t.pml4, euid, u);
+    write_task_u32(t.pml4, suid, u);
+    0
+}
+/// getresgid(120): the group-0 triple.
+pub fn sys_getresgid(rgid: u64, egid: u64, sgid: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const ESRCH_: u64 = (-3i64) as u64;
+    if !range_ok_w(rgid, 4) || !range_ok_w(egid, 4) || !range_ok_w(sgid, 4) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return ESRCH_ };
+    write_task_u32(t.pml4, rgid, 0);
+    write_task_u32(t.pml4, egid, 0);
+    write_task_u32(t.pml4, sgid, 0);
+    0
+}
+
+/// setgroups(116): root may set the supplementary list — the
+/// size gate is Linux's (EINVAL > NGROUPS_MAX=65536, EFAULT on
+/// a bad list pointer) but nothing is stored; getgroups still
+/// reports the empty set.
+pub fn sys_setgroups(size: u64, list: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    if size > 65536 {
+        return EINVAL_;
+    }
+    if size > 0 && !range_ok(list, size.saturating_mul(4)) {
+        return EFAULT_;
+    }
+    0
+}
+
+/// capget(125)/capset(126): every task runs with the full root
+/// capability set — get reports effective/permitted =
+/// CAP_LAST_CAP's full mask (bits 0..40 -> {0xffffffff,0x1ff})
+/// and inheritable = 0; set accepts inertly. The header is
+/// versioned: 0x19980330 fills one u32s, 0x20071026/0x20080522
+/// fill two; an unknown version EINVALs AND writes the
+/// preferred version back, like Linux.
+pub fn sys_capget(hdrp: u64, datap: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    const ESRCH_: u64 = (-3i64) as u64;
+    if !range_ok(hdrp, 8) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return ESRCH_ };
+    let h = read_task_u64(t.pml4, hdrp).unwrap_or(0);
+    let ver = h as u32;
+    let pid = (h >> 32) as u32 as i32;
+    if !matches!(ver, 0x19980330 | 0x20071026 | 0x20080522) {
+        write_task_u32(t.pml4, hdrp, 0x20080522);
+        return EINVAL_;
+    }
+    if pid < 0 || (pid != 0 && task_slot_by_pid(pid as u64).is_none()) {
+        return ESRCH_;
+    }
+    if datap != 0 {
+        let words = if ver == 0x19980330 { 1u64 } else { 2 };
+        if !range_ok_w(datap, words * 12) {
+            return EFAULT_;
+        }
+        for i in 0..words {
+            let e = if i == 0 { 0xffff_ffff } else { 0x1ff };
+            write_task_u32(t.pml4, datap + i * 12, e);
+            write_task_u32(t.pml4, datap + i * 12 + 4, e);
+            write_task_u32(t.pml4, datap + i * 12 + 8, 0);
+        }
+    }
+    0
+}
+/// capset(126): same version gate; Linux EPERMs any pid but the
+/// caller's own, EFAULTs a missing datap. Accepts the write
+/// inertly — nothing can drop below the full set anyway.
+pub fn sys_capset(hdrp: u64, datap: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    const ESRCH_: u64 = (-3i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    if !range_ok(hdrp, 8) {
+        return EFAULT_;
+    }
+    let Some(t) = cur_mut() else { return ESRCH_ };
+    let h = read_task_u64(t.pml4, hdrp).unwrap_or(0);
+    let ver = h as u32;
+    let pid = (h >> 32) as u32 as i32;
+    if !matches!(ver, 0x19980330 | 0x20071026 | 0x20080522) {
+        return EINVAL_;
+    }
+    if pid != 0 && pid as u64 != t.pid {
+        return EPERM_;
+    }
+    // Linux reads `tocopy` u32s — v1 needs one 12-byte triple.
+    let need = if ver == 0x19980330 { 12 } else { 24 };
+    if datap == 0 || !range_ok(datap, need) {
+        return EFAULT_;
+    }
+    0
+}
+
+/// Is `fd` open in the caller's table? execveat's AT_EMPTY_PATH
+/// EBADF gate.
+pub fn fd_is_open(fd: u64) -> bool {
+    let Some(t) = cur_mut() else { return false };
+    ofd(t, fd).is_some()
+}
+
+/// The fd's /proc link target — the real path for File/Ram OFDs,
+/// "pipe:[n]"/"socket:[n]"/"anon_inode:[x]" for the anonymous
+/// kinds (those exec as ENOENT at lookup like Linux's
+/// refuse-on-anon). execveat's AT_EMPTY_PATH resolution.
+pub fn fd_link_target(fd: i32, out: &mut [u8]) -> Option<usize> {
+    let t = cur_mut()?;
+    let o = ofd(t, fd as u64)?;
+    Some(fd_link_name(&o.kind, out))
+}
+
 /// sched_getaffinity(pid, size, mask): one CPU — the mask is 1,
 /// truncated honestly to the caller's size like Linux.
 pub fn sys_sched_getaffinity(_pid: u64, size: u64, mask: u64) -> u64 {
@@ -16047,6 +16266,7 @@ pub fn nt_thread_create(
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        uid: p.uid,
         sig_sp: 0,
         sig_size: 0,
         sig_sflags: 0,
@@ -33238,6 +33458,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        uid: p.uid,
         sig_sp: 0,
         sig_size: 0,
         sig_sflags: 0,
@@ -33430,6 +33651,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        uid: p.uid,
         sig_sp: 0,
         sig_size: 0,
         sig_sflags: 0,
