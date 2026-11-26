@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**343 unique CVEs recorded.**
+**344 unique CVEs recorded.**
 
 ## klib ports
 
@@ -439,6 +439,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-46141 | NVMe-MSI-X rung: I/O CQ interrupt delivery — msix_cap 64-bit BAR fix (type bits 0b100 rec… | audit run-36 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-46141, CVE-2026-80620 — n/a. Verified: make run exit 33, 76 tasks, frames equal, blktest 0… |
 | CVE-2026-52923 | SysV SHM rung (29/30/31/67): syscall layer over the existing SHMSEGS machinery — ShmSeg g… | rmid gate), STAT zero-fills 112B shmid_ds + stamps {key,mode,seq,size,nattch}, SET writes mode, LOCK/UNLOCK inert |
 | CVE-2026-52923 | SysV SHM rung (29/30/31/67): syscall layer over the existing SHMSEGS machinery — ShmSeg g… | rmid gate), STAT zero-fills 112B shmid_ds + stamps {key,mode,seq,size,nattch}, SET writes mode, LOCK/UNLOCK inert |
+| CVE-2026-52923 | SysV message queues (msgget 68 / msgsnd 69 / msgrcv 70 / msgctl 71): gen<<16 | ), E2BIG consumes like Linux, MSG_NOERROR truncates, ENOMSG NOWAIT, buffer range_ok_w'd up-front. msgctl — IPC_STAT writes msqid_ds fields into range_ok_w'd buf, IPC_SET accepts m… |
 | CVE-2026-52928 | af_unix rung (local IPC sockets): socket(AF_UNIX=1, SOCK_STREAM | name-parse class (bounded 3..=110 len gate, len+full-bytes name equality — abstract/path can't collide, zeroed marshal = no padding disclosure); peer-boundary class (kernel-owned… |
 | CVE-2026-52928 | recvmsg+SCM_RIGHTS rung (fd passing): recvmsg NR 47 (was a silent =>0 stub in the uid-fam… | audit run-50 scoped quick (security-audit skill): 0 confirmed, 1 fixed in-run; cve-now checked: CVE-2024-26923, CVE-2026-53005, CVE-2024-35970, CVE-2025-38236, CVE-2026-52928, CVE… |
 | CVE-2026-52928 | unix-seqpacket + recvmmsg rung: SOCK_SEQPACKET (5) for AF_UNIX — socketpair + bind/listen… | audit run-52 scoped quick (security-audit skill): 0 confirmed, 2 hardened in-run; cve-now checked: CVE-2026-52928 — n/a. Verified: make run exit 33, 83 tasks, frames equal; unixte… |
@@ -543,6 +544,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-90003 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
 | CVE-2026-90003 | futex_waitv+fchmodat2 rung (449/452): sys_futex_waitv validates the {val,uaddr,flags,res}… | stale-sleeper-read class (documented: waiters re-read under sleeper pml4 at wake via translate_r — a mid-wait unmap makes the wake miss, deny-side; Linux copies kernel-side); user… |
 | CVE-2026-90138 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
+| CVE-2026-93191 | SysV message queues (msgget 68 / msgsnd 69 / msgrcv 70 / msgctl 71): gen<<16 | ), E2BIG consumes like Linux, MSG_NOERROR truncates, ENOMSG NOWAIT, buffer range_ok_w'd up-front. msgctl — IPC_STAT writes msqid_ds fields into range_ok_w'd buf, IPC_SET accepts m… |
+| CVE-2026-93191 | SysV message queues (msgget 68 / msgsnd 69 / msgrcv 70 / msgctl 71): gen<<16 | ), E2BIG consumes like Linux, MSG_NOERROR truncates, ENOMSG NOWAIT, buffer range_ok_w'd up-front. msgctl — IPC_STAT writes msqid_ds fields into range_ok_w'd buf, IPC_SET accepts m… |
 | CVE-2026-97986 | virtio-input rung (/dev/input/event0 device events): virtio.rs gains virtio-input — DEV_V… | audit run-38 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-97986, CVE-2026-97987, CVE-2026-13216 — handled or n/a. Verified: make run exit 33, 78 tas… |
 | CVE-2026-97986 | virtio-input rung (/dev/input/event0 device events): virtio.rs gains virtio-input — DEV_V… | audit run-38 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-97986, CVE-2026-97987, CVE-2026-13216 — handled or n/a. Verified: make run exit 33, 78 tas… |
 | CVE-2026-97987 | virtio-input rung (/dev/input/event0 device events): virtio.rs gains virtio-input — DEV_V… | audit run-38 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-97986, CVE-2026-97987, CVE-2026-13216 — handled or n/a. Verified: make run exit 33, 78 tas… |

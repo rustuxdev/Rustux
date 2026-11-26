@@ -8230,3 +8230,23 @@ shadowed, so impls must land ON the consts. credtest proves the
 errno ladders, stored-uid read-back, fork inheritance, and real
 rel-path + AT_EMPTY_PATH execs. lstest floor 75->76, 103 tasks.
 Audit run-72: 0 confirmed.
+run-314 lands SysV message queues — the third real IPC
+namespace after pipes and SHM, built on the same skeleton:
+(gen<<16)|slot ids, rmid tombstones, WaitOn blocking. The
+design rule that makes it safe is Linux's own load_msg
+discipline — payloads are staged to kernel memory at msgsnd
+entry, so a blocked sender's bytes can't be unmapped or
+mutated underneath, and every buffer has exactly one owner
+(queue / waker / signal hook). msgrcv implements all four
+convert_mode picks including MSG_EXCEPT's EINVAL-on-mtype<=0
+and the E2BIG-consumes semantic; blocking senders sleep on a
+full qbytes ceiling and blocked receivers wake on send; IPC_
+RMID wakes everyone EIDRM and frees queued text. The one
+kernel fix the test found: msg_wake_snd was gated on delivery
+success, but E2BIG consumes the message — freed room skipped
+the wake and stranded the sender. msgtest proves every ladder
+plus live blocked-rcv / blocked-snd / RMID-wakes-EIDRM across
+real forks. lstest floor 76->77, 104 tasks. The 9-frame leak
+in the first run was test-side (queues persist like Linux —
+now RMID'd); final-code frames gate deferred on the recurring
+wget guest-side stall. Audit run-73: 0 confirmed.
