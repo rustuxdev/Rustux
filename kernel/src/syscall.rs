@@ -803,6 +803,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         161 => sys_chroot(a1),
         163 => sys_acct(a1),
         155 => sys_pivot_root(a1, a2),
+        139 => sys_sysfs(a1, a2, a3),
         248 => sys_add_key(a1, a2, a3, a4, a5),
         249 => sys_request_key(a1, a2, a3, a4),
         250 => sys_keyctl(a1, a2, a3, a4, a5),
@@ -1691,6 +1692,21 @@ fn sys_request_key(typ: u64, desc: u64, info: u64, dest: u64) -> u64 {
         Err(e) => return e,
     };
     user::sys_request_key(&tb[..tn], &db[..dn], info, dest)
+}
+
+/// sysfs(139): option 1's arg is a name string; 2/3 use the
+/// pointer/index slots raw.
+fn sys_sysfs(option: u64, a2: u64, a3: u64) -> u64 {
+    let mut nb = [0u8; 257];
+    let name = if option == 1 && a2 != 0 {
+        match copy_user_path(a2, &mut nb) {
+            Ok(n) => Some(&nb[..n]),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+    user::sys_sysfs(option, a2, a3, name)
 }
 
 /// keyctl(250): string args are positional — cmd 1 name is a2,

@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 116;
+const MAX_TASKS: usize = 117;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -18529,6 +18529,12 @@ pub fn sys_reboot(magic1: u64, magic2: u64, cmd: u64) -> u64 {
         || !matches!(magic2, 672274793 | 85072278 | 369367448 | 537993216)
     {
         return EINVAL;
+    }
+    // CAP_SYS_BOOT — an unprivileged task must not take the box down.
+    const EPERM_: u64 = (-1i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL };
+    if t.uid != 0 {
+        return EPERM_;
     }
     match cmd {
         0x89abcdef | 0 => 0, // CAD_ON / CAD_OFF — acknowledged no-ops
@@ -39715,6 +39721,64 @@ fn ttou_gate() -> u64 {
         return (-4i64) as u64; // EINTR: the stop lands first
     }
     0
+}
+
+/// sysfs(139): the vintage fs-registry query — option 1 maps a
+/// name to its index, 2 copies index's name to user buf, 3 is the
+/// count. The registry is the fstypes this kernel can serve:
+/// the seeded ramfs namespace, tmpfs (the only mountable), proc,
+/// devtmpfs, and ext2 (the disk adapter parses it).
+const SYSFS_FS: [&[u8]; 5] = [
+    b"rustux", b"tmpfs", b"proc", b"devtmpfs", b"ext2",
+];
+
+pub fn sys_sysfs(
+    option: u64, a2: u64, a3: u64, name: Option<&[u8]>,
+) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    match option {
+        1 => match name {
+            Some(n) => match sysfs_name_i(n) {
+                i if i >= 0 => i as u64,
+                _ => EINVAL_,
+            },
+            None => EINVAL_,
+        },
+        2 => {
+            let i = a2 as usize;
+            if i >= SYSFS_FS.len() {
+                return EINVAL_;
+            }
+            let name = SYSFS_FS[i];
+            let need = name.len() + 1;
+            if !range_ok_w(a3, need as u64) {
+                return EFAULT_;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    name.as_ptr(),
+                    a3 as *mut u8,
+                    name.len(),
+                );
+                (a3 as *mut u8).add(name.len()).write(0);
+            }
+            0
+        }
+        3 => SYSFS_FS.len() as u64,
+        _ => EINVAL_,
+    }
+}
+
+/// sysfs option 1: name -> index (the wrapper hands the string
+/// over since option shares the arg slot with pointers).
+pub fn sysfs_name_i(name: &[u8]) -> i64 {
+    for (i, f) in SYSFS_FS.iter().enumerate() {
+        if *f == name {
+            return i as i64;
+        }
+    }
+    -1
 }
 
 /// End of the scheduling run: reap whatever tasks remain — the last
