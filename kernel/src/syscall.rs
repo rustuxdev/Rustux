@@ -803,6 +803,10 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         161 => sys_chroot(a1),
         163 => sys_acct(a1),
         165 => sys_mount(a1, a2, a3, a4),
+        428 => sys_open_tree(a1, a2, a3),
+        429 => sys_move_mount(a1, a2, a3, a4, a5),
+        433 => sys_fspick(a1, a2, a3),
+        442 => sys_mount_setattr(a1, a2, a3, a4, a5),
         179 => sys_quotactl(a1, a2, a3, a4),
         166 => sys_umount2(a1, a2),
         457 => user::sys_statmount(a1, a2, a3, a4),
@@ -1644,6 +1648,73 @@ fn sys_umount2(tgt: u64, flags: u64) -> u64 {
         Err(e) => return e,
     };
     user::sys_umount2(&tb[..tn], flags)
+}
+
+/// open_tree(428): dirfd + possibly-NULL path (EMPTY_PATH) + flags.
+fn sys_open_tree(dfd: u64, path: u64, flags: u64) -> u64 {
+    let mut name = [0u8; 257];
+    if path == 0 {
+        return user::sys_open_tree(dfd, &name[..0], flags);
+    }
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_open_tree(dfd, &name[..n], flags)
+}
+
+/// move_mount(429): two dirfd+path pairs, both NULL-tolerant under
+/// their own *_EMPTY_PATH flag, plus the flag word.
+fn sys_move_mount(
+    fdfd: u64, fpath: u64, tdfd: u64, tpath: u64, flags: u64,
+) -> u64 {
+    let mut fb = [0u8; 257];
+    let mut tb = [0u8; 257];
+    let fn_ = if fpath == 0 {
+        0
+    } else {
+        match copy_user_path(fpath, &mut fb) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    let tn = if tpath == 0 {
+        0
+    } else {
+        match copy_user_path(tpath, &mut tb) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    user::sys_move_mount(fdfd, &fb[..fn_], tdfd, &tb[..tn], flags)
+}
+
+/// fspick(433): dirfd + possibly-NULL path (EMPTY_PATH) + flags.
+fn sys_fspick(dfd: u64, path: u64, flags: u64) -> u64 {
+    let mut name = [0u8; 257];
+    if path == 0 {
+        return user::sys_fspick(dfd, &name[..0], flags);
+    }
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_fspick(dfd, &name[..n], flags)
+}
+
+/// mount_setattr(442): path + mount_attr user ptr + struct size.
+fn sys_mount_setattr(
+    dfd: u64, path: u64, flags: u64, attr: u64, size: u64,
+) -> u64 {
+    let mut name = [0u8; 257];
+    if path == 0 {
+        return user::sys_mount_setattr(dfd, &name[..0], flags, attr, size);
+    }
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_mount_setattr(dfd, &name[..n], flags, attr, size)
 }
 
 /// name_to_handle_at(303): copy the path then delegate — the

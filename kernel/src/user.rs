@@ -619,6 +619,10 @@ enum FdKind {
     /// serial pair. Block devs and fifos never reach this — ENODEV /
     /// ENXIO at fd_open like Linux without a driver.
     Dev(usize),
+    /// A mount fd (open_tree/fspick): carries the minted mount id,
+    /// resolved to a MOUNTS slot at use — a closed+reused slot can
+    /// never alias a stale fd onto a different mount.
+    Mount(usize),
 }
 
 /// Max concurrent pipes — a hard bound on kernel frame pressure,
@@ -14131,6 +14135,7 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                     }
                 }
                 FdKind::Console => 0u64,
+                FdKind::Mount(_) => 0u64,
                 FdKind::File(d) => d.len().saturating_sub(o.pos) as u64,
                 FdKind::Proc { len, .. } => {
                     len.saturating_sub(o.pos) as u64
@@ -14952,6 +14957,7 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
                 .map_or(0o755u64, |d| d.mode as u64);
             (0o40000 | m, 0, 0)
         }
+        FdKind::Mount(_) => (0o100444, 0, 0), // detached-mount fd
         FdKind::File(d) => {
             let ino = (unsafe { *core::ptr::addr_of!(INITRD) })
                 .and_then(|arc| {
@@ -15624,6 +15630,7 @@ pub fn sys_open_by_handle_at(mfd: u64, handle: u64, flags: u64) -> u64 {
 /// values as MS_*). The ramfs namespace already serves every
 /// path — a mount point records ownership and enforces
 /// MS_RDONLY on every mutation underneath.
+#[derive(Clone)]
 struct Mount {
     path: [u8; 128],
     n: u8,
@@ -15633,6 +15640,14 @@ struct Mount {
     slen: u8,
     id: u32,
     flags: u32,
+    /// open_tree/fspick mint a detached mount: alive only while an
+    /// fd references it; move_mount attaches. Detached entries are
+    /// invisible to coverage, /proc/mounts, statmount, listmount.
+    detached: bool,
+    /// mount_setattr's propagation word — MS_SHARED/SLAVE/PRIVATE/
+    /// UNBINDABLE stored for statmount to report (no sharing
+    /// mechanics exist).
+    prop: u64,
 }
 
 const MAX_MOUNTS: usize = 16;
@@ -15654,6 +15669,8 @@ fn mounts() -> &'static mut [Option<Mount>; MAX_MOUNTS] {
                 slen: 0,
                 id: (i + 1) as u32,
                 flags: fl,
+                detached: false,
+                prop: 0,
             };
             m.path[..p.len()].copy_from_slice(p);
             m.n = p.len() as u8;
@@ -15678,6 +15695,9 @@ fn mount_i(cpath: &[u8]) -> Option<usize> {
     let mut best: Option<usize> = None;
     for (i, m) in ms.iter().enumerate() {
         let Some(m) = m else { continue };
+        if m.detached {
+            continue;
+        }
         let p = &m.path[..m.n as usize];
         let covers = p.is_empty()
             || (cpath.len() >= p.len()
@@ -15691,11 +15711,19 @@ fn mount_i(cpath: &[u8]) -> Option<usize> {
 }
 
 /// Mount index whose point IS cpath exactly ("" = root mount).
+/// Mount-id -> slot resolution for mount fds — detached mounts
+/// count (an fd is their only handle).
+fn mount_by_id(id: usize) -> Option<usize> {
+    mounts().iter().position(|s| {
+        s.as_ref().is_some_and(|m| m.id as usize == id)
+    })
+}
+
 fn mount_exact(cpath: &[u8]) -> Option<usize> {
     mounts()
         .iter()
         .position(|m| m.as_ref().is_some_and(|m| {
-            &m.path[..m.n as usize] == cpath
+            !m.detached && &m.path[..m.n as usize] == cpath
         }))
 }
 
@@ -15778,6 +15806,8 @@ pub fn sys_mount(src: &[u8], tgt: &[u8], fstype: &[u8], flags: u64) -> u64 {
         slen: src.len() as u8,
         id,
         flags: flags as u32,
+        detached: false,
+        prop: 0,
     };
     m.path[..p.len()].copy_from_slice(p);
     m.fstype[..5].copy_from_slice(b"tmpfs");
@@ -15872,7 +15902,7 @@ pub fn sys_statmount(req: u64, buf: u64, bufsize: u64, flags: u64) -> u64 {
     let Some(m) = ms
         .iter()
         .flatten()
-        .find(|m| m.id as u64 == mid)
+        .find(|m| !m.detached && m.id as u64 == mid)
     else {
         return ENOENT_;
     };
@@ -15947,7 +15977,7 @@ pub fn sys_statmount(req: u64, buf: u64, bufsize: u64, flags: u64) -> u64 {
         // MOUNT_ATTR: low MS bits map 1:1 (RDONLY..NOEXEC, ATIME
         // mask); RELATIME(0) is the default — nothing to set.
         w64(64, (m.flags & 0xf) as u64 | ((m.flags & 0x400) >> 6) as u64);
-        w64(72, 0); // mnt_propagation — always private
+        w64(72, m.prop); // mnt_propagation (mount_setattr-stored)
         w64(80, 0); // mnt_peer_group
         w64(88, 0); // mnt_master
         w64(96, 0); // propagate_from
@@ -15996,7 +16026,8 @@ pub fn sys_listmount(req: u64, ids: u64, nr: u64, flags: u64) -> u64 {
         mid
     };
     let ms = mounts();
-    if !ms.iter().flatten().any(|m| m.id as u64 == want) {
+    if !ms.iter().flatten().any(|m| !m.detached && m.id as u64 == want)
+    {
         return ENOENT_;
     }
     if nr > 0 && !range_ok_w(ids, nr * 8) {
@@ -16005,6 +16036,9 @@ pub fn sys_listmount(req: u64, ids: u64, nr: u64, flags: u64) -> u64 {
     let mut kids: [u64; MAX_MOUNTS] = [0; MAX_MOUNTS];
     let mut nkids = 0usize;
     for m in ms.iter().flatten() {
+        if m.detached {
+            continue;
+        }
         let m_id = m.id as u64;
         if m_id != want && mount_parent_id(m) == want && m_id > last {
             kids[nkids] = m_id;
@@ -16020,6 +16054,467 @@ pub fn sys_listmount(req: u64, ids: u64, nr: u64, flags: u64) -> u64 {
         }
     }
     n as u64
+}
+
+/// Mint an OFD + fd for a mount slot (open_tree/fspick share).
+fn mount_fd(t: &mut Task, slot: usize, cloexec: bool) -> u64 {
+    const EMFILE_: u64 = (-24i64) as u64;
+    let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+    let Some(oi) = ofds.iter().position(Option::is_none) else {
+        return EMFILE_;
+    };
+    let Some(fi) = fdt(t).fds.iter().position(Option::is_none) else {
+        return EMFILE_;
+    };
+    let mid = mounts()[slot].as_ref().unwrap().id as usize;
+    ofds[oi] = Some(OpenFile {
+        kind: FdKind::Mount(mid),
+        pos: 0,
+        refs: 1,
+        append: false,
+        nonblock: false,
+        accmode: 0,
+    });
+    fdt(t).fds[fi] = Some(oi as u16);
+    cloexec_set(t, fi, cloexec);
+    fi as u64
+}
+
+/// open_tree(428): mint a mount fd for the mount covering `path`
+/// (or the dfd's own object under AT_EMPTY_PATH). Without
+/// OPEN_TREE_CLONE the fd references the same mount — a later
+/// move_mount detaches it from its point; with CLONE a private
+/// detached copy is minted (new id, same flags/fstype/source).
+pub fn sys_open_tree(dfd: u64, name: &[u8], flags: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_RECURSIVE: u64 = 0x8000;
+    const OPEN_TREE_CLONE: u64 = 1;
+    const OPEN_TREE_CLOEXEC: u64 = 0o2000000;
+    const KNOWN: u64 =
+        OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH
+            | AT_SYMLINK_NOFOLLOW | AT_RECURSIVE;
+    if flags & !KNOWN != 0 {
+        return EINVAL_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    if t.uid != 0 {
+        return (-1i64) as u64; // CAP_SYS_ADMIN — a mount fd is privileged
+    }
+    // Resolve the covered path: EMPTY_PATH uses the dfd's own dir.
+    let mut pb = [0u8; 256];
+    let pn;
+    if name.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return ENOENT_;
+        }
+        let Some(o) = ofd(t, dfd) else { return EBADF };
+        match &o.kind {
+            FdKind::Dir(dp) => {
+                let b = dp.bytes();
+                pb[..b.len()].copy_from_slice(b);
+                pn = b.len();
+            }
+            FdKind::Mount(m) => {
+                // Re-fd an already-held mount — the clone/attach
+                // choice rides the flags like on a path.
+                let Some(mi) = mount_by_id(*m) else { return ENOENT_ };
+                if flags & OPEN_TREE_CLONE == 0 {
+                    return mount_fd(t, mi,
+                                    flags & OPEN_TREE_CLOEXEC != 0);
+                }
+                let ms = mounts();
+                let mm = ms[mi].as_ref().unwrap();
+                let slot = {
+                    let ms = mounts();
+                    let Some(s) = ms.iter().position(Option::is_none)
+                    else {
+                        return (-28i64) as u64; // ENOSPC
+                    };
+                    let mut c = mm.clone();
+                    let id = unsafe { *core::ptr::addr_of!(MOUNT_ID) };
+                    unsafe {
+                        *core::ptr::addr_of_mut!(MOUNT_ID) = id + 1
+                    };
+                    c.id = id;
+                    c.detached = true;
+                    mounts()[s] = Some(c);
+                    s
+                };
+                return mount_fd(t, slot,
+                                flags & OPEN_TREE_CLOEXEC != 0);
+            }
+            _ => return EBADF,
+        }
+    } else {
+        let (cb, cn) = match canon_path(dfd, name) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        let (rb, rn, _) = match resolve_links(
+            &cb[..cn],
+            flags & AT_SYMLINK_NOFOLLOW == 0,
+        ) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        pb[..rn].copy_from_slice(&rb[..rn]);
+        pn = rn;
+    }
+    let p = &pb[..pn];
+    if !dir_exists(p) && !is_file(p) {
+        return ENOENT_;
+    }
+    let Some(mi) = mount_i(p) else { return ENOENT_ };
+    if flags & OPEN_TREE_CLONE == 0 {
+        return mount_fd(t, mi, flags & OPEN_TREE_CLOEXEC != 0);
+    }
+    // Clone: same identity fields, fresh id, detached.
+    let ms = mounts();
+    let Some(s) = ms.iter().position(Option::is_none) else {
+        return (-28i64) as u64;
+    };
+    let mut c = ms[mi].as_ref().unwrap().clone();
+    let id = unsafe { *core::ptr::addr_of!(MOUNT_ID) };
+    unsafe { *core::ptr::addr_of_mut!(MOUNT_ID) = id + 1 };
+    c.id = id;
+    c.detached = true;
+    ms[s] = Some(c);
+    mount_fd(t, s, flags & OPEN_TREE_CLOEXEC != 0)
+}
+
+/// fspick(433): like open_tree without the clone option — the
+/// path must name a mount point exactly (the mount to "pick"
+/// for mount_setattr), else EINVAL.
+pub fn sys_fspick(dfd: u64, name: &[u8], flags: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const FSPICK_CLOEXEC: u64 = 0x1;
+    const FSPICK_SYMLINK_NOFOLLOW: u64 = 0x2;
+    const FSPICK_NO_AUTOMOUNT: u64 = 0x4;
+    const FSPICK_EMPTY_PATH: u64 = 0x8;
+    const KNOWN: u64 = FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW
+        | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
+    if flags & !KNOWN != 0 {
+        return EINVAL_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    let mi;
+    if name.is_empty() {
+        if flags & FSPICK_EMPTY_PATH == 0 {
+            return ENOENT_;
+        }
+        let Some(o) = ofd(t, dfd) else { return EBADF };
+        match &o.kind {
+            FdKind::Mount(m) => {
+                let Some(x) = mount_by_id(*m) else { return ENOENT_ };
+                mi = x;
+            }
+            FdKind::Dir(dp) => {
+                let Some(x) = mount_exact(dp.bytes()) else {
+                    return EINVAL_;
+                };
+                mi = x;
+            }
+            _ => return EBADF,
+        }
+    } else {
+        let (cb, cn) = match canon_path(dfd, name) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        let (rb, rn, _) = match resolve_links(
+            &cb[..cn],
+            flags & FSPICK_SYMLINK_NOFOLLOW == 0,
+        ) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        if !dir_exists(&rb[..rn]) && !is_file(&rb[..rn]) {
+            return ENOENT_;
+        }
+        let Some(x) = mount_exact(&rb[..rn]) else { return EINVAL_ };
+        mi = x;
+    }
+    mount_fd(t, mi, flags & FSPICK_CLOEXEC != 0)
+}
+
+/// move_mount(429): attach (or re-attach) a mount. `from` names
+/// either a detached mount via its fd (F_EMPTY_PATH) or a path
+/// naming an attached mount point to move (F_SYMLINKS follow).
+/// `to` is the new point — an existing dir, same EBUSY rule as
+/// mount() for an occupied point.
+pub fn sys_move_mount(
+    fdfd: u64, fpath: &[u8], tdfd: u64, tpath: &[u8], flags: u64,
+) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const ENOTDIR_: u64 = (-20i64) as u64;
+    const EBUSY_: u64 = (-16i64) as u64;
+    const F_SYMLINKS: u64 = 0x1;
+    const F_EMPTY_PATH: u64 = 0x4;
+    const T_SYMLINKS: u64 = 0x10;
+    const T_EMPTY_PATH: u64 = 0x40;
+    const SET_GROUP: u64 = 0x100;
+    const BENEATH: u64 = 0x200;
+    const KNOWN: u64 = 0x377;
+    if flags & !KNOWN != 0 || flags & (SET_GROUP | BENEATH) != 0 {
+        return EINVAL_; // no peer-group or stacking mechanics
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    if t.uid != 0 {
+        return (-1i64) as u64; // CAP_SYS_ADMIN
+    }
+    // Resolve the from-mount.
+    let mi = if fpath.is_empty() {
+        if flags & F_EMPTY_PATH == 0 {
+            return ENOENT_;
+        }
+        let Some(o) = ofd(t, fdfd) else { return EBADF };
+        let FdKind::Mount(m) = o.kind else { return EBADF };
+        let Some(x) = mount_by_id(m) else { return ENOENT_ };
+        x
+    } else {
+        let (cb, cn) = match canon_path(fdfd, fpath) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        let (rb, rn, _) = match resolve_links(
+            &cb[..cn],
+            flags & F_SYMLINKS != 0,
+        ) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        if !dir_exists(&rb[..rn]) && !is_file(&rb[..rn]) {
+            return ENOENT_;
+        }
+        let Some(x) = mount_exact(&rb[..rn]) else { return EINVAL_ };
+        x
+    };
+    if mounts()[mi].is_none() {
+        return ENOENT_; // the fd's mount already died
+    }
+    // Resolve the target dir.
+    let mut tb = [0u8; 256];
+    let tn = if tpath.is_empty() {
+        if flags & T_EMPTY_PATH == 0 {
+            return ENOENT_;
+        }
+        let Some(o) = ofd(t, tdfd) else { return EBADF };
+        let FdKind::Dir(dp) = &o.kind else { return ENOTDIR_ };
+        let b = dp.bytes();
+        tb[..b.len()].copy_from_slice(b);
+        b.len()
+    } else {
+        let (cb, cn) = match canon_path(tdfd, tpath) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        let (rb, rn, _) = match resolve_links(
+            &cb[..cn],
+            flags & T_SYMLINKS != 0,
+        ) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        tb[..rn].copy_from_slice(&rb[..rn]);
+        rn
+    };
+    let tp = &tb[..tn];
+    if is_file(tp) {
+        return ENOTDIR_;
+    }
+    if !dir_exists(tp) {
+        return ENOENT_;
+    }
+    if tp.len() > 128 {
+        return (-36i64) as u64;
+    }
+    if mount_exact(tp).is_some() && mount_exact(tp) != Some(mi) {
+        return EBUSY_;
+    }
+    {
+        let m = mounts()[mi].as_ref().unwrap();
+        if !m.detached && m.n == 0 {
+            // The root mount is pinned by every task's fs root —
+            // moving it would orphan all coverage (EBUSY like a
+            // busy target).
+            return EBUSY_;
+        }
+        // A mount can't be placed under its own tree — the target
+        // must not sit inside the moving mount's coverage.
+        if !m.detached
+            && tp.len() > m.n as usize
+            && tp[..m.n as usize] == m.path[..m.n as usize]
+            && tp[m.n as usize] == b'/'
+        {
+            return EINVAL_;
+        }
+    }
+    let m = mounts()[mi].as_mut().unwrap();
+    m.path = [0; 128];
+    m.path[..tp.len()].copy_from_slice(tp);
+    m.n = tp.len() as u8;
+    m.detached = false;
+    0
+}
+
+/// mount_setattr(442): flip mount flags through the mount_attr
+/// struct {attr_set, attr_clr, propagation, userns_fd}. MOUNT_ATTR
+/// bits map onto the mount's MS_* word (RDONLY..NOEXEC coincide;
+/// NOATIME/STRICTATIME/NODIRATIME/NOSYMFOLLOW translate); the
+/// atime group encodes in attr_set as RELATIME=0/NOATIME=0x10/
+/// STRICTATIME=0x20. uid==0; AT_RECURSIVE applies to mounts
+/// nested under the target too.
+pub fn sys_mount_setattr(
+    dfd: u64, name: &[u8], flags: u64, attr: u64, size: u64,
+) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_RECURSIVE: u64 = 0x8000;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const KNOWN_FLAGS: u64 =
+        AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW;
+    const ATTR_KNOWN: u64 = 0x1 | 0x2 | 0x4 | 0x8 | 0x70 | 0x80 | 0x100;
+    if flags & !KNOWN_FLAGS != 0 || size < 32 {
+        return EINVAL_;
+    }
+    if !range_ok(attr, 32) {
+        return EFAULT_;
+    }
+    // SAFETY: attr readable for 32 bytes (checked).
+    let (aset, aclr, prop, userns_fd) = unsafe {
+        (
+            (attr as *const u64).read_unaligned(),
+            (attr as *const u64).add(1).read_unaligned(),
+            (attr as *const u64).add(2).read_unaligned(),
+            (attr as *const u64).add(3).read_unaligned(),
+        )
+    };
+    if aset & aclr != 0 || (aset | aclr) & !ATTR_KNOWN != 0 {
+        return EINVAL_;
+    }
+    // MOUNT_ATTR_IDMAP (0x100000) needs a userns — none exist.
+    if userns_fd != 0 && userns_fd != u64::MAX {
+        return EINVAL_;
+    }
+    // propagation must be one of the four MS_* group bits or 0.
+    const PROP_KNOWN: u64 =
+        1 << 20 | 1 << 18 | 1 << 19 | 1 << 17;
+    if prop & !PROP_KNOWN != 0 || prop.count_ones() > 1 {
+        return EINVAL_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    if t.uid != 0 {
+        return EPERM_;
+    }
+    // Resolve the target mount: EMPTY_PATH accepts a Mount fd or
+    // a Dir OFD's covering mount; else the mount covering path.
+    let mi = if name.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        let Some(o) = ofd(t, dfd) else { return EBADF };
+        match &o.kind {
+            FdKind::Mount(m) => {
+                match mount_by_id(*m) {
+                    Some(x) => x,
+                    None => return ENOENT_,
+                }
+            }
+            FdKind::Dir(dp) => {
+                match mount_i(dp.bytes()) {
+                    Some(x) => x,
+                    None => return EINVAL_,
+                }
+            }
+            _ => return EBADF,
+        }
+    } else {
+        let (cb, cn) = match canon_path(dfd, name) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        let (rb, rn, _) = match resolve_links(
+            &cb[..cn],
+            flags & AT_SYMLINK_NOFOLLOW == 0,
+        ) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        if !dir_exists(&rb[..rn]) && !is_file(&rb[..rn]) {
+            return ENOENT_;
+        }
+        let Some(x) = mount_i(&rb[..rn]) else { return ENOENT_ };
+        x
+    };
+    if mounts()[mi].is_none() {
+        return ENOENT_;
+    }
+    // Translate MOUNT_ATTR bits -> MS bits. The atime group in
+    // attr_set is a replace: RELATIME(0) clears both.
+    let mut set_ms = 0u32;
+    let mut clr_ms = 0u32;
+    for (ab, ms) in
+        [(0x1u64, 0x1u32), (0x2, 0x2), (0x4, 0x4), (0x8, 0x8),
+         (0x80, 0x800u32), (0x100, 0x100u32)]
+    {
+        if aset & ab != 0 {
+            set_ms |= ms;
+        }
+        if aclr & ab != 0 {
+            clr_ms |= ms;
+        }
+    }
+    let atime_set = aset & 0x70;
+    if aset & 0x70 != 0 || aclr & 0x70 != 0 {
+        match atime_set {
+            0x10 => {
+                set_ms |= 0x400;
+                clr_ms |= 0x1000000;
+            }
+            0x20 => {
+                set_ms |= 0x1000000;
+                clr_ms |= 0x400;
+            }
+            _ => {
+                clr_ms |= 0x400 | 0x1000000; // RELATIME (or clear)
+            }
+        }
+    }
+    let apply = |m: &mut Mount| {
+        m.flags = (m.flags & !clr_ms) | set_ms;
+        if prop != 0 {
+            m.prop = prop;
+        }
+    };
+    apply(mounts()[mi].as_mut().unwrap());
+    if flags & AT_RECURSIVE != 0 {
+        let root = {
+            let m = mounts()[mi].as_ref().unwrap();
+            let mut b = [0u8; 128];
+            b[..m.n as usize].copy_from_slice(&m.path[..m.n as usize]);
+            (b, m.n as usize)
+        };
+        let (rb, rn) = root;
+        for m in mounts().iter_mut().flatten() {
+            if m.detached {
+                continue;
+            }
+            let p = &m.path[..m.n as usize];
+            if m.id != mounts()[mi].as_ref().unwrap().id
+                && p.len() > rn
+                && p[..rn] == rb[..rn]
+                && p[rn] == b'/'
+            {
+                apply(m);
+            }
+        }
+    }
+    0
 }
 
 /// quotactl(179): no quota accounting exists anywhere — the honest
@@ -20475,6 +20970,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Pidfd(_) => EINVAL,
         // mqds move messages through the mq_* calls — no read.
         FdKind::MQueue(_) => EINVAL,
+        FdKind::Mount(_) => EBADF, // detached-mount fd — no data side
         FdKind::Eventfd(i) => eventfd_read(ctx, *i, buf, len),
         FdKind::Timerfd(i) => timerfd_read(ctx, *i, buf, len),
         FdKind::Signalfd(i) => signalfd_read(ctx, *i, buf, len),
@@ -22848,6 +23344,9 @@ fn proc_fill(ent: &ProcEnt, s: &mut klib::seqbuf::SeqBuf) {
             }
             b"mounts" => {
                 for m in mounts().iter().flatten() {
+                    if m.detached {
+                        continue;
+                    }
                     s.putmem(&m.source[..m.slen as usize]);
                     s.putc(b' ');
                     s.putc(b'/');
@@ -23191,6 +23690,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         }
         FdKind::MQueue(_) => {
             s.puts(b"anon_inode:[mqueue]");
+        }
+        FdKind::Mount(_) => {
+            s.puts(b"anon_inode:[mnt]");
         }
         FdKind::Proc { .. } => {
             s.puts(b"anon_inode:[proc]");
@@ -25714,6 +26216,18 @@ fn ofd_release(oi: usize) {
     if let FdKind::MQueue(i) = kind {
         mq_release(i); // an unlinked queue dies at last close
     }
+    if let FdKind::Mount(i) = kind {
+        // A detached mount has no other reachability — last close
+        // is its destructor (fsmount'd mounts were never attached).
+        let ms = mounts();
+        if let Some(s) = ms.iter().position(|x| {
+            x.as_ref().is_some_and(|m| m.id as usize == i)
+        }) {
+            if ms[s].as_ref().is_some_and(|m| m.detached) {
+                ms[s] = None;
+            }
+        }
+    }
     if let FdKind::Dev(i) = kind {
         // pty end closed: masters are rdev 128, slaves 136 — the
         // index rides the minor. A dead master gives slave reads/
@@ -26409,6 +26923,9 @@ fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
         }
         // pidfd: POLLIN once the named task is dead — a zombie or a
         // fully reaped slot both count, like Linux's exit notice.
+        // A detached-mount fd carries no data but polls ready like
+        // an O_PATH descriptor — always.
+        FdKind::Mount(_) => POLLIN | POLLOUT,
         FdKind::Pidfd(pid) => {
             if pidfd_alive(*pid) { 0 } else { POLLIN }
         }

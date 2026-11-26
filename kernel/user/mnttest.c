@@ -374,6 +374,127 @@ int main(void) {
     check(syscall(179, 0x1234L << 8, "/", 0, 0) < 0
           && errno == EINVAL, "quotactl unknown subop EINVAL");
 
+    // ---- open_tree(428)/move_mount(429)/fspick(433)/mount_setattr(442)
+    {
+        const long AEP = 0x1000;  // AT_EMPTY_PATH
+        const long AREC = 0x8000; // AT_RECURSIVE
+        unsigned long long attr[4];
+
+        check(mkdir("/t_mm", 0755) == 0, "mkdir /t_mm");
+        check(mkdir("/t_mm2", 0755) == 0, "mkdir /t_mm2");
+        check(mkdir("/t_ot", 0755) == 0, "mkdir /t_ot");
+        check(mount("tmpfs", "/t_ot", "tmpfs", 0, 0) == 0,
+              "mount clone source");
+        // open_tree errno ladder first
+        errno = 0;
+        check(syscall(428, AT_FDCWD, "/t_ot", 1L << 20) < 0
+              && errno == EINVAL, "open_tree bad flags EINVAL");
+        errno = 0;
+        check(syscall(428, AT_FDCWD, "/no_such_x", 1) < 0
+              && errno == ENOENT, "open_tree ENOENT");
+        errno = 0;
+        check(syscall(428, AT_FDCWD, 0, 0) < 0
+              && errno == ENOENT, "open_tree null path no EMPTY_PATH");
+        // clone the /t_mnt tmpfs, attach it at /t_mm
+        int mf = syscall(428, AT_FDCWD, "/t_ot", 1);
+        check(mf >= 0, "open_tree clone tmpfs");
+        errno = 0;
+        check(syscall(429, 0 /*stdin*/, "", AT_FDCWD, "/t_mm", 4) < 0
+              && errno == EBADF, "move_mount non-mount fd EBADF");
+        errno = 0;
+        check(syscall(429, mf, "", AT_FDCWD, "/t_mm2",
+                      4 | 0x100) < 0 && errno == EINVAL,
+              "move_mount SET_GROUP EINVAL");
+        check(syscall(429, mf, "", AT_FDCWD, "/t_mm", 4) == 0,
+              "move_mount attaches detached clone");
+        check(has_mount("tmpfs", "/t_mm", "tmpfs", "rw"),
+              "/proc/mounts has moved clone");
+        // closed+re-attached fd: mf still valid but mount moved on
+        errno = 0;
+        check(syscall(429, mf, "", AT_FDCWD, "/t_mm2", 4) == 0,
+              "move_mount re-attach via stale-ish fd");
+        check(has_mount("tmpfs", "/t_mm2", "tmpfs", "rw"),
+              "clone now at /t_mm2");
+        check(umount2("/t_mm2", 0) == 0, "umount re-attached clone");
+        errno = 0;
+        check(syscall(429, mf, "", AT_FDCWD, "/t_mm2", 4) < 0
+              && errno == ENOENT, "move_mount dead mount fd ENOENT");
+        close(mf);
+        // fspick + mount_setattr ro<->rw
+        check(mount("tmpfs", "/t_mm", "tmpfs", 0, 0) == 0,
+              "mount for fspick/setattr");
+        int pf = syscall(433, AT_FDCWD, "/t_mm", 0);
+        check(pf >= 0, "fspick /t_mm");
+        errno = 0;
+        check(mkdir("/t_dir", 0755) == 0, "mkdir /t_dir");
+        check(syscall(433, AT_FDCWD, "/t_dir", 0) < 0 && errno == EINVAL,
+              "fspick non-mount dir EINVAL");
+        check(rmdir("/t_dir") == 0, "rmdir /t_dir");
+        errno = 0;
+        check(syscall(433, AT_FDCWD, "/t_mm", 0x20) < 0 && errno == EINVAL,
+              "fspick bad flags EINVAL");
+        memset(attr, 0, sizeof(attr));
+        attr[0] = 1; // MOUNT_ATTR_RDONLY
+        check(syscall(442, pf, "", AEP, attr, 32) == 0,
+              "mount_setattr rdonly via fspick fd");
+        errno = 0;
+        check(open("/t_mm/x", O_CREAT | O_WRONLY, 0644) < 0
+              && errno == EROFS, "EROFS after mount_setattr rdonly");
+        check(has_mount("tmpfs", "/t_mm", "tmpfs", "ro"),
+              "/proc/mounts shows ro");
+        // attr-set error ladder
+        errno = 0;
+        attr[0] = 3; attr[1] = 3; // set & clr overlap
+        check(syscall(442, pf, "", AEP, attr, 32) < 0 && errno == EINVAL,
+              "mount_setattr set/clr overlap EINVAL");
+        errno = 0;
+        check(syscall(442, pf, "", AEP, attr, 8) < 0 && errno == EINVAL,
+              "mount_setattr short size EINVAL");
+        errno = 0;
+        attr[0] = 0; attr[1] = 1;
+        attr[2] = 1 << 14;         // propagation: MS_SHARED|MS_PRIVATE both set
+        check(syscall(442, pf, "", AEP, attr, 32) < 0 && errno == EINVAL,
+              "mount_setattr bad propagation EINVAL");
+        attr[2] = 0;
+        check(syscall(442, AT_FDCWD, "/t_mm", 0, attr, 32) == 0,
+              "mount_setattr clr rdonly by path");
+        int wfd = open("/t_mm/x", O_CREAT | O_WRONLY, 0644);
+        check(wfd >= 0, "writable after attr_clr");
+        if (wfd >= 0) close(wfd);
+        // AT_RECURSIVE applies under the target too
+        check(mkdir("/t_mm/inner", 0755) == 0, "mkdir inner");
+        errno = 0;
+        check(syscall(429, AT_FDCWD, "/", AT_FDCWD, "/t_mm2", 0) < 0
+              && errno == EBUSY, "move_mount root EBUSY");
+        check(mkdir("/t_mm/sub", 0755) == 0, "mkdir /t_mm/sub");
+        errno = 0;
+        check(syscall(429, AT_FDCWD, "/t_mm", AT_FDCWD,
+                      "/t_mm/sub", 0) < 0 && errno == EINVAL,
+              "move_mount under self EINVAL");
+        check(rmdir("/t_mm/sub") == 0, "rmdir /t_mm/sub");
+        check(mount("tmpfs", "/t_mm/inner", "tmpfs", 0, 0) == 0,
+              "mount inner for recursive setattr");
+        memset(attr, 0, sizeof(attr));
+        attr[0] = 8; // MOUNT_ATTR_NOEXEC
+        check(syscall(442, AT_FDCWD, "/t_mm", AREC, attr, 32) == 0,
+              "mount_setattr recursive noexec");
+        check(has_mount("tmpfs", "/t_mm/inner", "tmpfs", "rw,noexec")
+              || has_mount("tmpfs", "/t_mm/inner", "tmpfs", "noexec"),
+              "recursive setattr hit inner mount");
+        // stale fspick fd after umount -> ENOENT not wrong-mount
+        close(pf);
+        check(umount2("/t_mm/inner", 0) == 0, "umount inner");
+        check(umount2("/t_mm", 0) == 0, "umount /t_mm");
+        check(umount2("/t_ot", 0) == 0 && rmdir("/t_ot") == 0,
+              "umount clone source");
+        errno = 0;
+        check(syscall(433, AT_FDCWD, "/t_mm", 0) < 0 && errno == EINVAL,
+              "fspick after umount EINVAL");
+        check(unlink("/t_mm/x") == 0
+              && rmdir("/t_mm/inner") == 0 && rmdir("/t_mm") == 0
+              && rmdir("/t_mm2") == 0, "rmdir mount dirs");
+    }
+
     // ---- privilege gate ----------------------------------------
     pid_t c = fork();
     if (c == 0) {
@@ -383,12 +504,23 @@ int main(void) {
             bad++;
         if (umount2("/dev", 0) != -1 || errno != EPERM)
             bad++;
+        unsigned long long zattr[4] = {0, 0, 0, 0};
+        if (syscall(428, AT_FDCWD, "/", 0) != -1 || errno != EPERM)
+            bad |= 4;
+        if (syscall(429, 0, "", AT_FDCWD, "/", 4) != -1
+            || errno != EPERM)
+            bad |= 8;
+        if (syscall(442, AT_FDCWD, "/", 0, zattr, 32) != -1
+            || errno != EPERM)
+            bad |= 16;
+        int pf2 = syscall(433, AT_FDCWD, "/", 0);
+        if (pf2 < 0) bad |= 32; else close(pf2);
         _exit(bad);
     }
     int st;
     waitpid(c, &st, 0);
     check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
-          "nonroot mount/umount EPERM");
+          "nonroot mount-API EPERM");
 
     printf("mnttest: %d failures\n", fails);
     return fails;
