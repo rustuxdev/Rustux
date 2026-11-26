@@ -7465,3 +7465,32 @@ Audit run-41: 0 confirmed — unsupported-op gating by design
 flush_d's index guard compared against a sector count.
 CVE-2023-54008 (vdpa affinity) n/a. Ledger at 206 CVEs.
 
+## run-283 — block discard/TRIM (run-42 audit, pushed)
+
+The storage command set was missing discard — mkfs.ext4 issues
+BLKDISCARD and every transport path answered ENOTTY. Now:
+
+- virtio-blk: F_BLK_DISCARD (bit 13) negotiated in the same
+  masked pass as F_FLUSH; REQ_DISCARD carries
+  {sector,num_sectors,flags} segment tables (1024-sector
+  segments, <=128 per command) through the data staging block
+- NVMe: DSM opcode 0x09 with the 16B range table via PRP1,
+  cdw10=nr-1, cdw11 deallocate bit
+- ATA/AHCI: no TRIM wired -> EOPNOTSUPP (correct Linux answer
+  for a device without discard)
+- user.rs: blk_discard dispatch (Option<bool> — unsupported vs
+  command-failure split), BLKDISCARD/BLKSECDISCARD arms with
+  the size-trio gating + alignment + window bounds
+
+Bug the review caught: the ioctl arm first bounded the
+node-relative start against base+cap — right bound is cap
+alone (partition byte 0 = partition base), in subtraction form
+so start+len can't overflow past the check.
+
+Proof: `discard=true` negotiated; BLKDISCARD acked on vda +
+nvme0n1; BLKSECDISCARD ok; EINVAL on misaligned/len0;
+EOPNOTSUPP on /dev/sda; ENOTTY on /dev/null. blktest 55 checks
+0 failures. Exit 33, 78 tasks, zero leak.
+
+Audit run-42: 0 confirmed. Ledger at 206 CVEs.
+
