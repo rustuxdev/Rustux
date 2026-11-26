@@ -9629,6 +9629,110 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             if blk_flush(v.rdev) { 0 } else { (-5i64) as u64 } // EIO
         }
+        0x2285 => {
+            // SG_IO — the sg(4) generic pass-through smartmontools
+            // and friends use. Valid on /dev/sgN (char 21, minor =
+            // disk index) and scsi-backed block nodes (major 65,
+            // minor/16 = disk index); everything else is ENOTTY.
+            // sg_io_hdr_t is 88 bytes; result fields write back in
+            // place — a CHECK CONDITION still returns 0 with
+            // status=2 + sense, like Linux (only header/transport
+            // faults are errnos).
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            let Some(v) = vfile(*i) else { return ENOTTY_ };
+            let idx = match v.rdev >> 8 {
+                21 => (v.rdev & 0xff) as usize,
+                // Whole-disk scsi block nodes only — a partition fd's
+                // pass-through would escape the partition window
+                // (SG_IO-on-partition restriction class).
+                65 if v.fmt == 0o60000 && v.rdev & 0xf == 0 => {
+                    (v.rdev as usize >> 4) & 0xf
+                }
+                _ => return ENOTTY_,
+            };
+            if idx >= crate::virtio::scsi_disks() as usize {
+                return (-6i64) as u64; // ENXIO — node without hardware
+            }
+            if !range_ok_w(arg, 88) {
+                return EFAULT;
+            }
+            // SAFETY: validated 88-byte user window under cur cr3;
+            // all field reads/writes stay inside it.
+            unsafe {
+                let p = arg as *const u8;
+                let interface_id = (p as *const i32).read();
+                let dir = (p.add(4) as *const i32).read();
+                let cmd_len = p.add(8).read() as usize;
+                let mx_sb = p.add(9).read() as usize;
+                let iov = (p.add(10) as *const u16).read();
+                let dxfer_len = (p.add(12) as *const u32).read() as usize;
+                let dxferp = (p.add(16) as *const u64).read() as usize;
+                let cmdp = (p.add(24) as *const u64).read() as usize;
+                let sbp = (p.add(32) as *const u64).read() as usize;
+                if interface_id != 'S' as i32 || iov != 0
+                    || cmd_len == 0 || cmd_len > 32
+                {
+                    return EINVAL;
+                }
+                let wr = match dir {
+                    -1 => false, // SG_DXFER_NONE — dxfer ignored
+                    -2 => true,  // SG_DXFER_TO_DEV
+                    -3 => false, // SG_DXFER_FROM_DEV
+                    _ => return EINVAL,
+                };
+                if wr && o.accmode == 0 {
+                    // A write command on a read-only fd would bypass
+                    // the open-mode check the node promised.
+                    return (-13i64) as u64; // EACCES
+                }
+                if !range_ok(cmdp as u64, cmd_len as u64) {
+                    return EFAULT;
+                }
+                if dxfer_len > 4096 {
+                    // Staging-bound: one command's data phase fits
+                    // the disk's S_BATCH*512 block (SG_IO on real
+                    // kernels bounces through the queue limit too).
+                    return EINVAL;
+                }
+                if dxfer_len > 0 && !range_ok_w(dxferp as u64, dxfer_len as u64) {
+                    return EFAULT;
+                }
+                if mx_sb > 0 && !range_ok_w(sbp as u64, mx_sb as u64) {
+                    return EFAULT;
+                }
+                let mut cdb = [0u8; 32];
+                core::ptr::copy_nonoverlapping(
+                    cmdp as *const u8, cdb.as_mut_ptr(), cmd_len);
+                let mut sense = [0u8; 118]; // S_RESP - 10
+                let sn = mx_sb.min(118);
+                let buf = if dxfer_len > 0 {
+                    core::slice::from_raw_parts_mut(
+                        dxferp as *mut u8, dxfer_len)
+                } else {
+                    &mut []
+                };
+                let (status, _resp) = crate::virtio::scsi_passthrough(
+                    idx, &cdb[..cmd_len], wr, buf, &mut sense[..sn]);
+                if sn > 0 {
+                    core::ptr::copy_nonoverlapping(
+                        sense.as_ptr(), sbp as *mut u8, sn);
+                }
+                let w = arg as *mut u8;
+                w.add(60).write(status);
+                w.add(61).write(status & 0x3e); // masked_status
+                w.add(62).write(0);             // msg_status
+                w.add(63).write(sn as u8);      // sb_len_wr
+                // 0x7f sentinel = transport timeout -> DID_ERROR.
+                let host = if status == 0x7f { 7u16 } else { 0u16 };
+                (w.add(64) as *mut u16).write(host);
+                (w.add(66) as *mut u16).write(0); // driver_status
+                (w.add(68) as *mut i32)
+                    .write(if host != 0 { dxfer_len as i32 } else { 0 });
+                (w.add(72) as *mut u32).write(0); // duration
+                (w.add(76) as *mut u32).write(0); // info
+            }
+            0
+        }
         0x5309 => {
             // CDROMEJECT — the ATAPI START STOP UNIT packet on the
             // secondary-channel CD drive. The fd must be an sr
@@ -15737,6 +15841,20 @@ pub fn dev_init() {
             }
         }
     }
+    // /dev/sgN — scsi generic nodes for SG_IO pass-through, Linux
+    // char major 21, one minor per probed scsi disk.
+    for i in 0..crate::virtio::scsi_disks().min(4) {
+        let mut name = *b"dev/sg0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        name[6] = b'0' + i as u8;
+        let r = vfile_create(&name[..7]);
+        if (r as i64) >= 0 {
+            if let Some(v) = vfile(r as usize) {
+                vfile_stamp(v, 0o660, 0);
+                v.fmt = 0o20000; // S_IFCHR
+                v.rdev = (21 << 8) | i;
+            }
+        }
+    }
     // /dev/sda — the node only exists when the ATA probe found a
     // disk, matching udev behavior (no hardware, no node). /dev/sr0
     // is always minted: the CDROM* ioctls probe the secondary
@@ -16977,6 +17095,10 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                         // ENXIO on a crafted node with no device.
                         229 if crate::virtio::console_present() => i,
                         229 => return ENXIO,
+                        // /dev/sgN — scsi generic; ENXIO on a
+                        // crafted node past the probed disks.
+                        21 if (v.rdev & 0xff) < crate::virtio::scsi_disks() => i,
+                        21 => return ENXIO,
                         // input core — evdev event nodes.
                         13 => i,
                         _ => return ENODEV,

@@ -2375,3 +2375,88 @@ pub fn scsi_disks() -> u32 {
 pub fn scsi_capacity(i: usize) -> u64 {
     sdisk_for(i).map_or(0, |d| d.sectors * 512)
 }
+
+/// SCSI generic pass-through — one arbitrary CDB through a single
+/// request. `wr` selects the data-phase direction; `buf` is staged
+/// through the disk's own data block so it must fit S_BATCH*512.
+/// On return, `sense` holds up to min(len, S_RESP-10) bytes from the
+/// resp slot's sense region; the tuple is (status, response) — raw
+/// bytes, not a success bool, so callers can honour CHECK CONDITION.
+pub fn scsi_passthrough(i: usize, cdb: &[u8], wr: bool, buf: &mut [u8], sense: &mut [u8]) -> (u8, u8) {
+    let Some(d) = sdisk_for(i) else {
+        return (0x7f, 0x7f); // no device
+    };
+    if cdb.is_empty() || cdb.len() > 32 || buf.len() > S_BATCH * 512 {
+        return (0x7f, 0x7f); // malformed request
+    }
+    let ctrl = mm::pmap(d.ctrl);
+    // SAFETY: ctrl/data are our own DMA blocks; CDB field is 32
+    // bytes at req+19; buf len validated <= S_BATCH*512 = data size.
+    unsafe {
+        let r = ctrl as *mut u8;
+        r.write_bytes(0, S_REQ as usize);
+        core::ptr::copy_nonoverlapping(d.lun.as_ptr(), r, 8);
+        for (i, &b) in cdb.iter().enumerate() {
+            r.add(19 + i).write_volatile(b);
+        }
+        ((ctrl + S_RESP_OFF) as *mut u8).write_bytes(0, S_RESP as usize);
+        if wr && !buf.is_empty() {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), mm::pmap(d.data) as *mut u8, buf.len());
+        } else if !buf.is_empty() {
+            // FROM_DEV with a no-data-phase CDB must yield zeros,
+            // not prior staging contents (SG_IO info-leak class).
+            (mm::pmap(d.data) as *mut u8).write_bytes(0, buf.len());
+        }
+    }
+    let mut i = 0usize;
+    d.vq.put_desc(i, d.ctrl, S_REQ, DESC_NEXT, (i + 1) as u16);
+    i += 1;
+    if wr && !buf.is_empty() {
+        d.vq.put_desc(i, d.data, buf.len() as u32, DESC_NEXT, (i + 1) as u16);
+        i += 1;
+    }
+    let tail = !wr && !buf.is_empty();
+    d.vq.put_desc(
+        i,
+        d.ctrl + S_RESP_OFF,
+        S_RESP,
+        DESC_WRITE | if tail { DESC_NEXT } else { 0 },
+        (i + 1) as u16,
+    );
+    i += 1;
+    if tail {
+        d.vq.put_desc(i, d.data, buf.len() as u32, DESC_WRITE, 0);
+    }
+    fence(Ordering::SeqCst);
+    if !d.vq.poll_once(0) {
+        return (0x7f, 0x7f); // transport timeout
+    }
+    // SAFETY: resp region the device just wrote; sense region starts
+    // at +10 and runs to S_RESP — take bounded copy into `sense`.
+    let (status, resp) = unsafe {
+        (
+            ((ctrl + S_RESP_OFF + 8) as *const u8).read_volatile(),
+            ((ctrl + S_RESP_OFF + 9) as *const u8).read_volatile(),
+        )
+    };
+    let sn = sense.len().min(S_RESP as usize - 10);
+    if sn > 0 {
+        // SAFETY: src is the device's resp sense region; dst is our
+        // caller's `sense` slice.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (ctrl + S_RESP_OFF + 10) as *const u8,
+                sense.as_mut_ptr(),
+                sn,
+            )
+        };
+    }
+    if !wr && !buf.is_empty() {
+        // SAFETY: datain landed in our staging block; buf len <=
+        // S_BATCH*512 validated above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(mm::pmap(d.data) as *const u8, buf.as_mut_ptr(), buf.len())
+        };
+    }
+    (status, resp)
+}
