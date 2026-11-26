@@ -34,6 +34,15 @@ const PXSSTS: u64 = 0x28;
 const PXCI: u64 = 0x38;
 
 const SIG_ATA: u32 = 0x0000_0101;
+/// ATAPI device signature — QEMU's media=cdrom lands on a SATA
+/// port with this sig, not the legacy 0x170 channel on q35.
+const SIG_ATAPI: u32 = 0xeb14_0101;
+/// The SATA port the CD-ROM sat on at scan time (u32::MAX = none).
+static ATAPI_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Scratch for the ATAPI path — same shape as PortMem but the
+/// data buffer is a full 4KiB (TOC replies and cooked 2KiB reads
+/// don't fit the disk path's 512B buf).
+static mut ATAPI_MEM: Option<PortMem> = None;
 const CMD_ST: u32 = 1 << 0;
 const CMD_FRE: u32 = 1 << 4;
 const CMD_FR: u32 = 1 << 14;
@@ -321,8 +330,13 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
         if ssts & 0xf != 3 {
             continue; // no device, or not established
         }
-        if r32(port_reg(p, PXSIG)) != SIG_ATA {
-            continue; // ATAPI/port multiplier — not a disk we DMA to
+        let sig = r32(port_reg(p, PXSIG));
+        if sig == SIG_ATAPI {
+            ATAPI_PORT.store(p as u32, Ordering::Relaxed);
+            continue; // packet device — atapi_cmd drives it
+        }
+        if sig != SIG_ATA {
+            continue; // port multiplier — not a disk we DMA to
         }
         if let Some(secs) = identify(p) {
             DISK_PORT[n].store(p as u32, Ordering::Relaxed);
@@ -438,4 +452,126 @@ pub fn write_sector(i: usize, lba: u64, buf: &[u8; 512]) -> bool {
         core::ptr::copy_nonoverlapping(buf.as_ptr(), phys_ptr(m.buf), 512);
     }
     issue(p, m, ATA_WRITE_DMA_EXT, lba, 1, true)
+}
+
+fn atapi_mem() -> Option<&'static PortMem> {
+    // SAFETY: single-threaded syscall context, like the disk statics.
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(ATAPI_MEM);
+        if slot.is_none() {
+            *slot = Some(PortMem {
+                cl: kalloc::alloc_frame()?,
+                fis: kalloc::alloc_frame()?,
+                ct: kalloc::alloc_frame()?,
+                buf: kalloc::alloc_frames(1)?,
+            });
+        }
+        slot.as_ref()
+    }
+}
+
+/// Issue one ATAPI PACKET command (0xa0): the 12-byte CDB rides in
+/// the command table's ACMD area, the byte-count limit sits in the
+/// LBA mid/high FIS fields, and returned data DMAs into buf then
+/// copies out to `din`. din.len() <= 4096 is enforced by callers.
+fn issue_packet(p: usize, m: &PortMem, cdb: &[u8; 12], din: &mut [u8]) -> bool {
+    zero(m.cl, 1024);
+    zero(m.fis, 256);
+    zero(m.ct, 256);
+
+    // SAFETY: m.fis is our frame.
+    unsafe {
+        let f = phys_ptr(m.fis);
+        *f = 0x27; // FIS_TYPE_REG_H2D
+        *f.add(1) = 0x80; // C = 1
+        *f.add(2) = 0xa0; // PACKET
+        // f[3] features = 0 — PIO data phase, no DMA bit.
+        let bc = din.len().min(0xfffe);
+        *f.add(5) = (bc & 0xff) as u8; // LBA mid — byte count lo
+        *f.add(6) = ((bc >> 8) & 0xff) as u8; // LBA hi — count hi
+    }
+
+    // Command list entry 0: CFL=5, the A bit set for ATAPI, PRDTL
+    // only when the command has a data phase, prefetch.
+    // SAFETY: m.cl is our frame.
+    unsafe {
+        let cl = phys_ptr(m.cl) as *mut u32;
+        let prdtl = if din.is_empty() { 0 } else { 1 << 16 };
+        cl.write_volatile(5 | (1 << 5) | prdtl | (1 << 31));
+        cl.add(1).write_volatile(0);
+        cl.add(2).write_volatile(m.ct as u32);
+        cl.add(3).write_volatile((m.ct >> 32) as u32);
+    }
+
+    // SAFETY: m.ct is our frame; CFIS is 20B, the 12B CDB sits in
+    // the 16-byte ACMD area at 0x40, PRDT lives at 0x80.
+    unsafe {
+        let ct = phys_ptr(m.ct);
+        core::ptr::copy_nonoverlapping(phys_ptr(m.fis), ct, 20);
+        core::ptr::copy_nonoverlapping(cdb.as_ptr(), ct.add(0x40), 12);
+        if !din.is_empty() {
+            let prdt = ct.add(0x80) as *mut u32;
+            prdt.write_volatile(m.buf as u32);
+            prdt.add(1).write_volatile((m.buf >> 32) as u32);
+            prdt.add(2).write_volatile(0);
+            prdt.add(3).write_volatile((din.len() as u32 - 1) & 0x3f_ffff);
+        }
+    }
+
+    // Same stop/program/start sequence as the disk path — the
+    // base registers latch only while the port is stopped.
+    let cmd_r = port_reg(p, PXCMD);
+    w32(cmd_r, r32(cmd_r) & !CMD_ST);
+    for _ in 0..100_000u32 {
+        if r32(cmd_r) & CMD_CR == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    w32(port_reg(p, PXCLB), m.cl as u32);
+    w32(port_reg(p, PXCLB) + 4, (m.cl >> 32) as u32);
+    w32(port_reg(p, PXFB), m.fis as u32);
+    w32(port_reg(p, PXFB) + 4, (m.fis >> 32) as u32);
+    w32(cmd_r, r32(cmd_r) | CMD_FRE | CMD_ST);
+    w32(port_reg(p, PXIS), 0xffff_ffff);
+    w32(port_reg(p, PXCI), 1);
+
+    let tfd_r = port_reg(p, PXTFD);
+    let ci_r = port_reg(p, PXCI);
+    for _ in 0..2_000_000u32 {
+        let tfd = r32(tfd_r);
+        if tfd & TFD_ERR != 0 {
+            return false;
+        }
+        if r32(ci_r) & 1 == 0 {
+            if !din.is_empty() {
+                // SAFETY: the device DMA'd into our 4KiB buf;
+                // copy back exactly what we advertised.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        phys_ptr(m.buf),
+                        din.as_mut_ptr(),
+                        din.len(),
+                    )
+                };
+            }
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// ATAPI packet pass-through on the scanned CD-ROM port — the
+/// transport for the CDROM* ioctl family. din may be empty for
+/// no-data commands (PREVENT ALLOW).
+pub fn atapi_cmd(cdb: &[u8; 12], din: &mut [u8]) -> bool {
+    let p = ATAPI_PORT.load(Ordering::Relaxed);
+    if p == u32::MAX || din.len() > 4096 {
+        return false;
+    }
+    let Some(m) = atapi_mem() else {
+        return false;
+    };
+    issue_packet(p as usize, m, cdb, din)
 }

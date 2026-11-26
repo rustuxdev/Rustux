@@ -147,7 +147,13 @@ $(ESP_IMG): $(KERNEL) $(INITRD)
 	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@ $(INITRD) ::/initrd.cpio
 
-run: build $(VIRTIO_DISK) $(GPT_DISK)
+TEST_ISO := kernel/src/cdtest.iso
+
+$(TEST_ISO):
+	mkdir -p /tmp/cdroot && printf 'cdrom-proof\n' > /tmp/cdroot/proof.txt
+	mkisofs -quiet -o $@ -V RUSTUX-TEST /tmp/cdroot
+
+run: build $(VIRTIO_DISK) $(GPT_DISK) $(TEST_ISO)
 	rm -f /tmp/hvc.sock /tmp/hvc_captured.log; python3 tools/hvcfeed.py & \
 	rm -f /tmp/vkbd-qmp.sock; python3 tools/kbdfeed.py & \
 	rm -f /tmp/balloon-qmp.sock /tmp/balloon_proof.log; python3 tools/balloonfeed.py & \
@@ -157,6 +163,7 @@ run: build $(VIRTIO_DISK) $(GPT_DISK)
 		-cpu qemu64,+rdrand \
 		-bios $(OVMF) \
 		-drive file=$(ESP_IMG),format=raw,if=ide \
+		-drive file=$(TEST_ISO),format=raw,media=cdrom,if=ide,index=2 \
 		-drive file=$(VIRTIO_DISK),format=raw,if=virtio \
 		-drive file=$(VIRTIO_DISK),format=raw,if=none,id=nvm0 \
 		-drive file=$(VIRTIO_DISK),format=raw,if=none,id=nvm1 \

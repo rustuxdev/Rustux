@@ -9972,6 +9972,148 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             if crate::ata::eject() { 0 } else { (-5i64) as u64 } // EIO
         }
+        0x5331 => {
+            // CDROM_GET_CAPABILITY — the fixed feature mask for an
+            // ATAPI drive we can packet-command. sr node required.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            if !vfile(*i).is_some_and(|v| v.rdev == 0xb00) {
+                return ENOTTY_;
+            }
+            // CDC_OPEN_TRAY|CDC_LOCK|CDC_CD_R|CDC_DRIVE_STATUS|
+            // CDC_IOCTLS|CDC_RESET — honest subset of what the
+            // drive + our ioctls actually support.
+            1 | 2 | 4 | 0x200 | 0x800 | 0x2000 | 0x1000
+        }
+        0x5329 => {
+            // CDROM_LOCKDOOR — arg is the lock flag VALUE (not a
+            // pointer): PREVENT ALLOW MEDIUM REMOVAL.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            if !vfile(*i).is_some_and(|v| v.rdev == 0xb00) {
+                return ENOTTY_;
+            }
+            let mut cdb = [0u8; 12];
+            cdb[0] = 0x1e;
+            cdb[4] = (arg & 1) as u8;
+            let mut none = [];
+            if crate::ahci::atapi_cmd(&cdb, &mut none) {
+                0
+            } else {
+                (-5i64) as u64 // EIO
+            }
+        }
+        0x5305 | 0x5306 => {
+            // CDROMREADTOCHDR / CDROMREADTOCENTRY — READ TOC(0x43).
+            // hdr: {len u16be, first, last}; descriptors 8B each:
+            // {rsvd, ctrl_adr, track, rsvd, lba u32be}. TOCENT
+            // struct: {track@0, adr@1, ctrl@2, format@3, addr@4} —
+            // format 2 = CDROM_LBA (int), 1 = CDROM_MSF.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            if !vfile(*i).is_some_and(|v| v.rdev == 0xb00) {
+                return ENOTTY_;
+            }
+            let mut cdb = [0u8; 12];
+            cdb[0] = 0x43;
+            let want_msf = req == 0x5306
+                && range_ok(arg, 8)
+                // SAFETY: validated 8-byte user window under cur cr3;
+                // cdte_format lives at arg+3.
+                && unsafe { (arg as *const u8).add(3).read() == 1 };
+            if want_msf {
+                cdb[1] = 2; // MSF bit
+            }
+            let mut toc = [0u8; 2048];
+            cdb[7..9].copy_from_slice(&(2048u16).to_be_bytes());
+            if !crate::ahci::atapi_cmd(&cdb, &mut toc) {
+                return (-5i64) as u64; // EIO — no media
+            }
+            let len = ((toc[0] as usize) << 8) | toc[1] as usize;
+            if req == 0x5305 {
+                if !range_ok_w(arg, 2) {
+                    return EFAULT;
+                }
+                // SAFETY: validated 2-byte user window.
+                unsafe {
+                    (arg as *mut u8).write(toc[2]);
+                    (arg as *mut u8).add(1).write(toc[3]);
+                }
+                0
+            } else {
+                if !range_ok_w(arg, 8) {
+                    return EFAULT;
+                }
+                // SAFETY: validated 8-byte user window.
+                let want = unsafe { (arg as *const u8).read() };
+                let nd = (len / 8).min(255);
+                let mut found = false;
+                for d in 0..nd {
+                    let base = 4 + d * 8;
+                    if base + 7 >= toc.len() {
+                        break;
+                    }
+                    if toc[base + 2] == want {
+                        // SAFETY: arg validated writable.
+                        unsafe {
+                            let w = arg as *mut u8;
+                            // ctrl_adr byte: low nibble control,
+                            // high nibble adr — the struct splits
+                            // them into two nibbles.
+                            let ca = toc[base + 1];
+                            w.add(1).write(ca >> 4); // cdte_adr
+                            w.add(2).write(ca & 0xf); // cdte_ctrl
+                            core::ptr::copy_nonoverlapping(
+                                toc.as_ptr().add(base + 4),
+                                w.add(4),
+                                4,
+                            );
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return EINVAL;
+                }
+                0
+            }
+        }
+        0x530d => {
+            // CDROMREADMODE1 — arg's first bytes are a cdrom_msf
+            // {min, sec, frame}; the 2048-byte cooked block lands in
+            // the same buffer. ATAPI READ(10) does the read.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            if !vfile(*i).is_some_and(|v| v.rdev == 0xb00) {
+                return ENOTTY_;
+            }
+            if !range_ok_w(arg, 2048) {
+                return EFAULT;
+            }
+            // SAFETY: validated 2048-byte user window; the msf
+            // fields live at arg+0..3 before we overwrite them.
+            let lba = unsafe {
+                let p = arg as *const u8;
+                let m = p.read() as u32;
+                let s = p.add(1).read() as u32;
+                let f = p.add(2).read() as u32;
+                ((m * 60 + s) * 75 + f).saturating_sub(150)
+            };
+            let mut cdb = [0u8; 12];
+            cdb[0] = 0x28;
+            cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+            cdb[8] = 1; // one block
+            let mut blk = [0u8; 2048];
+            if !crate::ahci::atapi_cmd(&cdb, &mut blk) {
+                return (-5i64) as u64; // EIO
+            }
+            // SAFETY: arg validated writable for 2048 bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    blk.as_ptr(),
+                    arg as *mut u8,
+                    2048,
+                )
+            };
+            0
+        }
         0x4600 | 0x4602 => {
             // FBIOGET_VSCREENINFO / FBIOGET_FSCREENINFO — the fbdev
             // pair every Linux framebuffer client probes first. The

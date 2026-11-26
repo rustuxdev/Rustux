@@ -415,6 +415,55 @@ int main(void) {
         unlink("blkback.img");
     }
 
+    // CD-ROM ioctls — /dev/sr0 backed by the test ISO on the
+    // secondary-master ATAPI: capability mask, door lock, READ
+    // TOC header/entries, and a cooked 2048-byte READMODE1 block.
+    {
+        int cd = open("/dev/sr0", O_RDWR);
+        check(cd >= 0, "open /dev/sr0");
+        struct stat cst;
+        check(fstat(cd, &cst) == 0 && S_ISBLK(cst.st_mode)
+              && major(cst.st_rdev) == 11 && minor(cst.st_rdev) == 0,
+              "fstat S_IFBLK 11:0");
+        unsigned long cap = ioctl(cd, 0x5331 /* GET_CAPABILITY */);
+        check((cap & 0x2000) != 0, "capability CDC_IOCTLS");
+        check(ioctl(cd, 0x5329 /* LOCKDOOR */, 1) == 0, "LOCKDOOR 1");
+        check(ioctl(cd, 0x5329, 0) == 0, "LOCKDOOR 0");
+        unsigned char hdr[2] = {0, 0};
+        check(ioctl(cd, 0x5305 /* READTOCHDR */, hdr) == 0
+              && hdr[0] == 1 && hdr[1] == 1,
+              "READTOCHDR tracks 1-1");
+        unsigned char ent[8] = {0};
+        ent[0] = 1; ent[3] = 2; // track 1, CDROM_LBA format
+        check(ioctl(cd, 0x5306 /* READTOCENTRY */, ent) == 0,
+              "READTOCENTRY track1");
+        check(ent[4] == 0 && ent[5] == 0 && ent[6] == 0
+              && ent[7] == 0, "track1 starts lba 0");
+        // Lead-out entry's lba covers the image size.
+        ent[0] = 0xaa; ent[3] = 2;
+        check(ioctl(cd, 0x5306, ent) == 0, "READTOCENTRY leadout");
+        unsigned int lead = (ent[4] << 24) | (ent[5] << 16)
+                          | (ent[6] << 8) | ent[7];
+        check(lead > 100, "leadout lba sane");
+        // Cooked read of the PVD at sector 16 via MSF addressing.
+        unsigned char blk[2048];
+        memset(blk, 0, sizeof(blk));
+        int lba = 16, s = lba + 150;
+        blk[0] = s / 4500;          // min
+        blk[1] = (s / 75) % 60;     // sec
+        blk[2] = s % 75;            // frame
+        check(ioctl(cd, 0x530d /* READMODE1 */, blk) == 0,
+              "READMODE1 sector16");
+        check(memcmp(blk + 1, "CD001", 5) == 0, "PVD CD001 magic");
+        // Gates: non-sr fd ENOTTY, unmapped hdr EFAULT.
+        check(ioctl(cd, 0x5306, 0) < 0 && errno == EFAULT,
+              "TOCENTRY null EFAULT");
+        int nf = open("/dev/null", O_RDWR);
+        check(ioctl(nf, 0x5331) < 0 && errno == ENOTTY,
+              "GET_CAPABILITY null ENOTTY");
+        close(nf); close(cd);
+    }
+
     char out[64];
     int n = snprintf(out, sizeof(out), "blktest: %d failure%s\n",
                      fails, fails == 1 ? "" : "s");
