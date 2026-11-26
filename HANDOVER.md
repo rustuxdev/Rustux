@@ -7394,3 +7394,46 @@ proof unaffected. Exit 33, 78 tasks, zero leak.
 Audit run-39: 0 confirmed — staging bounds, feature-masking,
 queue-count gate all by design; CVE-2022-48864 (vdpa device-side
 validation) n/a. Ledger at 203 CVEs. Commits pushed origin main.
+
+## run-281 — virtio-balloon driver (run-40 audit, pushed)
+
+Transitional virtio-balloon (DEV_BALLOON 0x1002 — QEMU numbers
+transitional devices by slot: rng was 0x1005/subsys 4, balloon is
+0x1002/subsys 5, no conflict). Legacy handshake, inflate/deflate
+queue pair (sel 0/1), zero feature bits.
+
+The pump rides stdin_pump — which runs in tick IRQ AND fd_read
+syscall context. Three defects the run dug out:
+
+1. Re-entrancy — an IRQ pump preempting a syscall pump could
+   race the held-PFN registry and double-post deflate desc 0.
+   BAL_BUSY compare_exchange guard: re-entrant calls skip.
+2. Publish order — BAL_IO (the pump's readiness gate) was stored
+   before BAL_IV/BAL_DV; an IRQ in the window let the pump
+   allocate held pages with no queue to post (bounded leak).
+   BAL_IO stores last now.
+3. Deflate protocol inversion — the deflate vq carries
+   guest-posted OUT PFNs, not a device-filled IN buffer. The
+   first build posted a standing DESC_WRITE buffer that could
+   never complete and read completion PFN counts off `len`
+   (QEMU leaves it 0 for OUT). Now the pump copies held PFNs to
+   the staging half-page, posts OUT, and frees only
+   held_remove-verified PFNs after the used completion.
+
+And a test-harness bug: balloonfeed's fixed sleeps sent
+`balloon 1024` before the guest's first config read — QEMU
+latches num_pages, so the deflate erased the inflate request
+before the pump polled it (6367 guest config reads all saw 0,
+confirmed via `-trace virtio_balloon*`). The feeder now holds
+each target and polls query-balloon until the guest's `actual`
+confirms the phase.
+
+Host-side proof: `balloon 1008` -> guest inflated 4096 pages ->
+QMP actual=1056964608; `balloon 1024` -> deflate freed 256-page
+chunks back to kalloc -> actual=1073741824. Exit 33, 78 tasks,
+`frames 207797 -> 207797` zero leak.
+
+Audit run-40: 0 confirmed — target bounded by BAL_MAX,
+held_remove verification, kalloc IRQ-safety all by design;
+CVE-2026-74481 (suspend-time UAF) n/a. Ledger at 204 CVEs.
+

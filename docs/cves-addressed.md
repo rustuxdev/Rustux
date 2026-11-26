@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**203 unique CVEs recorded.**
+**204 unique CVEs recorded.**
 
 ## klib ports
 
@@ -269,6 +269,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-72020 | tcp/ipv4 (mini) | exact seq+ack required on every transition (no blind RST/state jumps — 63913 class out); option walk bounded, wscale never shifted (31495); seq state fully initialized (72020); do… |
 | CVE-2026-72110 | process lifecycle: clone(56) fork-subset + SETTID writes, rt_sigprocmask(14) real sigmask… | RUN-TIME BUG CAUGHT BY REVIEW: translate/translate_r walked ANY va through the task pml4 -- which shares kernel upper-half slots by reference -- so a user-controlled VA reached ke… |
 | CVE-2026-72183 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
+| CVE-2026-74481 | virtio-balloon rung: virtio.rs gains the balloon driver — DEV_BALLOON 0x1002 transitional… | audit run-40 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-74481 — n/a. Verified: make run exit 33, 78 tasks, frames equal; balloon target 4096 -> in… |
+| CVE-2026-74481 | virtio-balloon rung: virtio.rs gains the balloon driver — DEV_BALLOON 0x1002 transitional… | audit run-40 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-74481 — n/a. Verified: make run exit 33, 78 tasks, frames equal; balloon target 4096 -> in… |
 | CVE-2026-74673 | /dev/input/event0 evdev + DOOM keyboard input: PS/2 decoder now emits Linux keycode press… | audit run-118 quick scoped + cve.now MCP live (entities.search on evdev/input classes — analogs above): verified ev_push bounded to EVR_SIZE with drop-on-full; ev_pop memmove stay… |
 | CVE-2026-74673 | i386 stat64 shims rung: glibc's stat family — fstatat64 (300), stat64/lstat64/fstat64 (19… | audit run-175 scoped quick (security-audit skill, run-3): verified every new arm either writes a fixed-size struct into a range_ok_w-validated range or reuses an already-validated… |
 | CVE-2026-74683 | /dev/input/event0 evdev + DOOM keyboard input: PS/2 decoder now emits Linux keycode press… | audit run-118 quick scoped + cve.now MCP live (entities.search on evdev/input classes — analogs above): verified ev_push bounded to EVR_SIZE with drop-on-full; ev_pop memmove stay… |
