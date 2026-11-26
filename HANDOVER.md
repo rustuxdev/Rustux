@@ -8145,3 +8145,25 @@ real altstack delivery — a handler checks its own frame lands
 inside the installed window. stest 24 checks green; exit 33, 99
 tasks, zero leak. Audit run-68: 0 confirmed, 3 fixed in-run.
 Ledger at 315 CVEs.
+run-310 lands the positioned-iovec pair plus four small classics:
+fallocate(285) is mode-0-only (FALLOC_FL_* get the honest EINVAL —
+no extent machinery) with the same seal gate fd_pwrite uses
+(WRITE|FUTURE_WRITE EPERM, GROW EPERM on extension) and ENOSPC at
+VFILE_MAX; preadv(295)/pwritev(296) share fd_pxvec — pos<0 EINVAL,
+32-iovec cap matching readv/writev, per-segment validation inside
+fd_pread/fd_pwrite, checked pos+done. sethostname(170)/
+setdomainname(171) write new UTS_NODE/UTS_DOMAIN statics that
+sys_uname now reads live (the other four fields stay fixed);
+get/setpriority(140/141) replace the pre-existing => 0 stubs with
+real gates — which>2 EINVAL, dead-pid who ESRCH, get returns the
+ABI's 20+nice=20 since there's no nice field, set clamps and
+inerts. fatest proves the lot (grow+zero-fill+ESPIPE/EBADF,
+positioned round-trip with untouched file pos, EINVAL/ESRCH
+ladders, live utsname readback); lstest floor 72->73, 100 tasks.
+The run's interesting bug was in the TEST not the kernel: glibc
+syscall() zero-extends int variadic args, so -1 literals arrived
+as 4294967295 — correct per the register-level ABI on real Linux
+too — fatest passes -1L now. Also fixed a cross-test race
+sighted this run: pmvtest/stest both write the shared wall clock
+and one's write could land inside the other's assert window; both
+windows now cover either epoch. Audit run-69: 0 confirmed.
