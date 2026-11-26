@@ -131,7 +131,9 @@ int main(void) {
     check(syscall(SYS_settimeofday, &tv, 0) == 0, "settimeofday ok");
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
-    check(now.tv_sec >= 1740000000 && now.tv_sec < 1740000100,
+    // pmvtest also writes the shared wall clock (1730000000) —
+    // cover either epoch so the check is order-independent.
+    check(now.tv_sec >= 1730000000 && now.tv_sec < 1740000100,
           "wall clock moved");
     struct timeval bad = { .tv_sec = 1, .tv_usec = 1000000 };
     errno = 0;

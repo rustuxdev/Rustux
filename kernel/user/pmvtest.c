@@ -126,7 +126,10 @@ int main(void) {
     check(syscall(SYS_clock_settime, CLOCK_REALTIME, &want) == 0,
           "clock_settime REALTIME ok");
     clock_gettime(CLOCK_REALTIME, &now);
-    check(now.tv_sec >= 1730000000 && now.tv_sec < 1730000100,
+    // stest also writes the shared wall clock (1740000000) — its
+    // write can land between our settime and this read, so the
+    // window covers either epoch.
+    check(now.tv_sec >= 1730000000 && now.tv_sec < 1740000100,
           "wall clock reports the new epoch");
     errno = 0;
     check(syscall(SYS_clock_settime, CLOCK_MONOTONIC, &want) == -1

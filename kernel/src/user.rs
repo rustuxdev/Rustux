@@ -9471,6 +9471,143 @@ pub fn sys_get_robust_list(pid: u64, head: u64, len: u64) -> u64 {
 }
 
 
+/// preadv(fd, iov, cnt, pos)/pwritev(fd, iov, cnt, pos): the
+/// positioned iovec pair — same 32-entry cap and stop-at-short-read
+/// rule as readv/writev, each segment at pos+done like Linux's
+/// iov_iter walk (pos<0 is EINVAL; it is not the "use file pos"
+/// sentinel — only pwritev2's -1 means that, and pwritev2 is
+/// unwired).
+fn fd_pxvec(fd: u64, iov: u64, cnt: u64, pos: i64, write: bool) -> u64 {
+    if pos < 0 {
+        return EINVAL;
+    }
+    if cnt == 0 {
+        return 0;
+    }
+    if cnt > 32 || !range_ok(iov, cnt * 16) {
+        return EINVAL;
+    }
+    let mut done = 0u64;
+    for i in 0..cnt {
+        // SAFETY: range_ok proved the iovec array readable user memory.
+        let (base, len) = unsafe {
+            (
+                ((iov + i * 16) as *const u64).read_unaligned(),
+                ((iov + i * 16 + 8) as *const u64).read_unaligned(),
+            )
+        };
+        if len == 0 {
+            continue;
+        }
+        let Some(p) = (pos as u64).checked_add(done) else {
+            return EINVAL;
+        };
+        let n = if write {
+            fd_pwrite(fd, base, len, p as i64)
+        } else {
+            fd_pread(fd, base, len, p as i64)
+        };
+        if (n as i64) < 0 {
+            return if done > 0 { done } else { n };
+        }
+        done += n;
+        if n < len {
+            break;
+        }
+    }
+    done
+}
+
+/// preadv(295): positioned scatter-read.
+pub fn fd_preadv(fd: u64, iov: u64, cnt: u64, pos: i64) -> u64 {
+    fd_pxvec(fd, iov, cnt, pos, false)
+}
+
+/// pwritev(296): positioned gather-write.
+pub fn fd_pwritev(fd: u64, iov: u64, cnt: u64, pos: i64) -> u64 {
+    fd_pxvec(fd, iov, cnt, pos, true)
+}
+
+/// fallocate(fd, mode, off, len): pre-allocate [off, off+len) of a
+/// Ram-backed file — mode 0 extends i_size when the range passes
+/// EOF (Linux) and always zero-fills the new extent via vfile_grow.
+/// The FALLOC_FL_* modes (PUNCH_HOLE/COLLAPSE/ZERO_RANGE/...) need
+/// real extent bookkeeping that doesn't exist — EINVAL, like a
+/// filesystem that doesn't support them.
+pub fn sys_fallocate(fd: u64, mode: u64, off: i64, len: i64) -> u64 {
+    const ESPIPE_: u64 = (-29i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    if mode != 0 || off < 0 || len <= 0 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    if o.accmode == 0 {
+        return EBADF;
+    }
+    let FdKind::Ram(i) = &o.kind else {
+        // Pipes, sockets, devices and read-only mounts.
+        return ESPIPE_;
+    };
+    let i = *i;
+    let Some(v) = vfile(i) else { return EBADF };
+    let Some(need) = (off as usize).checked_add(len as usize) else {
+        return EINVAL;
+    };
+    if v.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+        return EPERM_;
+    }
+    if need > v.len && v.seals & F_SEAL_GROW != 0 {
+        return EPERM_;
+    }
+    let r = vfile_grow(v, need);
+    if r != 0 {
+        return r;
+    }
+    // Grow zero-fills, so the extent needs no explicit scrub —
+    // mode-0 fallocate only guarantees allocated space, and our
+    // "allocated" is the whole buffer.
+    v.len = v.len.max(need);
+    let (ts, tns) = now();
+    v.mtime = ts;
+    v.mtime_ns = tns;
+    v.ctime = ts;
+    v.ctime_ns = tns;
+    0
+}
+
+/// getpriority(which, who)/setpriority(which, who, prio): the
+/// nice-value pair. No nice field exists — a single-CPU scheduler
+/// with no weighting — so set validates and inerts, get reports
+/// the documented ABI answer 20+nice = 20 (glibc's "0 nice"). who
+/// 0 is self; a nonzero who must name a live pid (ESRCH), which
+/// is also the ESRCH for dead pids. which>2 EINVALs.
+fn pri_check(which: u64, who: u64) -> Option<u64> {
+    const ESRCH_: u64 = (-3i64) as u64;
+    if which > 2 {
+        return Some(EINVAL);
+    }
+    if who != 0 && task_slot_by_pid(who).is_none() {
+        return Some(ESRCH_);
+    }
+    None
+}
+
+pub fn sys_getpriority(which: u64, who: u64) -> u64 {
+    if let Some(e) = pri_check(which, who) {
+        return e;
+    }
+    20
+}
+
+pub fn sys_setpriority(which: u64, who: u64, prio: i64) -> u64 {
+    if let Some(e) = pri_check(which, who) {
+        return e;
+    }
+    let _ = prio.clamp(-20, 19);
+    0
+}
+
 /// munmap(addr, len): Linux never fails on an aligned range — holes
 /// and foreign areas are silent no-ops. Pages are freed, range
 /// entries clipped/split, one TLB flush at the end.
@@ -10427,6 +10564,47 @@ pub fn sys_set_thread_area(u_info: u64) -> u64 {
 }
 
 /// uname(buf): Linux struct utsname — 6 fields ?-- 65 bytes.
+/// utsname's mutable pair — sethostname/setdomainname write these;
+/// every other field is fixed. 64-byte slots + a length like the
+/// ABI's 65-byte fields (trailing NUL is structural).
+static mut UTS_NODE: [u8; 64] = *b"rustux                                                          ";
+static mut UTS_DOMAIN: [u8; 64] = *b"(none)                                                          ";
+static mut UTS_NODE_LEN: usize = 6;
+static mut UTS_DOMAIN_LEN: usize = 6;
+
+/// sethostname/setdomainname's shared write: Linux truncates to
+/// 64 bytes (EINVAL past it), copies `len` raw bytes — the name
+/// needn't be NUL-terminated on input.
+fn uts_set(dst: &mut [u8; 64], dstlen: &mut usize, name: u64, len: u64) -> u64 {
+    if len > 64 {
+        return EINVAL;
+    }
+    if len != 0 && !range_ok(name, len) {
+        return EFAULT;
+    }
+    dst[..64].fill(0);
+    // SAFETY: name validated readable for len bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(name as *const u8, dst.as_mut_ptr(), len as usize)
+    };
+    *dstlen = len as usize;
+    0
+}
+
+/// sethostname(name, len): writes utsname's nodename slot.
+pub fn sys_sethostname(name: u64, len: u64) -> u64 {
+    let d = unsafe { &mut *core::ptr::addr_of_mut!(UTS_NODE) };
+    let l = unsafe { &mut *core::ptr::addr_of_mut!(UTS_NODE_LEN) };
+    uts_set(d, l, name, len)
+}
+
+/// setdomainname(name, len): writes utsname's domainname slot.
+pub fn sys_setdomainname(name: u64, len: u64) -> u64 {
+    let d = unsafe { &mut *core::ptr::addr_of_mut!(UTS_DOMAIN) };
+    let l = unsafe { &mut *core::ptr::addr_of_mut!(UTS_DOMAIN_LEN) };
+    uts_set(d, l, name, len)
+}
+
 pub fn sys_uname(buf: u64) -> u64 {
     if !range_ok_w(buf, 390) {
         return EFAULT;
@@ -10438,14 +10616,7 @@ pub fn sys_uname(buf: u64) -> u64 {
     } else {
         b"x86_64"
     };
-    let fields: [&[u8]; 6] = [
-        b"Rustux",
-        b"rustux",
-        b"0.1.0",
-        b"rustux kernel",
-        machine,
-        b"(none)",
-    ];
+    let fields: [&[u8]; 4] = [b"Rustux", b"", b"0.1.0", b"rustux kernel"];
     for (i, f) in fields.iter().enumerate() {
         // SAFETY: buf validated writable for 390 bytes; each field
         // starts zeroed at its 65-byte slot.
@@ -10457,6 +10628,29 @@ pub fn sys_uname(buf: u64) -> u64 {
                 f.len().min(64),
             );
         }
+    }
+    // nodename + machine + domainname — the live copies.
+    unsafe {
+        let nlen = *core::ptr::addr_of!(UTS_NODE_LEN);
+        core::ptr::write_bytes((buf + 65) as *mut u8, 0, 65);
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(UTS_NODE) as *const u8,
+            (buf + 65) as *mut u8,
+            nlen.min(64),
+        );
+        core::ptr::write_bytes((buf + 4 * 65) as *mut u8, 0, 65);
+        core::ptr::copy_nonoverlapping(
+            machine.as_ptr(),
+            (buf + 4 * 65) as *mut u8,
+            machine.len().min(64),
+        );
+        let dlen = *core::ptr::addr_of!(UTS_DOMAIN_LEN);
+        core::ptr::write_bytes((buf + 5 * 65) as *mut u8, 0, 65);
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(UTS_DOMAIN) as *const u8,
+            (buf + 5 * 65) as *mut u8,
+            dlen.min(64),
+        );
     }
     0
 }
