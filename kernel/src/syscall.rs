@@ -612,6 +612,13 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         197 => sys_removexattr(a1, a2),
         198 => sys_lremovexattr(a1, a2),
         199 => sys_fremovexattr(a1, a2),
+        // xattrat family: dfd-relative with AT_SYMLINK_NOFOLLOW +
+        // AT_EMPTY_PATH; set/get pack the tail args in xattr_args.
+        463 => sys_setxattrat(a1, a2, a3, a4, a5, a6),
+        464 => sys_getxattrat(a1, a2, a3, a4, a5, a6),
+        465 => sys_listxattrat(a1, a2, a3, a4, a5),
+        466 => sys_removexattrat(a1, a2, a3, a4),
+        447 => user::fd_memfd_secret(a1),
 
         NR_FUTEX_WAKE => user::sys_futex_wake(a1, a2, a3, a4),
         NR_FUTEX_WAIT => user::sys_futex_wait(ctx, a1, a2, a3, a4, a5, a6),
@@ -1687,6 +1694,149 @@ fn sys_fremovexattr(fd: u64, name: u64) -> u64 {
         Err(e) => return e,
     };
     match user::fd_xattr_vfi(fd) {
+        Ok(vfi) => user::fs_removexattr(vfi, &nb[..nn]),
+        Err(e) => e,
+    }
+}
+
+
+/// struct xattr_args { u64 value; u32 size; u32 flags } — the
+/// extensible packer setxattrat/getxattrat use for arg 5+6.
+/// copy_struct_from_user discipline: usize below VER0 (16) EINVAL,
+/// past a page E2BIG, and any nonzero tail past our 16 is E2BIG.
+fn copy_xattr_args(uargs: u64, usize_: u64) -> Result<(u64, u32, u32), u64> {
+    const E2BIG_: u64 = (-7i64) as u64;
+    if usize_ < 16 {
+        return Err(EINVAL);
+    }
+    if usize_ > 4096 {
+        return Err(E2BIG_);
+    }
+    if !user::range_ok(uargs, usize_) {
+        return Err(EFAULT);
+    }
+    // SAFETY: range_ok proved the window under the caller's cr3.
+    let (value, size, flags) = unsafe {
+        (
+            *(uargs as *const u64),
+            *((uargs + 8) as *const u32),
+            *((uargs + 12) as *const u32),
+        )
+    };
+    for i in 16..usize_ {
+        // SAFETY: same validated window.
+        if unsafe { *((uargs + i) as *const u8) } != 0 {
+            return Err(E2BIG_);
+        }
+    }
+    Ok((value, size, flags))
+}
+
+/// Shared dfd/path/at_flags resolution for the xattrat family:
+/// EMPTY_PATH on an empty-or-NULL path operates on dfd's own file;
+/// NOFOLLOW keeps the final link like the l* forms.
+fn xattrat_vfi(dfd: u64, path: u64, at_flags: u64) -> Result<usize, u64> {
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const EFAULT_: u64 = (-14i64) as u64;
+    if at_flags & AT_EMPTY_PATH != 0 {
+        let empty = if path == 0 {
+            true
+        } else {
+            if !user::range_ok(path, 1) {
+                return Err(EFAULT_);
+            }
+            // SAFETY: range_ok proved the byte.
+            unsafe { *(path as *const u8) == 0 }
+        };
+        if empty {
+            return user::fd_xattr_vfi(dfd);
+        }
+    }
+    let mut pbuf = [0u8; 257];
+    let pn = copy_user_path(path, &mut pbuf)?;
+    user::xattr_vfi(dfd, &pbuf[..pn], at_flags & AT_SYMLINK_NOFOLLOW == 0)
+}
+
+fn xattrat_flags_ok(at_flags: u64) -> bool {
+    at_flags & !(0x100 | 0x1000) == 0 // NOFOLLOW | EMPTY_PATH only
+}
+
+fn sys_setxattrat(
+    dfd: u64,
+    path: u64,
+    at_flags: u64,
+    name: u64,
+    uargs: u64,
+    usize_: u64,
+) -> u64 {
+    if !xattrat_flags_ok(at_flags) {
+        return EINVAL;
+    }
+    let (value, size, flags) = match copy_xattr_args(uargs, usize_) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let mut nb = [0u8; 256];
+    let nn = match copy_user_name(name, &mut nb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    match xattrat_vfi(dfd, path, at_flags) {
+        Ok(vfi) => user::fs_setxattr(vfi, &nb[..nn], value, size as u64, flags as u64),
+        Err(e) => e,
+    }
+}
+
+fn sys_getxattrat(
+    dfd: u64,
+    path: u64,
+    at_flags: u64,
+    name: u64,
+    uargs: u64,
+    usize_: u64,
+) -> u64 {
+    if !xattrat_flags_ok(at_flags) {
+        return EINVAL;
+    }
+    let (value, size, flags) = match copy_xattr_args(uargs, usize_) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if flags != 0 {
+        return EINVAL;
+    }
+    let mut nb = [0u8; 256];
+    let nn = match copy_user_name(name, &mut nb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    match xattrat_vfi(dfd, path, at_flags) {
+        Ok(vfi) => user::fs_getxattr(vfi, &nb[..nn], value, size as u64),
+        Err(e) => e,
+    }
+}
+
+fn sys_listxattrat(dfd: u64, path: u64, at_flags: u64, list: u64, size: u64) -> u64 {
+    if !xattrat_flags_ok(at_flags) {
+        return EINVAL;
+    }
+    match xattrat_vfi(dfd, path, at_flags) {
+        Ok(vfi) => user::fs_listxattr(vfi, list, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_removexattrat(dfd: u64, path: u64, at_flags: u64, name: u64) -> u64 {
+    if !xattrat_flags_ok(at_flags) {
+        return EINVAL;
+    }
+    let mut nb = [0u8; 256];
+    let nn = match copy_user_name(name, &mut nb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    match xattrat_vfi(dfd, path, at_flags) {
         Ok(vfi) => user::fs_removexattr(vfi, &nb[..nn]),
         Err(e) => e,
     }

@@ -18972,9 +18972,14 @@ pub fn fd_memfd_create(name: u64, flags: u64) -> u64 {
         vfile_stamp(v, 0o100777, 0);
     }
     // Mint the OFD + fd slot — the fd_open tail, minus path lookup.
-    // On EMFILE the inode dies with its slot: it is unlinked and
-    // nothing else names it.
     let Some(t) = cur_mut() else { return EBADF };
+    memfd_mint_ofd(t, i, flags & MFD_CLOEXEC != 0)
+}
+
+/// Mint an O_RDWR OFD + fd slot for an unlinked anonymous inode —
+/// the shared tail of memfd_create/memfd_secret. On EMFILE the
+/// orphan inode dies with its slot: nothing else names it.
+fn memfd_mint_ofd(t: &mut Task, i: usize, cloexec: bool) -> u64 {
     let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
     let Some(oi) = ofds.iter().position(Option::is_none) else {
         let vs = unsafe { &mut *core::ptr::addr_of_mut!(VFILES) };
@@ -18995,8 +19000,36 @@ pub fn fd_memfd_create(name: u64, flags: u64) -> u64 {
         accmode: 2, // memfd fds are always O_RDWR
     });
     fdt(t).fds[fi] = Some(oi as u16);
-    cloexec_set(t, fi, flags & MFD_CLOEXEC != 0);
+    cloexec_set(t, fi, cloexec);
     fi as u64
+}
+
+/// memfd_secret(flags): an anonymous secret-backed file — the same
+/// unlinked O_RDWR Ram inode memfd_create mints, minus the name
+/// label and opt-in sealing (Linux secretmem implements no seals;
+/// born with F_SEAL_SEAL so F_ADD_SEALS can't attach one either).
+/// "Secret" means no kernel page-table alias and hibernation-out
+/// upstream; our RAM fs never aliases file bytes into kernel maps
+/// to begin with, so the distinction is documentary. flags must be
+/// 0 — Linux EINVALs nonzero since none is defined yet.
+pub fn fd_memfd_secret(flags: u64) -> u64 {
+    if flags != 0 {
+        return EINVAL;
+    }
+    let i = vfile_create(b"memfd_secret:");
+    if (i as i64) < 0 {
+        return i;
+    }
+    let i = i as usize;
+    {
+        let Some(v) = vfile(i) else { return EBADF };
+        v.unlinked = true;
+        v.memfd = true;
+        v.seals = F_SEAL_SEAL;
+        vfile_stamp(v, 0o100777, 0);
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    memfd_mint_ofd(t, i, false)
 }
 
 /// Does `path` name anything in either namespace — access(2)'s only
