@@ -325,6 +325,96 @@ int main(void) {
         if (fd >= 0) close(fd);
     }
 
+    // Loop devices — /dev/loop-control + /dev/loopN (major 7):
+    // CTL_GET_FREE, SET_FD on a RAM backing file, reads/writes
+    // through both paths, GET_STATUS64, CLR_FD -> ENXIO.
+    {
+        int ctl = open("/dev/loop-control", O_RDWR);
+        check(ctl >= 0, "open /dev/loop-control");
+        int lno = ioctl(ctl, 0x4C82 /* LOOP_CTL_GET_FREE */);
+        check(lno == 0, "CTL_GET_FREE is 0");
+        // Unbound loop node opens (losetup needs the fd for
+        // SET_FD) but I/O on it fails — EIO at the transport.
+        int lf = open("/dev/loop0", O_RDWR);
+        check(lf >= 0, "unbound loop0 opens");
+        {
+            char b0[512];
+            check(pread(lf, b0, 512, 0) < 0 && errno == ENXIO,
+                  "unbound read ENXIO");
+            check(ioctl(lf, 0x4C01 /* LOOP_CLR_FD */) < 0
+                  && errno == ENXIO, "CLR unbound ENXIO");
+        }
+        close(lf);
+        // Backing: a 4-sector file in /tmp with a known pattern.
+        int bf = open("blkback.img", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        check(bf >= 0, "create backing file");
+        char pat[2048];
+        for (int i = 0; i < 2048; i++) pat[i] = (char)(i * 7 + 3);
+        check(write(bf, pat, 2048) == 2048, "fill backing pattern");
+        lf = open("/dev/loop0", O_RDWR);
+        check(lf >= 0, "open /dev/loop0 bound-fd");
+        check(ioctl(lf, 0x4C00 /* LOOP_SET_FD */, bf) == 0,
+              "LOOP_SET_FD");
+        // SET_FD twice is EBUSY.
+        check(ioctl(lf, 0x4C00, bf) < 0 && errno == EBUSY,
+              "SET_FD twice EBUSY");
+        // Capacity rides BLKGETSIZE64 like every block node.
+        unsigned long long sz = 0;
+        check(ioctl(lf, BLKGETSIZE64, &sz) == 0 && sz == 2048,
+              "loop BLKGETSIZE64 2048");
+        // Read through the loop node -> backing bytes.
+        char sec[512];
+        memset(sec, 0, sizeof(sec));
+        check(pread(lf, sec, 512, 512) == 512
+              && memcmp(sec, pat + 512, 512) == 0,
+              "loop read sees backing");
+        // Write through the loop node -> verify via the backing fd.
+        memset(sec, 0x41, sizeof(sec));
+        check(pwrite(lf, sec, 512, 0) == 512, "loop pwrite");
+        char back[512];
+        memset(back, 0, sizeof(back));
+        check(pread(bf, back, 512, 0) == 512 && back[0] == 0x41
+              && back[511] == 0x41, "backing got loop write");
+        // GET_STATUS64 reports the bind.
+        unsigned char info[232];
+        memset(info, 0, sizeof(info));
+        check(ioctl(lf, 0x4C05 /* LOOP_GET_STATUS64 */, info) == 0
+              && *(unsigned int *)(info + 40) == 0,
+              "GET_STATUS64 lo_number 0");
+        // SET_STATUS64 offset + sizelimit shrink the window.
+        memset(info, 0, sizeof(info));
+        *(unsigned long long *)(info + 24) = 512;  // lo_offset
+        *(unsigned long long *)(info + 32) = 1024; // lo_sizelimit
+        check(ioctl(lf, 0x4C04 /* LOOP_SET_STATUS64 */, info) == 0,
+              "SET_STATUS64");
+        sz = 0;
+        check(ioctl(lf, BLKGETSIZE64, &sz) == 0 && sz == 1024,
+              "offset+limit cap 1024");
+        memset(sec, 0, sizeof(sec));
+        check(pread(lf, sec, 512, 0) == 512
+              && memcmp(sec, pat + 512, 512) == 0,
+              "offset shifts window");
+        // CLR_FD detaches; the node is ENXIO again.
+        check(ioctl(lf, 0x4C01 /* LOOP_CLR_FD */) == 0,
+              "LOOP_CLR_FD");
+        close(lf);
+        lf = open("/dev/loop0", O_RDWR);
+        check(lf >= 0, "cleared loop reopens");
+        // Gates: SET_FD on a non-block fd, on a non-file backing.
+        check(ioctl(bf, 0x4C00, bf) < 0 && errno == ENOTTY,
+              "SET_FD on file ENOTTY");
+        check(ioctl(lf, 0x4C00, ctl) < 0 && errno == EINVAL,
+              "SET_FD dev backing EINVAL");
+        check(lf >= 0, "reopen loop0");
+        check(ioctl(lf, 0x4C00, bf) == 0, "rebind loop0");
+        memset(sec, 0, sizeof(sec));
+        check(pread(lf, sec, 512, 0) == 512 && sec[0] == 0x41,
+              "rebind sees writes");
+        check(ioctl(lf, 0x4C01) == 0, "final CLR_FD");
+        close(lf); close(bf); close(ctl);
+        unlink("blkback.img");
+    }
+
     char out[64];
     int n = snprintf(out, sizeof(out), "blktest: %d failure%s\n",
                      fails, fails == 1 ? "" : "s");

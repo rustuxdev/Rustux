@@ -9832,6 +9832,135 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 sf as u64
             }
         }
+        0x4C82 => {
+            // LOOP_CTL_GET_FREE — the allocator front door on
+            // /dev/loop-control; answers the first unbound index.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            if !vfile(*i).is_some_and(|v| v.rdev == (10 << 8 | 237)) {
+                return ENOTTY_;
+            }
+            let lps = unsafe { &*core::ptr::addr_of!(LOOPS) };
+            match lps.iter().position(Option::is_none) {
+                Some(i) => i as u64,
+                None => (-19i64) as u64, // ENODEV
+            }
+        }
+        0x4C00 => {
+            // LOOP_SET_FD — arg is the backing fd. The loop node
+            // must be unbound (EBUSY) and the backing must be a
+            // regular file (File slice or VFile); directories,
+            // devices and pipes are EINVAL like Linux.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            let Some(v) = vfile(*i) else { return ENOTTY_ };
+            if v.fmt != 0o60000 || v.rdev >> 8 != 7 {
+                return ENOTTY_;
+            }
+            let idx = (v.rdev & 0xff) as usize;
+            let lps = unsafe { &mut *core::ptr::addr_of_mut!(LOOPS) };
+            if lps[idx].is_some() {
+                return (-16i64) as u64; // EBUSY
+            }
+            let Some(bo) = ofd(t, arg) else { return EBADF };
+            let mut lp = Loop { file: None, ram: None, pin: None,
+                                off: 0, lim: 0, flags: 0 };
+            match bo.kind {
+                FdKind::File(sl) => lp.file = Some(sl),
+                FdKind::Ram(i) => {
+                    lp.ram = Some(i);
+                    // Pin the backing OFD so its VFile slot stays
+                    // owned while bound — an fd close must not let
+                    // an unrelated file take the slot.
+                    bo.refs += 1;
+                    lp.pin = Some(fd_to_ofd_idx(t, arg));
+                }
+                _ => return EINVAL,
+            }
+            // O_RDONLY loop (no write access on the loop fd)
+            // mirrors LO_FLAGS_READ_ONLY.
+            if o.accmode == 0 {
+                lp.flags = 1;
+            }
+            lps[idx] = Some(lp);
+            0
+        }
+        0x4C01 => {
+            // LOOP_CLR_FD — detach the backing. Unbound is ENXIO.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            let Some(v) = vfile(*i) else { return ENOTTY_ };
+            if v.fmt != 0o60000 || v.rdev >> 8 != 7 {
+                return ENOTTY_;
+            }
+            let idx = (v.rdev & 0xff) as usize;
+            let lps = unsafe { &mut *core::ptr::addr_of_mut!(LOOPS) };
+            match lps[idx].take() {
+                None => return (-6i64) as u64, // ENXIO
+                Some(lp) => {
+                    // Drop the backing pin — the fd's close path
+                    // can now reap the VFile normally.
+                    if let Some(oi) = lp.pin {
+                        if let Some(Some(bo)) = unsafe {
+                            (*core::ptr::addr_of_mut!(OFDS))
+                                .get_mut(oi as usize)
+                        } {
+                            bo.refs = bo.refs.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+            0
+        }
+        0x4C04 | 0x4C05 => {
+            // LOOP_SET_STATUS64 / LOOP_GET_STATUS64 — the 232-byte
+            // loop_info64; we honour lo_offset and lo_sizelimit
+            // (and the READ_ONLY flag) and report the rest honestly.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            let Some(v) = vfile(*i) else { return ENOTTY_ };
+            if v.fmt != 0o60000 || v.rdev >> 8 != 7 {
+                return ENOTTY_;
+            }
+            let idx = (v.rdev & 0xff) as usize;
+            let lps = unsafe { &mut *core::ptr::addr_of_mut!(LOOPS) };
+            let Some(lp) = lps[idx].as_mut() else {
+                return (-6i64) as u64; // ENXIO
+            };
+            if !range_ok_w(arg, 232) {
+                return EFAULT;
+            }
+            // SAFETY: validated 232-byte user window under cur cr3.
+            unsafe {
+                let p = arg as *mut u8;
+                if req == 0x4C04 {
+                    lp.off = (p.add(24) as *const u64).read();
+                    lp.lim = (p.add(32) as *const u64).read();
+                    lp.flags = (p.add(52) as *const u32).read();
+                } else {
+                    p.write_bytes(0, 232);
+                    let dev = ((7u64 << 8) | idx as u64) as u64;
+                    (p as *mut u64).write(dev);                    // lo_device
+                    (p.add(16) as *mut u64).write(dev);           // lo_rdevice
+                    (p.add(24) as *mut u64).write(lp.off);        // lo_offset
+                    (p.add(32) as *mut u64).write(lp.lim);        // lo_sizelimit
+                    (p.add(40) as *mut u32).write(idx as u32);    // lo_number
+                    (p.add(52) as *mut u32).write(lp.flags);      // lo_flags
+                }
+            }
+            0
+        }
+        0x4C07 => {
+            // LOOP_SET_CAPACITY — refresh capacity after the backing
+            // file grew. Ours is computed from the live window each
+            // access, so it's already fresh.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            let Some(v) = vfile(*i) else { return ENOTTY_ };
+            if v.fmt != 0o60000 || v.rdev >> 8 != 7 {
+                return ENOTTY_;
+            }
+            let idx = (v.rdev & 0xff) as usize;
+            if unsafe { &*core::ptr::addr_of!(LOOPS) }[idx].is_none() {
+                return (-6i64) as u64; // ENXIO
+            }
+            0
+        }
         0x5309 => {
             // CDROMEJECT — the ATAPI START STOP UNIT packet on the
             // secondary-channel CD drive. The fd must be an sr
@@ -14217,6 +14346,84 @@ struct DevPart {
 }
 static mut DEV_PARTS: [Option<DevPart>; 32] = [None; 32];
 
+/// A bound loop device — the backing fd's byte source captured at
+/// LOOP_SET_FD plus the SET_STATUS64 limits. `file` is an initrd
+/// slice (read-only), `ram` a VFile index (read-write).
+#[derive(Clone, Copy)]
+struct Loop {
+    file: Option<&'static [u8]>,
+    ram: Option<usize>,
+    /// OFD index pinned at SET_FD (Ram backings only — initrd
+    /// slices are immortal): keeps the VFile slot owned so an
+    /// unrelated file can't take it while bound.
+    pin: Option<u64>,
+    off: u64,
+    lim: u64,
+    flags: u32, // LO_FLAGS_READ_ONLY = bit0
+}
+static mut LOOPS: [Option<Loop>; 8] = [None; 8];
+
+/// The loop's mapped byte window: (backing ptr, usable len,
+/// writable). off shifts the start, lim caps the extent.
+fn loop_src(i: usize) -> Option<(*mut u8, usize, bool)> {
+    if i >= 8 {
+        return None;
+    }
+    let lp = unsafe { &*core::ptr::addr_of!(LOOPS) }[i].as_ref()?;
+    let (p, l, w) = if let Some(s) = lp.file {
+        (s.as_ptr() as *mut u8, s.len(), false)
+    } else {
+        let v = vfile(lp.ram?)?;
+        // LO_FLAGS_READ_ONLY makes a Ram backing read-only too.
+        (v.data, v.len, lp.flags & 1 == 0)
+    };
+    let lim = if lp.lim > 0 { lp.lim } else { u64::MAX };
+    let span = (l as u64).saturating_sub(lp.off).min(lim);
+    // SAFETY: span <= l - off <= l; the add stays inside the
+    // backing window.
+    Some((unsafe { p.add(lp.off as usize) }, span as usize, w))
+}
+
+/// Loop `i` capacity in bytes, sector-rounded. 0 when unbound —
+/// the blk_window arm relies on that to answer ENXIO.
+fn loop_capacity(i: usize) -> u64 {
+    loop_src(i).map(|(_, l, _)| l as u64 & !511).unwrap_or(0)
+}
+
+fn loop_read(i: usize, lba: u64, n: usize, b: &mut [u8]) -> bool {
+    let Some((p, l, _)) = loop_src(i) else { return false };
+    let need = lba as usize * 512 + n * 512;
+    if need > l || b.len() < n * 512 {
+        return false;
+    }
+    // SAFETY: need <= l inside the mapped window.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            p.add(lba as usize * 512),
+            b.as_mut_ptr(),
+            n * 512,
+        )
+    };
+    true
+}
+
+fn loop_write(i: usize, lba: u64, n: usize, b: &[u8]) -> bool {
+    let Some((p, l, w)) = loop_src(i) else { return false };
+    let need = lba as usize * 512 + n * 512;
+    if !w || need > l || b.len() < n * 512 {
+        return false;
+    }
+    // SAFETY: w proved the backing is a writable VFile; need <= l.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            b.as_ptr(),
+            p.add(lba as usize * 512),
+            n * 512,
+        )
+    };
+    true
+}
+
 /// The disk scan registers every partition entry that fits its
 /// parent — the /dev minors resolve against this table. Partition
 /// index is 1-based like the MBR slot order.
@@ -14243,7 +14450,7 @@ pub fn dev_part_add(major: u32, drv: usize, part: usize, lba: u64, sectors: u64)
 fn blk_window(rdev: u32) -> Option<(u32, usize, u64, u64)> {
     let major = rdev >> 8;
     let minor = (rdev & 0xff) as usize;
-    let (drv, part) = (minor / 16, minor % 16);
+    let (drv, part) = if major == 7 { (minor, 0) } else { (minor / 16, minor % 16) };
     // Whichever transport actually has this disk: the PIIX capacity
     // is 0 on AHCI machines, which made SEEK_END answer 0 and left
     // the installer unable to size the space after its first
@@ -14260,6 +14467,7 @@ fn blk_window(rdev: u32) -> Option<(u32, usize, u64, u64)> {
         254 => crate::virtio::disk_capacity(drv),
         259 => crate::nvme::disk_capacity(drv),
         65 => crate::virtio::scsi_capacity(drv),
+        7 => loop_capacity(drv),
         _ => return None,
     };
     if disk_cap == 0 {
@@ -14313,6 +14521,7 @@ fn blk_rd(t: u32, d: usize, lba: u64, n: usize, b: &mut [u8]) -> bool {
         }
         254 => crate::virtio::read_range(d, lba, n, b),
         65 => crate::virtio::scsi_read(d, lba, n, b),
+        7 => loop_read(d, lba, n, b),
         _ => crate::nvme::read_range(d, lba, n, b),
     }
 }
@@ -14328,6 +14537,7 @@ fn blk_wr(t: u32, d: usize, lba: u64, n: usize, b: &[u8]) -> bool {
         }
         254 => crate::virtio::write_range(d, lba, n, b),
         65 => crate::virtio::scsi_write(d, lba, n, b),
+        7 => loop_write(d, lba, n, b),
         _ => crate::nvme::write_range(d, lba, n, b),
     }
 }
@@ -14511,7 +14721,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             // Block devices read at the OFD position — sector I/O
             // through a kernel bounce buffer.
             match v.rdev >> 8 {
-                8 | 65 | 254 | 259 => return blk_read(o, v.rdev, buf, len),
+                7 | 8 | 65 | 254 | 259 => return blk_read(o, v.rdev, buf, len),
                 _ => {}
             }
             match v.rdev {
@@ -14836,7 +15046,7 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         // Block devices write at the OFD position; partial sectors
         // read-modify-write through a kernel bounce buffer.
         match v.rdev >> 8 {
-            8 | 65 | 254 | 259 => return blk_write(o, v.rdev, buf, len),
+            7 | 8 | 65 | 254 | 259 => return blk_write(o, v.rdev, buf, len),
             _ => {}
         }
         const ENOSPC_: u64 = (-28i64) as u64;
@@ -15963,6 +16173,31 @@ pub fn dev_init() {
                 vfile_stamp(v, 0o660, 0);
                 v.fmt = 0o20000; // S_IFCHR
                 v.rdev = 243 << 8;
+            }
+        }
+    }
+    // /dev/loop-control — the misc-device allocator front door
+    // (char 10:237); /dev/loop0-7 block nodes ride major 7 — they
+    // exist unbound, the open gate answers ENXIO until SET_FD.
+    {
+        let r = vfile_create(b"dev/loop-control");
+        if (r as i64) >= 0 {
+            if let Some(v) = vfile(r as usize) {
+                vfile_stamp(v, 0o660, 0);
+                v.fmt = 0o20000; // S_IFCHR
+                v.rdev = (10 << 8) | 237;
+            }
+        }
+        let mut name = *b"dev/loop0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        for i in 0..8u32 {
+            name[8] = b'0' + i as u8;
+            let r = vfile_create(&name[..9]);
+            if (r as i64) >= 0 {
+                if let Some(v) = vfile(r as usize) {
+                    vfile_stamp(v, 0o660, 0);
+                    v.fmt = 0o60000; // S_IFBLK
+                    v.rdev = (7 << 8) | i;
+                }
             }
         }
     }
@@ -17135,6 +17370,9 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                     // the installer could see /dev/sda (access()
                     // passes on the node) but never open it.
                     8 | 65 | 254 | 259 if blk_capacity(v.rdev) > 0 => i,
+                    // Loop minors open unbound — losetup needs the
+                    // fd for LOOP_SET_FD; reads fail at transport.
+                    7 => i,
                     8 | 65 | 254 | 259 => return ENXIO,
                     // /dev/sr0 — the ATAPI CD drive. No sector I/O
                     // (read/write are ENXIO below); it exists for
@@ -17213,6 +17451,9 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                         // /dev/nvme0 — the controller char node.
                         243 if crate::nvme::disks() > 0 => i,
                         243 => return ENXIO,
+                        // misc devices — /dev/loop-control always
+                        // exists (the loop allocator front door).
+                        10 => i,
                         // input core — evdev event nodes.
                         13 => i,
                         _ => return ENODEV,
@@ -18190,7 +18431,7 @@ pub fn fd_pread(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
             let saved = o.pos;
             o.pos = pos as usize;
             let r = match rdev >> 8 {
-                8 | 65 | 254 | 259 => blk_read(o, rdev, buf, len),
+                7 | 8 | 65 | 254 | 259 => blk_read(o, rdev, buf, len),
                 _ => {
                     o.pos = saved;
                     return ESPIPE_;
@@ -18286,7 +18527,7 @@ pub fn fd_pwrite(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
             let saved = o.pos;
             o.pos = pos as usize;
             let r = match rdev >> 8 {
-                8 | 65 | 254 | 259 => blk_write(o, rdev, buf, len),
+                7 | 8 | 65 | 254 | 259 => blk_write(o, rdev, buf, len),
                 _ => {
                     o.pos = saved;
                     return ESPIPE_;
