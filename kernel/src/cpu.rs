@@ -115,15 +115,38 @@ struct Tss {
 #[repr(align(16))]
 struct DfStack(#[allow(dead_code)] [u8; 8192]);
 
-static mut TSS: Tss = Tss {
-    _r0: 0,
-    _rsp: [0; 3],
-    _r1: 0,
-    ist: [0; 7],
-    _r2: 0,
-    _r3: 0,
-    iopb: 0,
+/// The TSS plus the space ioperm needs: the I/O permission bitmap is
+/// addressed as an OFFSET from the TSS base, so it must sit in the
+/// same static to stay contiguous. A set bit denies its port at
+/// CPL3; Linux's trailing all-ones byte covers the multi-byte port
+/// access that runs past bit 65535. The descriptor limit is widened
+/// to include the bitmap in init() — iopb past the limit means
+/// "deny all" (the no-ioperm default), which the 0xFF fill provides.
+#[repr(C)]
+struct TssBlock {
+    tss: Tss,
+    iomap: [u8; 8192],
+    tail: u8,
+}
+static mut TSSB: TssBlock = TssBlock {
+    tss: Tss { _r0: 0, _rsp: [0; 3], _r1: 0, ist: [0; 7], _r2: 0, _r3: 0, iopb: 0 },
+    iomap: [0xff; 8192],
+    tail: 0xff,
 };
+
+/// Swap the live I/O bitmap for the incoming task: `src` is the
+/// task-group's 8K deny bitmap, or null for deny-all. Called at every
+/// context-switch site; the unconditional copy is ~1µs at this scale
+/// and keeps the TSS honest even after a same-tgid ioperm mutation.
+pub fn load_iomap(src: *const u8) {
+    let b = unsafe { &mut *core::ptr::addr_of_mut!(TSSB) };
+    if src.is_null() {
+        b.iomap = [0xff; 8192];
+    } else {
+        // SAFETY: src names a live 8K task bitmap (IOPS slot).
+        unsafe { b.iomap.copy_from_slice(&*(src as *const [u8; 8192])) };
+    }
+}
 
 static mut DF_STACK: DfStack = DfStack([0; 8192]);
 static mut INTR_STACK: DfStack = DfStack([0; 8192]);
@@ -599,14 +622,15 @@ pub fn init() {
     // address only exists at runtime.
     // SAFETY: single-threaded; the statics are written once, before ltr.
     unsafe {
-        let tss = core::ptr::addr_of_mut!(TSS);
+        let tb = core::ptr::addr_of_mut!(TSSB);
+        let tss = core::ptr::addr_of_mut!((*tb).tss);
         (*tss).iopb = core::mem::size_of::<Tss>() as u16;
         (*tss).ist[0] = core::ptr::addr_of!(DF_STACK) as u64 + 8192;
         // CPL3->CPL0 interrupt entries (e.g. the LAPIC timer firing
         // while user code runs) get a dedicated kernel stack.
         (*tss)._rsp[0] = core::ptr::addr_of!(INTR_STACK) as u64 + 8192;
         let (lo, hi) =
-            tss_descriptor(tss as u64, core::mem::size_of::<Tss>() as u64 - 1);
+            tss_descriptor(tss as u64, core::mem::size_of::<TssBlock>() as u64 - 1);
         let gdt = core::ptr::addr_of_mut!(GDT);
         (*gdt)[3] = lo;
         (*gdt)[4] = hi;

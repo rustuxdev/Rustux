@@ -679,6 +679,8 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         306 => user::sys_syncfs(a1),
         170 => user::sys_sethostname(a1, a2),
         171 => user::sys_setdomainname(a1, a2),
+        172 => user::sys_iopl(ctx, a1),
+        173 => user::sys_ioperm(a1, a2, a3),
         285 => user::sys_fallocate(a1, a2, a3 as i64, a4 as i64),
         295 => user::fd_preadv(a1, a2, a3, a4 as i64),
         296 => user::fd_pwritev(a1, a2, a3, a4 as i64),

@@ -1914,6 +1914,15 @@ static BAL_BUSY: AtomicU32 = AtomicU32::new(0);
 static BAL_INF_LOGGED: AtomicU32 = AtomicU32::new(0);
 static BAL_DEF_LOGGED: AtomicU32 = AtomicU32::new(0);
 
+/// Frames the balloon currently holds for the host — counted as used
+/// by free_frames but guaranteed returnable on deflate. The task-leak
+/// window adds these back: a `before` sampled mid-inflation would
+/// otherwise read a false 4K-frame "leak" that the deflate repays
+/// mid-suite (the run-333 flake).
+pub fn balloon_held() -> u64 {
+    unsafe { *core::ptr::addr_of!(BAL_HELD_N) as u64 }
+}
+
 /// Remove `pfn` from the held registry — returns true when the
 /// balloon actually owned it.
 fn held_remove(pfn: u32) -> bool {

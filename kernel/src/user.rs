@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 119;
+const MAX_TASKS: usize = 120;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -1360,7 +1360,10 @@ pub fn rt_sigreturn32(ctx: &mut UCtx) -> u64 {
     ctx.rax = r32(44);
     ctx.rip = r32(56);
     ctx.cs = cpu::UC32_SEL as u64; // pinned
-    ctx.rflags = (r32(64) & 0x0033_ffff) | 0x200;
+    // IOPL is never frame-restorable — take the task's current bits
+    // like Linux's FIX_EFLAGS, or sigframe forgery grants itself
+    // IOPL=3 and every port opens with no CAP_SYS_RAWIO anywhere.
+    ctx.rflags = (r32(64) & 0x0030_ffff) | (ctx.rflags & 0x3000) | 0x200;
     ctx.rsp = r32(68); // sp_at_signal
     ctx.ss = 0x2b | 3; // pinned
     t.sigmask = r32(80) as u32; // oldmask
@@ -2149,7 +2152,12 @@ pub fn sigreturn(ctx: &mut UCtx) -> u64 {
     };
     saved.cs = 0x33;
     saved.ss = 0x2b;
-    saved.rflags = (saved.rflags | 0x2) & !(0x100 | 0x3000 | 0x4000);
+    // TF/NT never come back from a user frame, and IOPL is never
+    // frame-restorable — carry the task's own bits over (the frame
+    // can't raise it, and a legit iopl'd task keeps it, same as
+    // Linux's FIX_EFLAGS handling in restore_sigcontext).
+    saved.rflags =
+        ((saved.rflags | 0x2) & !(0x100 | 0x3000 | 0x4000)) | (ctx.rflags & 0x3000);
     // rsp == stack_top is legal (empty stack): require the byte
     // BELOW rsp — the first push target — to be writable user space.
     if saved.rip >= 0x8000_0000_0000
@@ -3229,6 +3237,7 @@ impl Task {
         self.release_sighand();
         self.release_fstab();
         aio_release_tgid(self.tgid);
+        iop_release_tgid(self.tgid);
         // NT handle table dies with the Task: refdown whatever its
         // slots still name or the NT_THREADS/NT_PROCS/NT_SECTIONS
         // ledgers leak an entry per abandoned handle. Idempotent —
@@ -20453,6 +20462,7 @@ pub fn nt_thread_create(
     // exit can't free frames this mm still maps.
     shm_pin_all(&c);
     secfilt_share(c.filtmask);
+    iop_inherit(p.tgid, c.tgid);
     tasks[slot] = Some(c);
     PROCS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Some((idx, tid))
@@ -38122,6 +38132,7 @@ pub fn launch() {
         // SAFETY: MSR write of a task-owned user FS base.
         unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
         unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
+        cpu::load_iomap(iop_map(t.tgid));
         let pid = t.pid;
         let rip = t.ctx.rip;
         let ex = core::str::from_utf8(
@@ -38161,6 +38172,7 @@ fn switch_to(n: usize) -> ! {
         for (i, &d) in t.tls.iter().enumerate() {
             cpu::install_tls(i, d);
         }
+        cpu::load_iomap(iop_map(t.tgid));
         (&t.ctx as *const UCtx, t.pml4, t.kstack_top, t.gs_sel)
     };
     // 0 clears the segment: harmless in 64-bit mode (the MSR base
@@ -38528,6 +38540,7 @@ fn resume_ctx(n: usize) -> *const UCtx {
     // the task across switches, same as launch/switch_to.
     unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
     unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
+    cpu::load_iomap(iop_map(t.tgid));
     &t.ctx
 }
 
@@ -38994,6 +39007,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
     c.tgid = c.pid; // a fork child leads its own group
     let cpid = c.pid;
     secfilt_share(c.filtmask);
+    iop_inherit(p.tgid, c.tgid);
     tasks[slot] = Some(c);
     PROCS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     cpid
@@ -39198,6 +39212,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
     // by shm_drop_all at this task's teardown.
     shm_pin_all(&c);
     secfilt_share(c.filtmask);
+    iop_inherit(p.tgid, c.tgid);
     tasks[slot] = Some(c);
     PROCS_CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     cpid
@@ -40390,6 +40405,116 @@ fn aio_find(id: u64, tgid: u64) -> Option<usize> {
 /// A task dying: drop its tgid's contexts once no sibling thread
 /// keeps the process (and its address space) alive — Linux frees
 /// the kioctx at mm teardown, which is the last CLONE_VM sharer.
+// ---- ioperm(173)/iopl(172): per-tgid I/O port permissions --------
+//
+// Linux keeps the 8K deny bitmap in io_context — shared by threads
+// (CLONE_IO) and copied at fork. The tgid key gives the same shape:
+// CLONE_THREAD members share one entry, a fork child gets a copy of
+// its parent's. A set bit denies the port at CPL3 (the TSS iomap is
+// a deny map); iopl rides the task's saved rflags IOPL bits, which
+// the CPU honors ahead of the bitmap — no per-task bitmap check.
+const IOPS_N: usize = 8;
+struct IopCtx {
+    tgid: u64,
+    map: [u8; 8192],
+}
+static mut IOPS: [Option<IopCtx>; IOPS_N] = [None, None, None, None, None, None, None, None];
+fn iops() -> &'static mut [Option<IopCtx>; IOPS_N] {
+    unsafe { &mut *core::ptr::addr_of_mut!(IOPS) }
+}
+
+/// The live bitmap for a tgid — what load_iomap wants on a switch.
+/// Null when the group never called ioperm (deny-all default).
+fn iop_map(tgid: u64) -> *const u8 {
+    match iops().iter().flatten().find(|c| c.tgid == tgid) {
+        Some(c) => c.map.as_ptr(),
+        None => core::ptr::null(),
+    }
+}
+
+/// A copy of `from`'s bitmap minted for `to` (a fork child's new
+/// group). Same-tgid children share the slot — nothing to do.
+fn iop_inherit(from: u64, to: u64) {
+    if from == to {
+        return;
+    }
+    let Some(src) = iops().iter().position(|c| matches!(c, Some(c) if c.tgid == from)) else {
+        return;
+    };
+    let Some(dst) = iops().iter().position(|c| c.is_none()) else {
+        return; // table full: child starts denied — a resource cap, not corruption
+    };
+    let map = iops()[src].as_ref().unwrap().map;
+    iops()[dst] = Some(IopCtx { tgid: to, map });
+}
+
+fn iop_release_tgid(tgid: u64) {
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    if tasks.iter().flatten().any(|t| t.tgid == tgid && t.state != TaskState::Exited) {
+        return;
+    }
+    for c in iops().iter_mut() {
+        if matches!(c, Some(c) if c.tgid == tgid) {
+            *c = None;
+        }
+    }
+}
+
+/// ioperm(from, num, on): grant or deny a port range. CAP_SYS_RAWIO.
+pub fn sys_ioperm(from: u64, num: u64, on: u64) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const ENOSPC_: u64 = (-28i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL };
+    let (uid, tgid) = (t.uid, t.tgid);
+    if uid != 0 {
+        return EPERM_;
+    }
+    if from.checked_add(num).is_none_or(|end| end <= from || end > 65536) {
+        return EINVAL;
+    }
+    let i = match iops().iter().position(|c| matches!(c, Some(c) if c.tgid == tgid))
+        .or_else(|| iops().iter().position(|c| c.is_none()))
+    {
+        Some(i) => i,
+        None => return ENOSPC_,
+    };
+    if iops()[i].is_none() {
+        iops()[i] = Some(IopCtx { tgid, map: [0xff; 8192] });
+    }
+    let map = &mut iops()[i].as_mut().unwrap().map;
+    for p in from..from + num {
+        let b = (p / 8) as usize;
+        let m = 1 << (p % 8);
+        if on != 0 {
+            map[b] &= !m; // bit clear -> port allowed
+        } else {
+            map[b] |= m;
+        }
+    }
+    // The running task expects the grant to apply NOW — refresh the
+    // TSS copy (the next switch reloads anyway, but this task won't
+    // yield between the syscall and its first in/out).
+    cpu::load_iomap(map.as_ptr());
+    0
+}
+
+/// iopl(level): IOPL travels in the task's saved rflags (bits 13:12);
+/// the iret/sysret return path installs it. Raising past the current
+/// level needs CAP_SYS_RAWIO — lowering is always allowed.
+pub fn sys_iopl(ctx: &mut UCtx, level: u64) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    if level > 3 {
+        return EINVAL;
+    }
+    let cur = (ctx.rflags >> 12) & 3;
+    let Some(t) = cur_mut() else { return EINVAL };
+    if level > cur && t.uid != 0 {
+        return EPERM_;
+    }
+    ctx.rflags = (ctx.rflags & !0x3000) | (level << 12);
+    0
+}
+
 fn aio_release_tgid(tgid: u64) {
     let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
     let alive = tasks.iter().flatten().any(|t| {

@@ -1734,9 +1734,12 @@ pub(crate) fn rustux_main(
     });
     // Boot-time /dev population — device nodes and their links are
     // kernel-lifetime objects like the initrd, so they belong outside
-    // the task-leak window.
+    // the task-leak window. Balloon-held frames are added back on both
+    // sides of the window: a QMP inflate racing the `before` sample
+    // (the balloonfeed script hits `balloon 1008` early in boot)
+    // reads as a 4K-frame "leak" the deflate repays mid-suite.
     user::dev_init();
-    let before = kalloc::free_frames();
+    let before = kalloc::free_frames() + virtio::balloon_held();
     let mut queued = 0u32;
     // Capture the fninit FPU image tasks start from — must run
     // before the first spawn copies INIT_FX into its Task.
@@ -1823,7 +1826,7 @@ pub(crate) fn rustux_main(
     // Enters the scheduler; returns when the last task has exited.
     user::launch();
     user::reap_all();
-    let after = kalloc::free_frames();
+    let after = kalloc::free_frames() + virtio::balloon_held();
     kprintln!(con, "rustux: tasks: {} ran, frames {} -> {} after reap{} (slab {})", queued, before, after,
         if after == before { " (zero leak)" } else { " (LEAK)" }, kalloc::slab_pages());
     kprintln!(
