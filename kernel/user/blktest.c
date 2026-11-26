@@ -141,6 +141,45 @@ int main(void) {
         close(fd);
     }
 
+    // ---- /dev/nvme0n3 — the GPT-partitioned namespace (259:32) ----
+    fd = open("/dev/nvme0n3", O_RDWR);
+    check(fd >= 0, "open nvme0n3");
+    if (fd >= 0) {
+        check(fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)
+              && major(st.st_rdev) == 259 && minor(st.st_rdev) == 32,
+              "fstat S_IFBLK 259:32");
+        // Sector 0 carries the protective MBR, not a partition.
+        check(pread(fd, sec, 512, 0) == 512
+              && (unsigned char)sec[510] == 0x55
+              && (unsigned char)sec[511] == 0xaa
+              && (unsigned char)sec[446 + 4] == 0xee,
+              "ns3 protective MBR");
+        close(fd);
+    }
+
+    // ---- /dev/nvme0n3p1 — the GPT partition window (259:33) ----
+    fd = open("/dev/nvme0n3p1", O_RDWR);
+    check(fd >= 0, "open nvme0n3p1");
+    if (fd >= 0) {
+        check(fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)
+              && major(st.st_rdev) == 259 && minor(st.st_rdev) == 33,
+              "fstat S_IFBLK 259:33");
+        check(ioctl(fd, BLKGETSIZE64, &cap) == 0 && cap > 0,
+              "gpt part BLKGETSIZE64");
+        check(pread(fd, sec, 4, 1080) == 4
+              && (unsigned char)sec[0] == 0x53
+              && (unsigned char)sec[1] == 0xef,
+              "gpt part ext4 magic");
+        check(pread(fd, sec, 512, cap - 512) == 512,
+              "gpt part last sector");
+        close(fd);
+    }
+    // GPT minor 2 was never registered — the entry table holds
+    // one partition, so p2 must ENXIO.
+    check(mknod("n3p2.nod", S_IFBLK | 0600, makedev(259, 34)) == 0
+          && open("n3p2.nod", O_RDWR) < 0 && errno == ENXIO,
+          "gpt unregistered minor ENXIO");
+
     // ---- /dev/nvme0n1p1 — the NVMe partition node (259:1) ----
     fd = open("/dev/nvme0n1p1", O_RDWR);
     check(fd >= 0, "open nvme0n1p1");

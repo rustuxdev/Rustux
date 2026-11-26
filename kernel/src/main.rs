@@ -117,6 +117,139 @@ pub(crate) fn boot_map() -> &'static [mm::MapEnt] {
 /// prefix ("etc", "etc/apt"); `depth`, `budget` and `copied` bound
 /// the walk, so a hostile or damaged root cannot exhaust the kernel
 /// stack, the vfile table, or the heap.
+/// GPT partition walk for one disk whose protective MBR carries
+/// 0xEE: validate the header (signature, size, header CRC), bound
+/// the entry array inside the disk, verify the entry-array CRC,
+/// then fill `parts` by GPT entry index — part number = index+1,
+/// so a sparse table keeps Linux's pN numbering. Only indices
+/// 1..=15 fit the /dev minor nibble; later entries are skipped.
+/// Nothing registers on a bad header or CRC — a malformed table
+/// yields no nodes rather than wrong ones.
+fn gpt_scan(io: &ext2::DiskIo, total: u64, parts: &mut [(u64, u64, u64); 15]) {
+    let mut hdr = [0u8; 512];
+    if !ext2::BlockIo::read(io, 512, &mut hdr) {
+        crate::log::printk(format_args!("rustux: gpt: lba1 read failed"));
+        return;
+    }
+    if &hdr[..8] != b"EFI PART" {
+        crate::log::printk(format_args!(
+            "rustux: gpt: bad sig {:02x}{:02x}{:02x}{:02x}",
+            hdr[0], hdr[1], hdr[2], hdr[3]));
+        return;
+    }
+    let rd32 = |o: usize| u32::from_le_bytes(hdr[o..o + 4].try_into().unwrap());
+    let rd64 = |o: usize| u64::from_le_bytes(hdr[o..o + 8].try_into().unwrap());
+    let hsz = rd32(12) as usize;
+    if !(92..=512).contains(&hsz) {
+        return;
+    }
+    let want_crc = rd32(16);
+    let mut h = [0u8; 512];
+    h[..hsz].copy_from_slice(&hdr[..hsz]);
+    h[16..20].copy_from_slice(&[0; 4]);
+    if !klib::crc::crc32_le(!0, &h[..hsz]) != want_crc {
+        crate::log::printk(format_args!(
+            "rustux: gpt: hdr crc got={:#x} want={:#x}",
+            !klib::crc::crc32_le(!0, &h[..hsz]), want_crc));
+        return;
+    }
+    let elba = rd64(72);
+    let nent = rd32(80) as u64;
+    let esz = rd32(84) as u64;
+    let first_usable = rd64(40);
+    let last_usable = rd64(48);
+    // Entry size is an architected multiple of 8 >= 128; the array
+    // must fit the disk and stay under a chunk-sane region size.
+    if !(128..=1024).contains(&esz)
+        || !esz.is_multiple_of(8)
+        || nent == 0 || nent > 4096
+        || elba.checked_mul(512).is_none_or(|b| b >= total)
+        || nent.checked_mul(esz).is_none_or(|b| {
+            b > (1 << 19)
+                || elba
+                    .checked_mul(512)
+                    .and_then(|e| e.checked_add(b))
+                    .is_none_or(|t| t > total)
+        })
+        // The usable range itself must be sane: entries claiming
+        // first==0 (the MBR) or past the disk get rejected below,
+        // but only if these fields mean anything.
+        || first_usable == 0
+        || last_usable < first_usable
+        || last_usable
+            .checked_add(1)
+            .is_none_or(|l| l > total / 512)
+    {
+        return;
+    }
+    // Stream the array sector-at-a-time: accumulate the CRC and
+    // parse each fully-contained entry in the same pass. A bad CRC
+    // clears everything — parts are only committed on a verified
+    // table.
+    let ebytes = nent * esz;
+    let escrc = rd32(88);
+    let mut crc = !0u32;
+    let mut off = 0u64;
+    let mut sec = [0u8; 512];
+    let mut registered = 0u32;
+    let mut io_ok = true;
+    while off < ebytes {
+        if !ext2::BlockIo::read(io, elba * 512 + off, &mut sec) {
+            io_ok = false;
+            break;
+        }
+        let take = (ebytes - off).min(512) as usize;
+        crc = klib::crc::crc32_le(crc, &sec[..take]);
+        // Entries fully inside this chunk: entry i sits at i*esz
+        // from the array start.
+        let mut i = off.div_ceil(esz);
+        while i < nent && i * esz + esz <= off + take as u64 {
+            let ein = (i * esz - off) as usize;
+            let e = &sec[ein..ein + esz as usize];
+            if !e[..16].iter().all(|b| *b == 0) {
+                let first =
+                    u64::from_le_bytes(e[32..40].try_into().unwrap());
+                let last =
+                    u64::from_le_bytes(e[40..48].try_into().unwrap());
+                // Within the usable range AND the disk — a lying
+                // entry can't reach past either bound.
+                if last >= first
+                    && first >= first_usable
+                    && last <= last_usable
+                    && !last
+                        .checked_add(1)
+                        .is_none_or(|l| l > total / 512)
+                {
+                    let pidx = i + 1;
+                    if pidx <= 15 {
+                        parts[(pidx - 1) as usize] = (
+                            first,
+                            last - first + 1,
+                            u32::from_le_bytes(e[0..4].try_into().unwrap())
+                                as u64,
+                        );
+                        registered += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        off += take as u64;
+    }
+    if !io_ok || !crc != escrc {
+        parts.fill((0, 0, 0));
+        crate::log::printk(format_args!(
+            "rustux: gpt: entry-array CRC mismatch — table rejected"
+        ));
+        return;
+    }
+    if registered > 0 {
+        crate::log::printk(format_args!(
+            "rustux: gpt: {registered} partition(s) registered ({nent} entries)"
+        ));
+    }
+}
+
 fn copy_root_dir(
     io: &dyn ext2::BlockIo,
     sb: &ext2::Super,
@@ -1358,19 +1491,34 @@ pub(crate) fn rustux_main(
             if &mbr[54..57] == b"FAT" || &mbr[82..85] == b"FAT" {
                 continue;
             }
-            for slot in 0..4usize {
-                let e = &mbr[446 + slot * 16..446 + slot * 16 + 16];
-                let ptype = e[4];
-                let start = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
-                let count = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64;
-                if ptype == 0 || count == 0 {
+            // The disk's advertised partitions: (start lba,
+            // sectors, type tag). MBR fills slot order 1-4; a
+            // protective 0xEE entry switches to the GPT walk, which
+            // fills by GPT entry index 1-15 (the minor nibble cap).
+            let mut parts = [(0u64, 0u64, 0u64); 15];
+            let gpt = (0..4usize).any(|s| mbr[446 + s * 16 + 4] == 0xee);
+            if gpt {
+                gpt_scan(&io, total, &mut parts);
+            } else {
+                for slot in 0..4usize {
+                    let e = &mbr[446 + slot * 16..446 + slot * 16 + 16];
+                    let ptype = e[4];
+                    let start =
+                        u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
+                    let count =
+                        u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64;
+                    let size = count * 512;
+                    if ptype != 0 && count != 0 && start * 512 + size <= total {
+                        parts[slot] = (start, count, ptype as u64);
+                    }
+                }
+            }
+            for (slot, &(start, count, ptype)) in parts.iter().enumerate() {
+                if count == 0 {
                     continue;
                 }
                 let base = start * 512;
                 let size = count * 512;
-                if base + size > total {
-                    continue;
-                }
                 // Register the partition's /dev minor — every valid
                 // entry gets a node, mounted fs or not, like udev.
                 let (tr, tdrv) = ext2::transport(d);

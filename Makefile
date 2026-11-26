@@ -121,6 +121,11 @@ $(EXT4_TEST): FORCE
 # partition holding the ext4 test filesystem — the boot scan mounts it
 # over the virtqueue datapath, end-to-end.
 VIRTIO_DISK := kernel/src/virtio_test.img
+# GPT-partitioned twin: the scan must mount the ext4 partition via
+# the GPT path, not the MBR path.
+GPT_DISK := kernel/src/gpt_test.img
+$(GPT_DISK): $(EXT4_TEST) tools/mkgpt.py
+	python3 tools/mkgpt.py $@ $(EXT4_TEST)
 $(VIRTIO_DISK): $(EXT4_TEST)
 	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
 	dd if=$(EXT4_TEST) of=$@ bs=512 seek=2048 conv=notrunc 2>/dev/null
@@ -142,7 +147,7 @@ $(ESP_IMG): $(KERNEL) $(INITRD)
 	mcopy -i $@ $(KERNEL) ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@ $(INITRD) ::/initrd.cpio
 
-run: build $(VIRTIO_DISK)
+run: build $(VIRTIO_DISK) $(GPT_DISK)
 	$(QEMU) \
 		-machine q35 \
 		-m 1G \
@@ -152,9 +157,11 @@ run: build $(VIRTIO_DISK)
 		-drive file=$(VIRTIO_DISK),format=raw,if=virtio \
 		-drive file=$(VIRTIO_DISK),format=raw,if=none,id=nvm0 \
 		-drive file=$(VIRTIO_DISK),format=raw,if=none,id=nvm1 \
+		-drive file=$(GPT_DISK),format=raw,if=none,id=nvm2 \
 		-device nvme,id=nvme0,serial=nv0 \
 		-device nvme-ns,drive=nvm0,nsid=1 \
 		-device nvme-ns,drive=nvm1,nsid=2 \
+		-device nvme-ns,drive=nvm2,nsid=3 \
 		-netdev user,id=n0 -device e1000e,netdev=n0 \
 		-netdev user,id=n1 -device virtio-net-pci-non-transitional,netdev=n1 \
 		-snapshot \
