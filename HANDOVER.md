@@ -8342,3 +8342,24 @@ WNOHANG-vs-WNOWAIT mask slip in the peek check); the kernel needed
 no fixes after the first green run. lstest floor 80->81, 108
 tasks, zero leak. Audit run-77: 0 confirmed — the waitid info-leak
 family (rusage/uninit-siginfo/io_uring classes) is all n/a.
+run-319 lands chroot(161) — the first namespace-flavored rung. FsTab
+grows a shared root field beside cwd (CLONE_FS siblings share the
+jail, non-CLONE_FS children get a copy). canon takes a floor param:
+'..' pops clamp at the root's byte-depth, absolute paths strip '/'
+and join the jail as base, and resolve_links re-roots absolute
+symlink targets the same way while relative targets floor at the
+link's own dir. sys_chroot mirrors sys_chdir (EPERM on uid!=0,
+ENOTDIR/ENOENT, cwd NOT moved — Linux keeps the escaped-cwd
+semantics). getcwd rewrites jail-relative: cwd==root prints bare
+'/', cwd outside prints '(unreachable)/<global-cwd>' — and glibc's
+getcwd masks that marker by inode-walking '..' anyway, so the test
+uses the raw syscall. Two subtle traps cost real debugging: inside
+a jail chdir("/jail/sub") is ENOENT not sub (absolute re-roots), and
+the "6-frame leak" turned out to be accounting noise — each
+persistent ramfs vfile with data kmalloc(4096)s, which with the
+16B header overflows 4096 into KIND_DIRECT order-1 (2 buddy frames
+held per file while it lives; freed at unlink). chrtest now cleans
+up /jail. lstest floor 81->82. Audit run-78: 0 confirmed — 11-item
+escape checklist verified (..' clamp, abs paths, symlink re-root,
+proc/self/{cwd,root} resolve inside the jail, sibling-prefix check,
+CLONE_FS sharing, escaped-cwd/fd-passing mirrored as Linux does).
