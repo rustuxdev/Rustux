@@ -8208,3 +8208,25 @@ this rung (mcopy "Disk full"). Two test-side catches: a vacuous
 check (== binds tighter than |) and a flags=3-vs-2 confusion on
 the NUMA combo probe — both gcc-visible, both fixed. Audit
 run-71: 0 confirmed.
+run-313 lands the credentials block plus execveat — seventeen
+numbers that make the uid real. Task gains a uid field: spawn
+mints 0, the setuid family stores into it (fork/clone/thread
+now INHERIT it — the audit caught all three mint sites zeroing
+it, which would de-privilege a setuid parent's child), and
+getresuid/getresgid write the r/e/s triple with all three
+pointers validated up-front. gid/groups stay the root collapse;
+setgroups keeps the NGROUPS_MAX+EFAULT gates. capget/capset
+speak the versioned header honestly — unknown versions EINVAL
+while writing back the preferred 0x20080522, datap fills the
+full CAP_LAST_CAP mask for effective/permitted, capset EPERMs
+a foreign pid and EFAULTs datap sized to `tocopy`. execveat
+factors out of execve: dirfd rides canon_path's Dir-OFD base,
+AT_EMPTY_PATH resolves the fd's own /proc link target (the real
+path — the earlier synthesized proc/self/fd/N route EACCES'd on
+the link's stat until credtest caught it), NOFOLLOW refuses to
+follow. Trap worth recording: NR_GETUID/GETGID/GETEUID/GETEGID
+already existed as => 0 stubs — literal arms are silently
+shadowed, so impls must land ON the consts. credtest proves the
+errno ladders, stored-uid read-back, fork inheritance, and real
+rel-path + AT_EMPTY_PATH execs. lstest floor 75->76, 103 tasks.
+Audit run-72: 0 confirmed.
