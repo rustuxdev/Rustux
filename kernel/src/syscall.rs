@@ -803,7 +803,10 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         161 => sys_chroot(a1),
         163 => sys_acct(a1),
         165 => sys_mount(a1, a2, a3, a4),
+        179 => sys_quotactl(a1, a2, a3, a4),
         166 => sys_umount2(a1, a2),
+        457 => user::sys_statmount(a1, a2, a3, a4),
+        458 => user::sys_listmount(a1, a2, a3, a4),
         272 => user::sys_unshare(a1),
         154 => user::sys_modify_ldt(a1, a2, a3),
         329..=331 => user::sys_pkey(a1, a2, a3),
@@ -1620,6 +1623,17 @@ fn sys_mount(src: u64, tgt: u64, fstype: u64, flags: u64) -> u64 {
         Err(e) => return e,
     };
     user::sys_mount(&sb[..sn], &tb[..tn], &fb[..fn_], flags)
+}
+
+/// quotactl(179): user `special` path string; id/addr are opaque
+/// to the quota-less surface (ESRCH after resolution anyway).
+fn sys_quotactl(cmd: u64, special: u64, id: u64, addr: u64) -> u64 {
+    let mut sb = [0u8; 257];
+    let sn = match copy_user_path(special, &mut sb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_quotactl(cmd, &sb[..sn], id, addr)
 }
 
 /// umount2(166): user target string + flags word.

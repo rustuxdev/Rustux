@@ -15819,6 +15819,247 @@ pub fn sys_umount2(tgt: &[u8], flags: u64) -> u64 {
     0
 }
 
+/// Parent mount of `m`: the mount covering the point's parent
+/// directory, computed on demand so an unmounted parent can't
+/// leave a dangling id. Root's parent is itself (Linux mounts
+/// the root under its own namespace entry).
+fn mount_parent_id(m: &Mount) -> u64 {
+    let p = &m.path[..m.n as usize];
+    let par = match p.iter().rposition(|&c| c == b'/') {
+        Some(i) => &p[..i],
+        None => b"",
+    };
+    let i = if p.is_empty() {
+        mount_exact(b"")
+    } else {
+        mount_i(par)
+    };
+    i.and_then(|i| mounts()[i].as_ref().map(|m| m.id as u64))
+        .unwrap_or(1)
+}
+
+/// statmount(457): statx-shaped mount report off the MOUNTS
+/// table. req is the 24-byte mnt_id_req {size, spare, mnt_id,
+/// param=mask}; buf is a 512-byte fixed statmount + string tail,
+/// emitted strings land at offsets relative to `str`. Only
+/// requested groups are written; EOVERFLOW carries the needed
+/// size back in buf->size like Linux.
+pub fn sys_statmount(req: u64, buf: u64, bufsize: u64, flags: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    const EOVERFLOW_: u64 = (-75i64) as u64;
+    const STATMOUNT_KNOWN: u64 = 0x3f; // bits 0..=5
+    if flags != 0 {
+        return EINVAL_;
+    }
+    if !range_ok(req, 24) {
+        return EFAULT_;
+    }
+    // SAFETY: req readable for 24 bytes (checked).
+    let (rsize, rspare, mid, mask) = unsafe {
+        (
+            (req as *const u32).read_unaligned() as usize,
+            (req as *const u32).add(1).read_unaligned(),
+            (req as *const u64).add(1).read_unaligned(),
+            (req as *const u64).add(2).read_unaligned(),
+        )
+    };
+    if rsize < 24 || rspare != 0 || mask & !STATMOUNT_KNOWN != 0 {
+        return EINVAL_;
+    }
+    let ms = mounts();
+    let Some(m) = ms
+        .iter()
+        .flatten()
+        .find(|m| m.id as u64 == mid)
+    else {
+        return ENOENT_;
+    };
+    // Strings, emitted only for the requested groups. fs_type is
+    // bit 5's payload; mnt_root "/" + mnt_point "/path" are
+    // bits 3/4.
+    let mut tail = [0u8; 256];
+    let mut tlen = 0usize;
+    let mut emit = |s: &[u8]| -> u32 {
+        let off = tlen as u32;
+        tail[tlen..tlen + s.len()].copy_from_slice(s);
+        tlen += s.len() + 1; // nul
+        off
+    };
+    let mut fst_off = 0u32;
+    let mut root_off = 0u32;
+    let mut pt_off = 0u32;
+    if mask & 0x20 != 0 {
+        fst_off = emit(&m.fstype[..m.fnlen as usize]);
+    }
+    if mask & 0x8 != 0 {
+        root_off = emit(b"/");
+    }
+    if mask & 0x10 != 0 {
+        let mut pt = [0u8; 130];
+        pt[0] = b'/';
+        pt[1..1 + m.n as usize].copy_from_slice(&m.path[..m.n as usize]);
+        pt_off = emit(&pt[..1 + m.n as usize]);
+    }
+    let need = 512 + tlen;
+    if bufsize < 4 {
+        return EFAULT;
+    }
+    if bufsize < need as u64 {
+        if !range_ok_w(buf, 4) {
+            return EFAULT_;
+        }
+        // SAFETY: buf writable for 4 bytes (checked).
+        unsafe { (buf as *mut u32).write_unaligned(need as u32) };
+        return EOVERFLOW_;
+    }
+    if !range_ok_w(buf, need as u64) {
+        return EFAULT_;
+    }
+    // SAFETY: buf writable for `need` bytes (checked above).
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, need);
+        let w32 = |off: usize, v: u32| {
+            ((buf + off as u64) as *mut u32).write_unaligned(v)
+        };
+        let w64 = |off: usize, v: u64| {
+            ((buf + off as u64) as *mut u64).write_unaligned(v)
+        };
+        w32(0, need as u32); // size
+        w64(8, mask); // mask: every requested bit landed
+        w32(16, 0); // sb_dev_major — no block devices
+        w32(20, 0); // sb_dev_minor
+        let magic: u64 = match &m.fstype[..m.fnlen as usize] {
+            b"proc" => 0x9fa0,
+            b"tmpfs" => 0x1021994,
+            _ => 0x8584_58f6,
+        };
+        w64(24, magic);
+        // SB_RDONLY|SYNCHRONOUS|DIRSYNC|LAZYTIME subset.
+        w32(32, m.flags & (0x1 | 0x10 | 0x80));
+        w32(36, fst_off);
+        w64(40, m.id as u64);
+        let pid_ = mount_parent_id(m);
+        w64(48, pid_);
+        w32(56, m.id); // mnt_id_old
+        w32(60, pid_ as u32); // mnt_parent_id_old
+        // MOUNT_ATTR: low MS bits map 1:1 (RDONLY..NOEXEC, ATIME
+        // mask); RELATIME(0) is the default — nothing to set.
+        w64(64, (m.flags & 0xf) as u64 | ((m.flags & 0x400) >> 6) as u64);
+        w64(72, 0); // mnt_propagation — always private
+        w64(80, 0); // mnt_peer_group
+        w64(88, 0); // mnt_master
+        w64(96, 0); // propagate_from
+        w32(104, root_off);
+        w32(108, pt_off);
+        core::ptr::copy_nonoverlapping(
+            tail.as_ptr(),
+            (buf + 512) as *mut u8,
+            tlen,
+        );
+    }
+    0
+}
+
+/// listmount(458): enumerate the children of a mount. req.mnt_id
+/// is the parent (LSMT_ROOT = -1 resolves to the root mount);
+/// req.param is the last id already listed (0 = start), so the
+/// caller pages by feeding the final id back. Returns the count
+/// written (<= nr).
+pub fn sys_listmount(req: u64, ids: u64, nr: u64, flags: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    const LSMT_ROOT: u64 = u64::MAX;
+    if flags != 0 {
+        return EINVAL_;
+    }
+    if !range_ok(req, 24) {
+        return EFAULT_;
+    }
+    // SAFETY: req readable for 24 bytes (checked).
+    let (rsize, rspare, mid, last) = unsafe {
+        (
+            (req as *const u32).read_unaligned() as usize,
+            (req as *const u32).add(1).read_unaligned(),
+            (req as *const u64).add(1).read_unaligned(),
+            (req as *const u64).add(2).read_unaligned(),
+        )
+    };
+    if rsize < 24 || rspare != 0 {
+        return EINVAL_;
+    }
+    let want = if mid == LSMT_ROOT {
+        mounts()[0].as_ref().map(|m| m.id as u64).unwrap_or(1)
+    } else {
+        mid
+    };
+    let ms = mounts();
+    if !ms.iter().flatten().any(|m| m.id as u64 == want) {
+        return ENOENT_;
+    }
+    if nr > 0 && !range_ok_w(ids, nr * 8) {
+        return EFAULT_;
+    }
+    let mut kids: [u64; MAX_MOUNTS] = [0; MAX_MOUNTS];
+    let mut nkids = 0usize;
+    for m in ms.iter().flatten() {
+        let m_id = m.id as u64;
+        if m_id != want && mount_parent_id(m) == want && m_id > last {
+            kids[nkids] = m_id;
+            nkids += 1;
+        }
+    }
+    kids[..nkids].sort_unstable();
+    let n = nkids.min(nr as usize);
+    // SAFETY: ids writable for nr*8 bytes (checked).
+    unsafe {
+        for (i, &kid) in kids.iter().enumerate().take(n) {
+            ((ids + i as u64 * 8) as *mut u64).write_unaligned(kid);
+        }
+    }
+    n as u64
+}
+
+/// quotactl(179): no quota accounting exists anywhere — the honest
+/// surface a quota-less filesystem gives. cmd packs (subop<<8)|type:
+/// type > 2 (USR/GRP/PRJ) or an unknown subop is EINVAL; `special`
+/// must resolve to an existing object (ENOENT); Q_SYNC is a real
+/// no-op like syncfs; everything else is ESRCH — Linux's "quota
+/// not enabled" answer.
+pub fn sys_quotactl(cmd: u64, special: &[u8], _id: u64, _addr: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const ESRCH_: u64 = (-3i64) as u64;
+    const Q_SYNC: u64 = 0x800001;
+    const KNOWN: [u64; 9] = [
+        0x800001, 0x800002, 0x800003, 0x800004, 0x800005, 0x800006,
+        0x800007, 0x800008, 0x800009,
+    ];
+    let sub = cmd >> 8;
+    let qtype = cmd & 0xff;
+    if qtype > 2 || !KNOWN.contains(&sub) {
+        return EINVAL_;
+    }
+    let (cb, cn) = match canon_path(u64::MAX, special) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let (rb, rn, _) = match resolve_links(&cb[..cn], true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let p = &rb[..rn];
+    if !is_file(p) && !dir_exists(p) && !p.starts_with(b"dev/") {
+        return ENOENT_;
+    }
+    if sub == Q_SYNC {
+        return 0; // nothing cached — the sync is honest
+    }
+    ESRCH_
+}
+
 // ---- BSD process accounting (acct 163) -------------------------
 /// Vfile slot of the accounting file while accounting is on; -1
 /// when disabled. The file must exist already — acct() opens

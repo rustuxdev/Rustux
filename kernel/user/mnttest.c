@@ -237,6 +237,143 @@ int main(void) {
     check(unlink("/t_mnt/wf") == 0 && rmdir("/t_mnt") == 0,
           "cleanup /t_mnt");
 
+    // ---- statmount(457) + listmount(458) ----------------------
+    struct mnt_id_req {
+        unsigned int size, spare;
+        unsigned long long mnt_id, param;
+    };
+    struct statmount {
+        unsigned int size, _s1;
+        unsigned long long mask;
+        unsigned int dev_maj, dev_min;
+        unsigned long long sb_magic;
+        unsigned int sb_flags, fs_type;
+        unsigned long long mnt_id, parent_id;
+        unsigned int mnt_id_old, parent_old;
+        unsigned long long mnt_attr, propagation, peer_group;
+        unsigned long long master, propagate_from;
+        unsigned int mnt_root, mnt_point;
+        unsigned long long _s2[50];
+        char str[];
+    };
+    const char *sm_str(const struct statmount *sm, unsigned int off) {
+        return sm->str + off;
+    }
+    struct statmount *sm;
+    struct mnt_id_req rq;
+
+    memset(&rq, 0, sizeof(rq));
+    rq.size = sizeof(rq);
+    rq.mnt_id = 1;             // seeded root mount
+    rq.param = 0x3f;           // all groups
+    char smbuf[768];
+    sm = (struct statmount *)smbuf;
+    memset(smbuf, 0, sizeof(smbuf));
+    check(syscall(457, &rq, sm, sizeof(smbuf), 0) == 0,
+          "statmount root succeeds");
+    check(sm->mnt_id == 1 && sm->parent_id == 1
+          && sm->sb_magic == RAMFS_MAGIC
+          && !(sm->sb_flags & 1)
+          && strcmp(sm_str(sm, sm->fs_type), "rustux") == 0
+          && strcmp(sm_str(sm, sm->mnt_point), "/") == 0
+          && strcmp(sm_str(sm, sm->mnt_root), "/") == 0,
+          "statmount root fields");
+    rq.mnt_id = 2;             // seeded proc mount
+    memset(smbuf, 0, sizeof(smbuf));
+    check(syscall(457, &rq, sm, sizeof(smbuf), 0) == 0
+          && sm->sb_magic == PROC_MAGIC
+          && (sm->sb_flags & 1)
+          && strcmp(sm_str(sm, sm->fs_type), "proc") == 0
+          && strcmp(sm_str(sm, sm->mnt_point), "/proc") == 0,
+          "statmount proc fields");
+    rq.mnt_id = 0xdead;
+    errno = 0;
+    check(syscall(457, &rq, sm, sizeof(smbuf), 0) < 0
+          && errno == ENOENT, "statmount bad id ENOENT");
+    rq.mnt_id = 1; rq.param = 1 << 8;
+    errno = 0;
+    check(syscall(457, &rq, sm, sizeof(smbuf), 0) < 0
+          && errno == EINVAL, "statmount unknown mask EINVAL");
+    rq.param = 0x3f; rq.spare = 1;
+    errno = 0;
+    check(syscall(457, &rq, sm, sizeof(smbuf), 0) < 0
+          && errno == EINVAL, "statmount nonzero spare EINVAL");
+    rq.spare = 0;
+    memset(smbuf, 0, sizeof(smbuf));
+    check(syscall(457, &rq, sm, 516, 0) < 0 && errno == EOVERFLOW
+          && sm->size > 512,
+          "statmount small buf EOVERFLOW + size");
+
+    // listmount: children of root
+    {
+        unsigned long long kids[8];
+        memset(&rq, 0, sizeof(rq));
+        rq.size = sizeof(rq);
+        rq.mnt_id = ~0ULL;     // LSMT_ROOT
+        long n = syscall(458, &rq, kids, 8, 0);
+        check(n == 2 && kids[0] == 2 && kids[1] == 3,
+              "listmount root children = proc+dev");
+        rq.mnt_id = 0xdead;
+        errno = 0;
+        check(syscall(458, &rq, kids, 8, 0) < 0 && errno == ENOENT,
+              "listmount bad parent ENOENT");
+        rq.mnt_id = ~0ULL;
+        errno = 0;
+        check(syscall(458, &rq, kids, 8, 1) < 0 && errno == EINVAL,
+              "listmount nonzero flags EINVAL");
+        // a fresh mount appears under root's children
+        check(mkdir("/t_sm", 0755) == 0, "mkdir /t_sm");
+        check(mount("s", "/t_sm", "tmpfs", 0, 0) == 0,
+              "mount for listmount");
+        n = syscall(458, &rq, kids, 8, 0);
+        check(n == 3 && kids[2] > 3,
+              "listmount sees new minted mount");
+        unsigned long long newid = kids[2];
+        // paginate: last id resumes after it
+        rq.param = kids[0];
+        n = syscall(458, &rq, kids, 8, 0);
+        check(n == 2 && kids[0] == 3 && kids[1] == newid,
+              "listmount param pagination");
+        rq.param = 0;
+        // statmount the new mount
+        memset(&rq, 0, sizeof(rq));
+        rq.size = sizeof(rq);
+        rq.mnt_id = newid;
+        rq.param = 0x3f;
+        memset(smbuf, 0, sizeof(smbuf));
+        check(syscall(457, &rq, sm, sizeof(smbuf), 0) == 0
+              && sm->sb_magic == TMPFS_MAGIC
+              && sm->parent_id == 1
+              && strcmp(sm_str(sm, sm->fs_type), "tmpfs") == 0
+              && strcmp(sm_str(sm, sm->mnt_point), "/t_sm") == 0,
+              "statmount minted tmpfs mount");
+        check(umount2("/t_sm", 0) == 0 && rmdir("/t_sm") == 0,
+              "cleanup /t_sm");
+        memset(&rq, 0, sizeof(rq));
+        rq.size = sizeof(rq);
+        rq.mnt_id = ~0ULL;
+        n = syscall(458, &rq, kids, 8, 0);
+        check(n == 2, "listmount loses unmounted");
+    }
+
+    // ---- quotactl(179) — quota-less surface --------------------
+    // QCMD(subop, type) = subop<<8 | type
+    errno = 0;
+    check(syscall(179, (0x800007L << 8) | 9, "/", 0, 0) < 0
+          && errno == EINVAL, "quotactl bad type EINVAL");
+    errno = 0;
+    check(syscall(179, 0x800007L << 8, "/", 0, 0) < 0
+          && errno == ESRCH, "quotactl Q_GETQUOTA ESRCH");
+    errno = 0;
+    check(syscall(179, 0x800001L << 8, "/", 0, 0) == 0,
+          "quotactl Q_SYNC ok");
+    errno = 0;
+    check(syscall(179, 0x800007L << 8, "/no_such_x", 0, 0) < 0
+          && errno == ENOENT, "quotactl bad special ENOENT");
+    errno = 0;
+    check(syscall(179, 0x1234L << 8, "/", 0, 0) < 0
+          && errno == EINVAL, "quotactl unknown subop EINVAL");
+
     // ---- privilege gate ----------------------------------------
     pid_t c = fork();
     if (c == 0) {
