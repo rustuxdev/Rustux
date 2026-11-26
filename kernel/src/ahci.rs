@@ -44,6 +44,8 @@ const TFD_BSY: u32 = 1 << 7;
 
 /// ATA commands we issue.
 const ATA_IDENTIFY: u8 = 0xec;
+/// FLUSH CACHE EXT — non-data command, commits the write cache.
+const ATA_FLUSH_EXT: u8 = 0xea;
 const ATA_READ_DMA_EXT: u8 = 0x25;
 const ATA_WRITE_DMA_EXT: u8 = 0x35;
 
@@ -330,6 +332,9 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
     }
     NDISKS.store(n as u32, Ordering::Relaxed);
     crate::log::printk(format_args!("rustux: ahci: {} disk(s) on {:#x}", n, base));
+    if n > 0 {
+        crate::log::printk(format_args!("rustux: ahci: disk0 flush {}", flush(0)));
+    }
     n as u32
 }
 
@@ -407,6 +412,18 @@ pub fn read_sector(i: usize, lba: u64, buf: &mut [u8; 512]) -> bool {
         core::ptr::copy_nonoverlapping(phys_ptr(m.buf), buf.as_mut_ptr(), 512);
     }
     true
+}
+
+/// FLUSH CACHE EXT — commits the port's volatile write cache.
+/// count=1 keeps issue()'s PRDT a valid 512B descriptor into
+/// m.buf; the device consumes nothing for a non-data command.
+pub fn flush(i: usize) -> bool {
+    if i >= MAX_DISKS || disk_sectors(i) == 0 {
+        return false;
+    }
+    let p = DISK_PORT[i].load(Ordering::Relaxed) as usize;
+    let Some(m) = mem_for(i) else { return false };
+    issue(p, m, ATA_FLUSH_EXT, 0, 1, false)
 }
 
 /// Write one 512-byte sector to disk `i`.

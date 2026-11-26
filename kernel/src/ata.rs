@@ -236,6 +236,17 @@ fn try_write(lba: u32, count: u32, buf: *const u8, d: usize) -> bool {
     wait(false)
 }
 
+/// FLUSH CACHE on disk `d` — the same commit write_d ends with,
+/// exposed so fsync/BLKFLSBUF have a standalone sync point.
+pub fn flush_d(d: usize) -> bool {
+    if sectors_d(d) == 0 || !wait(false) {
+        return false;
+    }
+    cmd(0, 0, CMD_FLUSH, d);
+    pause();
+    wait(false)
+}
+
 /// Eject the ATAPI drive on the secondary channel — the -cdrom
 /// medium QEMU's i440fx wires as secondary master. START STOP
 /// UNIT with LoEj set and Start clear opens the tray, exactly

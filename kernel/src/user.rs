@@ -9571,6 +9571,20 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             0
         }
+        0x1261 => {
+            // BLKFLSBUF — flush the device's write buffers, the
+            // ioctl twin of fsync on the node. Same block-node
+            // gating as the size trio, then the transport flush.
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            let Some(v) = vfile(*i) else { return ENOTTY_ };
+            if v.fmt != 0o60000 {
+                return ENOTTY_;
+            }
+            if blk_window(v.rdev).is_none() {
+                return (-6i64) as u64; // ENXIO — node without hardware
+            }
+            if blk_flush(v.rdev) { 0 } else { (-5i64) as u64 } // EIO
+        }
         0x5309 => {
             // CDROMEJECT — the ATAPI START STOP UNIT packet on the
             // secondary-channel CD drive. The fd must be an sr
@@ -14068,6 +14082,25 @@ fn blk_wr(t: u32, d: usize, lba: u64, n: usize, b: &[u8]) -> bool {
     }
 }
 
+/// Flush `rdev`'s backing store — whole-disk commit; a partition
+/// minor flushes its parent, matching Linux's fsync_bdev scope.
+fn blk_flush(rdev: u32) -> bool {
+    let Some((t, d, _, _)) = blk_window(rdev) else {
+        return false;
+    };
+    match t {
+        8 => {
+            if crate::ata::sectors_d(d) > 0 {
+                crate::ata::flush_d(d)
+            } else {
+                crate::ahci::flush(d)
+            }
+        }
+        254 => crate::virtio::blk_flush(d),
+        _ => crate::nvme::flush(d),
+    }
+}
+
 /// Block-device read at the OFD position — the bounce-buffered byte
 /// contract every transport shares: 512B-granular drivers,
 /// unaligned edges through a kernel sector buffer, reads clip at
@@ -17695,10 +17728,17 @@ pub fn fd_utimens(fd: u64, ts: Option<[[u64; 2]; 2]>) -> u64 {
 
 /// fsync/fdatasync(fd): RAM files have nothing to flush and archive
 /// files nothing to dirty — the honest answer to a valid fd is 0.
+/// Block-device nodes do have volatile cache worth committing:
+/// fsync on one drives the transport flush like fsync_bdev does.
 pub fn fd_fsync(fd: u64) -> u64 {
     let Some(t) = cur_mut() else { return EBADF };
-    if ofd(t, fd).is_none() {
-        return EBADF;
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    if let FdKind::Dev(i) = &o.kind {
+        if let Some(v) = vfile(*i) {
+            if v.fmt == 0o60000 && blk_window(v.rdev).is_some() {
+                return if blk_flush(v.rdev) { 0 } else { (-5i64) as u64 };
+            }
+        }
     }
     0
 }

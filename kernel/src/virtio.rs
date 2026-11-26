@@ -342,6 +342,10 @@ fn probe_io(dev_id: u16) -> Option<(u16, u32)> {
 // virtio-blk request types.
 const REQ_IN: u32 = 0;
 const REQ_OUT: u32 = 1;
+/// VIRTIO_BLK_T_FLUSH — the write-cache flush, gated on F_FLUSH.
+const REQ_FLUSH: u32 = 4;
+/// VIRTIO_BLK_F_FLUSH (feature bit 9): the device accepts REQ_FLUSH.
+const F_BLK_FLUSH: u32 = 1 << 9;
 /// Sectors per single request — bounds the data staging block.
 pub const BATCH: usize = 8;
 
@@ -352,6 +356,8 @@ struct VDisk {
     ctrl: u64,
     data: u64,
     sectors: u64,
+    /// F_FLUSH negotiated — blk_flush may issue REQ_FLUSH.
+    flush: bool,
 }
 
 static NDISKS: AtomicU32 = AtomicU32::new(0);
@@ -402,7 +408,12 @@ pub fn init() -> u32 {
     let Some((io, _)) = probe_io(DEV_BLK) else {
         return 0;
     };
-    if !handshake(io) {
+    // Prefer F_FLUSH (write-cache flush command); a device that
+    // refuses it still works — blk_flush then reports unsupported
+    // and callers fall back to the write completion they already
+    // had. handshake_feat resets the device each pass.
+    let has_flush = handshake_feat(io, F_BLK_FLUSH);
+    if !has_flush && !handshake(io) {
         return 0;
     }
     let Some(vq) = Vq::setup(io, 0) else {
@@ -426,12 +437,13 @@ pub fn init() -> u32 {
             ctrl,
             data,
             sectors,
+            flush: has_flush,
         });
     }
     NDISKS.store(1, Ordering::Release);
     let qsz = disk_for(0).map_or(0, |d| d.vq.size);
     crate::log::printk(format_args!(
-        "rustux: virtio: blk {io:#x} qsize={qsz} {sectors} sectors ({} MiB)",
+        "rustux: virtio: blk {io:#x} qsize={qsz} {sectors} sectors ({} MiB) flush={has_flush}",
         sectors / 2048
     ));
     // Datapath proof at probe time: read sector 0 through the queue
@@ -457,8 +469,9 @@ pub fn init() -> u32 {
     let v = w && read_range(0, 64, 1, &mut back) && back[..7] == pat[..7];
     let s = write_range(0, 64, 1, &orig);
     let s = s && read_range(0, 64, 1, &mut back) && back == orig;
+    let f = blk_flush(0);
     crate::log::printk(format_args!(
-        "rustux: virtio: write datapath {w} verify {v} restore {s}"
+        "rustux: virtio: write datapath {w} verify {v} restore {s} flush {f}"
     ));
     1
 }
@@ -523,6 +536,32 @@ pub fn write_range(i: usize, lba: u64, count: usize, buf: &[u8]) -> bool {
         done += n;
     }
     true
+}
+
+/// VIRTIO_BLK_T_FLUSH: a 2-descriptor chain — header OUT (type
+/// only, no sector semantics), status byte IN. No data phase;
+/// REQ_FLUSH is defined only when F_FLUSH negotiated.
+pub fn blk_flush(i: usize) -> bool {
+    let Some(d) = disk_for(i) else { return false };
+    if !d.flush {
+        return false;
+    }
+    let ctrl = mm::pmap(d.ctrl);
+    // SAFETY: ctrl is our own DMA block; same header as request().
+    unsafe {
+        (ctrl as *mut u32).write_volatile(REQ_FLUSH);
+        ((ctrl + 4) as *mut u32).write_volatile(0);
+        ((ctrl + 8) as *mut u64).write_volatile(0);
+        ((ctrl + 16) as *mut u8).write_volatile(0xff);
+    }
+    d.vq.put_desc(0, d.ctrl, 16, DESC_NEXT, 1);
+    d.vq.put_desc(1, d.ctrl + 16, 1, DESC_WRITE, 0);
+    fence(Ordering::SeqCst);
+    if !d.vq.poll_once(0) {
+        return false;
+    }
+    // SAFETY: ctrl+16 is the status byte the device just wrote.
+    unsafe { ((ctrl + 16) as *const u8).read_volatile() == 0 }
 }
 
 // -------------------------------------------------------------------

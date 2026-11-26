@@ -39,6 +39,7 @@ const OP_CREATE_IO_SQ: u8 = 0x01;
 const OP_CREATE_IO_CQ: u8 = 0x05;
 const OP_IDENTIFY: u8 = 0x06;
 // NVM command-set opcodes.
+const OP_FLUSH: u8 = 0x00;
 const OP_READ: u8 = 0x02;
 const OP_WRITE: u8 = 0x01;
 
@@ -424,8 +425,9 @@ pub fn init(is_mmio: impl Fn(u64, u64) -> bool) -> u32 {
         let v = w && read_range(d, 64, 1, &mut back) && back[..7] == pat[..7];
         let s = write_range(d, 64, 1, &orig);
         let s = s && read_range(d, 64, 1, &mut back) && back == orig;
+        let f = flush(d);
         crate::log::printk(format_args!(
-            "rustux: nvme: disk{d} write datapath {w} verify {v} restore {s}"
+            "rustux: nvme: disk{d} write datapath {w} verify {v} restore {s} flush {f}"
         ));
     }
     bound
@@ -575,4 +577,21 @@ pub fn write_range(i: usize, lba: u64, count: usize, buf: &[u8]) -> bool {
         done += n;
     }
     true
+}
+
+/// FLUSH (opcode 0x00) on the I/O SQ — commits volatile write
+/// cache to the medium for namespace `i`'s nsid. No PRP: the
+/// command carries no data.
+pub fn flush(i: usize) -> bool {
+    if i >= NDISKS.load(Ordering::Acquire) as usize
+        || NS_SECTORS[i].load(Ordering::Relaxed) == 0
+    {
+        return false;
+    }
+    let Some(q) = ioq() else { return false };
+    let dstrd = DSTRD.load(Ordering::Relaxed);
+    let mut e = [0u8; 64];
+    e[0] = OP_FLUSH;
+    e[4..8].copy_from_slice(&NSID[i].load(Ordering::Relaxed).to_le_bytes());
+    q.submit(1, dstrd, &mut e)
 }

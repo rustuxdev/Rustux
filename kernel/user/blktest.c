@@ -221,6 +221,33 @@ int main(void) {
           "BLKGETSIZE64 null ENOTTY");
     if (fd >= 0) close(fd);
 
+    // ---- write-cache flush: BLKFLSBUF + fsync on block nodes ----
+    fd = open("/dev/vda", O_RDWR);
+    check(fd >= 0 && ioctl(fd, BLKFLSBUF, 0) == 0, "BLKFLSBUF vda");
+    if (fd >= 0) {
+        check(fsync(fd) == 0, "fsync vda");
+        close(fd);
+    }
+    fd = open("/dev/nvme0n1", O_RDWR);
+    check(fd >= 0 && ioctl(fd, BLKFLSBUF, 0) == 0, "BLKFLSBUF nvme0n1");
+    if (fd >= 0) {
+        check(fdatasync(fd) == 0, "fdatasync nvme0n1");
+        close(fd);
+    }
+    // Same gate on a non-block node: ENOTTY, no hardware.
+    fd = open("/dev/null", O_RDONLY);
+    check(fd >= 0 && ioctl(fd, BLKFLSBUF, 0) < 0 && errno == ENOTTY,
+          "BLKFLSBUF null ENOTTY");
+    if (fd >= 0) close(fd);
+    // And a node with no registered hardware: ENXIO.
+    unlink("vdc.nod");
+    check(mknod("vdc.nod", S_IFBLK | 0600, makedev(254, 32)) == 0,
+          "mknod vdc");
+    fd = open("vdc.nod", O_RDONLY);
+    check(fd < 0 && errno == ENXIO, "open vdc -> ENXIO");
+    if (fd >= 0) close(fd);
+    unlink("vdc.nod");
+
     char out[64];
     int n = snprintf(out, sizeof(out), "blktest: %d failure%s\n",
                      fails, fails == 1 ? "" : "s");
