@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 113;
+const MAX_TASKS: usize = 114;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -10691,6 +10691,74 @@ pub fn sys_syncfs(fd: u64) -> u64 {
         Some(_) => EINVAL,
         None => EBADF,
     }
+}
+
+/// unshare(flags): dissociate shared task tables — CLONE_FILES
+/// mints a fresh FdTab copy, CLONE_FS a fresh FsTab, CLONE_SIGHAND
+/// a fresh disposition table (no VM-pairing rule in unshare: the
+/// task keeps its own mm). CLONE_SYSVSEM is inert — the undo
+/// ledger is (pid, semid, num)-keyed so each task already owns
+/// its list. CLONE_VM/CLONE_THREAD/CLONE_NEW* and unknown bits ->
+/// EINVAL (no namespaces exist to mint).
+pub fn sys_unshare(flags: u64) -> u64 {
+    const ENOMEM_: u64 = (-12i64) as u64;
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_FS: u64 = 0x0000_0200;
+    const CLONE_FILES: u64 = 0x0000_0400;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+    const CLONE_SYSVSEM: u64 = 0x0004_0000;
+    const CLONE_NEW: u64 = 0x0000_0040 | 0x0080_0000 | 0x0400_0000
+        | 0x0800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
+    const KNOWN: u64 = CLONE_FILES
+        | CLONE_FS
+        | CLONE_SIGHAND
+        | CLONE_VM
+        | CLONE_THREAD
+        | CLONE_SYSVSEM
+        | CLONE_NEW;
+    if flags & !KNOWN != 0
+        || flags & (CLONE_VM | CLONE_THREAD | CLONE_NEW) != 0
+    {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    if flags & CLONE_FILES != 0 {
+        let Some(n) = fdtab_dup(t.fdi) else { return ENOMEM_ };
+        let old = core::mem::replace(&mut t.fdi, n);
+        fdtab_release(old);
+    }
+    if flags & CLONE_FS != 0 {
+        let Some(n) = fstab_dup(t.fsi) else { return ENOMEM_ };
+        let old = core::mem::replace(&mut t.fsi, n);
+        fstab_release(old);
+    }
+    if flags & CLONE_SIGHAND != 0 {
+        let Some(n) = sigtab_dup(t.sigh) else { return ENOMEM_ };
+        let old = core::mem::replace(&mut t.sigh, n);
+        sigtab_release(old);
+    }
+    0
+}
+
+/// modify_ldt(func, ptr, bytecount): the running LDT is the
+/// default empty one — read funcs (0 read_ldt, 2 read_default_ldt)
+/// honestly report 0 entries. Write funcs (1, 0x11) have nothing
+/// to write into — no LDT slots exist — so EINVAL; any other func
+/// is EINVAL like Linux.
+pub fn sys_modify_ldt(func: u64, _ptr: u64, _bytecount: u64) -> u64 {
+    match func {
+        0 | 2 => 0,
+        _ => EINVAL,
+    }
+}
+
+/// pkey_alloc/pkey_free/pkey_mprotect: no PKU exists — no
+/// protection key can ever be allocated, so every call EINVALs
+/// (flags/rights validation in pkey_alloc is also EINVAL-only:
+/// even a clean request can't be satisfied). Wired together.
+pub fn sys_pkey(_a1: u64, _a2: u64, _a3: u64) -> u64 {
+    EINVAL
 }
 
 /// get_robust_list(pid, head_ptr, len_ptr): peer read of the
