@@ -8009,3 +8009,13 @@ nothing evicts; mlock2/mlockall flag-mask EINVALs, and MUNLOCKALL
 got its own =>0 arm after the audit caught a garbage-a1 EINVAL on
 a no-arg syscall. pmtvtest 27 checks green; exit 33, 92 tasks,
 zero leak. Ledger at 285 CVEs.
+
+mseal lands as a real enforcement rung: RNG_SEAL rides the range
+ledger's `ofl` through every split (partial ops can't carve
+coverage) and all eight layout/content mutator sites gate EPERM —
+munmap, mprotect, mremap src+dst, MAP_FIXED-over, madvise
+DONTNEED|FREE, brk shrink. cachestat reports VFile residency
+(size-clamped page count, everything RAM-resident). Audit caught a
+gate-coverage gap — four of eight sites were lost in an aborted
+apply; the compiled proof found it. msltest 27 checks green; exit
+33, 93 tasks, zero leak. Ledger at 290 CVEs.
