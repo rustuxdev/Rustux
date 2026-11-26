@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 112;
+const MAX_TASKS: usize = 113;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -2310,6 +2310,11 @@ pub struct Task {
     /// PERS_NT (nt::dispatch — NTSTATUS, r10-arg1, stack args at
     /// rsp+0x28). Set by the image format at exec/spawn.
     pers: u8,
+    /// personality(2) bits — the syscall-persona mask + flags.
+    /// Accept-and-report like the real semantics where the mask is
+    /// advisory: stored per task, inherited at fork, 0 (PER_LINUX)
+    /// at spawn.
+    persona: u32,
     /// ELFCLASS32 image: the task runs in IA-32e compatibility mode —
     /// entry on the GDT's 32-bit user CS, the whole address space in
     /// the low-4GiB compat window (private PDPT under PML4[0]), and
@@ -8065,6 +8070,7 @@ fn load(img: &[u8]) -> Option<Task> {
         sid: 1,
         did_exec: true,
         pers: PERS_LINUX,
+        persona: 0,
         is_compat: false,
         gs_base: 0,
         tls: [0; 4],
@@ -15530,6 +15536,264 @@ pub fn sys_open_by_handle_at(mfd: u64, handle: u64, flags: u64) -> u64 {
     fi as u64
 }
 
+// ---- BSD process accounting (acct 163) -------------------------
+/// Vfile slot of the accounting file while accounting is on; -1
+/// when disabled. The file must exist already — acct() opens
+/// O_WRONLY|O_APPEND without O_CREAT, so a missing path is ENOENT.
+static mut ACCT_VF: i64 = -1;
+
+/// comp_t — the acct_v3 16-bit compressed counter: 3-bit exponent
+/// + 13-bit mantissa (exp in bits 15..13). Round-to-nearest like
+///   the kernel's encode_comp_t.
+fn encode_comp_t(v: u64) -> u16 {
+    let (mut exp, mut mant, mut r) = (0u32, v, 0u32);
+    while mant > 0x1fff {
+        if r == 0 {
+            r = (mant & 1) as u32;
+        }
+        mant >>= 1;
+        exp += 1;
+        if exp > 7 {
+            return 0xffff; // saturate like the kernel's encoding
+        }
+    }
+    ((exp << 13) as u16 | (mant as u16 & 0x1fff))
+        .wrapping_add(r.min(1) as u16)
+}
+
+/// acct(name): name=="" disables; otherwise the path must resolve
+/// to an existing regular vfile (O_WRONLY|O_APPEND, no O_CREAT ->
+/// ENOENT; non-regular -> EACCES). uid!=0 -> EPERM
+/// (CAP_SYS_PACCT). Switching files while on is allowed — Linux's
+/// atomic swap.
+pub fn sys_acct(path: &[u8]) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const EACCES_: u64 = (-13i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    const EISDIR_: u64 = (-21i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL };
+    if t.uid != 0 {
+        return EPERM_;
+    }
+    if path.is_empty() {
+        unsafe { *core::ptr::addr_of_mut!(ACCT_VF) = -1 };
+        return 0;
+    }
+    let (cb, cn) = match canon_path(u64::MAX, path) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let (rb, rn, _) = match resolve_links(&cb[..cn], true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let p = &rb[..rn];
+    if dir_exists(p) {
+        return EISDIR_;
+    }
+    let Some(i) = vfile_find(p) else {
+        return ENOENT_;
+    };
+    let i = vfile_real(i);
+    let Some(v) = vfile(i) else { return ENOENT_ };
+    if v.fmt & 0o170000 != 0o100000 || v.is_link {
+        return EACCES_;
+    }
+    unsafe { *core::ptr::addr_of_mut!(ACCT_VF) = i as i64 };
+    0
+}
+
+/// Append the 64-byte acct_v3 record for an exiting task — called
+/// from exit_bookkeeping for EVERY task (do_exit -> acct_process
+/// accounts threads too). Fields we honestly know: uid/gid/pid/
+/// ppid, btime (wall-derived from start_ticks), etime float secs,
+/// utime/stime in AHZ units (TICKS is already 100Hz = USER_HZ),
+/// tty dev 5:1 when the console was its ctty, exitcode = the raw
+/// wstatus Linux records, comm = task name. Zeroed: mem/io/rw/
+/// faults/swaps (no counters exist — like a fresh driver's first
+/// day on acct).
+fn acct_emit_exit(t: &Task) {
+    let vf = unsafe { *core::ptr::addr_of!(ACCT_VF) };
+    if vf < 0 {
+        return;
+    }
+    let (uid, pid, ppid, status) = (t.uid, t.pid, t.ppid, t.exit_status);
+    let (start_ticks, utime, stime, name) =
+        (t.start_ticks, t.utime, t.stime, &t.name);
+    let had_ctty = t.sid == unsafe { *core::ptr::addr_of!(CONSOLE_SID) };
+    let forked_noexec = !t.did_exec;
+    let Some(v) = vfile(vf as usize) else { return };
+    if vfile_grow(v, v.len + 64) != 0 {
+        return; // accounting loss is silent — Linux drops too
+    }
+    let mut rec = [0u8; 64];
+    let mut flag = 0u8;
+    if forked_noexec {
+        flag |= 0x01; // AFORK
+    }
+    if status & 0x7f != 0 && status & 0x80 == 0 {
+        flag |= 0x10; // AXSIG — raw signo in the low byte
+    }
+    rec[0] = flag;
+    rec[1] = 2; // ACCT_VERSION (uapi acct.h)
+    let tty: u16 = if had_ctty { (5 << 8) | 1 } else { 0 };
+    rec[2..4].copy_from_slice(&tty.to_le_bytes());
+    rec[4..8].copy_from_slice(&(status as u32).to_le_bytes());
+    rec[8..12].copy_from_slice(&uid.to_le_bytes());
+    rec[12..16].copy_from_slice(&uid.to_le_bytes()); // gid = uid
+    rec[16..20].copy_from_slice(&(pid as u32).to_le_bytes());
+    rec[20..24].copy_from_slice(&(ppid as u32).to_le_bytes());
+    let tick = crate::apic::TICKS
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let elapsed = tick.saturating_sub(start_ticks);
+    let (ws, _wns) = crate::rtc::wall_now();
+    let btime = ws.saturating_sub(elapsed / 100);
+    rec[24..28].copy_from_slice(&(btime as u32).to_le_bytes());
+    let etime = elapsed as f32 / 100.0;
+    rec[28..32].copy_from_slice(&etime.to_le_bytes());
+    rec[32..34].copy_from_slice(&encode_comp_t(utime).to_le_bytes());
+    rec[34..36].copy_from_slice(&encode_comp_t(stime).to_le_bytes());
+    // 36..48: mem/io/rw/minflt/majflt/swaps — zeroed (no counters)
+    let cn = name.len().min(16).min(64 - 48);
+    rec[48..48 + cn].copy_from_slice(&name[..cn]);
+    // SAFETY: data is a live kmalloc buffer of cap >= len+64 bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            rec.as_ptr(),
+            v.data.add(v.len),
+            64,
+        );
+    }
+    v.len += 64;
+    let (ts, tns) = now();
+    v.mtime = ts;
+    v.mtime_ns = tns;
+    v.ctime = ts;
+    v.ctime_ns = tns;
+}
+
+/// personality(persona): 0xffffffff queries, anything else sets
+/// and returns the previous value — the kernel's contract. Stored
+/// per task (inherited at fork); the bits are advisory — no syscall
+/// table changes behind them, same as most personas on Linux.
+pub fn sys_personality(p: u64) -> u64 {
+    let Some(t) = cur_mut() else { return EINVAL };
+    let old = t.persona;
+    if p != 0xffff_ffff {
+        t.persona = p as u32;
+    }
+    old as u64
+}
+
+/// adjtimex(buf): the ntpd clock ABI — struct timex (x86-64: int
+/// modes @0, 4B pad, then longs @8: offset,freq,maxerror,esterror,
+/// status,constant,precision,tolerance,time.tv_sec,time.tv_usec,
+/// tick,ppsfreq,jitter,shift,stabil,jitcnt,calcnt,errcnt,stbcnt,
+/// tai,+11 pad = 232B). modes==0 is the read-only query anyone may
+/// make; modes!=0 needs uid==0 (CAP_SYS_TIME). Known ADJ_* bits are
+/// stored so a set->query round-trips like Linux; SETOFFSET and
+/// ADJTIME are accepted inert (no real clock-adjust loop exists).
+/// Unknown mode bits EINVAL. Returns the clock state — TIME_OK.
+pub fn sys_adjtimex(buf: u64) -> u64 {
+    adjtimex_core(buf)
+}
+
+/// clock_adjtime(305): glibc's adjtimex() wrapper calls THIS with
+/// CLOCK_REALTIME(0) — the legacy 159 arm and the dynamic-clock
+/// path share one core. clk!=0 would be a posix-clock fd; none
+/// exist here, so EINVAL like an unknown clk id.
+pub fn sys_clock_adjtime(clk: u64, buf: u64) -> u64 {
+    if clk != 0 {
+        return EINVAL;
+    }
+    adjtimex_core(buf)
+}
+
+fn adjtimex_core(buf: u64) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const TIMEX: usize = 232;
+    // modes bits the kernel accepts (linux/timex.h ADJ_*)
+    const KNOWN_MODES: u32 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20
+        | 0x80 | 0x100 | 0x1000 | 0x2000 | 0x4000 | 0x8000;
+    if !range_ok(buf, 8) {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    // SAFETY: buf readable for 8 bytes (checked).
+    let modes = unsafe { (buf as *const u32).read_unaligned() };
+    if modes & !KNOWN_MODES != 0 {
+        return EINVAL;
+    }
+    if modes != 0 && t.uid != 0 {
+        return EPERM_;
+    }
+    if !range_ok(buf, TIMEX as u64) || !range_ok_w(buf, TIMEX as u64) {
+        return EFAULT;
+    }
+    // Stored adjustments — inert but they round-trip (offsets/
+    // freq/tick/status live until the next set).
+    static mut A_OFF: i64 = 0;
+    static mut A_FREQ: i64 = 0;
+    static mut A_MAX: i64 = 0;
+    static mut A_EST: i64 = 0;
+    static mut A_STA: u32 = 0x40; // STA_UNSYNC
+    static mut A_CON: i64 = 0;
+    static mut A_TICK: i64 = 10_000; // 100Hz -> 10000us
+    static mut A_TAI: i64 = 37;
+    unsafe {
+        let b = buf as *mut u8;
+        if modes & 0x01 != 0 {
+            A_OFF = (b.add(8) as *const i64).read_unaligned();
+        }
+        if modes & 0x02 != 0 {
+            A_FREQ = (b.add(16) as *const i64).read_unaligned();
+        }
+        if modes & 0x04 != 0 {
+            A_MAX = (b.add(24) as *const i64).read_unaligned();
+        }
+        if modes & 0x08 != 0 {
+            A_EST = (b.add(32) as *const i64).read_unaligned();
+        }
+        if modes & 0x10 != 0 {
+            // The STA bits userspace writes land as-is (PLL/UNSYNC/
+            // INS/DEL...); the read-only PPS edge flags get masked.
+            A_STA =
+                (b.add(40) as *const u32).read_unaligned() & 0x3fff;
+        }
+        if modes & 0x20 != 0 {
+            A_CON = (b.add(48) as *const i64).read_unaligned();
+        }
+        if modes & 0x80 != 0 {
+            A_TAI =
+                (b.add(160) as *const i32).read_unaligned() as i64;
+        }
+        if modes & 0x4000 != 0 {
+            A_TICK = (b.add(88) as *const i64).read_unaligned();
+        }
+        // SETOFFSET(0x100)/ADJTIME(0x8000)/MICRO(0x1000)/NANO(0x2000)
+        // accepted inert — the wall clock stays honest.
+        let (ws, wns) = crate::rtc::wall_now();
+        (b.add(8) as *mut i64).write_unaligned(A_OFF);   // offset
+        (b.add(16) as *mut i64).write_unaligned(A_FREQ); // freq
+        (b.add(24) as *mut i64).write_unaligned(A_MAX);  // maxerror
+        (b.add(32) as *mut i64).write_unaligned(A_EST);  // esterror
+        (b.add(40) as *mut u32).write_unaligned(A_STA);  // status
+        (b.add(48) as *mut i64).write_unaligned(A_CON);  // constant
+        (b.add(56) as *mut i64).write_unaligned(1);       // precision
+        // tolerance @64 left untouched
+        (b.add(72) as *mut i64).write_unaligned(ws as i64);   // tv_sec
+        (b.add(80) as *mut i64).write_unaligned((wns / 1000) as i64);
+        (b.add(88) as *mut i64).write_unaligned(A_TICK); // tick
+        (b.add(160) as *mut i32).write_unaligned(A_TAI as i32); // tai
+        // clock state = the return: TIME_ERROR while unsynchronized
+        if A_STA & 0x40 != 0 {
+            5
+        } else {
+            0
+        }
+    }
+}
+
 /// syslog(type, bufp, len): the kernel-log-ring reader (klogctl).
 /// Types <9 need uid==0 (CAP_SYSLOG/CAP_SYS_ADMIN upstream; uid is
 /// this model's privilege bit, same as chroot/setuid checks).
@@ -18115,6 +18379,7 @@ pub fn nt_thread_create(
         sid: p.sid,
         did_exec: false,
         pers: p.pers,
+        persona: p.persona,
         is_compat: p.is_compat,
         gs_base: teb,
         tls: [0; 4],
@@ -35871,6 +36136,13 @@ fn exit_bookkeeping(n: usize) {
         t.tgid,
         t.uid,
     );
+    // acct_process(): the exit-time record lands before fds drop —
+    // every task accounts (threads included, AGROUP only marks the
+    // last-of-group which we don't split out).
+    {
+        let t = tasks.get_mut(n).and_then(|s| s.as_mut()).unwrap();
+        acct_emit_exit(t);
+    }
     // exit_files(2): the dying task's fds release NOW, not at reap —
     // a pipe writer's OFD must hit refs=0 here so blocked readers
     // see EOF instead of waiting for the scheduler's reaper pass.
@@ -36547,6 +36819,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         sid: p.sid,
         did_exec: false, // fork resets the child-exec'd flag
         pers: p.pers,
+        persona: p.persona,
         is_compat: p.is_compat,
         gs_base: p.gs_base,
         tls: p.tls,
@@ -36742,6 +37015,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         sid: p.sid,
         did_exec: false,
         pers: p.pers,
+        persona: p.persona,
         is_compat: p.is_compat,
         gs_base: p.gs_base,
         tls: p.tls,

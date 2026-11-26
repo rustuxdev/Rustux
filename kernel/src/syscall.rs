@@ -801,6 +801,10 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_CHDIR => sys_chdir(a1),
         NR_FCHDIR => user::sys_fchdir(a1),
         161 => sys_chroot(a1),
+        163 => sys_acct(a1),
+        135 => user::sys_personality(a1),
+        159 => user::sys_adjtimex(a1),
+        305 => user::sys_clock_adjtime(a1, a2),
         303 => sys_name_to_handle_at(a1, a2, a3, a4, a5),
         304 => user::sys_open_by_handle_at(a1, a2, a3),
         312 => user::sys_kcmp(a1, a2, a3, a4, a5),
@@ -1576,6 +1580,20 @@ fn sys_chroot(path: u64) -> u64 {
         Err(e) => return e,
     };
     user::sys_chroot(&name[..n])
+}
+
+/// acct(path): NULL disables — the empty slice is the kernel's
+/// off-signal; otherwise the same copy-then-delegate flow.
+fn sys_acct(path: u64) -> u64 {
+    if path == 0 {
+        return user::sys_acct(&[]);
+    }
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_acct(&name[..n])
 }
 
 /// name_to_handle_at(303): copy the path then delegate — the
