@@ -7641,3 +7641,30 @@ Proof: blktest +11 sr0 checks, 0 failures — PVD `CD001` read
 back through READMODE1. Exit 33, 80 tasks, zero leak.
 
 Audit run-47: 0 confirmed. Ledger at 226 CVEs.
+
+## run-289 — AF_PACKET capture sockets
+
+`socket(AF_PACKET, SOCK_RAW|SOCK_DGRAM, htons(proto))` — the
+tcpdump/dhcpcd ABI. `PKTSOCKS[4]` each hold an 8-deep ring of
+`PktFrame` (wire frame + sockaddr_ll metadata); `pkt_tap` runs at
+every link boundary — `drain_desc`, `virtio_rx_one`, `lo_drain`
+(inbound) and `tx_eth` (outgoing -> PACKET_OUTGOING). Filters are
+the socket/bind protocol (host-order ethertype, ETH_P_ALL wild)
+and the bound `sll_ifindex` (0=any, 1=lo, 2=nic). Cooked
+(SOCK_DGRAM) strips the 14-byte header on recv and composes it
+from the sockaddr_ll on sendto — src mac forced, no spoof.
+
+recvfrom answers a fully-initialised `sockaddr_ll`; a blocked
+receiver gets the frame through its own tables like udp_rx.
+MAX_TASKS went 80->88 — pkttest was the 81st spawned record.
+
+Two in-run findings: the IRQ/syscall re-entrancy on the capture
+rings (PKT_TAP_BUSY guard — nested tap drops, never corrupts)
+and the run-288 LEAK regression — `ATAPI_MEM`'s lazy alloc
+landed 5 frames past the baseline; now allocated in the init
+port scan like the disk `MEM[]` slots (zero leak restored).
+
+Proof: pkttest 24 checks 0 failures. Exit 33, 81 tasks, zero
+leak.
+
+Audit run-48: 0 confirmed, 1 fixed in-run. Ledger at 231 CVEs.
