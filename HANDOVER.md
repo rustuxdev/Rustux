@@ -8167,3 +8167,24 @@ too — fatest passes -1L now. Also fixed a cross-test race
 sighted this run: pmvtest/stest both write the shared wall clock
 and one's write could land inside the other's assert window; both
 windows now cover either epoch. Audit run-69: 0 confirmed.
+run-311 lands the pipe-motion trio plus the flagged positioned
+pair. sys_splice(275) covers all three directions — file->pipe,
+pipe->file, pipe->pipe — with Linux's rules: pipe ends take NULL
+offsets only (ESPIPE), file ends use/advance OFD pos or a
+validated off_t pointer, one end must be a pipe, same-pipe
+EINVALs. The dst-file arm goes through fd_pwrite's seal gate and
+vfile_grow; the mid-copy-block divergence is the documented
+sendfile shape (short copy or EAGAIN, never sleeps mid-copy).
+sys_tee(276) peeks the source ring without consuming — a real
+byte-duplicate that proves out against reads on both ends.
+sys_vmsplice(278) pushes iovecs into a pipe's write end with
+per-segment EFAULT and short-answer semantics. preadv2/pwritev2
+(327/328) add the RWF flag gate (SUBSET valid, APPEND maps to
+EOF) and pos==-1's use-and-advance-file-pos semantics. sptest
+covers all of it; stest's nr-276 probe was updated since tee is
+genuinely wired now; lstest floor 73->74, 101 tasks. Two -1
+literal test bugs repeated the run-310 lesson (zero-extension
+through glibc syscall() is correct ABI — pass -1L). Audit
+run-70: 0 confirmed — Dirty Pipe (CVE-2022-0847) is n/a by
+construction since rings own private frames and never alias
+page-cache memory.
