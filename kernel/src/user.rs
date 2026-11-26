@@ -2680,11 +2680,12 @@ pub fn fd_getsockopt(
             (if cooked { 2 } else { 3 }, false)
         }
         Some(FdKind::Unix(i)) => {
-            let dgram = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+            let (dgram, seq) = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
                 .get(*i)
                 .and_then(|k| k.as_ref())
-                .is_some_and(|k| matches!(k.kind, UnixKind::Dgram { .. }));
-            (if dgram { 2 } else { 1 }, false)
+                .map(|k| (matches!(k.kind, UnixKind::Dgram { .. }), k.seq))
+                .unwrap_or((false, false));
+            (if seq { 5 } else if dgram { 2 } else { 1 }, false)
         }
         Some(FdKind::Nl(i)) => {
             let raw = unsafe { &*core::ptr::addr_of!(NLSOCKS) }
@@ -10529,10 +10530,23 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                                 let conns = unsafe {
                                     &*core::ptr::addr_of!(UNIXCONNS)
                                 };
+                                let s = (*side & 1) as usize;
                                 conns[*conn].as_ref().map_or(0, |c| {
-                                    (c.r[(*side & 1) as usize].tail
-                                        - c.r[(*side & 1) as usize].head)
-                                        as u64
+                                    if c.seq
+                                        && c.r[s].tail - c.r[s].head >= 2
+                                    {
+                                        // FIONREAD on seqpacket is
+                                        // the pending record size.
+                                        u16::from_le_bytes([
+                                            c.r[s].data
+                                                [c.r[s].head % UNIX_BUF],
+                                            c.r[s].data
+                                                [(c.r[s].head + 1) % UNIX_BUF],
+                                        ]) as u64
+                                    } else {
+                                        (c.r[s].tail - c.r[s].head)
+                                            as u64
+                                    }
                                 })
                             }
                             _ => 0,
@@ -22466,8 +22480,8 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
     } else if domain == 1 {
         const ESOCKTNOSUPPORT_: u64 = (-94i64) as u64;
         const EPROTONOSUPPORT: u64 = (-93i64) as u64;
-        if base != 1 && base != 2 {
-            // unix: STREAM and DGRAM — no SEQPACKET yet.
+        if base != 1 && base != 2 && base != 5 {
+            // unix: STREAM, DGRAM, SEQPACKET.
             return ESOCKTNOSUPPORT_;
         }
         if _proto != 0 {
@@ -22491,11 +22505,12 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
         };
         socks[si] = Some(UnixSock {
             name: None,
-            kind: if base == 1 {
+            kind: if base == 1 || base == 5 {
                 UnixKind::Fresh
             } else {
                 UnixKind::Dgram { peer: None }
             },
+            seq: base == 5,
         });
         FdKind::Unix(si)
     } else if domain == 16 {
@@ -22583,14 +22598,15 @@ pub fn fd_socketpair(domain: u64, ty: u64, _proto: u64, sv: u64) -> u64 {
     if domain != 1 {
         return EAFNOSUPPORT_;
     }
-    if base != 1 && base != 2 {
+    if base != 1 && base != 2 && base != 5 {
         return ESOCKTNOSUPPORT_;
     }
     if !range_ok_w(sv, 8) {
         return EFAULT;
     }
     let Some(t) = cur_mut() else { return EBADF };
-    if base == 1 {
+    if base == 1 || base == 5 {
+        let seq = base == 5;
         let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
         let Some(conn) = conns.iter().position(Option::is_none) else {
             return ENFILE_;
@@ -22600,17 +22616,20 @@ pub fn fd_socketpair(domain: u64, ty: u64, _proto: u64, sv: u64) -> u64 {
             open: [true, true],
             rd_shut: [false, false],
             fp: [[None, None, None, None], [None, None, None, None]],
+            seq,
         });
         let a = unix_mint_fd(
             t,
             UnixKind::Stream { conn, side: 0 },
             ty & SOCK_CLOEXEC != 0,
+            seq,
         );
         let Ok(a) = a else { return a.unwrap_err() };
         let b = unix_mint_fd(
             t,
             UnixKind::Stream { conn, side: 1 },
             ty & SOCK_CLOEXEC != 0,
+            seq,
         );
         let Ok(b) = b else {
             // Free side A: close its fd so the OFD/sock release.
@@ -22625,12 +22644,14 @@ pub fn fd_socketpair(domain: u64, ty: u64, _proto: u64, sv: u64) -> u64 {
             t,
             UnixKind::Dgram { peer: None },
             ty & SOCK_CLOEXEC != 0,
+            false,
         );
         let Ok(a) = a else { return a.unwrap_err() };
         let b = unix_mint_fd(
             t,
             UnixKind::Dgram { peer: None },
             ty & SOCK_CLOEXEC != 0,
+            false,
         );
         let Ok(b) = b else {
             let _ = fd_close(a);
@@ -23649,6 +23670,45 @@ pub fn fd_sendmmsg(ctx: &mut UCtx, fd: u64, msgvec: u64, vlen: u64, flags: u64) 
     sent
 }
 
+/// recvmmsg(fd, msgvec, vlen, flags, timeout): the recv twin —
+/// per-entry recvmsg, byte count into mmsghdr.msg_len, first
+/// error after >=1 success short-stops. `timeout` is validated
+/// when passed but ignored: our recv paths have no deadline
+/// semantics (documented divergence — callers wanting a bound
+/// should use poll + MSG_DONTWAIT).
+pub fn fd_recvmmsg(
+    ctx: &mut UCtx,
+    fd: u64,
+    msgvec: u64,
+    vlen: u64,
+    flags: u64,
+    timeout: u64,
+) -> u64 {
+    if vlen == 0 {
+        return 0;
+    }
+    if vlen > 1024 {
+        return EINVAL; // UIO_MAXIOV
+    }
+    if timeout != 0 && !range_ok(timeout, 16) {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    if !range_ok(msgvec, vlen * 64) || !range_ok_w(msgvec, vlen * 64) {
+        return EFAULT;
+    }
+    let mut got = 0u64;
+    for i in 0..vlen {
+        let r = fd_recvmsg(ctx, fd, msgvec + i * 64, flags);
+        if (r as i64) < 0 {
+            return if got > 0 { got } else { r };
+        }
+        write_task_u64(t.pml4, msgvec + i * 64 + 56, r);
+        got += 1;
+    }
+    got
+}
+
 /// setsockopt(fd, level, optname, optval, optlen): option surface
 /// the resolver and busybox probe (IP_RECVERR, SO_* flags) — the
 /// socket layer honors none of them yet, so accept-and-drop like a
@@ -23802,6 +23862,9 @@ struct UnixSock {
     /// bind()ed name — None is the unnamed/autobind case.
     name: Option<UnixName>,
     kind: UnixKind,
+    /// SOCK_SEQPACKET — Stream-kind conns carry [u16 len][pay]
+    /// records instead of a byte stream.
+    seq: bool,
 }
 
 /// One direction of a stream connection: a plain byte ring.
@@ -23837,6 +23900,9 @@ struct UnixConn {
     open: [bool; 2],
     rd_shut: [bool; 2],
     fp: [[Option<FdAttach>; 4]; 2],
+    /// seqpacket pair — rings hold framed records, sends are
+    /// atomic, recv consumes exactly one record.
+    seq: bool,
 }
 
 static mut UNIXSOCKS: [Option<UnixSock>; MAX_UNIX] =
@@ -23845,7 +23911,7 @@ static mut UNIXSOCKS: [Option<UnixSock>; MAX_UNIX] =
 /// kernel memory, so a full ring can't park on the caller's VA.
 #[derive(Clone, Copy)]
 struct KSend {
-    data: [u8; 1024],
+    data: [u8; 4098],
     len: usize,
 }
 
@@ -24227,14 +24293,14 @@ fn unix_stream_take(
     flags: u64,
 ) -> Option<u64> {
     let s = side & 1;
-    let (avail, open) = {
+    let (avail, open, seqp) = {
         let conns = unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
         match conns[conn].as_ref() {
             Some(c) => {
                 (c.r[s].tail - c.r[s].head,
-                 c.open[1 - s] && !c.rd_shut[s])
+                 c.open[1 - s] && !c.rd_shut[s], c.seq)
             }
-            None => (0, false),
+            None => (0, false, false),
         }
     };
     if avail == 0 {
@@ -24248,6 +24314,60 @@ fn unix_stream_take(
         return Some(EFAULT);
     };
     let cap = umsg_iov_cap(t.pml4, &m);
+    if seqp {
+        // seqpacket: exactly one framed record per recvmsg;
+        // surplus past the iovec cap discards + MSG_TRUNC.
+        let (rl, hbase) = {
+            let conns = unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
+            let c = conns[conn].as_ref().unwrap();
+            (
+                (u16::from_le_bytes([
+                    c.r[s].data[c.r[s].head % UNIX_BUF],
+                    c.r[s].data[(c.r[s].head + 1) % UNIX_BUF],
+                ]) as usize)
+                    .min(avail.saturating_sub(2)),
+                c.r[s].head,
+            )
+        };
+        let n = core::cmp::min(cap, rl);
+        let mut tmp = [0u8; 4096];
+        let n = n.min(4096);
+        let new_head = {
+            let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
+            let c = conns[conn].as_mut().unwrap();
+            for i in 0..n {
+                tmp[i] = c.r[s].data[(hbase + 2 + i) % UNIX_BUF];
+            }
+            c.r[s].head += 2 + rl;
+            c.r[s].head
+        };
+        let cloexec = flags & (1u64 << 30) != 0;
+        let (_w, ctr) = unix_fp_emit(
+            t, conn, s, new_head, m.control, m.controllen, cloexec,
+        );
+        let src = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+            .iter()
+            .flatten()
+            .find(|k| {
+                matches!(k.kind, UnixKind::Stream { conn: c, side: sd }
+                    if c == conn && sd as usize != s)
+            })
+            .and_then(|k| k.name)
+            .unwrap_or(UNAME_NONE);
+        let done = unix_msg_deliver(
+            t, msg, flags, &tmp[..n], src, None, ctr,
+        );
+        // deliver's own scatter never truncates (blob == copied
+        // part) — the discarded record tail reports MSG_TRUNC here.
+        umsg_set_flags(
+            t.pml4,
+            msg,
+            (if rl > n { 0x20 } else { 0 })
+                | (if ctr { 0x08 } else { 0 }),
+        );
+        unix_wake(conn);
+        return Some(done);
+    }
     let n = core::cmp::min(cap, avail);
     // Stage the ring bytes (bounded by cap <= caller iovecs).
     let mut tmp = [0u8; 4096];
@@ -24376,6 +24496,33 @@ fn unix_wake(conn: usize) {
                 }
                 if avail == 0 {
                     t.ctx.rax = 0; // peer closed — EOF
+                } else if c.seq {
+                    // seqpacket — one framed record; surplus
+                    // past wait_len is discarded like the
+                    // inline arm.
+                    let rl = (u16::from_le_bytes([
+                        c.r[s].data[c.r[s].head % UNIX_BUF],
+                        c.r[s].data[(c.r[s].head + 1) % UNIX_BUF],
+                    ]) as usize)
+                        .min(avail.saturating_sub(2));
+                    let n = core::cmp::min(t.wait_len as usize, rl);
+                    let mut tmp = [0u8; 512];
+                    let mut done = 0usize;
+                    while done < n {
+                        let m = core::cmp::min(512, n - done);
+                        for (i, b) in tmp[..m].iter_mut().enumerate() {
+                            *b = c.r[s].data
+                                [(c.r[s].head + 2 + done + i) % UNIX_BUF];
+                        }
+                        write_task_bytes(
+                            t.pml4,
+                            t.wait_ptr + done as u64,
+                            &tmp[..m],
+                        );
+                        done += m;
+                    }
+                    c.r[s].head += 2 + rl;
+                    t.ctx.rax = n as u64;
                 } else {
                     let n = core::cmp::min(t.wait_len as usize, avail);
                     let mut tmp = [0u8; 512];
@@ -24425,7 +24572,55 @@ fn unix_wake(conn: usize) {
                     t.ctx.rax = (-32i64) as u64; // EPIPE
                 } else {
                     let free = UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head);
+                    // seqpacket: push only when the WHOLE framed
+                    // record fits — a half record corrupts the
+                    // peer's framing.
+                    if c.seq && free < 2 + t.wait_len as usize {
+                        continue;
+                    }
                     if free == 0 {
+                        continue;
+                    }
+                    if c.seq {
+                        let rl = (t.wait_len as u16).to_le_bytes();
+                        for (i, &b) in rl.iter().enumerate() {
+                            c.r[1 - s].data
+                                [(c.r[1 - s].tail + i) % UNIX_BUF] = b;
+                        }
+                        let n = t.wait_len as usize;
+                        let mut tmp = [0u8; 512];
+                        let mut done = 0usize;
+                        let mut ok = true;
+                        while done < n {
+                            let m = core::cmp::min(512, n - done);
+                            if !read_task_bytes(
+                                t.pml4,
+                                t.wait_ptr + done as u64,
+                                &mut tmp[..m],
+                            ) {
+                                ok = false;
+                                break;
+                            }
+                            for (i, &b) in tmp[..m].iter().enumerate() {
+                                c.r[1 - s].data
+                                    [(c.r[1 - s].tail + 2 + done + i) % UNIX_BUF] = b;
+                            }
+                            done += m;
+                        }
+                        // A bad VA mid-record abandons the whole
+                        // frame — tail stays, the half record is
+                        // never committed (atomicity preserved).
+                        if ok {
+                            c.r[1 - s].tail += 2 + done;
+                        }
+                        t.ctx.rax = if ok {
+                            done as u64
+                        } else {
+                            EFAULT
+                        };
+                        t.wait_on = WaitOn::None;
+                        t.wait_deadline = 0;
+                        t.state = TaskState::Runnable;
                         continue;
                     }
                     let n = core::cmp::min(t.wait_len as usize, free);
@@ -24480,13 +24675,27 @@ fn unix_wake(conn: usize) {
                     let ks = unsafe {
                         KSEND[conn][s].as_mut().unwrap()
                     };
-                    let n = core::cmp::min(ks.len, free);
+                    // seqpacket: staging holds the whole framed
+                    // record — all or nothing, and rax answers
+                    // the payload length not the frame length.
+                    if c.seq && free < ks.len {
+                        continue;
+                    }
+                    let n = if c.seq {
+                        ks.len
+                    } else {
+                        core::cmp::min(ks.len, free)
+                    };
                     for (i, &b) in ks.data[..n].iter().enumerate() {
                         c.r[1 - s].data
                             [(c.r[1 - s].tail + i) % UNIX_BUF] = b;
                     }
                     c.r[1 - s].tail += n;
-                    t.ctx.rax = n as u64;
+                    t.ctx.rax = if c.seq {
+                        (n - 2) as u64
+                    } else {
+                        n as u64
+                    };
                     unsafe { KSEND[conn][s] = None; }
                 }
                 t.wait_on = WaitOn::None;
@@ -24504,6 +24713,7 @@ fn unix_mint_fd(
     t: &mut Task,
     kind: UnixKind,
     ce: bool,
+    seq: bool,
 ) -> Result<u64, u64> {
     const ENFILE_: u64 = (-23i64) as u64;
     let socks = unsafe { &mut *core::ptr::addr_of_mut!(UNIXSOCKS) };
@@ -24519,7 +24729,7 @@ fn unix_mint_fd(
             ENFILE_
         });
     };
-    socks[si] = Some(UnixSock { name: None, kind });
+    socks[si] = Some(UnixSock { name: None, kind, seq });
     ofds[oi] = Some(OpenFile {
         kind: FdKind::Unix(si),
         pos: 0,
@@ -24559,6 +24769,7 @@ fn unix_wake_accept(li: usize) {
                 t,
                 UnixKind::Stream { conn, side: 1 },
                 t.wait_len & SOCK_CLOEXEC != 0,
+                socks[li].as_ref().map(|k| k.seq).unwrap_or(false),
             ) {
                 Ok(fd) => t.ctx.rax = fd,
                 Err(e) => {
@@ -24617,6 +24828,7 @@ fn unix_wake_conn(li: usize) {
         }
         let socks = unsafe { &mut *core::ptr::addr_of_mut!(UNIXSOCKS) };
         let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
+        let cseq = socks[ui].as_ref().map(|k| k.seq).unwrap_or(false);
         let Some(UnixKind::Listen { backlog, n }) =
             socks[li].as_mut().map(|k| &mut k.kind)
         else {
@@ -24637,6 +24849,7 @@ fn unix_wake_conn(li: usize) {
             open: [true, true],
             rd_shut: [false, false],
             fp: [[None, None, None, None], [None, None, None, None]],
+            seq: cseq,
         });
         backlog[*n] = conn;
         *n += 1;
@@ -24713,17 +24926,54 @@ fn unix_recv_stream(
     const EAGAIN_: u64 = (-11i64) as u64;
     const EINTR_: u64 = (-4i64) as u64;
     let Some(t) = cur_mut() else { return EBADF };
-    let (mut avail, open) = {
+    let (mut avail, open, seqp) = {
         let conns = unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
         match conns[conn].as_ref() {
             Some(c) => {
                 let s = side & 1;
                 (c.r[s].tail - c.r[s].head,
-                 c.open[1 - s] && !c.rd_shut[s])
+                 c.open[1 - s] && !c.rd_shut[s], c.seq)
             }
-            None => (0, false),
+            None => (0, false, false),
         }
     };
+    if avail > 0 && seqp {
+        // seqpacket: one framed record per recv — the tail past
+        // the caller's buffer is discarded (Linux's MSG_TRUNC on
+        // seqpacket read drops the surplus silently).
+        let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
+        let c = conns[conn].as_mut().unwrap();
+        let s = side & 1;
+        let rl = (u16::from_le_bytes([
+            c.r[s].data[c.r[s].head % UNIX_BUF],
+            c.r[s].data[(c.r[s].head + 1) % UNIX_BUF],
+        ]) as usize)
+            .min(avail.saturating_sub(2));
+        let n = core::cmp::min(len as usize, rl);
+        if n > 0 && !range_ok_w(buf, n as u64) {
+            return EFAULT;
+        }
+        let mut tmp = [0u8; 512];
+        let mut done = 0usize;
+        while done < n {
+            let m = core::cmp::min(512, n - done);
+            for (i, b) in tmp[..m].iter_mut().enumerate() {
+                *b = c.r[s].data[(c.r[s].head + 2 + done + i) % UNIX_BUF];
+            }
+            // SAFETY: buf validated writable under the current cr3.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    tmp.as_ptr(),
+                    (buf + done as u64) as *mut u8,
+                    m,
+                );
+            }
+            done += m;
+        }
+        c.r[s].head += 2 + rl;
+        unix_wake(conn); // drain frees the peer's send room
+        return n as u64;
+    }
     if avail > 0 {
         if !range_ok_w(buf, core::cmp::max(len.min(avail as u64), 1)) {
             return EFAULT;
@@ -24788,7 +25038,111 @@ fn unix_send_stream(
     const EAGAIN_: u64 = (-11i64) as u64;
     const EINTR_: u64 = (-4i64) as u64;
     const EPIPE_: u64 = (-32i64) as u64;
+    const EMSGSIZE_: u64 = (-90i64) as u64;
     let Some(t) = cur_mut() else { return EBADF };
+    // seqpacket: the whole record must fit the ring atomically —
+    // never a partial write. Cap = ring minus the 2-byte header.
+    if unsafe { (*core::ptr::addr_of!(UNIXCONNS))[conn]
+        .as_ref()
+        .map(|c| c.seq)
+        .unwrap_or(false)
+    } {
+        if len as usize > UNIX_BUF - 2 {
+            return EMSGSIZE_;
+        }
+        let need = 2 + len as usize;
+        loop {
+            let (free, open) = {
+                let conns = unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
+                match conns[conn].as_ref() {
+                    Some(c) => {
+                        let s = side & 1;
+                        (UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head),
+                         c.open[1 - s])
+                    }
+                    None => (0, false),
+                }
+            };
+            if !open {
+                return EPIPE_;
+            }
+            if free >= need {
+                if len > 0 && !range_ok(buf, len) {
+                    return EFAULT;
+                }
+                let conns = unsafe {
+                    &mut *core::ptr::addr_of_mut!(UNIXCONNS)
+                };
+                let c = conns[conn].as_mut().unwrap();
+                let s = side & 1;
+                let rl = (len as u16).to_le_bytes();
+                for (i, &b) in rl.iter().enumerate() {
+                    c.r[1 - s].data[(c.r[1 - s].tail + i) % UNIX_BUF] = b;
+                }
+                let mut tmp = [0u8; 512];
+                let mut done = 0usize;
+                while done < len as usize {
+                    let m = core::cmp::min(512, len as usize - done);
+                    // SAFETY: buf validated readable under cur cr3.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            (buf + done as u64) as *const u8,
+                            tmp.as_mut_ptr(),
+                            m,
+                        );
+                    }
+                    for (i, &b) in tmp[..m].iter().enumerate() {
+                        c.r[1 - s].data
+                            [(c.r[1 - s].tail + 2 + done + i) % UNIX_BUF] = b;
+                    }
+                    done += m;
+                }
+                c.r[1 - s].tail += need;
+                unix_wake(conn);
+                return len;
+            }
+            if len > 0 && !range_ok(buf, 1) {
+                return EFAULT;
+            }
+            if dw {
+                return EAGAIN_;
+            }
+            if deliverable(t) {
+                return EINTR_;
+            }
+            t.wait_on = WaitOn::UnixSend(conn, side as u8);
+            t.wait_ptr = buf;
+            t.wait_len = len.min(UNIX_BUF as u64);
+            t.wait_deadline = 0;
+            t.ctx = *ctx;
+            t.state = TaskState::Blocked;
+            if t.state == TaskState::Runnable {
+                return t.ctx.rax;
+            }
+            // Armed recheck — room may have raced the arming.
+            let (free2, open2) = {
+                let conns = unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
+                match conns[conn].as_ref() {
+                    Some(c) => {
+                        let s2 = side & 1;
+                        (UNIX_BUF - (c.r[1 - s2].tail - c.r[1 - s2].head),
+                         c.open[1 - s2])
+                    }
+                    None => (0, false),
+                }
+            };
+            if !open2 {
+                t.wait_on = WaitOn::None;
+                t.state = TaskState::Runnable;
+                return EPIPE_;
+            }
+            if free2 < need {
+                block_switch();
+            }
+            t.wait_on = WaitOn::None;
+            t.state = TaskState::Runnable;
+        }
+    }
     loop {
         let (free, open) = {
             let conns = unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
@@ -24893,22 +25247,33 @@ fn unix_send_stream_slice(
     const EAGAIN_: u64 = (-11i64) as u64;
     const EINTR_: u64 = (-4i64) as u64;
     const EPIPE_: u64 = (-32i64) as u64;
+    const EMSGSIZE_: u64 = (-90i64) as u64;
     let Some(t) = cur_mut() else { return EBADF };
     let s = side & 1;
-    let (free, open) = {
+    let (free, open, seqp) = {
         let conns = unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
         match conns[conn].as_ref() {
             Some(c) => {
                 (UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head),
-                 c.open[1 - s])
+                 c.open[1 - s], c.seq)
             }
-            None => (0, false),
+            None => (0, false, false),
         }
     };
     if !open {
         return EPIPE_;
     }
-    if free == 0 {
+    // seqpacket: atomic framed record — header+payload as one
+    // staging unit so the waker never half-writes a record.
+    let frame = if seqp {
+        if pay.len() > UNIX_BUF - 2 {
+            return EMSGSIZE_;
+        }
+        2 + pay.len()
+    } else {
+        pay.len()
+    };
+    if free < frame {
         if dw {
             return EAGAIN_;
         }
@@ -24916,28 +25281,41 @@ fn unix_send_stream_slice(
             return EINTR_;
         }
         // Park the payload in kernel staging — wait_ptr is dead.
+        // For seq the staging IS the record: [u16 len][pay].
         let ks = unsafe { &mut KSEND[conn][s] };
-        let len = core::cmp::min(pay.len(), 1024);
-        *ks = Some(KSend { data: [0u8; 1024], len });
-        ks.as_mut()
-            .unwrap()
-            .data[..len]
-            .copy_from_slice(&pay[..len]);
+        let len = core::cmp::min(frame, 4098);
+        *ks = Some(KSend { data: [0u8; 4098], len });
+        let kd = &mut ks.as_mut().unwrap().data;
+        if seqp {
+            kd[..2].copy_from_slice(
+                &(pay.len() as u16).to_le_bytes(),
+            );
+            kd[2..len].copy_from_slice(&pay[..len - 2]);
+        } else {
+            kd[..len].copy_from_slice(&pay[..len]);
+        }
         t.wait_on = WaitOn::UnixSendK(conn, side as u8);
         t.wait_deadline = 0;
         t.ctx = *ctx;
         t.state = TaskState::Blocked;
         block_switch()
     }
-    let n = core::cmp::min(pay.len(), free);
+    let n = core::cmp::min(frame, free);
     let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
     let c = conns[conn].as_mut().unwrap();
-    for (i, &b) in pay[..n].iter().enumerate() {
-        c.r[1 - s].data[(c.r[1 - s].tail + i) % UNIX_BUF] = b;
+    if seqp {
+        let rl = (pay.len() as u16).to_le_bytes();
+        for (i, &b) in rl.iter().enumerate() {
+            c.r[1 - s].data[(c.r[1 - s].tail + i) % UNIX_BUF] = b;
+        }
+    }
+    let off = if seqp { 2 } else { 0 };
+    for (i, &b) in pay[..n - off].iter().enumerate() {
+        c.r[1 - s].data[(c.r[1 - s].tail + off + i) % UNIX_BUF] = b;
     }
     c.r[1 - s].tail += n;
     unix_wake(conn); // data arrived for the peer's readers
-    n as u64
+    if seqp { pay.len() as u64 } else { n as u64 }
 }
 
 /// ---------------- AF_NETLINK ----------------
@@ -25590,7 +25968,12 @@ fn unix_connect(ctx: &mut UCtx, ui: usize, sa: u64, len: u64, dw: bool) -> u64 {
         *peer = Some(UnixPeer::Name(n));
         return 0;
     }
-    // Stream: the named socket must be listening.
+    // Stream/seqpacket: the named socket must be listening, and
+    // a seqpacket client needs a seqpacket listener.
+    let cseq = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }[ui]
+        .as_ref()
+        .map(|k| k.seq)
+        .unwrap_or(false);
     let li = unix_find_name(&n);
     let li = match li {
         Some(i)
@@ -25599,7 +25982,11 @@ fn unix_connect(ctx: &mut UCtx, ui: usize, sa: u64, len: u64, dw: bool) -> u64 {
                     .as_ref()
                     .map(|k| &k.kind),
                 Some(UnixKind::Listen { .. })
-            ) =>
+            ) && unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }[i]
+                .as_ref()
+                .map(|k| k.seq)
+                .unwrap_or(false)
+                == cseq =>
         {
             i
         }
@@ -25625,6 +26012,7 @@ fn unix_connect(ctx: &mut UCtx, ui: usize, sa: u64, len: u64, dw: bool) -> u64 {
                 open: [true, true],
                 rd_shut: [false, false],
                 fp: [[None, None, None, None], [None, None, None, None]],
+                seq: cseq,
             });
             backlog[*n] = conn;
             *n += 1;
@@ -26823,6 +27211,7 @@ pub fn fd_accept(ctx: &mut UCtx, fd: u64, sa: u64, _alen: u64, flags: u64) -> u6
                 match socks.get_mut(li).and_then(|s| s.as_mut()) {
                     Some(UnixSock {
                         kind: UnixKind::Listen { backlog, n },
+                        seq,
                         ..
                     }) if *n > 0 => {
                         let conn = backlog[0];
@@ -26830,12 +27219,14 @@ pub fn fd_accept(ctx: &mut UCtx, fd: u64, sa: u64, _alen: u64, flags: u64) -> u6
                             backlog[j - 1] = backlog[j];
                         }
                         *n -= 1;
+                        let aseq = *seq;
                         // Mint the server half in our own table.
                         let Some(t) = cur_mut() else { return EBADF };
                         return match unix_mint_fd(
                             t,
                             UnixKind::Stream { conn, side: 1 },
                             flags & SOCK_CLOEXEC != 0,
+                            aseq,
                         ) {
                             Ok(fd) => {
                                 if sa != 0 && range_ok_w(sa, 110) {

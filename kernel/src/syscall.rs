@@ -271,6 +271,7 @@ const NR_RECVMSG: u64 = 47;
 const NR_SOCKETPAIR: u64 = 53;
 const NR_SETSOCKOPT: u64 = 54;
 const NR_SENDMMSG: u64 = 307;
+const NR_RECVMMSG: u64 = 299;
 const NR_SHUTDOWN: u64 = 48;
 const NR_BIND: u64 = 49;
 const NR_LISTEN: u64 = 50;
@@ -505,6 +506,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_SETSOCKOPT => user::fd_setsockopt(a1, a2, a3, a4, a5),
         55 => user::fd_getsockopt(a1, a2, a3, a4, a5),
         NR_SENDMMSG => user::fd_sendmmsg(ctx, a1, a2, a3, a4),
+        NR_RECVMMSG => user::fd_recvmmsg(ctx, a1, a2, a3, a4, a5),
         NR_OPEN => sys_open(a1, a2, a3),
         NR_OPENAT => sys_openat(a1, a2, a3, a4),
         NR_PREAD64 => user::fd_pread(a1, a2, a3, a4 as i64),

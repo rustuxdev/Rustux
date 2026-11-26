@@ -55,8 +55,72 @@ int main(void) {
 
     check(socketpair(AF_INET, SOCK_STREAM, 0, sv) < 0 &&
           errno == EAFNOSUPPORT, "socketpair INET refused");
-    check(socket(AF_UNIX, SOCK_SEQPACKET, 0) < 0 &&
-          errno == ESOCKTNOSUPPORT, "seqpacket refused");
+    // --- SOCK_SEQPACKET via socketpair ---
+    {
+        check(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0,
+              "seqpacket pair");
+        int ty = 0; socklen_t tl = sizeof(ty);
+        check(getsockopt(sv[0], SOL_SOCKET, SO_TYPE, &ty, &tl) == 0 &&
+              ty == SOCK_SEQPACKET, "SO_TYPE seqpacket");
+        // Records keep their boundaries: two sends, two recvs.
+        check(write(sv[0], "aa", 2) == 2, "seq send a");
+        check(write(sv[0], "bbbbb", 5) == 5, "seq send b");
+        memset(buf, 0, sizeof(buf));
+        check(read(sv[1], buf, sizeof(buf)) == 2 &&
+              !memcmp(buf, "aa", 2), "seq record a");
+        memset(buf, 0, sizeof(buf));
+        check(read(sv[1], buf, sizeof(buf)) == 5 &&
+              !memcmp(buf, "bbbbb", 5), "seq record b");
+        // A short read discards the record's tail — the NEXT
+        // recv gets the next record, not the leftover bytes.
+        check(write(sv[0], "first-second", 12) == 12,
+              "seq send long");
+        memset(buf, 0, sizeof(buf));
+        check(read(sv[1], buf, 5) == 5 && !memcmp(buf, "first", 5),
+              "seq short read truncates");
+        check(write(sv[0], "next", 4) == 4, "seq send next");
+        memset(buf, 0, sizeof(buf));
+        check(read(sv[1], buf, sizeof(buf)) == 4 &&
+              !memcmp(buf, "next", 4), "seq tail discarded");
+        // FIONREAD = pending record payload size.
+        check(write(sv[0], "1234567", 7) == 7, "seq send c");
+        int inq = 0;
+        check(ioctl(sv[1], FIONREAD, &inq) == 0 && inq == 7,
+              "seq FIONREAD record len");
+        memset(buf, 0, sizeof(buf));
+        check(read(sv[1], buf, sizeof(buf)) == 7, "seq drain c");
+        // Oversized send -> EMSGSIZE.
+        static char big[8192];
+        errno = 0;
+        check(write(sv[0], big, sizeof(big)) < 0 &&
+              errno == EMSGSIZE, "seq EMSGSIZE");
+        // recvmsg on a short iovec reports MSG_TRUNC.
+        check(write(sv[0], "0123456789", 10) == 10, "seq send d");
+        struct msghdr mh; struct iovec io;
+        char small[4];
+        memset(&mh, 0, sizeof(mh));
+        io.iov_base = small; io.iov_len = sizeof(small);
+        mh.msg_iov = &io; mh.msg_iovlen = 1;
+        check(recvmsg(sv[1], &mh, 0) == 4 &&
+              (mh.msg_flags & MSG_TRUNC), "seq MSG_TRUNC flag");
+        close(sv[0]); close(sv[1]);
+
+        // seq client can't reach a stream listener and vice
+        // versa — mismatched types are refused like Linux's
+        // ECONNREFUSED on a wrong-kind peer.
+        struct sockaddr_un un;
+        memset(&un, 0, sizeof(un));
+        un.sun_family = AF_UNIX;
+        strcpy(un.sun_path, "\0utseq");
+        int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        int qfd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        check(qfd >= 0, "seq socket mint");
+        check(bind(sfd, (struct sockaddr *)&un, 10) == 0 &&
+              listen(sfd, 1) == 0, "stream listener up");
+        check(connect(qfd, (struct sockaddr *)&un, 10) < 0 &&
+              errno == ECONNREFUSED, "seq->stream refused");
+        close(sfd); close(qfd);
+    }
 
     // --- SOCK_STREAM via socketpair ---
     check(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "stream pair");
@@ -352,6 +416,37 @@ int main(void) {
     }
 
     close(ls);
+
+    // --- recvmmsg (NR 299) ---
+    {
+        check(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0,
+              "recvmmsg pair");
+        check(write(sv[0], "x1", 2) == 2, "mmsg dgram 1");
+        check(write(sv[0], "y22", 3) == 3, "mmsg dgram 2");
+        check(write(sv[0], "z333", 4) == 4, "mmsg dgram 3");
+        struct mmsghdr mv[3]; struct iovec io[3];
+        char b1[8], b2[8], b3[8];
+        memset(mv, 0, sizeof(mv));
+        io[0].iov_base = b1; io[0].iov_len = 8;
+        io[1].iov_base = b2; io[1].iov_len = 8;
+        io[2].iov_base = b3; io[2].iov_len = 8;
+        for (int i = 0; i < 3; i++) {
+            mv[i].msg_hdr.msg_iov = &io[i];
+            mv[i].msg_hdr.msg_iovlen = 1;
+        }
+        // Nonblocking so the drained queue can't park the suite.
+        fcntl(sv[1], F_SETFL, O_NONBLOCK);
+        n = recvmmsg(sv[1], mv, 3, 0, NULL);
+        check(n == 3, "recvmmsg count");
+        check(mv[0].msg_len == 2 && !memcmp(b1, "x1", 2) &&
+              mv[1].msg_len == 3 && !memcmp(b2, "y22", 3) &&
+              mv[2].msg_len == 4 && !memcmp(b3, "z333", 4),
+              "recvmmsg payloads + msg_len");
+        check(recvmmsg(sv[1], mv, 1, 0, NULL) < 0 &&
+              errno == EAGAIN, "recvmmsg drained EAGAIN");
+        close(sv[0]); close(sv[1]);
+    }
+
     char fin[64];
     int m = snprintf(fin, sizeof(fin),
                      "unixtest: %d failure(s)\n", fails);
