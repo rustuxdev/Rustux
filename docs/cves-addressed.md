@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**196 unique CVEs recorded.**
+**198 unique CVEs recorded.**
 
 ## klib ports
 
@@ -239,6 +239,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-46063 | queued signals: rt_sigqueueinfo(129)/rt_tgsigqueueinfo(297) + per-bit SigSrc provenance,… | 46063 n/a by construction (no shadow stack, no mmap locks, single-CPU IF-masked). Provenance-forgery gate verified (si_code>=0/SI_TKILL EPERM); copyout records zero-filled; audit… |
 | CVE-2026-46063 | signal-delivery regression + installed-boot chain rung: 9c167cc (ia32 pipe2) accidentally… | audit run-iso-rung + run-264 scoped quick (security-audit skill, run-23): restore is the previously-audited call site (i386 twin retained); cve-now sigreturn/frame class — CVE-201… |
 | CVE-2026-46063 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
+| CVE-2026-46141 | NVMe-MSI-X rung: I/O CQ interrupt delivery — msix_cap 64-bit BAR fix (type bits 0b100 rec… | audit run-36 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-46141, CVE-2026-80620 — n/a. Verified: make run exit 33, 76 tasks, frames equal, blktest 0… |
+| CVE-2026-46141 | NVMe-MSI-X rung: I/O CQ interrupt delivery — msix_cap 64-bit BAR fix (type bits 0b100 rec… | audit run-36 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-46141, CVE-2026-80620 — n/a. Verified: make run exit 33, 76 tasks, frames equal, blktest 0… |
 | CVE-2026-52937 | real GNU bash 5.2 (dynamic, +libtinfo second DT_NEEDED — ld.so's first multi-library reso… | sockaddr-leak class structurally absent: sock_name copies min(*addrlen,16) bytes of a sockaddr_in built by sockaddr_in() which zero-fills all 16 before writing fields — every copi… |
 | CVE-2026-63833 | real file metadata: chmod/fchmod/fchmodat + chown/lchown/fchown/fchownat + utime/utimensa… | 63833 n/a by construction — metadata stored but never enforced (no credential model/setuid-on-exec/perm checks); audit fixed: times read after pathname copy + nsec validated after… |
 | CVE-2026-63910 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
@@ -266,6 +268,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-80560 | signal-delivery regression + installed-boot chain rung: 9c167cc (ia32 pipe2) accidentally… | audit run-iso-rung + run-264 scoped quick (security-audit skill, run-23): restore is the previously-audited call site (i386 twin retained); cve-now sigreturn/frame class — CVE-201… |
 | CVE-2026-80560 | signals: rt_sigaction/rt_sigreturn/kill + EINTR | frame = [signo][UCtx] pushed onto the task's own stack through its own tables; sigreturn treats it as hostile: cs=0x33/ss=0x2b pinned not restored, TF/NT/IOPL cleared, rip canonic… |
 | CVE-2026-80590 | `net` (IPv4/ICMP) | **design-bound** — no reassembly queue at all; `parse_ipv4` drops MF/offset fragments. Reassembly = its own future audit. Only consumer-side ICMP hits (Smack DOI) — n/a |
+| CVE-2026-80620 | NVMe-MSI-X rung: I/O CQ interrupt delivery — msix_cap 64-bit BAR fix (type bits 0b100 rec… | audit run-36 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-46141, CVE-2026-80620 — n/a. Verified: make run exit 33, 76 tasks, frames equal, blktest 0… |
+| CVE-2026-80620 | NVMe-MSI-X rung: I/O CQ interrupt delivery — msix_cap 64-bit BAR fix (type bits 0b100 rec… | audit run-36 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-46141, CVE-2026-80620 — n/a. Verified: make run exit 33, 76 tasks, frames equal, blktest 0… |
 | CVE-2026-80758 | futex(202): FUTEX_WAIT/WAKE + real CHILD_CLEARTID (exit zeroes *ctid + futex-wakes = pthr… | all hits are requeue-PI and private-hash-pivot races — structurally absent: no PI/requeue ops (ENOSYS), no hash table to pivot (waiters live as WaitOn::Futex in TASKS), synchronou… |
 | CVE-2026-80776 | real Debian apt-get install end-to-end: aptprobe run() children now execve with PATH envp… | audit run-110 manual scoped + cve.now over HTTP JSON-RPC (entities.search confirmed the lost-wakeup class analogs): verified wait4_collect preserves Linux ordering (EINVAL on bad… |
 | CVE-2026-80808 | ext-family + virtio-blk rung: ext3/ext4 read support in ext2.rs — incompat whitelist (JOU… | audit run-24 scoped quick (security-audit skill): 0 confirmed; nv-24-1 RECOVER tolerated recorded; cve-now checked: CVE-2026-34961, CVE-2025-38314, CVE-2026-99682, CVE-2026-80808,… |

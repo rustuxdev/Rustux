@@ -7243,3 +7243,32 @@ Audit run-35: 0 confirmed — CVE-2023-53998's writer/reader race
 n/a (boot-context only), CVE-2026-87043's unready-device class
 handled (pool seeded first; absent device returns 0, reseed
 no-ops). Ledger at 196 CVEs. Commits pushed origin main.
+
+## run-277 — NVMe MSI-X I/O-CQ interrupts
+
+The NVMe datapath only spin-polled the CQ phase bit — no interrupt
+delivery at all. nvme.rs now arms MSI-X before Create-IOCQ (the
+CQ's interrupt vector is fixed in cdw11 at create: ien+iv=1 when
+armed), masks every entry then routes entry 1 -> IRQ_NVME (0xf5);
+the admin CQ's architected IV0 stays masked. on_irq is count-only —
+the phase-bit poll stays the sole completion consumer, same
+contract as virtio-net's handler. irq_selftest runs post-sti: one
+read must grow the IRQ count (bounded wait).
+
+BUG found by the proof: pci::msix_cap dropped the 64-bit BAR's
+high dword — NVMe's BAR at 0xc00000c000 truncated the MSI-X table
+address into low memory and every entry write was silently eaten
+(msix=true, 0 IRQs). The cap now reconstructs the high dword when
+type bits read 0b100 — fixes the class for every caller.
+
+apic.rs IRQ_NVME + dispatch arm; cpu.rs stub + IDT gate 28;
+main.rs calls irq_selftest in the post-sti block.
+
+Proof: `nvme: 2 I/O-CQ MSI IRQs on vec 0xf5 (read-caused)`,
+`I/O-CQ MSI receive path true`. Exit 33, 76 tasks, zero leak,
+blktest 0 failures.
+
+Audit run-36: 0 confirmed — the MSI-X lifecycle CVEs
+(CVE-2026-46141, CVE-2026-80620) are teardown/domain classes, n/a
+with no unload path. Ledger at 198 CVEs. Commits pushed origin
+main.
