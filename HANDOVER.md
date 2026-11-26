@@ -7045,3 +7045,37 @@ zero leak, both ext4 transports still mount.
 Next candidates: /dev block nodes in the OFD layer (write_range has
 no userspace reach yet), virtio IRQ-driven RX, modern-only virtio
 transport (cap list), multi-namespace NVMe.
+
+## run-270 — /dev block nodes + pwrite64 + NVMe doorbell fix
+
+user.rs grows the transport-generic block layer: blk_capacity,
+blk_transport, blk_read/blk_write (bounce-buffered byte interface —
+the same contract sd_read/sd_write have). Nodes: /dev/vd[abcd]
+(major 254, minor 16*i) for probed virtio disks, /dev/nvme0n[1-4]
+(major 259, minor=ns) for NVMe namespaces — hardware-gated minting
+like sd. Open gate ENXIOs dead minors; lseek SEEK_END through
+blk_capacity; BLKGETSIZE/BLKSSZGET/BLKGETSIZE64 trio added.
+Two ABI fixes surfaced by the compiled proof: fstat on a Dev OFD
+reported S_IFCHR for every node (now the stored S_IFMT), and
+pwrite64 was ENOSYS — implemented for Ram + block devs, plus a
+block arm in fd_pread.
+
+Real driver bug found by the proof, not review: the NVMe SQ tail
+doorbell carried the monotonic counter — the spec doorbell is a
+ring INDEX and QEMU rejects writes >= qsize, so the I/O queue
+wedged permanently at submission 32 (right after the init mount).
+Every later nvme op timed out (sf=0xdead). Fix: doorbell writes
+tail % size. CQ head was already index-bounded.
+
+blktest.c: 16 checks — open/fstat majors, SEEK_END cap, all three
+BLK ioctls, pread sector0 55AA, unaligned edge splice, pwrite/
+verify/restore roundtrip at lba 64 on BOTH /dev/vda and
+/dev/nvme0n1, mknod(254,16) -> ENXIO, BLKGETSIZE64 on /dev/null ->
+ENOTTY. 0 failures; suite 76 tasks, exit 33, zero leak.
+
+Audit: scoped quick, run-29 — 0 confirmed. cve-now: pread/pwrite
++ BLKGETSIZE classes — no entries.
+
+Next candidates: /dev partition minors (vda1/nvme0n1p1 from the
+MBR scan), virtio IRQ-driven RX, modern-only virtio transport,
+multi-namespace NVMe.
