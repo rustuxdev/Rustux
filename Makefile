@@ -150,6 +150,8 @@ run: build $(VIRTIO_DISK)
 		-bios $(OVMF) \
 		-drive file=$(ESP_IMG),format=raw,if=ide \
 		-drive file=$(VIRTIO_DISK),format=raw,if=virtio \
+		-drive file=$(VIRTIO_DISK),format=raw,if=none,id=nvm0 \
+		-device nvme,drive=nvm0,serial=nv0 \
 		-netdev user,id=n0 -device e1000e,netdev=n0 \
 		-netdev user,id=n1 -device virtio-net-pci,netdev=n1 \
 		-snapshot \

@@ -27,6 +27,7 @@ mod cpu;
 mod cpio;
 mod e1000;
 mod ext2;
+mod nvme;
 mod virtio;
 mod elf;
 mod net;
@@ -1303,6 +1304,12 @@ pub(crate) fn rustux_main(
     if n_virtio > 0 {
         kprintln!(con, "rustux: virtio: {n_virtio} disk(s)");
     }
+    // NVMe: PCI MMIO storage (-device nvme). The driver logs its own
+    // probe line; only the count matters here.
+    let n_nvme = nvme::init(bar_is_mmio);
+    if n_nvme > 0 {
+        kprintln!(con, "rustux: nvme: {n_nvme} disk(s)");
+    }
     // virtio-net: second NIC next to the e1000e — its own RX/TX
     // virtqueues, ARP round-trip proves the datapath (socket-layer
     // NIC dispatch is a later rung).
@@ -1313,7 +1320,7 @@ pub(crate) fn rustux_main(
     // disk probes so a disk is known). The boot disk is FAT, so ext2
     // must refuse it cleanly — proving the adapter reads and that the
     // parser rejects non-ext2 data instead of misparsing it.
-    if ata::sectors() > 0 || ahci::disks() > 0 || virtio::disks() > 0 {
+    if ata::sectors() > 0 || ahci::disks() > 0 || virtio::disks() > 0 || nvme::disks() > 0 {
         let dio = ext2::DiskIo { disk: 0 };
         let refused_disk = ext2::parse_super(&dio).is_none();
         kprintln!(con, "rustux: ext2: disk adapter len>0 {} refuses non-ext2 {refused_disk}",

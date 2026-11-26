@@ -547,12 +547,14 @@ pub struct DiskIo {
 /// should iterate `DiskIo{disk}` over.
 pub fn disk_count() -> usize {
     let n_ata = (0..2).filter(|&d| crate::ata::sectors_d(d) > 0).count();
-    n_ata + crate::ahci::disks() as usize + crate::virtio::disks() as usize
+    n_ata + crate::ahci::disks() as usize
+        + crate::virtio::disks() as usize
+        + crate::nvme::disks() as usize
 }
 
 /// Which transport owns global disk index `i`: ATA occupies the low
 /// indices (its own 0/1 master/slave numbering), then AHCI disks,
-/// then virtio disks.
+/// then virtio disks, then NVMe namespaces.
 fn transport(i: usize) -> (u8, usize) {
     let n_ata = (0..2).filter(|&d| crate::ata::sectors_d(d) > 0).count();
     if i < n_ata {
@@ -563,7 +565,12 @@ fn transport(i: usize) -> (u8, usize) {
     if i < n_ahci {
         return (1, i);
     }
-    (2, i - n_ahci)
+    let i = i - n_ahci;
+    let n_virtio = crate::virtio::disks() as usize;
+    if i < n_virtio {
+        return (2, i);
+    }
+    (3, i - n_virtio)
 }
 
 impl BlockIo for DiskIo {
@@ -571,7 +578,8 @@ impl BlockIo for DiskIo {
         match transport(self.disk) {
             (0, i) => crate::ata::capacity_d(i),
             (1, i) => crate::ahci::disk_capacity(i),
-            (_, i) => crate::virtio::disk_capacity(i),
+            (2, i) => crate::virtio::disk_capacity(i),
+            (_, i) => crate::nvme::disk_capacity(i),
         }
     }
 
@@ -590,7 +598,8 @@ impl BlockIo for DiskIo {
             let ok = match tr {
                 0 => crate::ata::read_d(lba as u32, &mut sec, i),
                 1 => crate::ahci::read_range(i, lba, 1, &mut sec),
-                _ => crate::virtio::read_range(i, lba, 1, &mut sec),
+                2 => crate::virtio::read_range(i, lba, 1, &mut sec),
+                _ => crate::nvme::read_range(i, lba, 1, &mut sec),
             };
             if !ok {
                 return false;
