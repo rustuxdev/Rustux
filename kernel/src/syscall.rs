@@ -267,6 +267,7 @@ const NR_ACCEPT: u64 = 43;
 const NR_SENDTO: u64 = 44;
 const NR_RECVFROM: u64 = 45;
 const NR_SENDMSG: u64 = 46;
+const NR_RECVMSG: u64 = 47;
 const NR_SOCKETPAIR: u64 = 53;
 const NR_SETSOCKOPT: u64 = 54;
 const NR_SENDMMSG: u64 = 307;
@@ -499,6 +500,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_SENDTO => user::fd_sendto(ctx, a1, a2, a3, a4, a5, a6),
         NR_RECVFROM => user::fd_recvfrom(ctx, a1, a2, a3, a4, a5, a6),
         NR_SENDMSG => user::fd_sendmsg(ctx, a1, a2, a3),
+        NR_RECVMSG => user::fd_recvmsg(ctx, a1, a2, a3),
         NR_SOCKETPAIR => user::fd_socketpair(a1, a2, a3, a4),
         NR_SETSOCKOPT => user::fd_setsockopt(a1, a2, a3, a4, a5),
         55 => user::fd_getsockopt(a1, a2, a3, a4, a5),
@@ -686,7 +688,7 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         // lseek's off is i32 — sign-extend like the wait4 pid fix.
         19 => user::fd_lseek(a1, a2 as u32 as i32 as i64, a3),
         20 => user::getpid(),
-        24 | 47 | 49 | 50 | 199..=202 => 0,      // {g,u,eu,eg}id{,32}
+        24 | 199..=202 => 0,                  // {g,u,eu,eg}id{,32}
         33 => sys_access(u64::MAX, a1, a2),
         37 => user::kill(a1 as u32 as i32 as i64, a2),
         39 => sys_mkdirat(u64::MAX, a1, a2),

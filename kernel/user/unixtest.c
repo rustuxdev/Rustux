@@ -196,6 +196,161 @@ int main(void) {
     int wst; waitpid(pid, &wst, 0);
     close(sv[0]); close(sv[1]);
 
+    // --- recvmsg + SCM_RIGHTS fd passing ---
+    {
+        int sp[2], dp[2], rx = -1;
+        struct msghdr mh;
+        struct iovec io;
+        struct cmsghdr *cm;
+        char ctrl[CMSG_SPACE(sizeof(int))];
+        char c, rb;
+        check(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0,
+              "scm pair");
+        check(socketpair(AF_UNIX, SOCK_DGRAM, 0, dp) == 0,
+              "donor pair");
+        memset(&mh, 0, sizeof(mh));
+        memset(ctrl, 0, sizeof(ctrl));
+        c = 'f';
+        io.iov_base = &c; io.iov_len = 1;
+        mh.msg_iov = &io; mh.msg_iovlen = 1;
+        mh.msg_control = ctrl; mh.msg_controllen = sizeof(ctrl);
+        cm = CMSG_FIRSTHDR(&mh);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type = SCM_RIGHTS;
+        cm->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cm), &dp[1], sizeof(int));
+        check(sendmsg(sp[0], &mh, 0) == 1, "sendmsg stream rights");
+        memset(&mh, 0, sizeof(mh));
+        memset(ctrl, 0, sizeof(ctrl));
+        rb = 0;
+        io.iov_base = &rb; io.iov_len = 1;
+        mh.msg_iov = &io; mh.msg_iovlen = 1;
+        mh.msg_control = ctrl; mh.msg_controllen = sizeof(ctrl);
+        check(recvmsg(sp[1], &mh, 0) == 1 && rb == 'f',
+              "recvmsg stream data");
+        cm = CMSG_FIRSTHDR(&mh);
+        check(cm && cm->cmsg_level == SOL_SOCKET &&
+              cm->cmsg_type == SCM_RIGHTS &&
+              cm->cmsg_len == CMSG_LEN(sizeof(int)),
+              "recvmsg cmsg shape");
+        if (cm) memcpy(&rx, CMSG_DATA(cm), sizeof(int));
+        check(rx >= 0 && rx != dp[1], "fd minted new slot");
+        check(write(rx, "Q", 1) == 1 &&
+              read(dp[0], buf, 1) == 1 && buf[0] == 'Q',
+              "passed fd works");
+        check(!(mh.msg_flags & MSG_CTRUNC), "no ctrunc");
+
+        // MSG_CTRUNC: no control room -> rights dropped + flag.
+        memset(&mh, 0, sizeof(mh));
+        c = 't';
+        io.iov_base = &c; io.iov_len = 1;
+        mh.msg_iov = &io; mh.msg_iovlen = 1;
+        mh.msg_control = ctrl; mh.msg_controllen = sizeof(ctrl);
+        cm = CMSG_FIRSTHDR(&mh);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type = SCM_RIGHTS;
+        cm->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cm), &dp[1], sizeof(int));
+        check(sendmsg(sp[0], &mh, 0) == 1, "sendmsg rights 2");
+        memset(&mh, 0, sizeof(mh));
+        rb = 0;
+        io.iov_base = &rb; io.iov_len = 1;
+        mh.msg_iov = &io; mh.msg_iovlen = 1;
+        check(recvmsg(sp[1], &mh, 0) == 1 && rb == 't',
+              "ctrunc data arrives");
+        check(mh.msg_flags & MSG_CTRUNC, "MSG_CTRUNC set");
+
+        // Dgram socket fd pass.
+        int dv[2], rx2 = -1;
+        check(socketpair(AF_UNIX, SOCK_DGRAM, 0, dv) == 0,
+              "dgram scm pair");
+        memset(&mh, 0, sizeof(mh));
+        memset(ctrl, 0, sizeof(ctrl));
+        c = 'g';
+        io.iov_base = &c; io.iov_len = 1;
+        mh.msg_iov = &io; mh.msg_iovlen = 1;
+        mh.msg_control = ctrl; mh.msg_controllen = sizeof(ctrl);
+        cm = CMSG_FIRSTHDR(&mh);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type = SCM_RIGHTS;
+        cm->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cm), &dp[0], sizeof(int));
+        check(sendmsg(dv[0], &mh, 0) == 1, "sendmsg dgram rights");
+        memset(&mh, 0, sizeof(mh));
+        memset(ctrl, 0, sizeof(ctrl));
+        rb = 0;
+        io.iov_base = &rb; io.iov_len = 1;
+        mh.msg_iov = &io; mh.msg_iovlen = 1;
+        mh.msg_control = ctrl; mh.msg_controllen = sizeof(ctrl);
+        check(recvmsg(dv[1], &mh, 0) == 1 && rb == 'g',
+              "recvmsg dgram data");
+        cm = CMSG_FIRSTHDR(&mh);
+        if (cm) memcpy(&rx2, CMSG_DATA(cm), sizeof(int));
+        check(rx2 >= 0 && write(rx2, "R", 1) == 1 &&
+              read(dp[1], buf, 1) == 1 && buf[0] == 'R',
+              "dgram passed fd works");
+        close(rx); close(rx2);
+        close(dv[0]); close(dv[1]);
+        close(sp[0]); close(sp[1]);
+
+        // Scatter/gather: two iovecs in, two out.
+        check(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0,
+              "scatter pair");
+        char a1 = 'H', a2 = 'i', b1 = 0, b2 = 0;
+        struct iovec si2[2] =
+            {{&a1, 1}, {&a2, 1}};
+        struct iovec ri2[2] =
+            {{&b1, 1}, {&b2, 1}};
+        memset(&mh, 0, sizeof(mh));
+        mh.msg_iov = si2; mh.msg_iovlen = 2;
+        check(sendmsg(sp[0], &mh, 0) == 2, "sendmsg 2-iov");
+        memset(&mh, 0, sizeof(mh));
+        mh.msg_iov = ri2; mh.msg_iovlen = 2;
+        check(recvmsg(sp[1], &mh, 0) == 2 &&
+              b1 == 'H' && b2 == 'i', "recvmsg scatter");
+        close(sp[0]); close(sp[1]);
+
+        // Blocked recvmsg: parent parks on the empty ring, the
+        // child's sendmsg + rights deliver through the waker.
+        check(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0,
+              "blocked recvmsg pair");
+        pid_t p2 = fork();
+        if (p2 == 0) {
+            struct msghdr cm2;
+            struct iovec io2;
+            char cc = 'm';
+            char ct2[CMSG_SPACE(sizeof(int))];
+            memset(&cm2, 0, sizeof(cm2));
+            memset(ct2, 0, sizeof(ct2));
+            io2.iov_base = &cc; io2.iov_len = 1;
+            cm2.msg_iov = &io2; cm2.msg_iovlen = 1;
+            cm2.msg_control = ct2; cm2.msg_controllen = sizeof(ct2);
+            struct cmsghdr *h2 = CMSG_FIRSTHDR(&cm2);
+            h2->cmsg_level = SOL_SOCKET;
+            h2->cmsg_type = SCM_RIGHTS;
+            h2->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(h2), &dp[1], sizeof(int));
+            _exit(sendmsg(sp[1], &cm2, 0) == 1 ? 0 : 1);
+        }
+        memset(&mh, 0, sizeof(mh));
+        memset(ctrl, 0, sizeof(ctrl));
+        rb = 0; int rx3 = -1;
+        io.iov_base = &rb; io.iov_len = 1;
+        mh.msg_iov = &io; mh.msg_iovlen = 1;
+        mh.msg_control = ctrl; mh.msg_controllen = sizeof(ctrl);
+        check(recvmsg(sp[0], &mh, 0) == 1 && rb == 'm',
+              "blocked recvmsg wakes");
+        cm = CMSG_FIRSTHDR(&mh);
+        if (cm) memcpy(&rx3, CMSG_DATA(cm), sizeof(int));
+        check(rx3 >= 0, "waker delivered rights");
+        if (rx3 >= 0) close(rx3);
+        int ws2; waitpid(p2, &ws2, 0);
+        check(WIFEXITED(ws2) && WEXITSTATUS(ws2) == 0,
+              "child sendmsg ok");
+        close(sp[0]); close(sp[1]);
+        close(dp[0]); close(dp[1]);
+    }
+
     close(ls);
     char fin[64];
     int m = snprintf(fin, sizeof(fin),

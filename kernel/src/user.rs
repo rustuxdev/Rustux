@@ -352,10 +352,20 @@ enum WaitOn {
     UnixConn(usize, usize),
     /// recv() on an empty AF_UNIX datagram queue.
     UnixDgram(usize),
+    /// recvmsg() on an empty AF_UNIX datagram queue — wait_ptr is
+    /// the msghdr VA, wait_len the syscall flags.
+    UnixDgramM(usize),
+    /// recvmsg() on an empty AF_UNIX stream ring — (conn, my side);
+    /// wait_ptr/wait_len carry msghdr + flags like UnixDgramM.
+    UnixRecvM(usize, u8),
     /// read() on an empty AF_UNIX stream ring — (conn, my side).
     UnixRecv(usize, u8),
     /// write() on a full AF_UNIX stream ring — (conn, my side).
     UnixSend(usize, u8),
+    /// sendmsg's stream push blocked on a full ring with the
+    /// payload in kernel staging (KSEND[conn][side]) — the user
+    /// VA is gone by then.
+    UnixSendK(usize, u8),
     /// nanosleep(): pure deadline wait — wait_deadline bounds it,
     /// the return is always 0.
     Timer,
@@ -15291,7 +15301,7 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             return unix_send_stream(ctx, conn, side, buf, len, o.nonblock);
         }
         // write() on a unix dgram = send() — needs a peer.
-        return unix_send_dgram(t, ui, buf, len, 0, 0);
+        return unix_send_dgram(t, ui, buf, len, 0, 0, None);
     }
     if let FdKind::Eventfd(i) = &o.kind {
         return eventfd_write(ctx, *i, buf, len);
@@ -22508,6 +22518,7 @@ pub fn fd_socketpair(domain: u64, ty: u64, _proto: u64, sv: u64) -> u64 {
             r: [URING, URING],
             open: [true, true],
             rd_shut: [false, false],
+            fp: [[None, None, None, None], [None, None, None, None]],
         });
         let a = unix_mint_fd(
             t,
@@ -22921,7 +22932,7 @@ pub fn fd_sendto(
                     || _flags & 0x40 != 0; // MSG_DONTWAIT
                 return unix_send_stream(ctx, conn, side, buf, len, dw);
             }
-            return unix_send_dgram(t, *i, buf, len, sa, alen);
+            return unix_send_dgram(t, *i, buf, len, sa, alen, None);
         }
         _ => None,
     }) else {
@@ -23032,6 +23043,172 @@ fn udp_send_core(t: &mut Task, si: usize, pay: &[u8], sa: u64, alen: u64) -> u64
 /// sockaddr; ancillary control data is validated readable and
 /// dropped, matching Linux's ignore-unknown-CMSG tolerance enough
 /// for the resolver's plain use.
+/// recvmsg(fd, msghdr, flags): the scatter/cmsg form — msghdr
+/// {name,namelen,iov,iovlen,control,controllen,flags@48}. Unix
+/// delivers SOCK_DGRAM payload + SCM_RIGHTS and SOCK_STREAM bytes
+/// + position-attached fd batches; UDP/TCP/Packet fill the iovec
+///   list from their single-buffer paths with no ancillary data.
+pub fn fd_recvmsg(ctx: &mut UCtx, fd: u64, msg: u64, flags: u64) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EINTR_: u64 = (-4i64) as u64;
+    if flags & !((1u64 << 30) | 0x40 | 0x20 | 0x800) != 0 {
+        return EINVAL; // MSG_CMSG_CLOEXEC|DONTWAIT|TRUNC|WAITALL
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    if !range_ok_w(msg, 56) {
+        return EFAULT;
+    }
+    let Some(m) = umsg_read(t.pml4, msg) else { return EFAULT };
+    if m.iovlen == 0 || m.iovlen > 1024 {
+        return EINVAL; // UIO_MAXIOV
+    }
+    if m.iovlen > 0 && !range_ok(m.iov, m.iovlen * 16) {
+        return EFAULT;
+    }
+    if m.control != 0 && !range_ok_w(m.control, m.controllen) {
+        return EFAULT;
+    }
+    let dw = flags & 0x40 != 0
+        || ofd(t, fd).map(|o| o.nonblock).unwrap_or(false);
+    match ofd(t, fd).map(|o| &o.kind) {
+        Some(&FdKind::Unix(ui)) => {
+            let kind = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+                .get(ui)
+                .and_then(|s| s.as_ref())
+                .map(|k| match &k.kind {
+                    UnixKind::Dgram { .. } => 1u8,
+                    UnixKind::Stream { .. } => 2,
+                    _ => 0,
+                });
+            match kind {
+                Some(1) => {
+                    // SOCK_DGRAM: pop, scatter, name, cmsg rights.
+                    let take = unix_dq(ui)
+                        .iter_mut()
+                        .find(|s| s.is_some())
+                        .and_then(Option::take);
+                    if let Some(d) = take {
+                        let n = unix_msg_deliver(
+                            t, msg, flags, &d.data[..d.len as usize],
+                            d.src, d.fds, false,
+                        );
+                        return if flags & 0x20 != 0 {
+                            d.len as u64 // MSG_TRUNC: real length
+                        } else {
+                            n
+                        };
+                    }
+                    if dw {
+                        return EAGAIN_;
+                    }
+                    if deliverable(t) {
+                        return EINTR_;
+                    }
+                    t.wait_on = WaitOn::UnixDgramM(ui);
+                    t.wait_ptr = msg;
+                    t.wait_len = flags;
+                    t.wait_deadline = 0;
+                    t.ctx = *ctx;
+                    t.state = TaskState::Blocked;
+                    block_switch()
+                }
+                Some(2) => {
+                    // SOCK_STREAM: ring bytes + due fd batches.
+                    let (conn, side) =
+                        match unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+                            [ui]
+                            .as_ref()
+                            .map(|k| &k.kind)
+                        {
+                            Some(UnixKind::Stream { conn, side }) => {
+                                (*conn, *side as usize)
+                            }
+                            _ => return EBADF,
+                        };
+                    match unix_stream_take(t, conn, side, msg, flags) {
+                        Some(v) => v,
+                        None => {
+                            if dw {
+                                return EAGAIN_;
+                            }
+                            if deliverable(t) {
+                                return EINTR_;
+                            }
+                            t.wait_on = WaitOn::UnixRecvM(conn, side as u8);
+                            t.wait_ptr = msg;
+                            t.wait_len = flags;
+                            t.wait_deadline = 0;
+                            t.ctx = *ctx;
+                            t.state = TaskState::Blocked;
+                            block_switch()
+                        }
+                    }
+                }
+                _ => (-107i64) as u64, // ENOTCONN: Fresh/Listen
+            }
+        }
+        Some(&FdKind::Udp(i)) => {
+            // First iovec carries the datagram (glibc resolver's
+            // shape); oversized dgrams truncate like recvfrom.
+            let (Some(base), Some(l)) = (
+                read_task_u(t.pml4, m.iov, 8),
+                read_task_u(t.pml4, m.iov + 8, 8),
+            ) else {
+                return EFAULT;
+            };
+            let r = udp_recv_or_block(ctx, i, base, l, m.name, dw);
+            if (r as i64) >= 0 {
+                umsg_set_flags(t.pml4, msg, 0);
+            }
+            r
+        }
+        Some(&FdKind::Tcp(i)) => {
+            // Stream: feed each iovec until one shorts or the
+            // first error after progress.
+            let mut got = 0u64;
+            for e in 0..m.iovlen {
+                let (Some(base), Some(l)) = (
+                    read_task_u(t.pml4, m.iov + e * 16, 8),
+                    read_task_u(t.pml4, m.iov + e * 16 + 8, 8),
+                ) else {
+                    return EFAULT;
+                };
+                if l == 0 {
+                    continue;
+                }
+                let r = tcp_recv_or_block(
+                    ctx, i, base, l, 0, dw || got > 0,
+                );
+                if (r as i64) < 0 {
+                    return if got > 0 { got } else { r };
+                }
+                got += r;
+                if (r as usize) < l as usize {
+                    break;
+                }
+            }
+            if (got as i64) >= 0 {
+                umsg_set_flags(t.pml4, msg, 0);
+            }
+            got
+        }
+        Some(&FdKind::Packet(i)) => {
+            let (Some(base), Some(l)) = (
+                read_task_u(t.pml4, m.iov, 8),
+                read_task_u(t.pml4, m.iov + 8, 8),
+            ) else {
+                return EFAULT;
+            };
+            let r = pkt_recv_or_block(ctx, i, base, l, m.name, dw);
+            if (r as i64) >= 0 {
+                umsg_set_flags(t.pml4, msg, 0);
+            }
+            r
+        }
+        _ => (-88i64) as u64, // ENOTSOCK
+    }
+}
+
 pub fn fd_sendmsg(ctx: &mut UCtx, fd: u64, msg: u64, flags: u64) -> u64 {
     let Some(t) = cur_mut() else { return EBADF };
     if !range_ok(msg, 48) {
@@ -23104,6 +23281,122 @@ pub fn fd_sendmsg(ctx: &mut UCtx, fd: u64, msg: u64, flags: u64) -> u64 {
                 n += l as usize;
             }
             udp_send_core(t, *i, &pay[..n], name, namelen)
+        }
+        Some(&FdKind::Unix(ui)) => {
+            // SCM_RIGHTS rides the ancillary buffer; the payload
+            // gathers through the same iovec walk as UDP.
+            let fbatch = match scm_parse(t, control, controllen) {
+                Ok(f) => f,
+                Err(e) => return e,
+            };
+            let kind = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+                .get(ui)
+                .and_then(|s| s.as_ref())
+                .map(|k| match &k.kind {
+                    UnixKind::Dgram { .. } => 1u8,
+                    UnixKind::Stream { .. } => 2,
+                    _ => 0,
+                });
+            let mut pay = [0u8; 1024];
+            let mut n = 0usize;
+            macro_rules! bail {
+                ($e:expr) => {{
+                    if let Some(f) = fbatch {
+                        scm_release(f);
+                    }
+                    return $e;
+                }};
+            }
+            for e in 0..iovlen {
+                let Some(base) = read_task_u(t.pml4, iov + e * 16, 8)
+                else {
+                    bail!(EFAULT)
+                };
+                let Some(l) =
+                    read_task_u(t.pml4, iov + e * 16 + 8, 8)
+                else {
+                    bail!(EFAULT)
+                };
+                if l == 0 {
+                    continue;
+                }
+                if !range_ok(base, l) {
+                    bail!(EFAULT)
+                }
+                if n + l as usize > pay.len() {
+                    bail!((-90i64) as u64) // EMSGSIZE
+                }
+                // SAFETY: base validated; n+l fits staging.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        base as *const u8,
+                        pay.as_mut_ptr().add(n),
+                        l as usize,
+                    );
+                }
+                n += l as usize;
+            }
+            match kind {
+                Some(1) => {
+                    if n == 0 {
+                        bail!(EINVAL)
+                    }
+                    unix_send_dgram_core(
+                        t, ui, &pay[..n], name, namelen, fbatch,
+                    )
+                }
+                Some(2) => {
+                    let (conn, side) =
+                        match unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+                            [ui]
+                            .as_ref()
+                            .map(|k| &k.kind)
+                        {
+                            Some(UnixKind::Stream { conn, side }) => {
+                                (*conn, *side as usize)
+                            }
+                            _ => bail!(EBADF),
+                        };
+                    // Attach point = stream position of this send's
+                    // first byte = the peer-side ring tail now.
+                    let at = {
+                        let conns =
+                            unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
+                        conns[conn]
+                            .as_ref()
+                            .map(|c| c.r[1 - (side & 1)].tail)
+                            .unwrap_or(0)
+                    };
+                    if n == 0 {
+                        // Ancillary-only send still delivers rights.
+                        if let Some(f) = fbatch {
+                            unix_fp_attach(conn, side, at as u64, f);
+                        }
+                        return 0;
+                    }
+                    let r = unix_send_stream_slice(
+                        ctx, conn, side, &pay[..n],
+                        flags & 0x40 != 0
+                            || ofd(t, fd)
+                                .map(|o| o.nonblock)
+                                .unwrap_or(false),
+                    );
+                    if (r as i64) >= 0 {
+                        if let Some(f) = fbatch {
+                            unix_fp_attach(conn, side, at as u64, f);
+                        }
+                    } else if let Some(f) = fbatch {
+                        scm_release(f);
+                    }
+                    r
+                }
+                _ => {
+                    if let Some(f) = fbatch {
+                        scm_release(f);
+                    }
+                    (-107i64) as u64 // ENOTCONN
+                }
+            }
         }
         _ => EBADF,
     }
@@ -23237,12 +23530,24 @@ struct UnixName {
 
 const UNAME_NONE: UnixName = UnixName { len: 0, addr: [0; 108] };
 
+/// SCM_RIGHTS payload in flight — OFD indices whose refs were
+/// taken at sendmsg; the receiver's mint consumes them, a dropped
+/// queue releases them. 8 caps the batch (SCM_MAX_FD in spirit —
+/// our fd table is 16).
+const SCM_MAX: usize = 8;
+#[derive(Clone, Copy)]
+struct UnixFds {
+    n: u8,
+    ofd: [u16; SCM_MAX],
+}
+
 /// One queued unix datagram — the sender's bound name rides along
-/// for recvfrom's sockaddr_un.
+/// for recvfrom's sockaddr_un; fds is an SCM_RIGHTS batch.
 #[derive(Clone, Copy)]
 struct UDgram {
     src: UnixName,
     len: u16,
+    fds: Option<UnixFds>,
     data: [u8; 1024],
 }
 
@@ -23291,17 +23596,44 @@ const URING: UnixRing = UnixRing {
     data: [0; UNIX_BUF],
 };
 
+/// An SCM_RIGHTS batch attached to a stream position: `at` is the
+/// absolute ring-tail offset where its sendmsg's first byte sits —
+/// delivered by the read that consumes past it, like Linux's
+/// cmsg-at-byte-boundary.
+#[derive(Clone, Copy)]
+struct FdAttach {
+    at: u64,
+    fds: UnixFds,
+}
+
 /// A connected pair: r[s] flows TO side s (the peer writes it);
 /// open[s] is that side's write-halve still alive (false -> the
-/// peer reads EOF, its writes EPIPE); rd_shut[s] a SHUT_RD flag.
+/// peer reads EOF, its writes EPIPE); rd_shut[s] a SHUT_RD flag;
+/// fp[s] queues fd batches heading TO side s.
 struct UnixConn {
     r: [UnixRing; 2],
     open: [bool; 2],
     rd_shut: [bool; 2],
+    fp: [[Option<FdAttach>; 4]; 2],
 }
 
 static mut UNIXSOCKS: [Option<UnixSock>; MAX_UNIX] =
     [const { None }; MAX_UNIX];
+/// Kernel staging for a blocked slice send — sendmsg gathers into
+/// kernel memory, so a full ring can't park on the caller's VA.
+#[derive(Clone, Copy)]
+struct KSend {
+    data: [u8; 1024],
+    len: usize,
+}
+
+/// Per-conn-direction staging; Some only while a UnixSendK sleeper
+/// owns it. `const None` needs a Copy value, KSend isn't — build
+/// through the explicit array form.
+#[allow(clippy::declare_interior_mutable_const)]
+static mut KSEND: [[Option<KSend>; 2]; MAX_UNIX] =
+    [[const { None }; 2]; MAX_UNIX];
+
 static mut UNIXCONNS: [Option<UnixConn>; MAX_UNIX] =
     [const { None }; MAX_UNIX];
 /// Datagram queues — sock `si` owns the slice at si*UNIX_DQ; the
@@ -23363,10 +23695,380 @@ fn unix_find_name(n: &UnixName) -> Option<usize> {
         .position(|s| s.as_ref().is_some_and(|k| k.name == Some(*n)))
 }
 
+/// msghdr on x86_64: name@0 namelen@8 iov@16 iovlen@24
+/// control@32 controllen@40 flags@48 (struct is 56 bytes).
+#[derive(Clone, Copy)]
+struct UMsg {
+    name: u64,
+    namelen: u64,
+    iov: u64,
+    iovlen: u64,
+    control: u64,
+    controllen: u64,
+}
+
+fn umsg_read(pml4: u64, msg: u64) -> Option<UMsg> {
+    if !range_ok(msg, 48) {
+        return None;
+    }
+    Some(UMsg {
+        name: read_task_u(pml4, msg, 8)?,
+        namelen: read_task_u(pml4, msg + 8, 8)?,
+        iov: read_task_u(pml4, msg + 16, 8)?,
+        iovlen: read_task_u(pml4, msg + 24, 8)?,
+        control: read_task_u(pml4, msg + 32, 8)?,
+        controllen: read_task_u(pml4, msg + 40, 8)?,
+    })
+}
+
+/// Total bytes the msghdr's iovec list can hold (capped).
+fn umsg_iov_cap(pml4: u64, m: &UMsg) -> usize {
+    let mut cap = 0usize;
+    for e in 0..m.iovlen.min(1024) {
+        if let Some(l) = read_task_u(pml4, m.iov + e * 16 + 8, 8) {
+            cap = cap.saturating_add(l as usize);
+        }
+    }
+    cap
+}
+
+/// Scatter `pay` across the msghdr's iovec list under `pml4`;
+/// returns bytes delivered.
+fn umsg_scatter(pml4: u64, m: &UMsg, pay: &[u8]) -> usize {
+    let mut done = 0usize;
+    for e in 0..m.iovlen.min(1024) {
+        let (Some(base), Some(l)) = (
+            read_task_u(pml4, m.iov + e * 16, 8),
+            read_task_u(pml4, m.iov + e * 16 + 8, 8),
+        ) else {
+            break;
+        };
+        if l == 0 {
+            continue;
+        }
+        let n = core::cmp::min(l as usize, pay.len() - done);
+        if n == 0 {
+            break;
+        }
+        write_task_bytes(pml4, base, &pay[done..done + n]);
+        done += n;
+    }
+    done
+}
+
+/// Release the OFD refs a scm batch still holds (send failure,
+/// queue death, or a batch the receiver's table couldn't take).
+fn scm_release(fds: UnixFds) {
+    for &oi in fds.ofd[..fds.n as usize].iter() {
+        ofd_release(oi as usize);
+    }
+}
+
+/// Parse the msghdr control buffer for SOL_SOCKET/SCM_RIGHTS —
+/// cmsg {len:u64, level:i32, type:i32, data}; each fd resolves
+/// through `t`'s table and takes an OFD ref. Errors release what
+/// was taken.
+fn scm_parse(
+    t: &mut Task,
+    control: u64,
+    controllen: u64,
+) -> Result<Option<UnixFds>, u64> {
+    if control == 0 || controllen == 0 {
+        return Ok(None);
+    }
+    if controllen < 16 || !range_ok(control, controllen) {
+        return Err(EFAULT);
+    }
+    let mut out = UnixFds { n: 0, ofd: [0; SCM_MAX] };
+    let mut got = false;
+    let mut off = 0u64;
+    while off + 16 <= controllen {
+        let (Some(cmsg_len), Some(lt)) = (
+            read_task_u(t.pml4, control + off, 8),
+            read_task_u(t.pml4, control + off + 8, 8),
+        ) else {
+            scm_release(out);
+            return Err(EFAULT);
+        };
+        if cmsg_len < 16 || cmsg_len > controllen - off {
+            scm_release(out);
+            return Err(EINVAL);
+        }
+        let (level, ctype) = (lt as u32, (lt >> 32) as u32);
+        if level == 1 && ctype == 1 {
+            // SOL_SOCKET / SCM_RIGHTS
+            let n = (cmsg_len - 16) / 4;
+            if n > SCM_MAX as u64 {
+                scm_release(out);
+                return Err(EINVAL);
+            }
+            let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+            for i in 0..n {
+                let Some(fd) =
+                    read_task_u(t.pml4, control + off + 16 + i * 4, 4)
+                else {
+                    scm_release(out);
+                    return Err(EFAULT);
+                };
+                let Some(Some(oi)) = fdt(t).fds.get(fd as usize)
+                else {
+                    // unbounded user fd — out of fdt range or an
+                    // empty slot both mean EBADF, never a panic.
+                    scm_release(out);
+                    return Err(EBADF);
+                };
+                let oi = *oi;
+                if let Some(o) = ofds[oi as usize].as_mut() {
+                    o.refs += 1;
+                }
+                out.ofd[out.n as usize] = oi as u16;
+                out.n += 1;
+            }
+            got = true;
+        }
+        off += (cmsg_len + 7) & !7;
+    }
+    Ok(got.then_some(out))
+}
+
+/// Emit one SCM_RIGHTS cmsg into the receiver's control buffer,
+/// minting each OFD as a fresh fd inside `t`. Returns
+/// (bytes-consumed, ctrunc) — ctrunc when the buffer or fd table
+/// couldn't take the whole batch (the residue's refs release,
+/// matching Linux's MSG_CTRUNC drop).
+fn scm_emit(
+    t: &mut Task,
+    control: u64,
+    controllen: u64,
+    fds: UnixFds,
+    cloexec: bool,
+) -> (u64, bool) {
+    let need = 16 + fds.n as u64 * 4;
+    if control == 0 || controllen < need || !range_ok_w(control, need) {
+        scm_release(fds);
+        return (0, true);
+    }
+    write_task_u64(t.pml4, control, need);
+    write_task_u64(t.pml4, control + 8, 1 | (1 << 32)); // SOL/SCM
+    let mut ctrunc = false;
+    for i in 0..fds.n as usize {
+        let oi = fds.ofd[i];
+        let Some(fi) = fdt(t).fds.iter().position(Option::is_none)
+        else {
+            // fd table full — the rest release like a refused mint.
+            for &oi in fds.ofd[i..fds.n as usize].iter() {
+                ofd_release(oi as usize);
+            }
+            ctrunc = true;
+            break;
+        };
+        fdt(t).fds[fi] = Some(oi as u8);
+        cloexec_set(t, fi, cloexec);
+        write_task_bytes(
+            t.pml4,
+            control + 16 + i as u64 * 4,
+            &(fi as i32).to_le_bytes(),
+        );
+    }
+    ((need + 7) & !7, ctrunc)
+}
+
+/// Write the msghdr's msg_flags field (@48).
+fn umsg_set_flags(pml4: u64, msg: u64, flags: u32) {
+    if range_ok_w(msg + 48, 4) {
+        write_task_bytes(pml4, msg + 48, &flags.to_le_bytes());
+    }
+}
+
+/// Take fp batches on conn destined for `side` whose attach point
+/// the reader has consumed (`at < new_head`), releasing the slots.
+fn unix_fp_take(conn: usize, side: usize, new_head: usize) -> [Option<UnixFds>; 4] {
+    let mut out = [None, None, None, None];
+    let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
+    let Some(c) = conns.get_mut(conn).and_then(|x| x.as_mut()) else {
+        return out;
+    };
+    for (i, slot) in c.fp[side & 1].iter_mut().enumerate() {
+        if let Some(a) = slot {
+            if (a.at as usize) < new_head {
+                out[i] = Some(a.fds);
+                *slot = None;
+            }
+        }
+    }
+    out
+}
+
+/// Queue an SCM_RIGHTS batch at stream position `at` — a reader
+/// consuming past it takes the cmsg. `side` is the SENDER's side;
+/// the batch lands on the peer's consume list.
+fn unix_fp_attach(conn: usize, side: usize, at: u64, fds: UnixFds) {
+    let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
+    let Some(c) = conns.get_mut(conn).and_then(|x| x.as_mut()) else {
+        scm_release(fds);
+        return;
+    };
+    for slot in c.fp[1 - (side & 1)].iter_mut() {
+        if slot.is_none() {
+            *slot = Some(FdAttach { at, fds });
+            return;
+        }
+    }
+    scm_release(fds); // attach list full — rights drop silently
+}
+
+/// Emit due fp batches for `side` into the control buffer.
+/// Returns (bytes written, ctrunc).
+fn unix_fp_emit(
+    t: &mut Task,
+    conn: usize,
+    side: usize,
+    new_head: usize,
+    control: u64,
+    controllen: u64,
+    cloexec: bool,
+) -> (u64, bool) {
+    let due = unix_fp_take(conn, side, new_head);
+    let mut off = 0u64;
+    let mut trunc = false;
+    for f in due.iter().flatten() {
+        let (w, c) = scm_emit(
+            t,
+            control.wrapping_add(off),
+            controllen.saturating_sub(off),
+            *f,
+            cloexec,
+        );
+        off += w;
+        trunc |= c;
+    }
+    (off, trunc)
+}
+
+/// Full recvmsg delivery — re-parses the msghdr under `t`'s
+/// tables: iovec scatter, sockaddr writeback, SCM cmsg emit,
+/// msg_flags. Returns the byte count for rax. Shared by the
+/// inline recvmsg path and the msg-mode wakers (which arm
+/// wait_ptr=msg, wait_len=flags).
+fn unix_msg_deliver(
+    t: &mut Task,
+    msg: u64,
+    flags: u64,
+    pay: &[u8],
+    src: UnixName,
+    fds: Option<UnixFds>,
+    fp_trunc: bool,
+) -> u64 {
+    let Some(m) = umsg_read(t.pml4, msg) else {
+        if let Some(f) = fds {
+            scm_release(f);
+        }
+        return EFAULT;
+    };
+    let done = umsg_scatter(t.pml4, &m, pay);
+    let mut mflags = 0u32;
+    if done < pay.len() {
+        mflags |= 0x20; // MSG_TRUNC
+    }
+    if m.name != 0 {
+        let u = sockaddr_un(&src);
+        let want = 2 + src.len as usize;
+        let cp = core::cmp::min(m.namelen as usize, want);
+        write_task_bytes(t.pml4, m.name, &u[..cp]);
+        // addrlen in/out lives at msghdr+8 (u64 here — namelen).
+        write_task_u64(t.pml4, msg + 8, want as u64);
+    }
+    let cloexec = flags & (1u64 << 30) != 0; // MSG_CMSG_CLOEXEC
+    if let Some(f) = fds {
+        let (_w, c) = scm_emit(t, m.control, m.controllen, f, cloexec);
+        if c {
+            mflags |= 8; // MSG_CTRUNC
+        }
+    }
+    if fp_trunc {
+        mflags |= 8;
+    }
+    umsg_set_flags(t.pml4, msg, mflags);
+    done as u64
+}
+
+/// Shared stream recvmsg delivery: consumes ring bytes toward
+/// `side`, scatters through the msghdr, emits due fp cmsgs at
+/// control+0, writes msg_flags — the inline path and the
+/// UnixRecvM waker both answer through it. None when empty and
+/// the peer is still open (block for real).
+fn unix_stream_take(
+    t: &mut Task,
+    conn: usize,
+    side: usize,
+    msg: u64,
+    flags: u64,
+) -> Option<u64> {
+    let s = side & 1;
+    let (avail, open) = {
+        let conns = unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
+        match conns[conn].as_ref() {
+            Some(c) => {
+                (c.r[s].tail - c.r[s].head,
+                 c.open[1 - s] && !c.rd_shut[s])
+            }
+            None => (0, false),
+        }
+    };
+    if avail == 0 {
+        if open {
+            return None;
+        }
+        umsg_set_flags(t.pml4, msg, 0);
+        return Some(0); // EOF
+    }
+    let Some(m) = umsg_read(t.pml4, msg) else {
+        return Some(EFAULT);
+    };
+    let cap = umsg_iov_cap(t.pml4, &m);
+    let n = core::cmp::min(cap, avail);
+    // Stage the ring bytes (bounded by cap <= caller iovecs).
+    let mut tmp = [0u8; 4096];
+    let n = n.min(4096);
+    let new_head = {
+        let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
+        let c = conns[conn].as_mut().unwrap();
+        for i in 0..n {
+            tmp[i] = c.r[s].data[(c.r[s].head + i) % UNIX_BUF];
+        }
+        c.r[s].head += n;
+        c.r[s].head
+    };
+    let cloexec = flags & (1u64 << 30) != 0;
+    let (_w, ctr) = unix_fp_emit(
+        t, conn, s, new_head, m.control, m.controllen, cloexec,
+    );
+    let src = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+        .iter()
+        .flatten()
+        .find(|k| {
+            matches!(k.kind, UnixKind::Stream { conn: c, side: sd }
+                if c == conn && sd as usize != s)
+        })
+        .and_then(|k| k.name)
+        .unwrap_or(UNAME_NONE);
+    let done = unix_msg_deliver(
+        t, msg, flags, &tmp[..n], src, None, ctr,
+    );
+    unix_wake(conn); // drain frees the peer's send room
+    Some(done)
+}
+
 /// Deliver one datagram to socket `di`: a blocked receiver gets it
 /// straight through its tables; otherwise the queue takes it.
 /// Returns false when the queue is full — honest unix loss.
-fn unix_dgram_push(di: usize, src: UnixName, pay: &[u8]) -> bool {
+/// `fds` is an SCM_RIGHTS batch riding the datagram.
+fn unix_dgram_push(
+    di: usize,
+    src: UnixName,
+    pay: &[u8],
+    fds: Option<UnixFds>,
+) -> bool {
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
     for t in tasks.iter_mut().flatten() {
         if t.state == TaskState::Blocked
@@ -23386,6 +24088,22 @@ fn unix_dgram_push(di: usize, src: UnixName, pay: &[u8]) -> bool {
             t.wait_deadline = 0;
             t.wait_ptr2 = 0;
             t.state = TaskState::Runnable;
+            if let Some(f) = fds {
+                scm_release(f); // recvfrom-style wait can't take fds
+            }
+            return true;
+        }
+        if t.state == TaskState::Blocked
+            && t.wait_on == WaitOn::UnixDgramM(di)
+        {
+            // recvmsg sleeper: msghdr is at wait_ptr — scatter,
+            // name, and the fd batch all deliver through it.
+            t.ctx.rax = unix_msg_deliver(
+                t, t.wait_ptr, t.wait_len, pay, src, fds, false,
+            );
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            t.state = TaskState::Runnable;
             return true;
         }
     }
@@ -23399,7 +24117,7 @@ fn unix_dgram_push(di: usize, src: UnixName, pay: &[u8]) -> bool {
     let Some(slot) = unix_dq(di).iter_mut().find(|s| s.is_none()) else {
         return false; // queue full — datagram loss
     };
-    let mut d = UDgram { src, len: 0, data: [0; 1024] };
+    let mut d = UDgram { src, len: 0, fds, data: [0; 1024] };
     let n = pay.len().min(1024);
     d.data[..n].copy_from_slice(&pay[..n]);
     d.len = n as u16;
@@ -23455,6 +24173,23 @@ fn unix_wake(conn: usize) {
                 t.wait_deadline = 0;
                 t.state = TaskState::Runnable;
             }
+            // A recvmsg on side s: same readiness rule as the
+            // linear arm, but the payload scatters through the
+            // sleeper's msghdr (wait_ptr) with fp cmsgs emitted.
+            WaitOn::UnixRecvM(wc, side) if wc == conn => {
+                let s = side as usize & 1;
+                match unix_stream_take(
+                    t, conn, s, t.wait_ptr, t.wait_len,
+                ) {
+                    Some(v) => {
+                        t.ctx.rax = v;
+                        t.wait_on = WaitOn::None;
+                        t.wait_deadline = 0;
+                        t.state = TaskState::Runnable;
+                    }
+                    None => continue,
+                }
+            }
             // A writer on side s sleeps on r[1-s] space (or the
             // peer's close which makes it EPIPE).
             WaitOn::UnixSend(wc, side) if wc == conn => {
@@ -23496,6 +24231,41 @@ fn unix_wake(conn: usize) {
                     } else {
                         done as u64
                     };
+                }
+                t.wait_on = WaitOn::None;
+                t.wait_deadline = 0;
+                t.state = TaskState::Runnable;
+            }
+            // A blocked slice send: the payload lives in kernel
+            // staging KSEND[conn][side] — push what fits, drop
+            // the slot, deposit the pushed count.
+            WaitOn::UnixSendK(wc, side) if wc == conn => {
+                let s = side as usize & 1;
+                let c = unsafe {
+                    (*core::ptr::addr_of_mut!(UNIXCONNS))[conn]
+                        .as_mut()
+                        .unwrap()
+                };
+                if !c.open[1 - s] {
+                    t.ctx.rax = (-32i64) as u64; // EPIPE
+                    unsafe { KSEND[conn][s] = None; }
+                } else {
+                    let free =
+                        UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head);
+                    if free == 0 {
+                        continue;
+                    }
+                    let ks = unsafe {
+                        KSEND[conn][s].as_mut().unwrap()
+                    };
+                    let n = core::cmp::min(ks.len, free);
+                    for (i, &b) in ks.data[..n].iter().enumerate() {
+                        c.r[1 - s].data
+                            [(c.r[1 - s].tail + i) % UNIX_BUF] = b;
+                    }
+                    c.r[1 - s].tail += n;
+                    t.ctx.rax = n as u64;
+                    unsafe { KSEND[conn][s] = None; }
                 }
                 t.wait_on = WaitOn::None;
                 t.wait_deadline = 0;
@@ -23644,6 +24414,7 @@ fn unix_wake_conn(li: usize) {
             r: [URING, URING],
             open: [true, true],
             rd_shut: [false, false],
+            fp: [[None, None, None, None], [None, None, None, None]],
         });
         backlog[*n] = conn;
         *n += 1;
@@ -23667,7 +24438,11 @@ fn unix_sock_close(si: usize) {
     };
     if let UnixKind::Dgram { .. } = k.kind {
         for slot in unix_dq(si).iter_mut() {
-            *slot = None;
+            if let Some(d) = slot.take() {
+                if let Some(f) = d.fds {
+                    scm_release(f); // queued rights die with the sock
+                }
+            }
         }
     }
     if let UnixKind::Listen { .. } = k.kind {
@@ -23691,7 +24466,12 @@ fn unix_sock_close(si: usize) {
         if let Some(c) = conns.get_mut(conn).and_then(|x| x.as_mut()) {
             c.open[side as usize & 1] = false;
             if !c.open[0] && !c.open[1] {
-                conns[conn] = None;
+                let c = conns[conn].take().unwrap();
+                for dir in c.fp.iter() {
+                    for a in dir.iter().flatten() {
+                        scm_release(a.fds); // undelivered rights die
+                    }
+                }
             }
         }
         unix_wake(conn);
@@ -23877,6 +24657,67 @@ fn unix_send_stream(
     }
 }
 
+/// Slice form of unix_send_stream for sendmsg: the payload is
+/// already gathered into kernel memory. A full ring still blocks
+/// honestly — the bytes park in KSEND[conn][side] and the
+/// UnixSendK waker pushes them under the sleeper's tables.
+fn unix_send_stream_slice(
+    ctx: &mut UCtx,
+    conn: usize,
+    side: usize,
+    pay: &[u8],
+    dw: bool,
+) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EINTR_: u64 = (-4i64) as u64;
+    const EPIPE_: u64 = (-32i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF };
+    let s = side & 1;
+    let (free, open) = {
+        let conns = unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
+        match conns[conn].as_ref() {
+            Some(c) => {
+                (UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head),
+                 c.open[1 - s])
+            }
+            None => (0, false),
+        }
+    };
+    if !open {
+        return EPIPE_;
+    }
+    if free == 0 {
+        if dw {
+            return EAGAIN_;
+        }
+        if deliverable(t) {
+            return EINTR_;
+        }
+        // Park the payload in kernel staging — wait_ptr is dead.
+        let ks = unsafe { &mut KSEND[conn][s] };
+        let len = core::cmp::min(pay.len(), 1024);
+        *ks = Some(KSend { data: [0u8; 1024], len });
+        ks.as_mut()
+            .unwrap()
+            .data[..len]
+            .copy_from_slice(&pay[..len]);
+        t.wait_on = WaitOn::UnixSendK(conn, side as u8);
+        t.wait_deadline = 0;
+        t.ctx = *ctx;
+        t.state = TaskState::Blocked;
+        block_switch()
+    }
+    let n = core::cmp::min(pay.len(), free);
+    let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
+    let c = conns[conn].as_mut().unwrap();
+    for (i, &b) in pay[..n].iter().enumerate() {
+        c.r[1 - s].data[(c.r[1 - s].tail + i) % UNIX_BUF] = b;
+    }
+    c.r[1 - s].tail += n;
+    unix_wake(conn); // data arrived for the peer's readers
+    n as u64
+}
+
 /// Datagram recv shared by read/recvfrom — the queue gives back
 /// sender name + payload; empty blocks like UdpRecv.
 fn unix_recv_dgram(
@@ -23930,6 +24771,11 @@ fn unix_recv_dgram(
                 );
             }
         }
+        if let Some(f) = d.fds {
+            // recv/recvfrom can't carry cmsgs — Linux MSG_CTRUNCs
+            // and closes the passed fds.
+            scm_release(f);
+        }
         return n as u64;
     }
     if !range_ok_w(buf, len.clamp(1, 1024)) {
@@ -23964,48 +24810,16 @@ fn unix_send_dgram(
     len: u64,
     sa: u64,
     alen: u64,
+    fds: Option<UnixFds>,
 ) -> u64 {
-    const ENOENT_: u64 = (-2i64) as u64;
-    const EOPNOTSUPP_: u64 = (-95i64) as u64;
-    const EDESTADDRREQ_: u64 = (-89i64) as u64;
-    const EAGAIN_: u64 = (-11i64) as u64;
     if len == 0 || len > 1024 {
+        if let Some(f) = fds { scm_release(f); }
         return EINVAL;
     }
     if !range_ok(buf, len) {
+        if let Some(f) = fds { scm_release(f); }
         return EFAULT;
     }
-    let (peer, src) = {
-        let socks = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) };
-        let Some(k) = socks[si].as_ref() else { return EBADF };
-        match &k.kind {
-            UnixKind::Dgram { peer, .. } => (*peer, k.name),
-            _ => return EOPNOTSUPP_,
-        }
-    };
-    let di = if sa != 0 {
-        if peer.is_some() {
-            return (-106i64) as u64; // EISCONN
-        }
-        let Some(n) = parse_sockaddr_un(t.pml4, sa, alen) else {
-            return ENOENT_;
-        };
-        let Some(i) = unix_find_name(&n) else {
-            return ENOENT_; // no socket owns the name
-        };
-        i
-    } else {
-        match peer {
-            Some(UnixPeer::Name(n)) => {
-                let Some(i) = unix_find_name(&n) else {
-                    return ENOENT_;
-                };
-                i
-            }
-            Some(UnixPeer::Sock(i)) => i,
-            None => return EDESTADDRREQ_,
-        }
-    };
     let mut pay = [0u8; 1024];
     // SAFETY: buf validated readable for len under the current cr3.
     unsafe {
@@ -24015,10 +24829,71 @@ fn unix_send_dgram(
             len as usize,
         );
     }
-    if unix_dgram_push(di, src.unwrap_or(UNAME_NONE), &pay[..len as usize]) {
+    unix_send_dgram_core(t, si, &pay[..len as usize], sa, alen, fds)
+}
+
+/// Slice core shared with sendmsg — the payload is already
+/// gathered so the caller's buffer shape doesn't matter. Every
+/// error path releases `fds`: rights die with a failed send.
+fn unix_send_dgram_core(
+    t: &mut Task,
+    si: usize,
+    pay: &[u8],
+    sa: u64,
+    alen: u64,
+    fds: Option<UnixFds>,
+) -> u64 {
+    const ENOENT_: u64 = (-2i64) as u64;
+    const EOPNOTSUPP_: u64 = (-95i64) as u64;
+    const EDESTADDRREQ_: u64 = (-89i64) as u64;
+    const EAGAIN_: u64 = (-11i64) as u64;
+    let len = pay.len() as u64;
+    macro_rules! bail {
+        ($e:expr) => {{
+            if let Some(f) = fds {
+                scm_release(f);
+            }
+            return $e;
+        }};
+    }
+    let (peer, src) = {
+        let socks = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) };
+        let Some(k) = socks[si].as_ref() else { bail!(EBADF) };
+        match &k.kind {
+            UnixKind::Dgram { peer, .. } => (*peer, k.name),
+            _ => bail!(EOPNOTSUPP_),
+        }
+    };
+    let di = if sa != 0 {
+        if peer.is_some() {
+            bail!((-106i64) as u64); // EISCONN
+        }
+        let Some(n) = parse_sockaddr_un(t.pml4, sa, alen) else {
+            bail!(ENOENT_)
+        };
+        let Some(i) = unix_find_name(&n) else {
+            bail!(ENOENT_); // no socket owns the name
+        };
+        i
+    } else {
+        match peer {
+            Some(UnixPeer::Name(n)) => {
+                let Some(i) = unix_find_name(&n) else {
+                    bail!(ENOENT_)
+                };
+                i
+            }
+            Some(UnixPeer::Sock(i)) => i,
+            None => bail!(EDESTADDRREQ_),
+        }
+    };
+    if unix_dgram_push(di, src.unwrap_or(UNAME_NONE), pay, fds) {
         len
     } else {
-        EAGAIN_ // queue full — datagram loss
+        if let Some(f) = fds {
+            scm_release(f);
+        }
+        EAGAIN_ // queue full — datagram loss, rights die
     }
 }
 
@@ -24091,6 +24966,7 @@ fn unix_connect(ctx: &mut UCtx, ui: usize, sa: u64, len: u64, dw: bool) -> u64 {
                 r: [URING, URING],
                 open: [true, true],
                 rd_shut: [false, false],
+                fp: [[None, None, None, None], [None, None, None, None]],
             });
             backlog[*n] = conn;
             *n += 1;
