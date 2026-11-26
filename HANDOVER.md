@@ -8267,3 +8267,26 @@ keys across concurrent suite instances (pid-derived keys now).
 CVE-2026-58098 (semop seq-wraparound OOB) is structurally
 absent — RMID EIDRMs every waiter before the slot can remint.
 lstest floor 77->78, 105 tasks. Audit run-74: 0 confirmed.
+
+run-316 lands POSIX per-process timers — timer_create/settime/
+gettime/getoverrun/delete (222-226) on a 32-slot PTIMERS table,
+slot-index timerids scoped to the creator's tgid. REALTIME and
+MONOTONIC collapse onto the TICKS clock; sigevent is read as
+u32 fields with notify, signo and THREAD_ID tid all gated.
+ptimer_expire joins the tick service list modeled on
+itimer_expire — pend_one delivers SI_TIMER with sigev_value in
+si_value, expirations that land while the last notification is
+still pending collapse into overrun, and interval timers roll
+the deadline past missed ticks. Two audit catches: the
+expire-time target lookup checked only pid, so a dead
+SIGEV_THREAD_ID target's reused pid could pull a notification
+across the process boundary (now requires same tgid), and there
+was no exit path for timer slots (ptimer_release_tgid now runs
+at exec and when the last tgid member reaps — Linux's
+exit_itimers shape). The interval test tolerates Linux's
+coalescing: under load a task can sleep through expirations, so
+hits+overrun proves rearming. CVE-2017-18344 (unvalidated
+sigev_notify -> OOB disclosure) is gated EINVAL; all 20
+posix-cpu-timers family CVEs are n/a — no cpu-timer, timerqueue
+or sighand machinery exists. lstest floor 78->79, 106 tasks.
+Audit run-75: 0 confirmed.
