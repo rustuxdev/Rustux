@@ -2577,8 +2577,20 @@ struct FsTab {
     /// CLONE_FS shares it, so a sibling chdir moves the group.
     cwd: [u8; 128],
     cwdlen: u8,
+    /// chroot jail — the canonical flat name absolute paths and
+    /// '..' clamp to ("" = real root). Shared under CLONE_FS like
+    /// cwd, matching Linux's fs_struct root.
+    root: [u8; 128],
+    rootlen: u8,
 }
-const FS_EMPTY: FsTab = FsTab { users: 0, umask: 0, cwd: [0; 128], cwdlen: 0 };
+const FS_EMPTY: FsTab = FsTab {
+    users: 0,
+    umask: 0,
+    cwd: [0; 128],
+    cwdlen: 0,
+    root: [0; 128],
+    rootlen: 0,
+};
 const MAX_FSTABS: usize = MAX_TASKS;
 /// Task.fsi sentinel after release.
 const FSI_NONE: u8 = u8::MAX;
@@ -2593,7 +2605,14 @@ fn fst(t: &Task) -> &mut FsTab {
 fn fstab_alloc(umask: u16) -> Option<u8> {
     let ts = unsafe { &mut *core::ptr::addr_of_mut!(FSTABS) };
     ts.iter().position(|x| x.users == 0).map(|i| {
-        ts[i] = FsTab { users: 1, umask, cwd: [0; 128], cwdlen: 0 };
+        ts[i] = FsTab {
+            users: 1,
+            umask,
+            cwd: [0; 128],
+            cwdlen: 0,
+            root: [0; 128],
+            rootlen: 0,
+        };
         i as u8
     })
 }
@@ -14703,28 +14722,48 @@ pub fn fd_readv32(ctx: &mut UCtx, fd: u64, iov: u64, cnt: u64) -> u64 {
 
 /// getcwd(buf, len): "/" + the shared cwd bytes + NUL; ERANGE
 /// when the caller's buffer can't hold it — Linux semantics.
+/// In a chroot the answer is root-relative (cwd at the jail root
+/// reads "/"); a cwd outside the jail reports "(unreachable)/cwd".
 pub fn sys_getcwd(buf: u64, len: u64) -> u64 {
     const ERANGE_: u64 = (-34i64) as u64;
     let Some(t) = cur_mut() else { return EBADF };
     let f = fst(t);
-    let n = f.cwdlen as usize;
-    if len < n as u64 + 2 {
+    let (cwd, cn, root, rn) = (f.cwd, f.cwdlen as usize, f.root, f.rootlen as usize);
+    // (text, len) the user sees — jail-relative when inside, the
+    // Linux "(unreachable)" marker when the cwd escaped the root.
+    let mut txt = [0u8; 300];
+    let mut tn = 0usize;
+    if rn != 0 && root_floor(&cwd[..cn], &root[..rn]) == 0 {
+        txt[..13].copy_from_slice(b"(unreachable)");
+        tn = 13;
+    }
+    txt[tn] = b'/';
+    tn += 1;
+    let tail = if rn != 0 && cwd[..cn] == root[..rn] {
+        &cwd[0..0] // cwd IS the jail root -> bare "/"
+    } else if rn != 0
+        && cn > rn
+        && cwd[..rn] == root[..rn]
+        && cwd[rn] == b'/'
+    {
+        &cwd[rn + 1..cn] // jail-relative tail
+    } else {
+        &cwd[..cn]
+    };
+    txt[tn..tn + tail.len()].copy_from_slice(tail);
+    tn += tail.len();
+    if len < tn as u64 + 1 {
         return ERANGE_;
     }
-    if !range_ok_w(buf, n as u64 + 2) {
+    if !range_ok_w(buf, tn as u64 + 1) {
         return EFAULT;
     }
-    // SAFETY: buf validated writable for n+2 bytes.
+    // SAFETY: buf validated writable for tn+1 bytes.
     unsafe {
-        (buf as *mut u8).write(b'/');
-        core::ptr::copy_nonoverlapping(
-            f.cwd.as_ptr(),
-            (buf + 1) as *mut u8,
-            n,
-        );
-        ((buf + 1 + n as u64) as *mut u8).write(0);
+        core::ptr::copy_nonoverlapping(txt.as_ptr(), buf as *mut u8, tn);
+        ((buf + tn as u64) as *mut u8).write(0);
     }
-    n as u64 + 2
+    tn as u64 + 1
 }
 
 /// clock_getres(clk, res): the APIC ticks at 100Hz — 10ms.
@@ -15289,6 +15328,41 @@ pub fn sys_fchdir(fd: u64) -> u64 {
     let f = fst(t);
     f.cwd[..pn].copy_from_slice(&pb[..pn]);
     f.cwdlen = pn as u8;
+    0
+}
+
+/// chroot(161): repoint the task's fs root at a resolved dir —
+/// EPERM without CAP_SYS_CHROOT (our uid model: uid != 0 fails),
+/// ENOTDIR on a file, ENOENT on a miss, ENAMETOOLONG past the
+/// 128-byte field. cwd is NOT moved (the classic escape stays
+/// possible, like Linux). Shared under CLONE_FS via FsTab.
+pub fn sys_chroot(path: &[u8]) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const ENOTDIR_: u64 = (-20i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF };
+    if t.uid != 0 {
+        return EPERM_;
+    }
+    let (buf, n) = match canon_path(u64::MAX, path) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let (rb, rn, _) = match resolve_links(&buf[..n], true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if is_file(&rb[..rn]) {
+        return ENOTDIR_;
+    }
+    if !dir_exists(&rb[..rn]) {
+        return ENOENT;
+    }
+    if rn > 128 {
+        return (-36i64) as u64; // ENAMETOOLONG: root field is 128
+    }
+    let f = fst(t);
+    f.root[..rn].copy_from_slice(&rb[..rn]);
+    f.rootlen = rn as u8;
     0
 }
 
@@ -20042,18 +20116,38 @@ fn vdir_remove(i: usize) {
 /// empty and "." components, ".." pops the last (at root it stays
 /// root — the Linux rule). Output is the flat-name convention:
 /// no leading '/', root = "". None on overflow (ENAMETOOLONG).
-fn canon(base: &[u8], path: &[u8], out: &mut [u8; 256]) -> Option<usize> {
+/// '..' floor for a resolution starting at `base` under jail
+/// `root`: the root's byte depth when base sits inside-or-at it,
+/// else 0 — a base outside the jail (escaped cwd, old dfd) keeps
+/// the global view like a real chroot.
+fn root_floor(base: &[u8], root: &[u8]) -> usize {
+    if !root.is_empty()
+        && (base == root
+            || (base.len() > root.len()
+                && base[..root.len()] == *root
+                && base[root.len()] == b'/'))
+    {
+        root.len()
+    } else {
+        0
+    }
+}
+
+/// base+path canonicalizer: `floor` is the byte depth below which
+/// '..' may not pop — canon_path passes the task's chroot prefix so
+/// escapes clamp at the jail root like Linux's fs_struct root.
+fn canon(base: &[u8], path: &[u8], out: &mut [u8; 256], floor: usize) -> Option<usize> {
     let mut n = 0usize;
-    fn push(out: &mut [u8; 256], n: &mut usize, comp: &[u8]) -> bool {
+    fn push(out: &mut [u8; 256], n: &mut usize, comp: &[u8], floor: usize) -> bool {
         if comp.is_empty() || comp == b"." {
             return true;
         }
         if comp == b".." {
-            if *n > 0 {
-                while *n > 0 && out[*n - 1] != b'/' {
+            if *n > floor {
+                while *n > floor && out[*n - 1] != b'/' {
                     *n -= 1;
                 }
-                if *n > 0 {
+                if *n > floor {
                     *n -= 1; // drop the '/'
                 }
             }
@@ -20072,13 +20166,13 @@ fn canon(base: &[u8], path: &[u8], out: &mut [u8; 256]) -> Option<usize> {
     }
     if !path.starts_with(b"/") {
         for comp in base.split(|&c| c == b'/') {
-            if !push(out, &mut n, comp) {
+            if !push(out, &mut n, comp, floor) {
                 return None;
             }
         }
     }
     for comp in path.split(|&c| c == b'/') {
-        if !push(out, &mut n, comp) {
+        if !push(out, &mut n, comp, floor) {
             return None;
         }
     }
@@ -20097,20 +20191,29 @@ pub fn canon_path(dfd: u64, path: &[u8]) -> Result<([u8; 256], usize), u64> {
         return Err(ENOENT);
     }
     let dfd_i = dfd as u32 as i32;
-    let base: ([u8; 128], usize) = if path[0] == b'/' {
-        ([0; 128], 0)
+    // The task's chroot jail: an absolute path re-roots under it
+    // (leading '/' stripped so it joins the root base), and '..'
+    // clamps at the jail depth whenever the resolution started
+    // inside — a base outside the jail (escaped cwd, old dfd)
+    // keeps the global view like a real chroot.
+    let Some(t) = cur_mut() else { return Err(EBADF) };
+    let (root, rootlen) = {
+        let f = fst(t);
+        (f.root, f.rootlen as usize)
+    };
+    let (base, base_n, rel): ([u8; 128], usize, &[u8]) = if path[0] == b'/' {
+        (root, rootlen, &path[1..])
     } else if dfd_i != -100 && dfd != u64::MAX {
-        let Some(t) = cur_mut() else { return Err(EBADF) };
         let Some(o) = ofd(t, dfd_i as u64) else { return Err(EBADF) };
         let FdKind::Dir(dp) = &o.kind else { return Err(ENOTDIR_) };
-        (dp.b, dp.n as usize)
+        (dp.b, dp.n as usize, path)
     } else {
-        let Some(t) = cur_mut() else { return Err(EBADF) };
         let f = fst(t);
-        (f.cwd, f.cwdlen as usize)
+        (f.cwd, f.cwdlen as usize, path)
     };
+    let floor = root_floor(&base[..base_n], &root[..rootlen]);
     let mut out = [0u8; 256];
-    match canon(&base.0[..base.1], path, &mut out) {
+    match canon(&base[..base_n], rel, &mut out, floor) {
         Some(n) => Ok((out, n)),
         None => Err(ENAMETOOLONG),
     }
@@ -20270,6 +20373,15 @@ pub fn resolve_links(
 ) -> Result<([u8; 256], usize, bool), u64> {
     const ELOOP_: u64 = (-40i64) as u64;
     const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    // The caller's chroot jail bounds link-target resolution too:
+    // an absolute target re-roots at the jail, a relative one's
+    // '..' clamps at the jail depth while the link sits inside.
+    let (root, rootlen) = cur_mut()
+        .map(|t| {
+            let f = fst(t);
+            (f.root, f.rootlen as usize)
+        })
+        .unwrap_or(([0u8; 128], 0));
     let mut cur = [0u8; 256];
     let mut cn = cpath.len().min(256);
     cur[..cn].copy_from_slice(&cpath[..cn]);
@@ -20324,12 +20436,24 @@ pub fn resolve_links(
                 }
             }
             if tl > 0 {
-                // A relative target joins the link's own directory —
-                // canon already discards the base on '/'-led input.
-                let dir_end =
-                    cur[..end].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                // A relative target joins the link's own directory;
+                // an absolute one re-roots at the jail like Linux.
+                let (lb, ln, tp, floor) = if tgt[..tl].starts_with(b"/") {
+                    // Absolute target re-roots at the jail — strip
+                    // the slash so it joins the root base.
+                    let mut d = [0u8; 256];
+                    d[..rootlen].copy_from_slice(&root[..rootlen]);
+                    (d, rootlen, &tgt[1..tl], rootlen)
+                } else {
+                    let dir_end =
+                        cur[..end].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                    let mut d = [0u8; 256];
+                    d[..dir_end].copy_from_slice(&cur[..dir_end]);
+                    let fl = root_floor(&cur[..dir_end], &root[..rootlen]);
+                    (d, dir_end, &tgt[..tl], fl)
+                };
                 let mut nb = [0u8; 256];
-                let Some(nn) = canon(&cur[..dir_end], &tgt[..tl], &mut nb)
+                let Some(nn) = canon(&lb[..ln], tp, &mut nb, floor)
                 else {
                     return Err(ENAMETOOLONG_);
                 };

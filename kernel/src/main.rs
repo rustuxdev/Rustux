@@ -1824,8 +1824,8 @@ pub(crate) fn rustux_main(
     user::launch();
     user::reap_all();
     let after = kalloc::free_frames();
-    kprintln!(con, "rustux: tasks: {} ran, frames {} -> {} after reap{}", queued, before, after,
-        if after == before { " (zero leak)" } else { " (LEAK)" });
+    kprintln!(con, "rustux: tasks: {} ran, frames {} -> {} after reap{} (slab {})", queued, before, after,
+        if after == before { " (zero leak)" } else { " (LEAK)" }, kalloc::slab_pages());
     kprintln!(
         con,
         "rustux: log: {} records through klib::prb ring, {} dropped",

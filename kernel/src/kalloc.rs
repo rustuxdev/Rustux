@@ -64,6 +64,7 @@ fn refill(alloc: &mut Kalloc, c: usize) {
         order += 1;
     }
     let Some(b) = alloc.buddy.alloc(order) else { return };
+    unsafe { *core::ptr::addr_of_mut!(SLAB_PAGES) += 1u64 << order };
     let n = (PAGE << order) / obj;
     for i in 0..n {
         let slot = pmap(b + i * obj);
@@ -220,6 +221,12 @@ pub unsafe fn kfree(p: *mut u8) {
         ));
     }
     unsafe { irq_restore(f) };
+}
+
+static mut SLAB_PAGES: u64 = 0;
+/// Debug accounting: buddy pages carved into slab caches since boot.
+pub fn slab_pages() -> u64 {
+    unsafe { *core::ptr::addr_of!(SLAB_PAGES) }
 }
 
 /// Frames currently free in the buddy underneath (slab-resident pages

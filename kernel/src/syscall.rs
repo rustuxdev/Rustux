@@ -793,6 +793,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_REBOOT => user::sys_reboot(a1, a2, a3),
         NR_CHDIR => sys_chdir(a1),
         NR_FCHDIR => user::sys_fchdir(a1),
+        161 => sys_chroot(a1),
         NR_CHMOD => sys_chmod(a1, a2),
         NR_FCHMOD => user::fd_chmod(a1, a2),
         NR_FCHMODAT => sys_fchmodat(a1, a2, a3),
@@ -1555,6 +1556,16 @@ fn sys_chdir(path: u64) -> u64 {
         Err(e) => return e,
     };
     user::sys_chdir(&name[..n])
+}
+
+/// chroot(path): user string then the shared-table root update.
+fn sys_chroot(path: u64) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_chroot(&name[..n])
 }
 
 /// mkdir/mkdirat(dirfd, path, mode): mode is the new dir's stored
