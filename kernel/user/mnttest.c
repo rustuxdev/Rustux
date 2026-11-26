@@ -495,6 +495,126 @@ int main(void) {
               && rmdir("/t_mm2") == 0, "rmdir mount dirs");
     }
 
+    // ---- pivot_root(155) ---------------------------------------
+    {
+        check(mkdir("/t_pv", 0755) == 0, "mkdir /t_pv");
+        check(mount("tmpfs", "/t_pv", "tmpfs", 0, 0) == 0,
+              "mount pivot target");
+        check(mkdir("/t_pv/old", 0755) == 0, "mkdir /t_pv/old");
+        // errno ladder first
+        errno = 0;
+        check(syscall(155, "/", "/x") < 0 && errno == EINVAL,
+              "pivot to root EINVAL");
+        errno = 0;
+        check(syscall(155, "/t_dir_missing", "/t_dir_missing/x") < 0
+              && errno == EINVAL, "pivot non-mount EINVAL");
+        errno = 0;
+        check(syscall(155, "/t_pv", "/not_under") < 0
+              && errno == ENOENT, "pivot put_old missing ENOENT");
+        check(mkdir("/t_out", 0755) == 0, "mkdir /t_out");
+        errno = 0;
+        check(syscall(155, "/t_pv", "/t_out") < 0
+              && errno == EINVAL, "pivot put_old outside EINVAL");
+        check(rmdir("/t_out") == 0, "rmdir /t_out");
+        check(mkdir("/t_pv/old/tp", 0755) == 0,
+              "mkdir restore point");
+        check(syscall(155, "/t_pv", "/t_pv/old") == 0,
+              "pivot_root forward");
+        // tmpfs now owns "/" coverage; rustux old root sits at
+        // /t_pv/old
+        check(has_mount("tmpfs", "/", "tmpfs", "rw"),
+              "pivot: tmpfs is root");
+        check(has_mount("rustux", "/t_pv/old", "rustux", "rw"),
+              "pivot: rustux under old");
+        check(statfs("/", &sf) == 0 && sf.f_type == TMPFS_MAGIC,
+              "statfs / -> tmpfs after pivot");
+        // pivot back to restore the suite's world
+        check(syscall(155, "/t_pv/old", "/t_pv/old/tp") == 0,
+              "pivot_root back");
+        check(has_mount("rustux", "/", "rustux", "rw"),
+              "pivot back: rustux is root");
+        check(has_mount("tmpfs", "/t_pv/old/tp", "tmpfs", "rw"),
+              "pivot back: tmpfs under tp");
+        check(umount2("/t_pv/old/tp", 0) == 0,
+              "umount pivoted tmpfs");
+        check(rmdir("/t_pv/old/tp") == 0 && rmdir("/t_pv/old") == 0
+              && rmdir("/t_pv") == 0, "rmdir pivot dirs");
+        // umounting the root mount stays EBUSY even post-pivot
+        errno = 0;
+        check(umount2("/", 0) < 0 && errno == EBUSY,
+              "umount root EBUSY");
+    }
+
+    // ---- fsopen(430)/fsconfig(431)/fsmount(432) + quotactl_fd(443)
+    {
+        errno = 0;
+        check(syscall(430, "tmpfs", 4) < 0 && errno == EINVAL,
+              "fsopen bad flags EINVAL");
+        errno = 0;
+        check(syscall(430, "bogusfs", 0) < 0 && errno == ENODEV,
+              "fsopen unknown fs ENODEV");
+        int ff = syscall(430, "tmpfs", 0);
+        check(ff >= 0, "fsopen tmpfs");
+        // fsconfig ladder
+        errno = 0;
+        check(syscall(431, 0, 6, 0, 0, 0) < 0 && errno == EINVAL,
+              "fsconfig non-fsctx fd EINVAL");
+        errno = 0;
+        check(syscall(431, ff, 9, 0, 0, 0) < 0 && errno == EINVAL,
+              "fsconfig bad cmd EINVAL");
+        errno = 0;
+        check(syscall(431, ff, 1, "bogus", "v", 0) < 0
+              && errno == EINVAL, "fsconfig unknown key EINVAL");
+        errno = 0;
+        check(syscall(431, ff, 2, "source", "x", 0) < 0
+              && errno == EINVAL, "fsconfig binary EINVAL");
+        check(syscall(431, ff, 1, "source", "news", 0) == 0,
+              "fsconfig source string");
+        check(syscall(431, ff, 0, "nosuid", 0, 0) == 0,
+              "fsconfig nosuid flag");
+        // fsmount before CREATE -> EINVAL
+        errno = 0;
+        check(syscall(432, ff, 0, 0) < 0 && errno == EINVAL,
+              "fsmount before create EINVAL");
+        check(syscall(431, ff, 6, 0, 0, 0) == 0,
+              "fsconfig CMD_CREATE");
+        errno = 0;
+        check(syscall(431, ff, 6, 0, 0, 0) < 0 && errno == EBUSY,
+              "fsconfig repeat CREATE EBUSY");
+        errno = 0;
+        check(syscall(431, ff, 7, 0, 0, 0) < 0 && errno == EINVAL,
+              "fsconfig RECONFIGURE EINVAL");
+        int mfd2 = syscall(432, ff, 0, 0);
+        check(mfd2 >= 0, "fsmount minted detached mount");
+        // attach it
+        check(mkdir("/t_fm", 0755) == 0, "mkdir /t_fm");
+        check(syscall(429, mfd2, "", AT_FDCWD, "/t_fm", 4) == 0,
+              "move_mount attaches fsmount");
+        check(has_mount("news", "/t_fm", "tmpfs", "rw,nosuid"),
+              "fsmount attrs applied");
+        check(umount2("/t_fm", 0) == 0 && rmdir("/t_fm") == 0,
+              "cleanup fsmount");
+        close(mfd2);
+        close(ff);
+        // quotactl_fd
+        int qfd = open("/xat_qf", O_CREAT | O_RDONLY, 0644);
+        check(qfd >= 0, "open quotactl_fd target");
+        errno = 0;
+        check(syscall(443, qfd, (0x800007L << 8), 0, 0) < 0
+              && errno == ESRCH, "quotactl_fd query ESRCH");
+        errno = 0;
+        check(syscall(443, qfd, (0x800001L << 8), 0, 0) == 0,
+              "quotactl_fd Q_SYNC ok");
+        errno = 0;
+        check(syscall(443, qfd, (0x800007L << 8) | 9, 0, 0) < 0
+              && errno == EINVAL, "quotactl_fd bad type EINVAL");
+        errno = 0;
+        check(syscall(443, 99, (0x800007L << 8), 0, 0) < 0
+              && errno == EBADF, "quotactl_fd bad fd EBADF");
+        close(qfd);
+        unlink("/xat_qf");
+    }
+
     // ---- privilege gate ----------------------------------------
     pid_t c = fork();
     if (c == 0) {
@@ -515,6 +635,10 @@ int main(void) {
             bad |= 16;
         int pf2 = syscall(433, AT_FDCWD, "/", 0);
         if (pf2 < 0) bad |= 32; else close(pf2);
+        if (syscall(155, "/", "/x") != -1 || errno != EPERM)
+            bad |= 64;
+        if (syscall(430, "tmpfs", 0) != -1 || errno != EPERM)
+            bad |= 128;
         _exit(bad);
     }
     int st;

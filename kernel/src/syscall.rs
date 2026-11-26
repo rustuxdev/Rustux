@@ -802,7 +802,12 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_FCHDIR => user::sys_fchdir(a1),
         161 => sys_chroot(a1),
         163 => sys_acct(a1),
+        155 => sys_pivot_root(a1, a2),
         165 => sys_mount(a1, a2, a3, a4),
+        430 => sys_fsopen(a1, a2),
+        431 => sys_fsconfig(a1, a2, a3, a4, a5),
+        432 => user::sys_fsmount(a1, a2, a3),
+        443 => user::sys_quotactl_fd(a1, a2, a3, a4),
         428 => sys_open_tree(a1, a2, a3),
         429 => sys_move_mount(a1, a2, a3, a4, a5),
         433 => sys_fspick(a1, a2, a3),
@@ -1648,6 +1653,57 @@ fn sys_umount2(tgt: u64, flags: u64) -> u64 {
         Err(e) => return e,
     };
     user::sys_umount2(&tb[..tn], flags)
+}
+
+/// pivot_root(155): two canonicalized user path strings.
+fn sys_pivot_root(new_root: u64, put_old: u64) -> u64 {
+    let mut nb = [0u8; 257];
+    let mut ob = [0u8; 257];
+    let nn = match copy_user_path(new_root, &mut nb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let on = match copy_user_path(put_old, &mut ob) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_pivot_root(&nb[..nn], &ob[..on])
+}
+
+/// fsopen(430): fstype name string + flags.
+fn sys_fsopen(name: u64, flags: u64) -> u64 {
+    let mut nb = [0u8; 257];
+    let n = match copy_user_path(name, &mut nb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::sys_fsopen(&nb[..n], flags)
+}
+
+/// fsconfig(431): key/value strings — NULL maps to empty (SET_FLAG
+/// passes key only; SET_EMPTY has no value).
+fn sys_fsconfig(
+    fd: u64, cmd: u64, key: u64, value: u64, aux: u64,
+) -> u64 {
+    let mut kb = [0u8; 257];
+    let mut vb = [0u8; 257];
+    let kn = if key == 0 {
+        0
+    } else {
+        match copy_user_path(key, &mut kb) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    let vn = if value == 0 {
+        0
+    } else {
+        match copy_user_path(value, &mut vb) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    user::sys_fsconfig(fd, cmd, &kb[..kn], &vb[..vn], aux)
 }
 
 /// open_tree(428): dirfd + possibly-NULL path (EMPTY_PATH) + flags.

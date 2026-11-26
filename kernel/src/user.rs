@@ -623,6 +623,9 @@ enum FdKind {
     /// resolved to a MOUNTS slot at use — a closed+reused slot can
     /// never alias a stale fd onto a different mount.
     Mount(usize),
+    /// An fs_context (fsopen): slot into FSCS. The OFD is the only
+    /// handle, so the index is safe to reuse after close.
+    FsCtx(usize),
 }
 
 /// Max concurrent pipes — a hard bound on kernel frame pressure,
@@ -14135,7 +14138,7 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                     }
                 }
                 FdKind::Console => 0u64,
-                FdKind::Mount(_) => 0u64,
+                FdKind::Mount(_) | FdKind::FsCtx(_) => 0u64,
                 FdKind::File(d) => d.len().saturating_sub(o.pos) as u64,
                 FdKind::Proc { len, .. } => {
                     len.saturating_sub(o.pos) as u64
@@ -14958,6 +14961,7 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
             (0o40000 | m, 0, 0)
         }
         FdKind::Mount(_) => (0o100444, 0, 0), // detached-mount fd
+        FdKind::FsCtx(_) => (0o100444, 0, 0), // fs_context fd
         FdKind::File(d) => {
             let ino = (unsafe { *core::ptr::addr_of!(INITRD) })
                 .and_then(|arc| {
@@ -15842,8 +15846,10 @@ pub fn sys_umount2(tgt: &[u8], flags: u64) -> u64 {
     };
     let p = &rb[..rn];
     let Some(i) = mount_exact(p) else { return EINVAL_ };
-    if i == 0 {
-        return EBUSY_; // the root mount is busy forever
+    // The root mount is busy forever — identified by its empty
+    // point, not slot 0 (pivot_root moves the role).
+    if mounts()[i].as_ref().is_some_and(|m| m.n == 0) {
+        return EBUSY_;
     }
     mounts()[i] = None;
     0
@@ -16515,6 +16521,273 @@ pub fn sys_mount_setattr(
         }
     }
     0
+}
+
+/// pivot_root(155): move the new_root mount to "" (root coverage)
+/// and the old root under put_old. Path-string model: the pivot is
+/// a mount-record relabel — vdirs still resolve (they're flat-
+/// addressed), so the only observable change is which mount's
+/// flags/fstype owns a covered region. Caller's fs root/cwd keep
+/// their strings (still resolve — no dentry pinning exists).
+pub fn sys_pivot_root(new_root: &[u8], put_old: &[u8]) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    if t.uid != 0 {
+        return (-1i64) as u64; // CAP_SYS_ADMIN
+    }
+    let (cb, cn) = match canon_path(u64::MAX, new_root) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let (rb, rn, _) = match resolve_links(&cb[..cn], true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let (ob, on) = match canon_path(u64::MAX, put_old) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let (orb, orn, _) = match resolve_links(&ob[..on], true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let np = &rb[..rn];
+    let op = &orb[..orn];
+    // new_root must be a mount point and not the root mount.
+    let Some(ni) = mount_exact(np) else { return EINVAL_ };
+    if mounts()[ni].as_ref().is_none_or(|m| m.n == 0) {
+        return EINVAL_;
+    }
+    // put_old must be a dir strictly inside the new root's tree.
+    if !dir_exists(op) {
+        return ENOENT_;
+    }
+    if op.len() <= np.len()
+        || op[..np.len()] != *np
+        || op[np.len()] != b'/'
+    {
+        return EINVAL_;
+    }
+    if mount_i(op) != Some(ni) {
+        return EINVAL_; // put_old crosses a mount boundary
+    }
+    if op.len() > 128 {
+        return (-36i64) as u64;
+    }
+    let Some(ri) = mount_exact(b"") else { return EINVAL_ };
+    {
+        let m = mounts()[ri].as_mut().unwrap();
+        m.path = [0; 128];
+        m.path[..op.len()].copy_from_slice(op);
+        m.n = op.len() as u8;
+    }
+    {
+        let m = mounts()[ni].as_mut().unwrap();
+        m.path = [0; 128];
+        m.n = 0;
+    }
+    // Any task rooted/cwd'd at the old root keeps the real root —
+    // its "" strings now name the new tree, matching a pivoting
+    // process's own view. (Sibling processes diverge: their root
+    // string still covers the new tree — documented.)
+    0
+}
+
+/// fsopen/fsconfig/fsmount state — an fs_context is fd-owned only
+/// (the OFD is its sole handle; slot reuse can't alias because
+/// closing drops the slot).
+struct FsCtx {
+    fstype: [u8; 16],
+    fnlen: u8,
+    source: [u8; 32],
+    slen: u8,
+    attr: u32,      // ro/nosuid/nodev/noexec flag params
+    created: bool,  // FSCONFIG_CMD_CREATE latched
+}
+const MAX_FSCS: usize = 8;
+static mut FSCS: [Option<FsCtx>; MAX_FSCS] = [const { None }; 8];
+
+/// fsopen(430): CAP_SYS_ADMIN (an fs_context can create mounts);
+/// flags = FSOPEN_CLOEXEC only; fstype must be one the mounter
+/// knows (tmpfs — same ENODEV rule as mount(2)).
+pub fn sys_fsopen(name: &[u8], flags: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENODEV_: u64 = (-19i64) as u64;
+    const EMFILE_: u64 = (-24i64) as u64;
+    if flags & !0x1 != 0 {
+        return EINVAL_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    if t.uid != 0 {
+        return (-1i64) as u64;
+    }
+    if name != b"tmpfs" {
+        return ENODEV_;
+    }
+    let fscs = unsafe { &mut *core::ptr::addr_of_mut!(FSCS) };
+    let Some(si) = fscs.iter().position(Option::is_none) else {
+        return EMFILE_;
+    };
+    let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+    let Some(oi) = ofds.iter().position(Option::is_none) else {
+        return EMFILE_;
+    };
+    let Some(fi) = fdt(t).fds.iter().position(Option::is_none) else {
+        return EMFILE_;
+    };
+    let mut c = FsCtx {
+        fstype: [0; 16],
+        fnlen: name.len() as u8,
+        source: [0; 32],
+        slen: 0,
+        attr: 0,
+        created: false,
+    };
+    c.fstype[..name.len()].copy_from_slice(name);
+    fscs[si] = Some(c);
+    ofds[oi] = Some(OpenFile {
+        kind: FdKind::FsCtx(si),
+        pos: 0,
+        refs: 1,
+        append: false,
+        nonblock: false,
+        accmode: 0,
+    });
+    fdt(t).fds[fi] = Some(oi as u16);
+    cloexec_set(t, fi, flags & 0x1 != 0);
+    fi as u64
+}
+
+/// fsconfig(431): configure an fs_context. tmpfs surface: "source"
+/// accepts SET_STRING/SET_EMPTY; ro/nosuid/nodev/noexec accept
+/// SET_FLAG; CMD_CREATE latches ready (repeat -> EBUSY); PATH/FD/
+/// BINARY params and CMD_RECONFIGURE -> EINVAL (no such params or
+/// a superblock to reconfigure).
+pub fn sys_fsconfig(
+    fd: u64, cmd: u64, key: &[u8], value: &[u8], aux: u64,
+) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const EBUSY_: u64 = (-16i64) as u64;
+    if cmd > 8 {
+        return EINVAL_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let FdKind::FsCtx(si) = o.kind else { return EINVAL_ };
+    let fscs = unsafe { &mut *core::ptr::addr_of_mut!(FSCS) };
+    let Some(c) = fscs[si].as_mut() else { return EINVAL_ };
+    match cmd {
+        6 | 8 => {
+            // CMD_CREATE / CMD_CREATE_EXCL — single-superblock
+            // model makes EXCL and CREATE identical.
+            if aux != 0 {
+                return EINVAL_;
+            }
+            if c.created {
+                return EBUSY_;
+            }
+            c.created = true;
+            0
+        }
+        7 => EINVAL_, // CMD_RECONFIGURE — no attached superblock
+        _ => {
+            if aux != 0 || value.is_empty() && cmd != 0 && cmd != 3 {
+                // SET_BINARY(2)/SET_PATH(4)/SET_FD(5) carry aux or
+                // need a value — tmpfs takes neither.
+                return EINVAL_;
+            }
+            match (key, cmd) {
+                (b"source", 1) | (b"source", 3) => {
+                    if value.len() > 32 {
+                        return (-36i64) as u64;
+                    }
+                    c.source[..value.len()].copy_from_slice(value);
+                    c.slen = value.len() as u8;
+                    0
+                }
+                (b"ro", 0) => { c.attr |= 0x1; 0 }
+                (b"nosuid", 0) => { c.attr |= 0x2; 0 }
+                (b"nodev", 0) => { c.attr |= 0x4; 0 }
+                (b"noexec", 0) => { c.attr |= 0x8; 0 }
+                _ => EINVAL_,
+            }
+        }
+    }
+}
+
+/// fsmount(432): mint a detached mount from a created fs_context
+/// and return its mount fd. flags = FSMOUNT_CLOEXEC; msflags is
+/// the MOUNT_ATTR word — same bits as mount_setattr minus IDMAP.
+pub fn sys_fsmount(fd: u64, flags: u64, msflags: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ENOSPC_: u64 = (-28i64) as u64;
+    const ATTR_KNOWN: u64 = 0x1 | 0x2 | 0x4 | 0x8 | 0x70 | 0x80;
+    if flags & !0x1 != 0 || msflags & !ATTR_KNOWN != 0 {
+        return EINVAL_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let FdKind::FsCtx(si) = o.kind else { return EINVAL_ };
+    let fscs = unsafe { &mut *core::ptr::addr_of_mut!(FSCS) };
+    let Some(c) = fscs[si].as_ref() else { return EINVAL_ };
+    if !c.created {
+        return EINVAL_;
+    }
+    let ms = mounts();
+    let Some(s) = ms.iter().position(Option::is_none) else {
+        return ENOSPC_;
+    };
+    let id = unsafe { *core::ptr::addr_of!(MOUNT_ID) };
+    unsafe { *core::ptr::addr_of_mut!(MOUNT_ID) = id + 1 };
+    let mut m = Mount {
+        path: [0; 128],
+        n: 0,
+        fstype: [0; 16],
+        fnlen: c.fnlen,
+        source: [0; 32],
+        slen: c.slen,
+        id,
+        flags: c.attr | (msflags as u32),
+        detached: true,
+        prop: 0,
+    };
+    m.fstype[..c.fnlen as usize]
+        .copy_from_slice(&c.fstype[..c.fnlen as usize]);
+    m.source[..c.slen as usize]
+        .copy_from_slice(&c.source[..c.slen as usize]);
+    ms[s] = Some(m);
+    mount_fd(t, s, flags & 0x1 != 0)
+}
+
+/// quotactl_fd(443): the quota-less answer via an fs fd — the fd
+/// just picks the fs like `special` does for quotactl(179). Any
+/// file/dir/mount fd resolves to an existing object (EBADF empty,
+/// EINVAL for a non-fs kind); cmd validation mirrors quotactl:
+/// Q_SYNC no-op, queries ESRCH.
+pub fn sys_quotactl_fd(fd: u64, cmd: u64, _id: u64, _addr: u64) -> u64 {
+    const EINVAL_: u64 = (-22i64) as u64;
+    const ESRCH_: u64 = (-3i64) as u64;
+    const KNOWN: [u64; 9] = [
+        0x800001, 0x800002, 0x800003, 0x800004, 0x800005, 0x800006,
+        0x800007, 0x800008, 0x800009,
+    ];
+    let sub = cmd >> 8;
+    let qtype = cmd & 0xff;
+    if qtype > 2 || !KNOWN.contains(&sub) {
+        return EINVAL_;
+    }
+    let Some(t) = cur_mut() else { return EINVAL_ };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    match &o.kind {
+        FdKind::Ram(_) | FdKind::Dir(_) | FdKind::File(_)
+        | FdKind::Dev(_) | FdKind::Mount(_) => {}
+        _ => return EINVAL_,
+    }
+    if sub == 0x800001 {
+        return 0; // Q_SYNC
+    }
+    ESRCH_
 }
 
 /// quotactl(179): no quota accounting exists anywhere — the honest
@@ -20970,7 +21243,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Pidfd(_) => EINVAL,
         // mqds move messages through the mq_* calls — no read.
         FdKind::MQueue(_) => EINVAL,
-        FdKind::Mount(_) => EBADF, // detached-mount fd — no data side
+        FdKind::Mount(_) | FdKind::FsCtx(_) => EBADF, // no data side
         FdKind::Eventfd(i) => eventfd_read(ctx, *i, buf, len),
         FdKind::Timerfd(i) => timerfd_read(ctx, *i, buf, len),
         FdKind::Signalfd(i) => signalfd_read(ctx, *i, buf, len),
@@ -23694,6 +23967,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         FdKind::Mount(_) => {
             s.puts(b"anon_inode:[mnt]");
         }
+        FdKind::FsCtx(_) => {
+            s.puts(b"anon_inode:[fscontext]");
+        }
         FdKind::Proc { .. } => {
             s.puts(b"anon_inode:[proc]");
         }
@@ -26216,6 +26492,9 @@ fn ofd_release(oi: usize) {
     if let FdKind::MQueue(i) = kind {
         mq_release(i); // an unlinked queue dies at last close
     }
+    if let FdKind::FsCtx(i) = kind {
+        unsafe { (*core::ptr::addr_of_mut!(FSCS))[i] = None };
+    }
     if let FdKind::Mount(i) = kind {
         // A detached mount has no other reachability — last close
         // is its destructor (fsmount'd mounts were never attached).
@@ -26925,7 +27204,7 @@ fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
         // fully reaped slot both count, like Linux's exit notice.
         // A detached-mount fd carries no data but polls ready like
         // an O_PATH descriptor — always.
-        FdKind::Mount(_) => POLLIN | POLLOUT,
+        FdKind::Mount(_) | FdKind::FsCtx(_) => POLLIN | POLLOUT,
         FdKind::Pidfd(pid) => {
             if pidfd_alive(*pid) { 0 } else { POLLIN }
         }
