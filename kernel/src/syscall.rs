@@ -628,6 +628,12 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         309 => user::sys_getcpu(a1, a2, a3),
         314 => user::sys_sched_setattr(a1, a2, a3, a4),
         315 => user::sys_sched_getattr(a1, a2, a3, a4),
+        // SysV SHM over the SHMSEGS machinery — shmid encodes
+        // (gen << 16) | slot so stale ids EINVAL.
+        29 => user::sys_shmget(a1, a2, a3),
+        30 => user::sys_shmat(a1, a2, a3),
+        31 => user::sys_shmctl(a1, a2, a3),
+        67 => user::sys_shmdt(a1),
 
         NR_FUTEX_WAKE => user::sys_futex_wake(a1, a2, a3, a4),
         NR_FUTEX_WAIT => user::sys_futex_wait(ctx, a1, a2, a3, a4, a5, a6),

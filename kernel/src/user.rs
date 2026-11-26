@@ -173,11 +173,25 @@ struct ShmSeg {
     frames: [u64; SHM_MAX_PAGES],
     nframes: u32,
     refs: u32,
+    /// SysV SHM fields — sysv segments persist at refs==0 until
+    /// IPC_RMID marks them; anon (MAP_SHARED) segments never set
+    /// this and still die at the last VMA drop.
+    sysv: bool,
+    key: i32,
+    size: u64,
+    mode: u32,
+    rmid: bool,
+    gen: u16,
 }
 
 static mut SHMSEGS: [Option<ShmSeg>; MAX_SHM_SEGS] =
     [None, None, None, None, None, None, None, None,
      None, None, None, None, None, None, None, None];
+
+/// Per-slot generation stamped into SysV shmids
+/// ((gen << 16) | slot) — a freed-then-reused slot never answers
+/// a stale id. Bumped on each shmget mint.
+static mut SHMGEN: [u16; MAX_SHM_SEGS] = [0; MAX_SHM_SEGS];
 
 /// Does `va` lie in one of `t`'s shared-anon VMAs? Pages that do are
 /// owned by the segment — never the task's private copy/free set.
@@ -209,18 +223,30 @@ fn shm_owns(t: &Task, va: u64, phys: u64) -> bool {
 fn shm_drop_all(t: &mut Task) {
     for i in 0..t.nshms {
         let (_, _, seg) = t.shms[i];
-        let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
-        if let Some(s) = &mut segs[seg as usize] {
-            s.refs = s.refs.saturating_sub(1);
-            if s.refs == 0 {
-                for f in 0..s.nframes as usize {
-                    kalloc::free_frame(s.frames[f]);
-                }
-                segs[seg as usize] = None;
+        shm_unref(seg as usize);
+    }
+    t.nshms = 0;
+}
+
+/// Drop one segment reference — the SysV variant of the last-ref
+/// rule: sysv segments survive a zero refcount until IPC_RMID
+/// marks them (Linux keeps them until destroyed), anon segments
+/// still die at the last drop.
+fn shm_unref(seg: usize) {
+    let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
+    let dead = if let Some(s) = &mut segs[seg] {
+        s.refs = s.refs.saturating_sub(1);
+        s.refs == 0 && (!s.sysv || s.rmid)
+    } else {
+        false
+    };
+    if dead {
+        if let Some(s) = segs[seg].take() {
+            for f in s.frames.iter().take(s.nframes as usize) {
+                kalloc::free_frame(*f);
             }
         }
     }
-    t.nshms = 0;
 }
 
 /// Pin every segment named by `t`'s VMA list once more — fork/clone
@@ -239,8 +265,9 @@ fn shm_pin_all(t: &Task) {
 /// kernel heap by enqueueing forever. 48 was fork-EAGAIN-tight
 /// for the 39-task suite + concurrent children (observed on VM);
 /// 88 went resident-slot-tight once the initrd member count hit
-/// 85+daemons (pidfdtest was the refused 86th spawn).
-const MAX_TASKS: usize = 96;
+/// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
+/// until shmtest became the refused 97th.
+const MAX_TASKS: usize = 112;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -8569,7 +8596,17 @@ fn shm_mmap(t: &mut Task, addr: u64, len: u64, prot: u64, flags: u64) -> u64 {
         let Some(v) = mmap_find(t, len) else { return ENOMEM };
         v
     };
-    let mut s = ShmSeg { frames: [0; SHM_MAX_PAGES], nframes: 0, refs: 1 };
+    let mut s = ShmSeg {
+        frames: [0; SHM_MAX_PAGES],
+        nframes: 0,
+        refs: 1,
+        sysv: false,
+        key: 0,
+        size: 0,
+        mode: 0,
+        rmid: false,
+        gen: 0,
+    };
     let leaf = prot_leaf(prot);
     let mut mapped = 0usize;
     for i in 0..npages {
@@ -8613,22 +8650,319 @@ fn shm_unmap_range(t: &mut Task, lo: u64, hi: u64) {
     for i in 0..t.nshms {
         let (vlo, vhi, seg) = t.shms[i];
         if vlo >= lo && vhi <= hi {
-            let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
-            if let Some(s) = &mut segs[seg as usize] {
-                s.refs = s.refs.saturating_sub(1);
-                if s.refs == 0 {
-                    for f in 0..s.nframes as usize {
-                        kalloc::free_frame(s.frames[f]);
-                    }
-                    segs[seg as usize] = None;
-                }
-            }
+            shm_unref(seg as usize);
             continue;
         }
         t.shms[w] = t.shms[i];
         w += 1;
     }
     t.nshms = w;
+}
+
+// --- SysV shared memory: shmget/shmat/shmctl/shmdt ------------------
+// The syscall layer over SHMSEGS: segments minted here carry
+// sysv:true and persist at refs==0 until IPC_RMID marks them —
+// the shmid dies at mark time, the frames die at the last detach,
+// exactly Linux's two-stage removal. shmid = (gen << 16) | slot;
+// the per-slot generation makes a freed-then-reused slot refuse
+// stale ids with EINVAL like Linux.
+
+const IPC_CREAT: u64 = 0o1000;
+const IPC_EXCL: u64 = 0o2000;
+const SHM_NORESERVE: u64 = 0o100000;
+
+const IPC_RMID: u64 = 0;
+const IPC_SET: u64 = 1;
+const IPC_STAT: u64 = 2;
+
+const SHM_RDONLY: u64 = 0o10000;
+const SHM_RND: u64 = 0o20000;
+const SHM_REMAP: u64 = 0o40000;
+const SHM_EXEC: u64 = 0o100000;
+
+/// A live sysv segment's slot for a user shmid — destroyed,
+/// rmided, stale-gen or out-of-range ids all answer EINVAL like
+/// Linux's ipc_obtain_object failure.
+fn shm_id_resolve(id: u64) -> Option<usize> {
+    let slot = (id & 0xffff) as usize;
+    let gen = (id >> 16) as u16;
+    if slot >= MAX_SHM_SEGS {
+        return None;
+    }
+    let segs = unsafe { &*core::ptr::addr_of!(SHMSEGS) };
+    match &segs[slot] {
+        Some(s) if s.sysv && s.gen == gen && !s.rmid => Some(slot),
+        _ => None,
+    }
+}
+
+/// shmget(key, size, shmflg): key 0 (IPC_PRIVATE) always mints;
+/// else find-by-key or create under IPC_CREAT. Frames allocate
+/// eagerly at mint — bounded by SHM_MAX_PAGES like the mmap path.
+pub fn sys_shmget(key: u64, size: u64, shmflg: u64) -> u64 {
+    const ENOENT: u64 = (-2i64) as u64;
+    const EEXIST_: u64 = (-17i64) as u64;
+    const ENOSPC_: u64 = (-28i64) as u64;
+    if shmflg & !(IPC_CREAT | IPC_EXCL | 0o777 | SHM_NORESERVE) != 0 {
+        return EINVAL;
+    }
+    let key = key as i32;
+    let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
+    let gens = unsafe { &mut *core::ptr::addr_of_mut!(SHMGEN) };
+    if key != 0 {
+        for (i, s) in segs.iter().enumerate() {
+            let Some(s) = s else { continue };
+            if s.sysv && s.key == key {
+                if shmflg & (IPC_CREAT | IPC_EXCL) == IPC_CREAT | IPC_EXCL {
+                    return EEXIST_;
+                }
+                if size > s.size {
+                    return EINVAL;
+                }
+                return ((s.gen as u64) << 16) | i as u64;
+            }
+        }
+        if shmflg & IPC_CREAT == 0 {
+            return ENOENT;
+        }
+    }
+    if size == 0 || size > (SHM_MAX_PAGES as u64) * PAGE {
+        return EINVAL;
+    }
+    let Some(slot) = segs.iter().position(Option::is_none) else {
+        return ENOSPC_;
+    };
+    let npages = size.div_ceil(PAGE) as usize;
+    let mut frames = [0u64; SHM_MAX_PAGES];
+    let mut got = 0usize;
+    for f in frames.iter_mut().take(npages) {
+        let Some(p) = kalloc::alloc_frame() else { break };
+        *f = p;
+        got += 1;
+    }
+    if got < npages {
+        for f in &frames[..got] {
+            kalloc::free_frame(*f);
+        }
+        return ENOSPC_;
+    }
+    gens[slot] = gens[slot].wrapping_add(1);
+    segs[slot] = Some(ShmSeg {
+        frames,
+        nframes: npages as u32,
+        refs: 0,
+        sysv: true,
+        key,
+        size,
+        mode: (shmflg & 0o777) as u32,
+        rmid: false,
+        gen: gens[slot],
+    });
+    ((gens[slot] as u64) << 16) | slot as u64
+}
+
+/// shmat(shmid, addr, shmflg): alias a live segment's frames into
+/// the caller's space. addr==0 first-fits like mmap; SHM_RND
+/// rounds a hint down to SHMLBA(=PAGE); SHM_REMAP zaps whatever
+/// the window held; an occupied window without REMAP EINVALs.
+pub fn sys_shmat(id: u64, addr: u64, shmflg: u64) -> u64 {
+    const ENOMEM_: u64 = (-12i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    if shmflg & !(SHM_RDONLY | SHM_RND | SHM_REMAP | SHM_EXEC) != 0 {
+        return EINVAL;
+    }
+    let Some(slot) = shm_id_resolve(id) else { return EINVAL };
+    let Some(t) = cur_mut() else { return EINVAL };
+    let len = {
+        let segs = unsafe { &*core::ptr::addr_of!(SHMSEGS) };
+        let Some(s) = &segs[slot] else { return EINVAL };
+        (s.nframes as u64) * PAGE
+    };
+    let (ulo, uhi) = user_window(t);
+    let va = if addr == 0 {
+        if shmflg & SHM_REMAP != 0 {
+            return EINVAL;
+        }
+        let Some(v) = mmap_find(t, len) else { return ENOMEM_ };
+        v
+    } else {
+        let a = if shmflg & SHM_RND != 0 {
+            addr & !(PAGE - 1)
+        } else if addr & (PAGE - 1) != 0 {
+            return EINVAL;
+        } else {
+            addr
+        };
+        if a < ulo || a.checked_add(len).is_none_or(|e| e > uhi) {
+            return EINVAL;
+        }
+        if shmflg & SHM_REMAP != 0 {
+            if range_sealed(t, a, a + len) {
+                return EPERM_;
+            }
+            if clip_entry_count(t, a, a + len) >= MAX_RANGES {
+                return ENOMEM_;
+            }
+            let mut v = a;
+            while v < a + len {
+                unmap_page(t, v);
+                v += PAGE;
+            }
+            shm_unmap_range(t, a, a + len);
+            range_clip(t, a, a + len);
+            flush_tlb();
+        } else if t.ranges[..t.nranges]
+            .iter()
+            .any(|&(lo, hi, _)| lo < a + len && hi > a)
+        {
+            return EINVAL;
+        }
+        a
+    };
+    if t.nshms >= MAX_SHM_VMAS || t.nranges >= MAX_RANGES {
+        return ENOMEM_;
+    }
+    // RDONLY drops the write bit; SHM_EXEC also clears NX like
+    // Linux's exec-permitted shm attach.
+    let prot = match (shmflg & SHM_RDONLY != 0, shmflg & SHM_EXEC != 0) {
+        (false, false) => 3,
+        (false, true) => 7,
+        (true, false) => 1,
+        (true, true) => 5,
+    };
+    let leaf = prot_leaf(prot);
+    // Register the VMA before mapping: a partial-map rollback then
+    // takes the normal shm-aware unmap path — unmap_page checks
+    // shm_owns and never frees segment-owned frames.
+    t.shms[t.nshms] = (va, va + len, slot as u8);
+    t.nshms += 1;
+    let mapped = {
+        let segs = unsafe { &*core::ptr::addr_of!(SHMSEGS) };
+        let Some(s) = &segs[slot] else {
+            t.nshms -= 1;
+            return EINVAL;
+        };
+        let mut m = 0usize;
+        for (i, f) in s.frames.iter().take(s.nframes as usize).enumerate() {
+            if !map_frame(t, va + (i as u64) * PAGE, *f, leaf) {
+                break;
+            }
+            m = i + 1;
+        }
+        m
+    };
+    if mapped as u64 * PAGE < len {
+        let mut v = va;
+        while v < va + (mapped as u64) * PAGE {
+            unmap_page(t, v);
+            v += PAGE;
+        }
+        t.nshms -= 1;
+        flush_tlb();
+        return ENOMEM_;
+    }
+    {
+        let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
+        if let Some(s) = &mut segs[slot] {
+            s.refs += 1;
+        }
+    }
+    range_add(t, va, va + len, prot_rng(prot));
+    va
+}
+
+/// shmdt(addr): detach the whole shm VMA containing addr — Linux
+/// EINVALs when nothing is attached there, and a MAP_SHARED-anon
+/// VMA doesn't count (it was never a shmat).
+pub fn sys_shmdt(addr: u64) -> u64 {
+    let Some(t) = cur_mut() else { return EINVAL };
+    let Some(i) = (0..t.nshms).find(|&i| {
+        let (lo, hi, _) = t.shms[i];
+        addr >= lo && addr < hi
+    }) else {
+        return EINVAL;
+    };
+    let (lo, hi, seg) = t.shms[i];
+    {
+        let segs = unsafe { &*core::ptr::addr_of!(SHMSEGS) };
+        match &segs[seg as usize] {
+            Some(s) if s.sysv => {}
+            _ => return EINVAL,
+        }
+    }
+    if range_sealed(t, lo, hi) {
+        return (-1i64) as u64; // EPERM — detach is an unmap
+    }
+    let mut v = lo;
+    while v < hi {
+        unmap_page(t, v);
+        v += PAGE;
+    }
+    shm_unref(seg as usize);
+    t.shms[i] = t.shms[t.nshms - 1];
+    t.nshms -= 1;
+    range_clip(t, lo, hi);
+    flush_tlb();
+    0
+}
+
+/// shmctl(shmid, cmd, buf): IPC_RMID marks the id dead (frames
+/// live until the last attach drops), IPC_STAT zero-fills the
+/// 112-byte shmid_ds and stamps the fields we carry, IPC_SET
+/// writes back the mode (creds collapsed like everywhere),
+/// SHM_LOCK/UNLOCK are inert success — nothing evicts anyway.
+pub fn sys_shmctl(id: u64, cmd: u64, buf: u64) -> u64 {
+    const EFAULT_: u64 = EFAULT;
+    let Some(slot) = shm_id_resolve(id) else { return EINVAL };
+    match cmd {
+        IPC_RMID => {
+            let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
+            if let Some(s) = &mut segs[slot] {
+                s.rmid = true;
+            }
+            if segs[slot].as_ref().is_some_and(|s| s.refs == 0) {
+                if let Some(s) = segs[slot].take() {
+                    for f in s.frames.iter().take(s.nframes as usize) {
+                        kalloc::free_frame(*f);
+                    }
+                }
+            }
+            0
+        }
+        IPC_STAT => {
+            if !range_ok_w(buf, 112) {
+                return EFAULT_;
+            }
+            let segs = unsafe { &*core::ptr::addr_of!(SHMSEGS) };
+            let Some(s) = &segs[slot] else { return EINVAL };
+            // SAFETY: validated 112-byte window under cur cr3 —
+            // x86-64 shmid_ds: ipc_perm{key@0,mode@20,seq@24},
+            // shm_segsz@48, shm_nattch@88.
+            unsafe {
+                core::ptr::write_bytes(buf as *mut u8, 0, 112);
+                *(buf as *mut i32) = s.key;
+                *((buf + 20) as *mut u32) = s.mode;
+                *((buf + 24) as *mut u16) = s.gen;
+                *((buf + 48) as *mut u64) = s.size;
+                *((buf + 88) as *mut u64) = s.refs as u64;
+            }
+            0
+        }
+        IPC_SET => {
+            if !range_ok(buf, 112) {
+                return EFAULT_;
+            }
+            // SAFETY: validated window under cur cr3.
+            let mode = unsafe { *((buf + 20) as *const u32) };
+            let segs = unsafe { &mut *core::ptr::addr_of_mut!(SHMSEGS) };
+            if let Some(s) = &mut segs[slot] {
+                s.mode = mode;
+            }
+            0
+        }
+        11 | 12 => 0, // SHM_LOCK / SHM_UNLOCK
+        _ => EINVAL,
+    }
 }
 
 /// munmap(addr, len): Linux never fails on an aligned range — holes
