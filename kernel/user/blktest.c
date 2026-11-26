@@ -248,6 +248,46 @@ int main(void) {
     if (fd >= 0) close(fd);
     unlink("vdc.nod");
 
+    // ---- discard: BLKDISCARD/BLKSECDISCARD on real hardware ----
+    {
+        unsigned long long range[2] = {128 * 512, 4 * 512};
+        fd = open("/dev/vda", O_RDWR);
+        check(fd >= 0 && ioctl(fd, BLKDISCARD, range) == 0,
+              "BLKDISCARD vda");
+        if (fd >= 0) close(fd);
+        fd = open("/dev/nvme0n1", O_RDWR);
+        check(fd >= 0 && ioctl(fd, BLKDISCARD, range) == 0,
+              "BLKDISCARD nvme0n1");
+        if (fd >= 0) close(fd);
+        // Sector-granular variant.
+        unsigned long long srange[2] = {130, 2};
+        fd = open("/dev/nvme0n1", O_RDWR);
+        check(fd >= 0 && ioctl(fd, BLKSECDISCARD, srange) == 0,
+              "BLKSECDISCARD nvme0n1");
+        if (fd >= 0) close(fd);
+        // Misaligned and zero-length ranges are EINVAL.
+        unsigned long long bad[2] = {128 * 512 + 1, 4 * 512};
+        fd = open("/dev/nvme0n1", O_RDWR);
+        check(fd >= 0 && ioctl(fd, BLKDISCARD, bad) < 0
+              && errno == EINVAL, "BLKDISCARD misalign EINVAL");
+        if (fd >= 0) close(fd);
+        unsigned long long zero[2] = {128 * 512, 0};
+        fd = open("/dev/nvme0n1", O_RDWR);
+        check(fd >= 0 && ioctl(fd, BLKDISCARD, zero) < 0
+              && errno == EINVAL, "BLKDISCARD len0 EINVAL");
+        if (fd >= 0) close(fd);
+        // A transport without a discard path: EOPNOTSUPP.
+        fd = open("/dev/sda", O_RDWR);
+        check(fd >= 0 && ioctl(fd, BLKDISCARD, range) < 0
+              && errno == EOPNOTSUPP, "BLKDISCARD sda EOPNOTSUPP");
+        if (fd >= 0) close(fd);
+        // And the non-block gate.
+        fd = open("/dev/null", O_RDONLY);
+        check(fd >= 0 && ioctl(fd, BLKDISCARD, range) < 0
+              && errno == ENOTTY, "BLKDISCARD null ENOTTY");
+        if (fd >= 0) close(fd);
+    }
+
     char out[64];
     int n = snprintf(out, sizeof(out), "blktest: %d failure%s\n",
                      fails, fails == 1 ? "" : "s");

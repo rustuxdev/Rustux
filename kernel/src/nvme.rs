@@ -40,6 +40,8 @@ const OP_CREATE_IO_CQ: u8 = 0x05;
 const OP_IDENTIFY: u8 = 0x06;
 // NVM command-set opcodes.
 const OP_FLUSH: u8 = 0x00;
+/// Dataset Management (TRIM/deallocate) — opcode 0x09.
+const OP_DSM: u8 = 0x09;
 const OP_READ: u8 = 0x02;
 const OP_WRITE: u8 = 0x01;
 
@@ -575,6 +577,54 @@ pub fn write_range(i: usize, lba: u64, count: usize, buf: &[u8]) -> bool {
             return false;
         }
         done += n;
+    }
+    true
+}
+
+/// DSM range-table entries per command — each is 16B
+/// {cattr u32, nlb u32, slba u64} through the DATA staging page.
+const DSM_MAX: usize = 128;
+
+/// Dataset Management deallocate for `nsec` sectors at `lba` on
+/// namespace `i` — the TRIM path: cdw10 carries nr-1, cdw11 sets
+/// attribute bit 2 (deallocate), PRP1 names the range table.
+pub fn discard(i: usize, lba: u64, nsec: usize) -> bool {
+    if i >= NDISKS.load(Ordering::Acquire) as usize || nsec == 0 {
+        return false;
+    }
+    let sectors = NS_SECTORS[i].load(Ordering::Relaxed);
+    if lba + nsec as u64 > sectors {
+        return false;
+    }
+    let Some(q) = ioq() else { return false };
+    let dstrd = DSTRD.load(Ordering::Relaxed);
+    let data = DATA.load(Ordering::Relaxed);
+    let mut done = 0usize;
+    while done < nsec {
+        let ranges = ((nsec - done) / 1024).clamp(1, DSM_MAX);
+        // SAFETY: DATA is our staging page; ranges <= 128 keeps the
+        // table inside its first 2KiB.
+        unsafe {
+            for r in 0..ranges {
+                let e = mm::pmap(data) + (r * 16) as u64;
+                (e as *mut u32).write_volatile(0); // context attrs
+                let n = ((nsec - done - r * 1024).min(1024)) as u32;
+                ((e + 4) as *mut u32).write_volatile(n);
+                ((e + 8) as *mut u64)
+                    .write_volatile(lba + done as u64 + (r * 1024) as u64);
+            }
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let mut e = [0u8; 64];
+        e[0] = OP_DSM;
+        e[4..8].copy_from_slice(&NSID[i].load(Ordering::Relaxed).to_le_bytes());
+        e[24..32].copy_from_slice(&data.to_le_bytes()); // PRP1 -> ranges
+        e[40..44].copy_from_slice(&((ranges as u32 - 1).to_le_bytes()));
+        e[44..48].copy_from_slice(&4u32.to_le_bytes()); // cdw11: AD=1 (bit 2)
+        if !q.submit(1, dstrd, &mut e) {
+            return false;
+        }
+        done += ranges * 1024;
     }
     true
 }

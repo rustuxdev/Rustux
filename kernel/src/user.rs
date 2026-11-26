@@ -9571,6 +9571,50 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             0
         }
+        0x1277 | 0x127d => {
+            // BLKDISCARD / BLKSECDISCARD — arg points at u64[2]
+            // {start, len} in bytes / sectors. Same gating as the
+            // size trio, then alignment + window bounds before the
+            // transport command (Linux: misaligned -> EINVAL,
+            // no discard support -> EOPNOTSUPP).
+            let FdKind::Dev(i) = &o.kind else { return ENOTTY_ };
+            let Some(v) = vfile(*i) else { return ENOTTY_ };
+            if v.fmt != 0o60000 {
+                return ENOTTY_;
+            }
+            let Some((_, _, _, cap)) = blk_window(v.rdev) else {
+                return (-6i64) as u64; // ENXIO
+            };
+            if !range_ok_w(arg, 16) {
+                return EFAULT;
+            }
+            // SAFETY: validated user window under cur cr3.
+            let (mut start, mut len) = unsafe {
+                (
+                    (arg as *const u64).read(),
+                    (arg as *const u64).add(1).read(),
+                )
+            };
+            if req == 0x127d {
+                start = start.saturating_mul(512);
+                len = len.saturating_mul(512);
+            }
+            // The user's window is node-relative — a partition
+            // node's byte 0 is the partition base. start+len can
+            // overflow before the cap check, so check the pieces.
+            if len == 0 || start % 512 != 0 || len % 512 != 0
+                || start >= cap || len > cap - start
+            {
+                return EINVAL;
+            }
+            let lba = start / 512;
+            let nsec = (len / 512) as usize;
+            match blk_discard(v.rdev, lba, nsec) {
+                Some(true) => 0,
+                Some(false) => (-5i64) as u64,  // EIO
+                None => (-95i64) as u64,        // EOPNOTSUPP
+            }
+        }
         0x1261 => {
             // BLKFLSBUF — flush the device's write buffers, the
             // ioctl twin of fsync on the node. Same block-node
@@ -14079,6 +14123,31 @@ fn blk_wr(t: u32, d: usize, lba: u64, n: usize, b: &[u8]) -> bool {
         }
         254 => crate::virtio::write_range(d, lba, n, b),
         _ => crate::nvme::write_range(d, lba, n, b),
+    }
+}
+
+/// Discard `nsec` sectors at `lba` (device-relative sectors) on
+/// `rdev`'s transport. Returns: Some(true) ok, Some(false) the
+/// transport rejected it (EIO), None unsupported (EOPNOTSUPP —
+/// ATA/AHCI have no TRIM wired, virtio without F_DISCARD).
+fn blk_discard(rdev: u32, lba: u64, nsec: usize) -> Option<bool> {
+    let (t, d, base, cap) = blk_window(rdev)?;
+    let byte0 = base.checked_add(lba.checked_mul(512)?)?;
+    let byte1 = byte0.checked_add((nsec as u64).checked_mul(512)?)?;
+    if byte1 > base.checked_add(cap)? {
+        return Some(false); // past the window — EINVAL at the caller
+    }
+    let dlba = lba + base / 512;
+    match t {
+        254 => crate::virtio::blk_discard(d, dlba, nsec),
+        259 => {
+            if crate::nvme::discard(d, dlba, nsec) {
+                Some(true)
+            } else {
+                Some(false)
+            }
+        }
+        _ => None, // ata/ahci — no TRIM path
     }
 }
 

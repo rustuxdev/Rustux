@@ -346,6 +346,10 @@ const REQ_OUT: u32 = 1;
 const REQ_FLUSH: u32 = 4;
 /// VIRTIO_BLK_F_FLUSH (feature bit 9): the device accepts REQ_FLUSH.
 const F_BLK_FLUSH: u32 = 1 << 9;
+/// VIRTIO_BLK_T_DISCARD — TRIM/discard segments, gated on F_DISCARD.
+const REQ_DISCARD: u32 = 11;
+/// VIRTIO_BLK_F_DISCARD (feature bit 13).
+const F_BLK_DISCARD: u32 = 1 << 13;
 /// Sectors per single request — bounds the data staging block.
 pub const BATCH: usize = 8;
 
@@ -358,6 +362,8 @@ struct VDisk {
     sectors: u64,
     /// F_FLUSH negotiated — blk_flush may issue REQ_FLUSH.
     flush: bool,
+    /// F_DISCARD negotiated — blk_discard may issue REQ_DISCARD.
+    discard: bool,
 }
 
 static NDISKS: AtomicU32 = AtomicU32::new(0);
@@ -408,14 +414,16 @@ pub fn init() -> u32 {
     let Some((io, _)) = probe_io(DEV_BLK) else {
         return 0;
     };
-    // Prefer F_FLUSH (write-cache flush command); a device that
-    // refuses it still works — blk_flush then reports unsupported
-    // and callers fall back to the write completion they already
-    // had. handshake_feat resets the device each pass.
-    let has_flush = handshake_feat(io, F_BLK_FLUSH);
-    if !has_flush && !handshake(io) {
+    // Negotiate F_FLUSH + F_DISCARD in one pass — handshake_feat
+    // masks the ask against what the device offers, so whichever
+    // subset lands is what the command paths may issue. A total
+    // refusal still falls back to the featureless handshake.
+    let offered = inl(io + R_FEATURES);
+    if !handshake_feat(io, F_BLK_FLUSH | F_BLK_DISCARD) {
         return 0;
     }
+    let has_flush = offered & F_BLK_FLUSH != 0;
+    let has_discard = offered & F_BLK_DISCARD != 0;
     let Some(vq) = Vq::setup(io, 0) else {
         fail(io);
         return 0;
@@ -438,12 +446,13 @@ pub fn init() -> u32 {
             data,
             sectors,
             flush: has_flush,
+            discard: has_discard,
         });
     }
     NDISKS.store(1, Ordering::Release);
     let qsz = disk_for(0).map_or(0, |d| d.vq.size);
     crate::log::printk(format_args!(
-        "rustux: virtio: blk {io:#x} qsize={qsz} {sectors} sectors ({} MiB) flush={has_flush}",
+        "rustux: virtio: blk {io:#x} qsize={qsz} {sectors} sectors ({} MiB) flush={has_flush} discard={has_discard}",
         sectors / 2048
     ));
     // Datapath proof at probe time: read sector 0 through the queue
@@ -536,6 +545,62 @@ pub fn write_range(i: usize, lba: u64, count: usize, buf: &[u8]) -> bool {
         done += n;
     }
     true
+}
+
+/// One discard command covers up to MAX_SEG segments in the data
+/// staging block — the {sector, num_sectors, flags} triples the
+/// device trims. Callers loop their range over this bound.
+const MAX_SEG: usize = 128;
+
+/// VIRTIO_BLK_T_DISCARD for `nsec` sectors at `lba` — chunked into
+/// MAX_SEG-segment commands. Returns false when F_DISCARD wasn't
+/// negotiated so callers can answer EOPNOTSUPP.
+pub fn blk_discard(i: usize, lba: u64, nsec: usize) -> Option<bool> {
+    let d = disk_for(i)?;
+    if !d.discard {
+        return None; // unsupported — EOPNOTSUPP, not EIO
+    }
+    if nsec == 0 || lba + nsec as u64 > d.sectors {
+        return Some(false);
+    }
+    let data = mm::pmap(d.data);
+    let mut done = 0usize;
+    while done < nsec {
+        // Fill up to MAX_SEG contiguous 512K-sector segments —
+        // splitting arbitrary ranges into uniform chunks keeps the
+        // segment table simple and bounded.
+        let segs = ((nsec - done) / 1024).clamp(1, MAX_SEG);
+        let ctrl = mm::pmap(d.ctrl);
+        // SAFETY: ctrl/data are our own DMA blocks; segs <= MAX_SEG
+        // keeps the segment table inside the data page's first 2KiB.
+        unsafe {
+            (ctrl as *mut u32).write_volatile(REQ_DISCARD);
+            ((ctrl + 4) as *mut u32).write_volatile(0);
+            ((ctrl + 8) as *mut u64).write_volatile(0);
+            ((ctrl + 16) as *mut u8).write_volatile(0xff);
+            for sgi in 0..segs {
+                let base = lba + done as u64 + (sgi * 1024) as u64;
+                let n = ((nsec - done - sgi * 1024).min(1024)) as u32;
+                let e = data + (sgi * 16) as u64;
+                (e as *mut u64).write_volatile(base);
+                ((e + 8) as *mut u32).write_volatile(n);
+                ((e + 12) as *mut u32).write_volatile(0);
+            }
+        }
+        d.vq.put_desc(0, d.ctrl, 16, DESC_NEXT, 1);
+        d.vq.put_desc(1, d.data, (segs * 16) as u32, DESC_NEXT, 2);
+        d.vq.put_desc(2, d.ctrl + 16, 1, DESC_WRITE, 0);
+        fence(Ordering::SeqCst);
+        if !d.vq.poll_once(0) {
+            return Some(false);
+        }
+        // SAFETY: status byte the device just wrote.
+        if unsafe { ((ctrl + 16) as *const u8).read_volatile() } != 0 {
+            return Some(false);
+        }
+        done += segs * 1024;
+    }
+    Some(true)
 }
 
 /// VIRTIO_BLK_T_FLUSH: a 2-descriptor chain — header OUT (type
