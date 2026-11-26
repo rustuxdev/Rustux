@@ -8053,3 +8053,29 @@ into kernel maps anyway. Both memfd_secret CVE classes confirmed
 absent (direct-map n/a; MAP_SHARED EINVALs so no truncate-alias
 panic). xat2test 30 checks green; exit 33, 95 tasks, zero leak.
 Audit run-64: 0 confirmed. Ledger at 299 CVEs.
+run-306 ships five small classics: select(23), msync(26),
+getcpu(309), sched_setattr(314), sched_getattr(315). fd_select
+reuses the whole pselect engine — the 16-byte user timeval is
+range_ok_w'd once, rewritten in place as a layout-identical
+timespec (usec*1000 stays <1e9), and the wait runs through
+fd_pselect untouched. The remaining-time writeback is the one
+select-specific behaviour Linux owes userspace, and it had to
+land at wake time not arm time: a wait_tv/wait_tv_dl ticket arms
+before the block and psel_restore — which already restores the
+sigmask on EVERY Pselect resume (ready, timeout, signal) —
+discharges it, so a timed-out select writes {0,0} and an EINTR
+writes real remaining. Sync returns discharge the ticket inline
+gated on wait_on!=Pselect so an armed ticket never double-writes.
+msync validates like Linux (unknown-flag, SYNC|ASYNC, unaligned
+EINVAL; len0->0; ENOMEM on any uncommitted page) then no-ops —
+eager private copies never have anything outstanding. getcpu
+writes 0s. sched_attr reports the fixed single-CPU normal-class
+scheduler: getattr zero-fills then stamps {48,SCHED_OTHER};
+setattr enforces the copy_struct_from_user tail (E2BIG),
+OTHER|BATCH|IDLE, nice [-20,19], priority+deadline fields 0 —
+EPERM/caps absent under the standing creds collapse. fxtest got
+an in-run unflake: its phase-2 ctid child EAGAIN'd off phase-1's
+stale word=1 and CLEARTID could zero join_word before the SETTID
+check read it — word reset so the child blocks, woken after the
+check. seltest 36 checks green; exit 33, 96 tasks, zero leak.
+Audit run-65: 0 confirmed. Ledger at 300 CVEs.

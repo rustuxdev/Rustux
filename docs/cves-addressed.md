@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**299 unique CVEs recorded.**
+**300 unique CVEs recorded.**
 
 ## klib ports
 
@@ -190,6 +190,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-50531 | newfstatat: 144-byte Linux struct stat over the cpio fs | the stat buffer is [0u64;18] zeroed before any field is set -- the uninit-kernel-struct copy_to_user info-leak class (50531/KMSAN family) is structurally absent; copy_user_path ge… |
 | CVE-2022-50531 | real statfs/fstatfs: frame-allocator capacity + vfile inode counts, procfs superblock dis… | struct zeroed then fixed-offset fills only; fsid/spare stay zero; ENOENT-before-write ordering matches Linux; no new class rows. audit run-76: 0 confirmed; iotest +7 green, zero l… |
 | CVE-2022-50531 | real-busybox verification: sysinfo struct fill (totalram/freeram/procs/mem_unit) + lstat/… | struct zeroed then fully written at fixed offsets — no kernel bytes escape; unrelated-driver entries recorded for the class, n/a by construction (sysinfo writes only known values)… |
+| CVE-2022-50652 | select+msync+getcpu+sched_attr rung (23/26/309/314/315): fd_select — tv range_ok_w'd once… | BATCH |
+| CVE-2022-50652 | select+msync+getcpu+sched_attr rung (23/26/309/314/315): fd_select — tv range_ok_w'd once… | BATCH |
 | CVE-2022-50661 | fork/wait4/getpid + full-ctx syscall stub | eager deep copy of user space — no COW, so the 5195 COW-breakage race class is structurally absent; child ctx = parent syscall UCtx with rax=0, parent gets pid (user-only regs, no… |
 | CVE-2022-50661 | task abstraction + frame reclaim | per-task page tables + kmalloc'd syscall stack, initrd iterates as process table; teardown freeing designed-in: reap walks user PML4 slots 128-255 only, PHYS_MASK strips NX/flags… |
 | CVE-2023-3106 | netlink rung (NETLINK_ROUTE): socket(AF_NETLINK=16, SOCK_RAW | user-oob-write class (fixed in-run: getsockname wrote 8B into a 4B socklen_t* — kernel->user stack overwrite); portid-stamp class (fixed in-run: reply nlmsg_pid = destination pid,… |
