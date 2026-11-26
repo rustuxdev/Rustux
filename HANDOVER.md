@@ -8541,3 +8541,21 @@ index can't alias), no LSM. keytest.c new task -> MAX_TASKS
 115->116. Audit run-88: 0 confirmed — every keyctl CVE class
 needs refcounts, ring-in-ring graphs, or unbounded allocation;
 all absent by construction.
+
+run-330 lands the system-management tail: sysfs(139) is new —
+the vintage fs-registry query — and reboot(169) gains its
+missing uid==0 (CAP_SYS_BOOT) gate (a nonroot task could
+0xCF9-reset the box; gate sits after magic validation so bad
+magic stays EINVAL like Linux). sysinfo(99)/reboot were already
+dispatched via NR_ constant arms — the numeric-NR survey scan
+missed them. sysfs is the vintage
+fs-registry query over a 5-entry table (rustux/tmpfs/proc/
+devtmpfs/ext2) — name->index, index->NUL'd name, count.
+Divergences: sysinfo loads/shared/buffer/swap/high zeroed (no
+load accounting or swap exist); reboot maps every power cmd to
+the one chipset reset (no restart-vs-halt distinction in qemu);
+sysfs registry is static (ext2 listed since the disk adapter
+parses it). systest.c new task -> MAX_TASKS 116->117, lstest
+floor 88->90. Audit run-89: 0 confirmed — no Linux-kernel
+sysinfo/reboot/sysfs CVE classes exist; the one real risk
+(missing CAP_SYS_BOOT) shipped as the fix.
