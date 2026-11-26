@@ -23,6 +23,8 @@ pub const IRQ_PIT: u64 = 0xf1;
 pub const IRQ_KBD: u64 = 0xf2;
 /// MSI vector programmed into the e1000's message data.
 pub const IRQ_NET: u64 = 0xf3;
+/// Device IRQ vector for the virtio-net MSI-X receive path.
+pub const IRQ_VNET: u64 = 0xf4;
 /// Spurious interrupt vector — hardware requires the low nibble be 0xf.
 pub const IRQ_SPURIOUS: u64 = 0xff;
 
@@ -129,6 +131,10 @@ pub fn irq_dispatch(vec: u64) {
         }
         IRQ_NET => {
             crate::e1000::on_irq();
+            eoi();
+        }
+        IRQ_VNET => {
+            crate::virtio::net_on_irq();
             eoi();
         }
         IRQ_SPURIOUS => {} // per spec: no EOI on a spurious interrupt

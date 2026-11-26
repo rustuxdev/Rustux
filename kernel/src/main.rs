@@ -1515,6 +1515,13 @@ pub(crate) fn rustux_main(
                 ip[0], ip[1], ip[2], ip[3]
             );
         }
+        // The virtio NIC's own MSI path: RX queue bound to vector
+        // 0xf4 — arrivals now wake the idle hlt loops immediately
+        // instead of waiting for the next tick.
+        if virtio::net_up() {
+            let virq = virtio::net_irq_selftest();
+            kprintln!(con, "rustux: virtio: net MSI receive path {virq}");
+        }
         // A virtio-only boot never ran DHCP — seed the static slirp
         // lease so the socket layer considers the NIC usable. No-op
         // when the e1000 leased an address above.

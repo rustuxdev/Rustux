@@ -40,6 +40,11 @@ const R_QNOTIFY: u16 = 0x10; // wo u16 — write queue index to kick
 const R_STATUS: u16 = 0x12; // rw u8 — device status byte
 const R_ISR: u16 = 0x13; // ro u8 — interrupt status (read acks)
 const R_CFG: u16 = 0x14; // device-specific config starts here
+// With MSI-X enabled these two u16s occupy 0x14/0x16 and push the
+// device config to 0x18 — arm MSI-X only after config reads (MAC).
+const R_MSIX_CFG: u16 = 0x14; // rw u16 — config-change vector
+const R_MSIX_Q: u16 = 0x16; // rw u16 — vector for the selected queue
+const MSIX_NO_VEC: u16 = 0xFFFF; // VIRTIO_MSI_NO_VECTOR
 
 // Status byte bits (virtio spec, legacy).
 const S_ACK: u8 = 1;
@@ -227,7 +232,7 @@ fn handshake(io: u16) -> bool {
 
 /// Find the first transitional function of `dev_id` with a legacy
 /// I/O BAR and enable IO + bus-mastering. Returns the io base.
-fn probe_io(dev_id: u16) -> Option<u16> {
+fn probe_io(dev_id: u16) -> Option<(u16, u32)> {
     let (bus, dev, f) = pci::find(VENDOR, dev_id)?;
     let bar = pci::bar_raw(bus, dev, f, 0);
     if bar & 1 == 0 || bar == 0 || bar == u32::MAX {
@@ -238,7 +243,7 @@ fn probe_io(dev_id: u16) -> Option<u16> {
     }
     // CMD bit 0 = I/O space; pci.rs names the memory/busmaster bits.
     pci::command_or(bus, dev, f, 1 | pci::CMD_BUS_MASTER);
-    Some((bar & !3) as u16)
+    Some(((bar & !3) as u16, (bus as u32) << 8 | (dev as u32) << 3 | f as u32))
 }
 
 // -------------------------------------------------------------------
@@ -304,7 +309,7 @@ fn request(d: &VDisk, write: bool, sector: u64, nsec: usize) -> bool {
 /// request queue, and publish the disk count. Returns the number of
 /// disks now usable via disk_* calls.
 pub fn init() -> u32 {
-    let Some(io) = probe_io(DEV_BLK) else {
+    let Some((io, _)) = probe_io(DEV_BLK) else {
         return 0;
     };
     if !handshake(io) {
@@ -468,10 +473,20 @@ fn vnet() -> Option<&'static VNet> {
 /// Probe the first transitional virtio-net function, set up rx/tx
 /// queues, pre-post the receive buffers. Returns true when the NIC
 /// is usable via net_* calls.
+/// BDF of the bound net function — the IRQ arm needs it for the
+/// MSI-X capability walk.
+static NBDF: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Vector count of RX-caused MSI-X messages — the IRQ-side proof a
+/// used-buffer completion delivered an interrupt.
+pub static NET_RX_IRQS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub fn net_init() -> bool {
-    let Some(io) = probe_io(DEV_NET) else {
+    let Some((io, bdf)) = probe_io(DEV_NET) else {
         return false;
     };
+    NBDF.store(bdf, Ordering::Relaxed);
     if !handshake(io) {
         return false;
     }
@@ -676,4 +691,119 @@ pub fn net_selftest() -> bool {
         }
         core::hint::spin_loop();
     }
+}
+
+/// Interrupt-status read for the net function — the read itself is
+/// the acknowledge. Bit 0 marks a used-buffer completion on any
+/// queue (only RX is vector-armed). Like e1000::on_irq the handler
+/// only counts: draining the virtqueue mutates rx_seen and the
+/// avail ring without a lock, which an IRQ context cannot do
+/// safely over an interrupted syscall-side drain. The IRQ's real
+/// work is waking the `sti;hlt` idle loops so a blocked socket
+/// task drains the moment a frame lands instead of at next tick.
+pub fn net_on_irq() {
+    let Some(n) = vnet() else { return };
+    let isr = inb(n.rx.io + R_ISR);
+    if isr & 1 != 0 {
+        NET_RX_IRQS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// MSI-X receive path for the virtio NIC — mirrors
+/// e1000::irq_selftest: table entry 0 carries vector IRQ_VNET to
+/// this LAPIC, the device-side queue vector binds the RX queue to
+/// entry 0, then the ARP probe's reply must raise the IRQ.
+/// Interrupts must be live (`sti`); runs after net_init so the
+/// device config (MAC at R_CFG) was already read — enabling MSI-X
+/// shifts the config window +4.
+pub fn net_irq_selftest() -> bool {
+    let Some(n) = vnet() else { return false };
+    let bdf = NBDF.load(Ordering::Relaxed);
+    if bdf == u32::MAX {
+        return false;
+    }
+    let (bus, dev, f) = (
+        (bdf >> 8) as u8,
+        ((bdf >> 3) & 0x1f) as u8,
+        (bdf & 7) as u8,
+    );
+    let dest = crate::apic::lapic_id() as u8;
+    let Some(cap) = pci::msix_cap(bus, dev, f) else {
+        crate::log::printk(format_args!("rustux: virtio: net has no MSI-X capability"));
+        return false;
+    };
+    // Entry 0 -> IRQ_VNET on this LAPIC; every other entry masked.
+    // SAFETY: cap.table is the device MSI-X BAR window, inside the
+    // identity map.
+    unsafe {
+        pci::msix_set(&cap, 0, crate::apic::IRQ_VNET as u8, dest, false);
+        for v in 1..cap.nvec {
+            pci::msix_set(&cap, v, 0, 0, true);
+        }
+    }
+    pci::msix_enable(bus, dev, f, &cap);
+    // Device side: no config-change vector, RX queue -> entry 0,
+    // TX queue stays unvectorized (TX completion is polled).
+    outw(n.rx.io + R_MSIX_CFG, MSIX_NO_VEC);
+    outw(n.rx.io + R_QSEL, 0);
+    outw(n.rx.io + R_MSIX_Q, 0);
+    outw(n.rx.io + R_QSEL, 1);
+    outw(n.rx.io + R_MSIX_Q, MSIX_NO_VEC);
+    let bound = {
+        outw(n.rx.io + R_QSEL, 0);
+        inw(n.rx.io + R_MSIX_Q)
+    };
+    crate::log::printk(format_args!(
+        "rustux: virtio: net MSI-X on ({} vectors, table @{:#x}) -> vec {:#x} rxq-vec {bound}",
+        cap.nvec,
+        cap.table,
+        crate::apic::IRQ_VNET
+    ));
+
+    // Same ARP probe as the polling test — this time the reply must
+    // arrive through vector IRQ_VNET, not be discovered by a poll.
+    let mac = n.mac;
+    let mut f = [0u8; 42];
+    f[..6].copy_from_slice(&[0xff; 6]);
+    f[6..12].copy_from_slice(&mac);
+    f[12] = 0x08;
+    f[13] = 0x06;
+    f[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+    f[22..28].copy_from_slice(&mac);
+    f[28..32].copy_from_slice(&[10, 0, 2, 15]);
+    f[38..42].copy_from_slice(&[10, 0, 2, 2]);
+    let before = NET_RX_IRQS.load(Ordering::Relaxed);
+    if !net_tx(&f) {
+        return false;
+    }
+    // Up to ~1.5s: hlt until the MSI (or any IRQ) wakes us.
+    let t0 = crate::apic::TICKS.load(Ordering::Relaxed);
+    while NET_RX_IRQS.load(Ordering::Relaxed) == before
+        && crate::apic::TICKS.load(Ordering::Relaxed) - t0 < 150
+    {
+        // SAFETY: hlt wakes on any delivered IRQ; IF is set.
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+    }
+    let delivered = NET_RX_IRQS.load(Ordering::Relaxed) - before;
+    // The IRQ already fired — harvest the reply from the used ring.
+    let mut buf = [0u8; 1600];
+    let mut got_reply = false;
+    while let Some(n) = net_rx(&mut buf) {
+        if n >= 42
+            && buf[12] == 0x08
+            && buf[13] == 0x06
+            && buf[20] == 0
+            && buf[21] == 2
+            && buf[28..32] == [10, 0, 2, 2]
+        {
+            got_reply = true;
+        }
+    }
+    crate::log::printk(format_args!(
+        "rustux: virtio: net {} MSI IRQs on vec {:#x} (rx-caused), reply {}",
+        delivered,
+        crate::apic::IRQ_VNET,
+        if got_reply { "received" } else { "missing" }
+    ));
+    delivered > 0 && got_reply
 }
