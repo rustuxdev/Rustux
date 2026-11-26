@@ -23,14 +23,16 @@ struct mbuf { long mtype; char text[64]; };
 int main(void) {
     printf("msgtest: sysv message queues\n");
 
-    // --- msgget
+    // --- msgget (pid-derived key: concurrent suite instances
+    // must not share the queue)
+    key_t k = 0x12345 + getpid() * 16;
     errno = 0;
-    check(msgget(0x12345, 0) == -1 && errno == ENOENT, "msgget missing ENOENT");
-    int q = msgget(0x12345, IPC_CREAT | 0600);
+    check(msgget(k, 0) == -1 && errno == ENOENT, "msgget missing ENOENT");
+    int q = msgget(k, IPC_CREAT | 0600);
     check(q >= 0, "msgget create");
-    check(msgget(0x12345, IPC_CREAT | IPC_EXCL) == -1 && errno == EEXIST,
+    check(msgget(k, IPC_CREAT | IPC_EXCL) == -1 && errno == EEXIST,
           "msgget EXCL EEXIST");
-    int q2 = msgget(0x12345, 0);
+    int q2 = msgget(k, 0);
     check(q2 == q, "msgget same key same id");
     int qpv = msgget(IPC_PRIVATE, 0600);
     check(qpv >= 0, "msgget PRIVATE mints");

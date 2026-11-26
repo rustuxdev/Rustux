@@ -690,6 +690,11 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         126 => user::sys_capset(a1, a2),
         322 => sys_execveat(ctx, a1, a2, a3, a4, a5),
         // SysV message queues — same gen<<16|slot id model as SHM.
+        // SysV semaphore family — the third sibling of 29-31/68-71.
+        64 => user::sys_semget(a1, a2, a3),
+        65 => user::sys_semop(ctx, a1, a2, a3),
+        66 => user::sys_semctl(a1, a2, a3, a4),
+        220 => user::sys_semtimedop(ctx, a1, a2, a3, a4),
         68 => user::sys_msgget(a1, a2),
         69 => user::sys_msgsnd(ctx, a1, a2, a3, a4),
         70 => user::sys_msgrcv(ctx, a1, a2, a3, a4, a5),
