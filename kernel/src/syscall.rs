@@ -304,6 +304,8 @@ const NR_PIDFD_GETFD: u64 = 438;
 const NR_CLONE3: u64 = 435;
 const NR_CLOSE_RANGE: u64 = 436;
 const NR_EPOLL_PWAIT2: u64 = 441;
+const NR_OPENAT2: u64 = 437;
+const NR_PROCESS_MRELEASE: u64 = 448;
 const NR_RSEQ: u64 = 334;
 const NR_SENDFILE: u64 = 40;
 const NR_STAT: u64 = 4;
@@ -572,6 +574,8 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_CLONE3 => user::sys_clone3(ctx, a1, a2),
         NR_CLOSE_RANGE => user::fd_close_range(a1, a2, a3),
         NR_EPOLL_PWAIT2 => user::fd_epoll_pwait2(ctx, a1, a2, a3, a4, a5, a6),
+        NR_OPENAT2 => sys_openat2(a1, a2, a3, a4),
+        NR_PROCESS_MRELEASE => user::fd_process_mrelease(a1, a2),
         NR_CLONE => user::sys_clone(ctx, a1, a2, a3, a4, a5),
         NR_TGKILL => user::sys_tgkill(a1, a2, a3),
         NR_GETCWD => user::sys_getcwd(a1, a2),
@@ -957,6 +961,44 @@ fn sys_openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> u64 {
         Err(e) => return e,
     };
     user::fd_open(&cb[..cn], flags, mode)
+}
+
+/// openat2(dirfd, path, how, size): read the 24-byte open_how
+/// {flags, mode, resolve}; size < 24 EINVALs, > PAGE_SIZE E2BIGs,
+/// and a longer struct must carry an all-zero tail (the same
+/// forward-compat rule clone3 applies). Everything after the
+/// struct read is fd_openat2's resolve-scoped walk in user.rs.
+fn sys_openat2(dirfd: u64, path: u64, how: u64, size: u64) -> u64 {
+    const E2BIG_: u64 = (-7i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    if size < 24 {
+        return EINVAL;
+    }
+    if size > 4096 {
+        return E2BIG_;
+    }
+    if !user::range_ok(how, size) {
+        return EFAULT_;
+    }
+    for i in 24..size {
+        if unsafe { ((how + i) as *const u8).read_unaligned() } != 0 {
+            return E2BIG_;
+        }
+    }
+    // SAFETY: how range validated readable above.
+    let (flags, mode, resolve) = unsafe {
+        (
+            (how as *const u64).read_unaligned(),
+            ((how + 8) as *const u64).read_unaligned(),
+            ((how + 16) as *const u64).read_unaligned(),
+        )
+    };
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    user::fd_openat2(dirfd, &name[..n], flags, mode, resolve)
 }
 
 /// execve(path, argv, envp): resolve the name in the initrd, verify it

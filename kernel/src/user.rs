@@ -16442,6 +16442,145 @@ pub fn canon_path(dfd: u64, path: &[u8]) -> Result<([u8; 256], usize), u64> {
     }
 }
 
+/// openat2's scoped canonicalizer: join dirfd's `base` + `path`
+/// component-wise where '..' may never dip below the base's own
+/// depth. RESOLVE_BENEATH EXDEVs the escape attempt; RESOLVE_
+/// IN_ROOT treats the base as '/' — '..' at the floor clamps
+/// silently and a leading '/' on the path is stripped so
+/// absolute-looking names stay inside the dirfd-as-root view.
+fn canon_beneath(
+    base: &[u8],
+    path: &[u8],
+    in_root: bool,
+) -> Result<([u8; 256], usize), u64> {
+    const EXDEV_: u64 = (-18i64) as u64;
+    const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    let mut out = [0u8; 256];
+    let floor = base.len().min(256);
+    out[..floor].copy_from_slice(&base[..floor]);
+    let mut n = floor;
+    let p = if in_root && path[0] == b'/' { &path[1..] } else { path };
+    for comp in p.split(|&c| c == b'/') {
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+        if comp == b".." {
+            if n > floor {
+                while n > 0 && out[n - 1] != b'/' {
+                    n -= 1;
+                }
+                n = n.saturating_sub(1);
+            } else if !in_root {
+                return Err(EXDEV_);
+            }
+            continue;
+        }
+        if n + comp.len() + usize::from(n > 0) > 256 {
+            return Err(ENAMETOOLONG_);
+        }
+        if n > 0 {
+            out[n] = b'/';
+            n += 1;
+        }
+        out[n..n + comp.len()].copy_from_slice(comp);
+        n += comp.len();
+    }
+    Ok((out, n))
+}
+
+/// The kernel half of openat2(dirfd, path, how): the RESOLVE_*
+/// gates against the canonical name, then fd_open. NO_XDEV and
+/// CACHED are structurally satisfied (no mounts; every lookup is
+/// already a local resolve). BENEATH/IN_ROOT scope resolution to
+/// dirfd's directory via canon_beneath. NO_SYMLINKS ELOOPs when a
+/// resolve rewrite happened or the final name is a link;
+/// NO_MAGICLINKS ELOOPs on the /proc/<pid>/fd/<n> shape — a proc
+/// fd link is exactly Linux's "magic link" class.
+pub fn fd_openat2(
+    dirfd: u64,
+    path: &[u8],
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+) -> u64 {
+    const ELOOP_: u64 = (-40i64) as u64;
+    const EXDEV_: u64 = (-18i64) as u64;
+    const ENOTDIR_: u64 = (-20i64) as u64;
+    const RESOLVE_MASK: u64 = 0x3f;
+    const NO_MAGICLINKS: u64 = 0x02;
+    const NO_SYMLINKS: u64 = 0x04;
+    const BENEATH: u64 = 0x08;
+    const IN_ROOT: u64 = 0x10;
+    if resolve & !RESOLVE_MASK != 0
+        || resolve & (BENEATH | IN_ROOT) == (BENEATH | IN_ROOT)
+    {
+        return EINVAL;
+    }
+    if path.is_empty() {
+        return ENOENT;
+    }
+    let mut baseb = [0u8; 256];
+    let mut basen = 0usize;
+    let (cb, cn) = if resolve & (BENEATH | IN_ROOT) != 0 {
+        let Some(t) = cur_mut() else { return EBADF };
+        let Some(o) = ofd(t, dirfd) else { return EBADF };
+        let FdKind::Dir(dp) = &o.kind else { return ENOTDIR_ };
+        basen = dp.n as usize;
+        baseb[..basen].copy_from_slice(&dp.b[..basen]);
+        if resolve & BENEATH != 0 && path[0] == b'/' {
+            return EXDEV_;
+        }
+        match canon_beneath(&baseb[..basen], path, resolve & IN_ROOT != 0)
+        {
+            Ok(x) => x,
+            Err(e) => return e,
+        }
+    } else {
+        match canon_path(dirfd, path) {
+            Ok(x) => x,
+            Err(e) => return e,
+        }
+    };
+    if resolve & (BENEATH | IN_ROOT) != 0 {
+        // Symlink hops must keep the path under the dirfd too —
+        // canon_beneath only scopes the literal components. The
+        // fully resolved name (final component included, since
+        // fd_open will follow it) must still carry the base as a
+        // component prefix or the open escapes the scope. IN_ROOT
+        // shares the check as a deny-side approximation: a real
+        // virtual root would re-anchor absolute targets rather
+        // than erroring.
+        let (rb2, rn2, _) = match resolve_links(&cb[..cn], true) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        let inside = basen == 0
+            || rn2 == basen
+            || (rn2 > basen
+                && rb2[..basen] == baseb[..basen]
+                && rb2[basen] == b'/');
+        if !inside {
+            return EXDEV_;
+        }
+    }
+    if resolve & (NO_SYMLINKS | NO_MAGICLINKS) != 0 {
+        let (rb, rn, was_link) = match resolve_links(&cb[..cn], false) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        if resolve & NO_SYMLINKS != 0 && (was_link || rb[..rn] != cb[..cn]) {
+            return ELOOP_;
+        }
+        if resolve & NO_MAGICLINKS != 0
+            && (matches!(proc_parse(&cb[..cn]), Some(ProcEnt::TaskFd(..)))
+                || matches!(proc_parse(&rb[..rn]), Some(ProcEnt::TaskFd(..))))
+        {
+            return ELOOP_;
+        }
+    }
+    fd_open(&cb[..cn], flags, mode)
+}
+
 /// Follow symlinks inside a canonical flat name. Every component
 /// prefix that names a link VFile is replaced by canon(link's dir +
 /// stored target) — an absolute target ignores the dir, exactly like
@@ -22072,6 +22211,42 @@ pub fn fd_pidfd_getfd(fd: u64, targetfd: u64, flags: u64) -> u64 {
     fdt(me).fds[fi] = Some(oi);
     cloexec_set(me, fi, false); // a getfd'd fd is never CLOEXEC
     fi as u64
+}
+
+/// process_mrelease(pidfd, flags): force a dying task's address
+/// space teardown now instead of at waitpid — Linux's oom-reaper
+/// syscall. flags must be 0 (EINVAL); a non-pidfd EBADFs; a
+/// reaped task ESRCHs. A still-alive task EINVALs, as does an mm
+/// still shared by other tasks (Linux: shared-with-live-process
+/// is ineligible — here any live MM_REFS entry is, a safe
+/// under-approximation). For a real zombie the pml4 and frames
+/// still exist: free_user_mappings returns the user space early.
+/// It frees page-table frames but leaves the entries themselves,
+/// so the user half of the pml4 is zeroed afterwards — reap's
+/// own free_user_mappings then finds nothing PRESENT and the
+/// pml4 frame still dies in reap like always. mm_release stays
+/// reap-side so MM_REFS accounting is untouched.
+pub fn fd_process_mrelease(fd: u64, flags: u64) -> u64 {
+    const ESRCH: u64 = (-3i64) as u64;
+    if flags != 0 {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let FdKind::Pidfd(pid) = o.kind else { return EBADF };
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let Some(tt) = tasks.iter_mut().flatten().find(|x| x.pid == pid)
+    else {
+        return ESRCH;
+    };
+    if tt.state != TaskState::Exited || mm_is_shared(tt.pml4) {
+        return EINVAL;
+    }
+    tt.free_user_mappings();
+    for i in 128..256u64 {
+        wr64(tt.pml4 + 8 * i, 0);
+    }
+    0
 }
 
 /// eventfd(initval)/eventfd2(initval, flags): a u64 kernel
