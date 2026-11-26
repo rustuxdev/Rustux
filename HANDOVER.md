@@ -7079,3 +7079,33 @@ Audit: scoped quick, run-29 — 0 confirmed. cve-now: pread/pwrite
 Next candidates: /dev partition minors (vda1/nvme0n1p1 from the
 MBR scan), virtio IRQ-driven RX, modern-only virtio transport,
 multi-namespace NVMe.
+## run-271 — /dev partition minors (sda1..4, vda1..4, nvme0n1pN)
+
+The MBR scan now registers every validated partition into a
+DEV_PARTS table (dev_part_add — part 1-15, lba/sectors u32-clamped)
+via ext2::transport (pub) mapping the DiskIo index to (major,
+drive). blk_window resolves an rdev to (transport, drive,
+base_lba, cap_bytes): minor%16==0 is the whole disk, 1-15 looks
+up the registered partition and re-validates base+cap<=disk_cap
+per call. blk_read/blk_write run at base+lba. The nvme minor
+scheme moved to Linux's drv*16+part (was ns-per-minor) so all
+three majors share one encoding; the sd/ahci read/write arms are
+consolidated onto blk_* (sd_read/sd_write/sd_drive/ahci_read/
+ahci_write deleted); the open gate is blk_capacity>0 for all.
+dev_init mints sda1..4 / vda1..4 / nvme0n1p1..4 for registered
+partitions only, after the whole-disk nodes.
+
+blktest grew +10 checks (26 total): vda1 + nvme0n1p1 open, rdev
+minor decode, BLKGETSIZE64 = partition size (not disk), pread of
+the ext4 magic at +1080 inside the window, last-sector read at
+the window end, crafted mknod vda5 -> ENXIO. 0 failures over
+both transports.
+
+iotest's IN_CREATE check failed once under suite load — rerun
+green; it's a watch-queue race (any task touching / queues
+events ahead of inochild.tmp), not this diff.
+
+Audit run-30: 0 confirmed — CVE-2026-64318's class (on-disk
+count driving an OOB partition scan) is handled by design:
+fixed 4-slot MBR, u32 bounds at registration, per-call
+re-validation in blk_window. Commit pushed origin main.

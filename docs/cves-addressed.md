@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**183 unique CVEs recorded.**
+**185 unique CVEs recorded.**
 
 ## klib ports
 
@@ -196,6 +196,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2025-40292 | virtio-net datapath rung: virtio.rs refactored to a shared Vq split-ring (blk+net); net_i… | audit run-25 scoped quick (security-audit skill): 0 confirmed; clamp hardening applied in-run; cve-now checked: CVE-2025-40292, CVE-2025-38551, CVE-2010-0741, CVE-2025-38314 class… |
 | CVE-2025-40292 | virtio-net datapath rung: virtio.rs refactored to a shared Vq split-ring (blk+net); net_i… | audit run-25 scoped quick (security-audit skill): 0 confirmed; clamp hardening applied in-run; cve-now checked: CVE-2025-40292, CVE-2025-38551, CVE-2010-0741, CVE-2025-38314 class… |
 | CVE-2025-40292 | virtio-net socket wiring rung (NIC abstraction): e1000.rs becomes the NIC-agnostic IP sta… | audit run-26 scoped quick (security-audit skill): 0 confirmed; in-run fixes (malformed-entry repost, arrival-NIC ARP answers, gw ARP fallback); cve-now checked: CVE-2025-40292 re-… |
+| CVE-2025-40295 | partition-minors rung (sd1/vd1/nvme0n1pN nodes): user.rs gains DEV_PARTS[32] registry + d… | audit run-30 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-64318 (handled by design), CVE-2025-40295 (fscrypt i_blkbits — n/a, fixed 512B sectors). V… |
 | CVE-2025-68756 | NVMe write rung: nvme.rs gains write_range — OP_WRITE (0x01) NVM command mirroring the au… | audit run-28 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2023-6536/6535/6356, CVE-2024-51566/51562, CVE-2024-45013, CVE-2025-68756, CVE-2023-6238 — n/a… |
 | CVE-2025-68814 | fd table + initrd-as-rootfs (read/open/close) | 16-slot table bounded EMFILE; pathname copied byte-wise under range_ok, 256B cap ENAMETOOLONG (getname class); read target must be user-writable range; File borrows immortal LOADE… |
 | CVE-2025-68814 | file-I/O ABI: openat(257)+dirfd int32 semantics, pread64(17), fcntl(72) FD flags, dup(32)… | RUN-TIME BUG CAUGHT BY THE REAL BINARY: glibc passes dirfd as a 32-bit int (mov edi,-100 zero-extends to 0xffffff9c) so a u64 compare vs sign-extended AT_FDCWD never matched -- ev… |
@@ -226,6 +227,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-63833 | real file metadata: chmod/fchmod/fchmodat + chown/lchown/fchown/fchownat + utime/utimensa… | 63833 n/a by construction — metadata stored but never enforced (no credential model/setuid-on-exec/perm checks); audit fixed: times read after pathname copy + nsec validated after… |
 | CVE-2026-63910 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
 | CVE-2026-63913 | tcp/ipv4 (mini) | exact seq+ack required on every transition (no blind RST/state jumps — 63913 class out); option walk bounded, wscale never shifted (31495); seq state fully initialized (72020); do… |
+| CVE-2026-64318 | partition-minors rung (sd1/vd1/nvme0n1pN nodes): user.rs gains DEV_PARTS[32] registry + d… | audit run-30 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-64318 (handled by design), CVE-2025-40295 (fscrypt i_blkbits — n/a, fixed 512B sectors). V… |
+| CVE-2026-64318 | partition-minors rung (sd1/vd1/nvme0n1pN nodes): user.rs gains DEV_PARTS[32] registry + d… | audit run-30 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-64318 (handled by design), CVE-2025-40295 (fscrypt i_blkbits — n/a, fixed 512B sectors). V… |
 | CVE-2026-64371 | procfs breadth: generated /proc — global uptime/meminfo/loadavg/version/stat + per-pid di… | 64371 n/a by construction: single-CPU IF-masked syscall context means a task cannot exec while its stat is read, and the seq_file snapshot freezes content at open — reads never sa… |
 | CVE-2026-64400 | hierarchical VFS: per-task cwd in FsTab, canon_path resolution (. .. rel/abs, root-clampe… | 64400 structurally absent: canon clamps .. AT root with no retry/reconstruct path, and there are no mount/share boundaries to escape through (cwd is the only base). getdents-leak… |
 | CVE-2026-64496 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
