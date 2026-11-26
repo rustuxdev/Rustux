@@ -8363,3 +8363,15 @@ up /jail. lstest floor 81->82. Audit run-78: 0 confirmed — 11-item
 escape checklist verified (..' clamp, abs paths, symlink re-root,
 proc/self/{cwd,root} resolve inside the jail, sibling-prefix check,
 CLONE_FS sharing, escaped-cwd/fd-passing mirrored as Linux does).
+run-320 lands a small-classics trio: getdents(78) with the legacy
+linux_dirent layout (d_type in the record's last byte, not @18 —
+pad-wipe stops one byte short), setrlimit(160) as a prlimit64 alias,
+and syslog(103) — a real klogctl reader over the klib::prb ring.
+READ blocks on the new WaitOn::Kmsg(seq) until kmsg_expire on the
+tick service marshals fresh records through the sleeper's pml4;
+READ_ALL/READ_CLEAR/CLEAR and the two size probes round it out, all
+content-bearing types gated on uid==0. The blocking proof is a
+two-child dance: c1 arms a blocking read, c2 exits, sys_exit's
+'pid N exit' printk wakes c1 on the next tick. lstest floor 82->83.
+Audit run-79: 0 confirmed — dirent-UAF and rlimit-bypass CVE classes
+all n/a by construction.
