@@ -8250,3 +8250,20 @@ real forks. lstest floor 76->77, 104 tasks. The 9-frame leak
 in the first run was test-side (queues persist like Linux —
 now RMID'd); final-code frames gate deferred on the recurring
 wget guest-side stall. Audit run-73: 0 confirmed.
+run-315 completes the SysV trio — semaphores land on the same
+(gen<<16)|slot skeleton with staged-buffer ownership borrowed
+from msgsnd: the whole sembuf array is copied at entry, so a
+blocked call's ops can't be unmapped underneath, and every
+buffer has exactly one owner (caller / waker / signal-or-tick
+hook). sem_try's scratch-val simulation gives Linux's atomic
+all-or-nothing landings; the waker re-evaluates each waiter's
+staged array on any val change; SEM_UNDO runs a flat
+(pid,semid,num)->adj ledger applied at reap with the
+[0,SEMVMX] clamp. Two audit catches: stage buffers in slab
+classes permanently counted as frame leaks (slab pages never
+return — new stage_alloc routes <=4KiB through order-0 frames,
+gate now reads zero), and both msgtest/semtest had shared IPC
+keys across concurrent suite instances (pid-derived keys now).
+CVE-2026-58098 (semop seq-wraparound OOB) is structurally
+absent — RMID EIDRMs every waiter before the slot can remint.
+lstest floor 77->78, 105 tasks. Audit run-74: 0 confirmed.

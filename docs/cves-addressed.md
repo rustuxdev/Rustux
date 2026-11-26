@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**344 unique CVEs recorded.**
+**345 unique CVEs recorded.**
 
 ## klib ports
 
@@ -440,6 +440,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-52923 | SysV SHM rung (29/30/31/67): syscall layer over the existing SHMSEGS machinery — ShmSeg g… | rmid gate), STAT zero-fills 112B shmid_ds + stamps {key,mode,seq,size,nattch}, SET writes mode, LOCK/UNLOCK inert |
 | CVE-2026-52923 | SysV SHM rung (29/30/31/67): syscall layer over the existing SHMSEGS machinery — ShmSeg g… | rmid gate), STAT zero-fills 112B shmid_ds + stamps {key,mode,seq,size,nattch}, SET writes mode, LOCK/UNLOCK inert |
 | CVE-2026-52923 | SysV message queues (msgget 68 / msgsnd 69 / msgrcv 70 / msgctl 71): gen<<16 | ), E2BIG consumes like Linux, MSG_NOERROR truncates, ENOMSG NOWAIT, buffer range_ok_w'd up-front. msgctl — IPC_STAT writes msqid_ds fields into range_ok_w'd buf, IPC_SET accepts m… |
+| CVE-2026-52923 | SysV semaphores (semget 64 / semop 65 / semctl 66 / semtimedop 220): (gen<<16) | semop seq-wraparound OOB (CVE-2026-58098 — n/a: waiters die EIDRM before slot reuse); SysV id truncation (CVE-2026-52923 — gen-bounded slots, still n/a); blocked-waiter staged-buf… |
 | CVE-2026-52928 | af_unix rung (local IPC sockets): socket(AF_UNIX=1, SOCK_STREAM | name-parse class (bounded 3..=110 len gate, len+full-bytes name equality — abstract/path can't collide, zeroed marshal = no padding disclosure); peer-boundary class (kernel-owned… |
 | CVE-2026-52928 | recvmsg+SCM_RIGHTS rung (fd passing): recvmsg NR 47 (was a silent =>0 stub in the uid-fam… | audit run-50 scoped quick (security-audit skill): 0 confirmed, 1 fixed in-run; cve-now checked: CVE-2024-26923, CVE-2026-53005, CVE-2024-35970, CVE-2025-38236, CVE-2026-52928, CVE… |
 | CVE-2026-52928 | unix-seqpacket + recvmmsg rung: SOCK_SEQPACKET (5) for AF_UNIX — socketpair + bind/listen… | audit run-52 scoped quick (security-audit skill): 0 confirmed, 2 hardened in-run; cve-now checked: CVE-2026-52928 — n/a. Verified: make run exit 33, 83 tasks, frames equal; unixte… |
@@ -454,6 +455,9 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-53005 | recvmsg+SCM_RIGHTS rung (fd passing): recvmsg NR 47 (was a silent =>0 stub in the uid-fam… | audit run-50 scoped quick (security-audit skill): 0 confirmed, 1 fixed in-run; cve-now checked: CVE-2024-26923, CVE-2026-53005, CVE-2024-35970, CVE-2025-38236, CVE-2026-52928, CVE… |
 | CVE-2026-58084 | process_vm+cfr+clock+affinity rung (310/311/326/227/221/203): process_vm — shared engine… | kernel/src/user.rs (process_vm + sys_process_vm_readv/writev + CfrSrc + sys_copy_file_range + sys_clock_settime + sys_fadvise64 + sys_sched_setaffinity), kernel/src/rtc.rs (set_wa… |
 | CVE-2026-58084 | process_vm+cfr+clock+affinity rung (310/311/326/227/221/203): process_vm — shared engine… | kernel/src/user.rs (process_vm + sys_process_vm_readv/writev + CfrSrc + sys_copy_file_range + sys_clock_settime + sys_fadvise64 + sys_sched_setaffinity), kernel/src/rtc.rs (set_wa… |
+| CVE-2026-58098 | SysV semaphores (semget 64 / semop 65 / semctl 66 / semtimedop 220): (gen<<16) | semop seq-wraparound OOB (CVE-2026-58098 — n/a: waiters die EIDRM before slot reuse); SysV id truncation (CVE-2026-52923 — gen-bounded slots, still n/a); blocked-waiter staged-buf… |
+| CVE-2026-58098 | SysV semaphores (semget 64 / semop 65 / semctl 66 / semtimedop 220): (gen<<16) | semop seq-wraparound OOB (CVE-2026-58098 — n/a: waiters die EIDRM before slot reuse); SysV id truncation (CVE-2026-52923 — gen-bounded slots, still n/a); blocked-waiter staged-buf… |
+| CVE-2026-58098 | SysV semaphores (semget 64 / semop 65 / semctl 66 / semtimedop 220): (gen<<16) | semop seq-wraparound OOB (CVE-2026-58098 — n/a: waiters die EIDRM before slot reuse); SysV id truncation (CVE-2026-52923 — gen-bounded slots, still n/a); blocked-waiter staged-buf… |
 | CVE-2026-63833 | real file metadata: chmod/fchmod/fchmodat + chown/lchown/fchown/fchownat + utime/utimensa… | 63833 n/a by construction — metadata stored but never enforced (no credential model/setuid-on-exec/perm checks); audit fixed: times read after pathname copy + nsec validated after… |
 | CVE-2026-63910 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
 | CVE-2026-63913 | tcp/ipv4 (mini) | exact seq+ack required on every transition (no blind RST/state jumps — 63913 class out); option walk bounded, wscale never shifted (31495); seq state fully initialized (72020); do… |
