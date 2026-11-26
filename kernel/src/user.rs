@@ -21360,14 +21360,18 @@ pub fn sys_futex_waitv(
     for i in 0..nr {
         let e = waiters + i * 24;
         // SAFETY: the whole waiter array validated readable above.
-        let (val, uaddr, wf) = unsafe {
+        let (val, uaddr, wf, res) = unsafe {
             (
                 (e as *const u64).read_unaligned(),
                 ((e + 8) as *const u64).read_unaligned(),
                 ((e + 16) as *const u32).read_unaligned() as u64,
+                ((e + 20) as *const u32).read_unaligned(),
             )
         };
-        if wf & !(2 | 128) != 0 || wf & 2 == 0 {
+        if res != 0
+            || wf & !(3 | 4 | 128) != 0
+            || wf & 3 != 2
+        {
             return EINVAL;
         }
         if !range_ok(uaddr, 4) {
@@ -21425,6 +21429,192 @@ pub fn sys_futex_waitv(
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
+}
+
+/// The shared futex2 flag gate — parse_waitv's rule: size field
+/// (low 2 bits) must be U32, valid extras are NUMA(4)|PRIVATE(128).
+fn futex2_flags_ok(wf: u64) -> bool {
+    wf & !(3 | 4 | 128) == 0 && wf & 3 == 2
+}
+
+/// futex_wait(uaddr, val, mask, flags, timeout, clockid): the
+/// futex2 single-wait — same compare-then-block as FUTEX_WAIT but
+/// with a bitset mask (collapsed like futex's — extra wakes are
+/// legal spurious wakes) and an ABSOLUTE deadline on clockid
+/// {REALTIME,MONOTONIC}. flags must be futex2-valid U32.
+pub fn sys_futex_wait(
+    ctx: &mut UCtx,
+    uaddr: u64,
+    val: u64,
+    _mask: u64,
+    flags: u64,
+    timeout: u64,
+    clockid: u64,
+) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const ETIMEDOUT_: u64 = (-110i64) as u64;
+    if !futex2_flags_ok(flags) || !matches!(clockid, 0 | 1) {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EAGAIN_ };
+    if !range_ok(uaddr, 4) {
+        return EFAULT;
+    }
+    // SAFETY: validated user futex word under cur cr3.
+    if unsafe { (uaddr as *const u32).read_unaligned() } != val as u32 {
+        return EAGAIN_;
+    }
+    let mut deadline = 0u64;
+    if timeout != 0 {
+        if !range_ok(timeout, 16) {
+            return EFAULT;
+        }
+        // SAFETY: validated user timespec under cur cr3.
+        let (sec, nsec) = unsafe {
+            (
+                (timeout as *const i64).read_unaligned(),
+                ((timeout as *const i64).add(1)).read_unaligned(),
+            )
+        };
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return EINVAL;
+        }
+        let ts_ns = (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec as u64);
+        let now =
+            crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        deadline = if clockid == 0 {
+            let (ws, wns) = crate::rtc::wall_now();
+            let wall_ns = ws
+                .saturating_mul(1_000_000_000)
+                .saturating_add(wns);
+            now.saturating_add(
+                ts_ns.saturating_sub(wall_ns).div_ceil(10_000_000),
+            )
+        } else {
+            ts_ns.div_ceil(10_000_000)
+        };
+        if deadline <= now {
+            return ETIMEDOUT_;
+        }
+    }
+    if deliverable(t) {
+        return (-4i64) as u64; // -EINTR before sleep
+    }
+    t.wait_on = WaitOn::Futex(uaddr);
+    t.wait_deadline = deadline;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
+/// futex_wake(uaddr, mask, nr, flags): the futex2 wake — rides the
+/// same pml4-keyed waiter scan as FUTEX_WAKE; mask collapses like
+/// the bitset (waking extra is a legal spurious wake). flags must
+/// be futex2-valid U32. Returns the wake count.
+pub fn sys_futex_wake(uaddr: u64, _mask: u64, nr: u64, flags: u64) -> u64 {
+    if !futex2_flags_ok(flags) {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return 0 };
+    let pml4 = t.pml4;
+    futex_wake(pml4, uaddr, nr)
+}
+
+/// futex_requeue(waiters[2], flags, nr_wake, nr_requeue): CMP_
+/// REQUEUE in futex2 dress — waiters[0].val is the cmpval on src
+/// (EAGAIN on mismatch), nr_wake waiters wake normally, up to
+/// nr_requeue more get their key rewritten A->B atomically (the
+/// single-CPU syscall window makes the move atomic). FutexV
+/// waiters stay — a waitv sleeper isn't requeueable (its array is
+/// the sleeper's own). Returns wake+requeue count like Linux.
+pub fn sys_futex_requeue(
+    waiters: u64,
+    flags: u64,
+    nr_wake: u64,
+    nr_requeue: u64,
+) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    if flags != 0 || waiters == 0 {
+        return EINVAL;
+    }
+    if !range_ok(waiters, 48) {
+        return EFAULT_;
+    }
+    // SAFETY: the 2x24B waiter pair validated readable above.
+    let (cmpval, src, wf0, dst, wf1, res1) = unsafe {
+        (
+            (waiters as *const u64).read_unaligned(),
+            ((waiters + 8) as *const u64).read_unaligned(),
+            ((waiters + 16) as *const u32).read_unaligned() as u64,
+            ((waiters + 32) as *const u64).read_unaligned(),
+            ((waiters + 40) as *const u32).read_unaligned() as u64,
+            ((waiters + 44) as *const u32).read_unaligned(),
+        )
+    };
+    // CVE-2026-31554: the two waiters must carry identical flags
+    // (mixed sizes/privacy was a requeue UaF); CVE-2014-3153:
+    // src==dst requeue corrupts the queue — EINVAL both.
+    if res1 != 0
+        || !futex2_flags_ok(wf0)
+        || !futex2_flags_ok(wf1)
+        || wf0 != wf1
+        || src == dst
+    {
+        return EINVAL;
+    }
+    if !range_ok(src, 4) {
+        return EFAULT_;
+    }
+    // SAFETY: validated user futex word under cur cr3.
+    if unsafe { (src as *const u32).read_unaligned() } != cmpval as u32 {
+        return EAGAIN_;
+    }
+    let Some(t) = cur_mut() else { return 0 };
+    let pml4 = t.pml4;
+    let woke = futex_wake(pml4, src, nr_wake);
+    let mut moved = 0u64;
+    if nr_requeue > 0 {
+        let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+        for s in tasks.iter_mut() {
+            if moved == nr_requeue {
+                break;
+            }
+            let Some(x) = s.as_mut() else { continue };
+            if x.state == TaskState::Blocked
+                && x.wait_on == WaitOn::Futex(src)
+                && x.pml4 == pml4
+            {
+                x.wait_on = WaitOn::Futex(dst);
+                moved += 1;
+            }
+        }
+    }
+    woke + moved
+}
+
+/// membarrier(cmd, flags, cpu_id): execution-ordering barriers —
+/// on a single CPU every command is trivially satisfied, so the
+/// honest surface is QUERY's supported-bitmask plus accepted-noop
+/// for the commands that bitmap declares. Unknown cmd ENOSYSs like
+/// Linux's unsupported-command answer; flags!=0 EINVALs.
+pub fn sys_membarrier(cmd: u64, flags: u64, _cpu_id: u64) -> u64 {
+    const ENOSYS_: u64 = (-38i64) as u64;
+    // GLOBAL|GLOBAL_EXPEDITED|REG_GLOBAL_EXPEDITED|PRIVATE_EXPEDITED|
+    // REG_PRIVATE_EXPEDITED — uniprocessor-safe set.
+    const SUPPORTED: u64 = 1 | 2 | 4 | 8 | 16;
+    if flags != 0 {
+        return EINVAL;
+    }
+    if cmd == 0 {
+        return SUPPORTED;
+    }
+    if cmd <= 256 && SUPPORTED & cmd != 0 {
+        return 0;
+    }
+    ENOSYS_
 }
 
 /// Timer tick: expire timed poll waits — the return is 0 with
