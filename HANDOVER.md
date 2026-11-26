@@ -8123,3 +8123,25 @@ parent reads its buffer cross-mm, writes through it, child
 verifies on exit. pmvtest 28 checks green; exit 33, 98 tasks,
 zero leak. Audit run-67: 0 confirmed, 3 fixed in-run. Ledger at
 313 CVEs.
+run-309 fixes a real numbering bug and lands sigaltstack: the NR
+audit found NR_RENAMEAT2=276 — tee's number ran a 5-arg rename
+while real renameat2 (316) ENOSYS'd; a full-table sweep found no
+other alias, and fs_rename gained RENAME_NOREPLACE (EEXIST on any
+live target, EXCHANGE/WHITEOUT get the honest EINVAL). The real
+feature is sigaltstack(131) + SA_ONSTACK delivery: three Task
+fields hold {ss_sp,ss_size,ss_flags}, sigaltstack validates the
+24B stack_t (flags ⊆ DISABLE|AUTODISARM, size>=MINSIGSTKSZ
+ENOMEM, ANY modification while on-stack EPERMs), and a shared
+sig_frame_sp helper switches the delivery base to ss_sp+ss_size
+when the handler is SA_ONSTACK and the interrupted rsp isn't
+already inside — AUTODISARM one-shots like Linux. The rung's
+test-catch: handler entry rsp was ≡0 mod 16 — a latent ABI break
+that #GP'd the first handler using aligned SSE on a local; the
+frame base is now ≡8 (x64) / ≡12 (i386). Smaller pieces:
+settimeofday(164) shares rtc::set_wall with clock_settime,
+syncfs(306) gates fd-kind then inerts, get_robust_list(274)
+honestly reports the empty list the kernel keeps. stest proves
+real altstack delivery — a handler checks its own frame lands
+inside the installed window. stest 24 checks green; exit 33, 99
+tasks, zero leak. Audit run-68: 0 confirmed, 3 fixed in-run.
+Ledger at 315 CVEs.
