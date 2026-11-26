@@ -7945,3 +7945,19 @@ Proof: cl3test 41 checks, 0 failures. Exit 33, 87 tasks, zero
 leak — zero FAILs suite-wide this run.
 
 Audit run-56: 0 confirmed, 1 fixed in-run. Ledger at 259 CVEs.
+## run-298 — openat2 (437) + process_mrelease (448)
+
+openat2 wires the full RESOLVE_* discipline: sys_openat2 validates the
+open_how (size<24 EINVAL, >4096 E2BIG, nonzero tail E2BIG, single
+range_ok'd copy — the CVE-2022-48832 audit-deref class structurally
+absent); fd_openat2's canon_beneath scopes '..' to the dirfd floor
+(BENEATH EXDEVs escapes and absolute paths; IN_ROOT clamps and treats
+dirfd as root). Audit finding: the literal-component scope alone left a
+symlink inside the subtree free to escape — resolved path must now keep
+the base as a component prefix or EXDEV (CVE-2026-77763 class, both abs
+and rel targets refused). NO_SYMLINKS ELOOPs on any rewrite or final
+link; NO_MAGICLINKS ELOOPs on /proc fd links. process_mrelease gates
+flags/fd/live/reaped/shared-mm like Linux, then releases a zombie's mm
+early — pml4 user-half cleared so reap's re-walk can't double-free.
+Audit run-57: 0 confirmed, 1 fixed in-run. oa2test 38 checks green;
+exit 33, 88 tasks, zero leak. Ledger at 263 CVEs.
