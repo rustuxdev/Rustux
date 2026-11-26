@@ -8405,3 +8405,24 @@ mutated-handle class (CVE-2026-99616) is absent by construction,
 the access gate is test-proven; no kcmp/handle-ABI kernel CVEs
 exist in the catalog. In-run fixes: AT_FDCWD 0xffffff9c form,
 proc/self EOPNOTSUPP gap, S_IFLNK node-gate exclusion.
+
+run-323 lands the process-attrs + accounting trio: acct(163),
+personality(135), adjtimex(159) — plus clock_adjtime(305), which
+is where glibc's adjtimex() actually lands (in-run discovery:
+adjtimex() maps to NR 305 with CLOCK_REALTIME, not 159; both arms
+share adjtimex_core). BSD accounting: ACCT_VF slot + a fixed
+64-byte acct_v3 record appended via vfile_grow inside
+exit_bookkeeping for every exiting task (gid collapses to the
+unmodelled uid; mem/io/rw/fault comp_t fields zeroed — no
+counters exist); acct() itself is uid==0-gated, ENOENT on a
+missing file (no O_CREAT), EISDIR dir, EACCES non-regular, NULL
+stops. personality stores a per-task persona u32 inherited at
+fork — advisory, no syscall-table consumer. adjtimex: modes==0
+open query, modes!=0 uid==0 (CAP_SYS_TIME), ADJ_* mask EINVAL on
+unknown bits, writable fields stored so set->query round-trips,
+TIME_ERROR(5) while STA_UNSYNC / TIME_OK(0) after. clock_adjtime
+gates clk==0 — no dynamic-clock path exists. lstest floor 85->86.
+Audit run-82: 0 confirmed — both CAP gates EPERM-proven, the
+record write is grow-then-fixed-copy, the personality W^X classes
+(CVE-2024-47745 / CVE-2016-10044) are absent by construction
+(stored-only field, no mmap/AIO consumer, no LSM layer).
