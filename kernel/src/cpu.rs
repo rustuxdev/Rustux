@@ -44,8 +44,9 @@ pub const UC32_SEL: u16 = 0x38 | 3;
 // Slots 8-11 are the i386 TLS descriptors (set_thread_area): per-task
 // state installed into these slots on every switch, Linux's GDT
 // TLS-entry scheme. Compat %gs bases come from the descriptor, so the
-// slots must be live while the task runs.
-static mut GDT: [u64; 12] = [
+// slots must be live while the task runs. Slots 12-13 hold the
+// per-task LDT descriptor (modify_ldt), installed on every switch.
+static mut GDT: [u64; 14] = [
     0,
     0x00af_9a00_0000_ffff, // 0x08 kernel code
     0x00af_9200_0000_ffff, // 0x10 kernel data
@@ -62,6 +63,8 @@ static mut GDT: [u64; 12] = [
     0, // 0x40-0x5f i386 TLS slots 8-11 (set_thread_area, per task)
     0,
     0,
+    0,
+    0, // 0x60-0x67 per-task LDT descriptor (lldt, installed per switch)
     0,
 ];
 
@@ -150,6 +153,39 @@ pub fn load_iomap(src: *const u8) {
 
 static mut DF_STACK: DfStack = DfStack([0; 8192]);
 static mut INTR_STACK: DfStack = DfStack([0; 8192]);
+
+/// Selector of the LDT descriptor (GDT slots 12-13).
+pub const LDT_SEL: u16 = 12 << 3;
+
+/// Build the 16-byte system descriptor for an LDT (type 0x2, present).
+fn ldt_descriptor(base: u64, limit: u64) -> (u64, u64) {
+    let low = (limit & 0xffff)
+        | ((base & 0x00ff_ffff) << 16)
+        | (0b0010_u64 << 40) // type: LDT
+        | (1_u64 << 47) // present
+        | (((limit >> 16) & 0xf) << 48)
+        | ((base & 0xff00_0000) << 32);
+    let high = base >> 32;
+    (low, high)
+}
+
+/// Point the GDT's LDT slot at `base`/`limit` and lldt it — or unload
+/// the LDT entirely when `base` is null (lldt 0 marks LDTR invalid,
+/// so every LDT selector #GPs). Called at every switch site.
+pub fn load_ldt(base: *const u64, limit: u16) {
+    unsafe {
+        if base.is_null() {
+            (*core::ptr::addr_of_mut!(GDT))[12] = 0;
+            (*core::ptr::addr_of_mut!(GDT))[13] = 0;
+            core::arch::asm!("lldt ax", in("ax") 0u16, options(nostack));
+            return;
+        }
+        let (lo, hi) = ldt_descriptor(base as u64, limit as u64);
+        (*core::ptr::addr_of_mut!(GDT))[12] = lo;
+        (*core::ptr::addr_of_mut!(GDT))[13] = hi;
+        core::arch::asm!("lldt {0:x}", in(reg) LDT_SEL as u64, options(nostack));
+    }
+}
 
 /// Build the 16-byte system descriptor for a 64-bit available TSS.
 fn tss_descriptor(base: u64, limit: u64) -> (u64, u64) {
@@ -637,7 +673,7 @@ pub fn init() {
     }
 
     let gdtr = TablePtr {
-        limit: (core::mem::size_of::<[u64; 12]>() - 1) as u16,
+        limit: (core::mem::size_of::<[u64; 14]>() - 1) as u16,
         base: core::ptr::addr_of!(GDT) as u64,
     };
     // SAFETY: gdtr points at our valid flat GDT; CS reload uses a far return

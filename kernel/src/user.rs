@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 123;
+const MAX_TASKS: usize = 124;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -2456,6 +2456,11 @@ pub struct Task {
     /// PTRACE_GETSIGINFO's answer. stop_sig gets consumed by the
     /// wait4 report; this copy survives it.
     si_signo: i32,
+    /// Task LDT (modify_ldt): descriptor bytes, up to 16 slots; a
+    /// zero descriptor is an empty LDT entry (not-present).
+    ldt: [u64; 16],
+    /// Number of LDT slots in use — the descriptor's limit rides on it.
+    ldt_n: u8,
     si_code: i64,
     si_addr: u64,
     /// syscall nr captured at the entry-stop — GETREGS' orig_rax.
@@ -8213,6 +8218,8 @@ fn load(img: &[u8]) -> Option<Task> {
         sys_ph: 0,
         inject: 0,
         si_signo: 0,
+        ldt: [0; 16],
+        ldt_n: 0,
         si_code: 0,
         si_addr: 0,
         orig_rax: 0,
@@ -10913,11 +10920,8 @@ pub fn sys_unshare(flags: u64) -> u64 {
 /// honestly report 0 entries. Write funcs (1, 0x11) have nothing
 /// to write into — no LDT slots exist — so EINVAL; any other func
 /// is EINVAL like Linux.
-pub fn sys_modify_ldt(func: u64, _ptr: u64, _bytecount: u64) -> u64 {
-    match func {
-        0 | 2 => 0,
-        _ => EINVAL,
-    }
+pub fn sys_modify_ldt(func: u64, ptr: u64, bytecount: u64) -> u64 {
+    sys_modify_ldt_real(func, ptr, bytecount)
 }
 
 /// pkey_alloc/pkey_free/pkey_mprotect: no PKU exists — no
@@ -20508,6 +20512,8 @@ pub fn nt_thread_create(
         sys_ph: 0,
         inject: 0,
         si_signo: 0,
+        ldt: [0; 16],
+        ldt_n: 0,
         si_code: 0,
         si_addr: 0,
         orig_rax: 0,
@@ -38286,6 +38292,7 @@ pub fn launch() {
         unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
         unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
         cpu::load_iomap(iop_map(t.tgid));
+        load_ldt_of(t);
         let pid = t.pid;
         let rip = t.ctx.rip;
         let ex = core::str::from_utf8(
@@ -38326,6 +38333,7 @@ fn switch_to(n: usize) -> ! {
             cpu::install_tls(i, d);
         }
         cpu::load_iomap(iop_map(t.tgid));
+        load_ldt_of(t);
         (&t.ctx as *const UCtx, t.pml4, t.kstack_top, t.gs_sel)
     };
     // 0 clears the segment: harmless in 64-bit mode (the MSR base
@@ -38694,6 +38702,7 @@ fn resume_ctx(n: usize) -> *const UCtx {
     unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
     unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
     cpu::load_iomap(iop_map(t.tgid));
+    load_ldt_of(t);
     &t.ctx
 }
 
@@ -39109,6 +39118,8 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         is_compat: p.is_compat,
         gs_base: p.gs_base,
         tls: p.tls,
+        ldt: p.ldt,
+        ldt_n: p.ldt_n,
         gs_sel: p.gs_sel,
         nth: p.nth,
         nth_fd: p.nth_fd,
@@ -39321,6 +39332,8 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         is_compat: p.is_compat,
         gs_base: p.gs_base,
         tls: p.tls,
+        ldt: p.ldt,
+        ldt_n: p.ldt_n,
         gs_sel: p.gs_sel,
         nth: p.nth,
         nth_fd: p.nth_fd,
@@ -41746,6 +41759,134 @@ pub fn sys_vhangup() -> u64 {
         *core::ptr::addr_of_mut!(CONSOLE_SID) = u64::MAX;
     }
     0
+}
+
+/// Install the task's LDT (or unload it) — called at every switch
+/// site next to load_iomap. The descriptor's base points INTO the
+/// task struct (stable — TASKS is a static), and the switch out of
+/// an LDT task unloads before any reap.
+fn load_ldt_of(t: &Task) {
+    if t.ldt_n == 0 {
+        cpu::load_ldt(core::ptr::null(), 0);
+    } else {
+        cpu::load_ldt(t.ldt.as_ptr(), t.ldt_n as u16 * 8 - 1);
+    }
+}
+
+/// modify_ldt(func, ptr, bytecount): real per-task LDT — func 0 reads
+/// the task's descriptor bytes into the user buffer, func 2 reads the
+/// (empty) default LDT, func 1 / 0x11 write a user_desc into a slot.
+/// user_desc: {u32 entry_number, base_addr, limit, flags} where flags
+/// = seg_32bit|contents<<1|read_exec_only<<0? no — the on-wire layout:
+/// bit0 seg_32bit, bits1-2 contents, bit3 read_exec_only, bit4
+/// limit_in_pages, bit5 seg_not_present, bit6 useable.
+pub fn sys_modify_ldt_real(func: u64, ptr: u64, bytecount: u64) -> u64 {
+    const ENOSYS_: u64 = (-38i64) as u64;
+    const ENOMEM_: u64 = (-12i64) as u64;
+    match func {
+        0 => {
+            // Read the task's LDT into the user buffer.
+            let Some(t) = cur_mut() else { return ENOSYS_ };
+            let n = (t.ldt_n as usize * 8).min(bytecount as usize);
+            if n == 0 {
+                return 0;
+            }
+            if !range_ok_w(ptr, n as u64) {
+                return EFAULT;
+            }
+            // SAFETY: ptr is a validated writable user window under
+            // the current cr3; the LDT bytes are ours.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    t.ldt.as_ptr() as *const u8,
+                    ptr as *mut u8,
+                    n,
+                )
+            };
+            n as u64
+        }
+        2 => 0, // default LDT is empty
+        1 | 0x11 => {
+            if bytecount != 16 || !range_ok(ptr, 16) {
+                return EINVAL;
+            }
+            // SAFETY: ptr is a validated readable user window.
+            let ud = unsafe {
+                [
+                    (ptr as *const u32).read_unaligned(),
+                    (ptr as *const u32).add(1).read_unaligned(),
+                    (ptr as *const u32).add(2).read_unaligned(),
+                    (ptr as *const u32).add(3).read_unaligned(),
+                ]
+            };
+            let (mut entry, base, limit, flags) = (ud[0], ud[1], ud[2], ud[3]);
+            let (seg32, contents, rex_only, lim_pages, not_present, useable) = (
+                flags & 1,
+                (flags >> 1) & 3,
+                flags & 8,
+                flags & 16,
+                flags & 32,
+                flags & 64,
+            );
+            let Some(t) = cur_mut() else { return ENOSYS_ };
+            if entry == u32::MAX {
+                // -1: first free (zero) slot.
+                let free = t
+                    .ldt
+                    .iter()
+                    .position(|&d| d == 0)
+                    .unwrap_or(usize::MAX);
+                if free == usize::MAX {
+                    return ENOMEM_;
+                }
+                entry = free as u32;
+                // Linux writes the chosen entry_number back.
+                if range_ok_w(ptr, 4) {
+                    unsafe { (ptr as *mut u32).write_unaligned(entry) };
+                }
+            }
+            if entry as usize >= t.ldt.len() {
+                return EINVAL;
+            }
+            let slot = entry as usize;
+            let desc = if useable == 0 {
+                0u64 // useable=0 clears the slot like Linux
+            } else {
+                // Type nibble per contents: 0 data, 1 expand-down
+                // data, 2 code, 3 conforming code; bit1 = W for data,
+                // R for code (read_exec_only clears it).
+                let typ: u64 = match contents {
+                    2 => 0b1000,
+                    3 => 0b1100,
+                    1 => 0b0100,
+                    _ => 0b0000,
+                } | ((rex_only == 0) as u64) << 1;
+                (limit as u64 & 0xffff)
+                    | ((base as u64 & 0xffff) << 16)
+                    | ((base as u64 & 0xff_0000) << 16)
+                    | (typ << 40)
+                    | (1 << 44) // S: code-or-data
+                    | (3 << 45) // DPL 3
+                    | ((not_present == 0) as u64) << 47
+                    | (((limit as u64 >> 16) & 0xf) << 48)
+                    | ((useable as u64 & 1) << 52)
+                    | ((seg32 as u64 & 1) << 54)
+                    | ((lim_pages as u64 & 1) << 55)
+                    | ((base as u64 >> 24) << 56)
+            };
+            t.ldt[slot] = desc;
+            if slot + 1 > t.ldt_n as usize {
+                t.ldt_n = slot as u8 + 1;
+            }
+            // The GDT descriptor's limit follows ldt_n — reinstall
+            // immediately so this task's own segment ops see the new
+            // table (descriptor memory is read per segment-load, but
+            // LDTR's cached limit is not).
+            load_ldt_of(t);
+            0
+        }
+        _ => EINVAL,
+    }
 }
 
 /// End of the scheduling run: reap whatever tasks remain — the last
