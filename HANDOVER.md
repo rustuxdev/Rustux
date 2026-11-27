@@ -9005,3 +9005,42 @@ CVE-2015-5706 (path_openat UAF — no dentry/inode split),
 CVE-2026-72379 (unmapped fsuid — no idmapped mounts),
 CVE-2026-89768 (overlayfs backing — no overlayfs) all absent.
 7 gate PASSes, 127 tasks, frames zero leak; dtest 0 failures.
+
+## run-346 — real O_PATH: FdKind::Path name-reference fds + newfstatat AT_EMPTY_PATH fix
+
+- O_PATH stops being a flag-only no-op: new `FdKind::Path { p:
+  DirPath, link }` mints a pure dentry reference (accmode=0, no
+  stream). `link` pins O_NOFOLLOW'd symlinks — fstat answers the
+  lstat view and dangling links mint (the dentry is real).
+- I/O is fully inert: read/write/pread/lseek/getdents/ioctl EBADF,
+  poll POLLNVAL, epoll_ctl EBADF, mmap ENODEV — every arm verified
+  against Linux 7.0 host probes. What works: fstat (re-resolves the
+  stored name fresh), dirfd use (canon_path/openat2 BENEATH bases,
+  chroot floor intact), fchdir on dir-named paths, AT_EMPTY_PATH
+  consumers (fstatat/statx/move_mount/mount_setattr), name_to_handle_at.
+- F_GETFL reconstructs the O_PATH bit; dup/fork/SCM_RIGHTS inherit
+  the reference generically.
+- PRE-EXISTING FIX: sys_newfstatat (nr 262) never honored
+  AT_EMPTY_PATH — empty name fell into canon_path -> ENOENT while
+  the ia32 shim and statx routed it correctly. Now: empty+flag ->
+  statx_dirfd_stat + shared emit_stat (144B copy hoisted from
+  newfstatat); empty w/o flag -> ENOENT like Linux.
+- Flake note: one `unlinkat dirfd-relative` failure in gate3 —
+  first-ever failure of that check, no path in this diff explains it
+  (file genuinely vanished between access and unlinkat; shared
+  global-table/OFD-lifecycle flake family, documented since run-138).
+  Passed in gates 1,2,4,5 and every historical gate.
+- Docs row appended; ledger regen; impl/docs commits split.
+
+run-346 audit (run-104): scoped quick, one hunter wave — 0
+confirmed. Hunter enumerated ~50 FdKind match sites / fd consumers:
+every stream (read/write/pread/pwrite/lseek/getdents/sendfile/
+splice/mmap), mutation (chmod/chown/utimens/truncate/xattr/locks),
+reuse (signalfd/timerfd/inotify/fanotify/epoll/pidfd/uring/SCM),
+and AT_EMPTY_PATH consumer (statx/newfstatat/fstatat64/execveat/
+fchmodat2/open_tree/fspick/move_mount/mount_setattr/handle_at)
+kind-gates or re-resolves Path correctly; /proc/fd cross-open
+can't upgrade accmode=0. Lows all fail-safe: fsync false-0 and
+open_tree/fspick Path-dirfd rejection fixed in-run; errno-shape
+divergences deferred (fail-strict). No CVE class maps to this
+scope.
