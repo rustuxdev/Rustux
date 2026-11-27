@@ -2467,6 +2467,10 @@ pub struct Task {
     /// a compat task's %gs base comes from its descriptor, so the
     /// slots must hold this task's entries while it runs.
     tls: [u64; 4],
+    /// The raw 16-byte user_desc behind each `tls` slot — get_thread_area
+    /// returns it verbatim (the encoded descriptor loses user flag bits
+    /// that don't survive the GDT type-field packing).
+    tls_raw: [[u8; 16]; 4],
     /// Compat task's %gs selector (0 = none), reloaded on switch so
     /// the hidden descriptor base matches the task's TLS entry.
     gs_sel: u16,
@@ -8283,6 +8287,7 @@ fn load(img: &[u8]) -> Option<Task> {
         is_compat: false,
         gs_base: 0,
         tls: [0; 4],
+        tls_raw: [[0; 16]; 4],
         gs_sel: 0,
         ds_sel: cpu::UD_SEL,
         es_sel: cpu::UD_SEL,
@@ -9473,6 +9478,9 @@ const MSG_SZ_MAX: usize = 8192;
 const MSG_NOERROR: u64 = 0o10000;
 const MSG_EXCEPT: u64 = 0o20000;
 const IPC_NOWAIT: u64 = 0o4000;
+/// msgrcv peek flag (Linux 3.8+): mtype becomes an ordinal index
+/// and the message is copied WITHOUT dequeue (checkpoint/restore).
+const MSG_COPY: u64 = 0o40000;
 
 struct MsgQMsg {
     mtype: i64,
@@ -9590,6 +9598,30 @@ fn msg_deliver(t: &mut Task, q: &mut MsgQ, idx: usize, msgp: u64, msgsz: u64, fl
                 core::slice::from_raw_parts(m.data, n)
             }));
     unsafe { stage_free(m.len, m.data) };
+    if !ok {
+        return EFAULT_;
+    }
+    n as u64
+}
+
+/// msgrcv MSG_COPY's read-without-dequeue into `t`'s space — same
+/// size/EFAULT rules as msg_deliver but the message stays queued.
+fn msg_copy_deliver(t: &Task, q: &MsgQ, idx: usize, msgp: u64, msgsz: u64, flags: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const E2BIG_: u64 = (-7i64) as u64;
+    const ENOMSG_: u64 = (-42i64) as u64;
+    let Some(m) = q.msgs[idx].as_ref() else { return ENOMSG_ };
+    if m.len as u64 > msgsz && flags & MSG_NOERROR == 0 {
+        return E2BIG_;
+    }
+    let n = m.len.min(msgsz as usize);
+    let mut mt = [0u8; 8];
+    mt[..8].copy_from_slice(&m.mtype.to_le_bytes());
+    let ok = write_task_bytes(t.pml4, msgp, &mt)
+        && (n == 0
+            || write_task_bytes(t.pml4, msgp + 8, unsafe {
+                core::slice::from_raw_parts(m.data, n)
+            }));
     if !ok {
         return EFAULT_;
     }
@@ -9817,13 +9849,19 @@ pub fn sys_msgsnd(ctx: &mut UCtx, id: u64, msgp: u64, msgsz: u64, msgflg: u64) -
 pub fn sys_msgrcv(ctx: &mut UCtx, id: u64, msgp: u64, msgsz: u64, mtype: u64, msgflg: u64) -> u64 {
     const EFAULT_: u64 = (-14i64) as u64;
     const ENOMSG_: u64 = (-42i64) as u64;
-    const E2BIG_: u64 = (-7i64) as u64;
     const EINTR_: u64 = (-4i64) as u64;
     const EIDRM_: u64 = (-43i64) as u64;
-    if msgflg & !(IPC_NOWAIT | MSG_NOERROR | MSG_EXCEPT) != 0 {
+    if msgflg & !(IPC_NOWAIT | MSG_NOERROR | MSG_EXCEPT | MSG_COPY) != 0 {
         return EINVAL;
     }
     if msgflg & MSG_EXCEPT != 0 && (mtype as i64) <= 0 {
+        return EINVAL;
+    }
+    // MSG_COPY (checkpoint-restore peek): Linux requires IPC_NOWAIT
+    // and forbids MSG_EXCEPT — a copy can never block.
+    if msgflg & MSG_COPY != 0
+        && (msgflg & MSG_EXCEPT != 0 || msgflg & IPC_NOWAIT == 0)
+    {
         return EINVAL;
     }
     if msgsz > MSG_SZ_MAX as u64 || !range_ok_w(msgp, msgsz + 8) {
@@ -9834,6 +9872,29 @@ pub fn sys_msgrcv(ctx: &mut UCtx, id: u64, msgp: u64, msgsz: u64, mtype: u64, ms
         return EINVAL;
     };
     let Some(t) = cur_mut() else { return EINVAL };
+    if msgflg & MSG_COPY != 0 {
+        // mtype is the ORDINAL index over present messages, not a
+        // type selector — and nothing is dequeued, so the queue (and
+        // its sender/sleeper accounting) is untouched.
+        let qs = unsafe { &mut *core::ptr::addr_of_mut!(MSGQS) };
+        let Some(q) = qs.get_mut(slot).and_then(|x| x.as_mut()) else {
+            return EIDRM_;
+        };
+        let mut ord = mtype;
+        let mut idx = None;
+        for (i, m) in q.msgs.iter().enumerate() {
+            if m.is_some() {
+                if ord == 0 {
+                    idx = Some(i);
+                    break;
+                }
+                ord -= 1;
+            }
+        }
+        let Some(i) = idx else { return ENOMSG_ };
+        let r = msg_copy_deliver(t, q, i, msgp, msgsz, msgflg);
+        return r;
+    }
     loop {
         let qs = unsafe { &mut *core::ptr::addr_of_mut!(MSGQS) };
         let Some(q) = qs.get_mut(slot).and_then(|x| x.as_mut()) else {
@@ -11005,11 +11066,10 @@ pub fn sys_unshare(flags: u64) -> u64 {
     0
 }
 
-/// modify_ldt(func, ptr, bytecount): the running LDT is the
-/// default empty one — read funcs (0 read_ldt, 2 read_default_ldt)
-/// honestly report 0 entries. Write funcs (1, 0x11) have nothing
-/// to write into — no LDT slots exist — so EINVAL; any other func
-/// is EINVAL like Linux.
+/// modify_ldt(func, ptr, bytecount): real per-task LDT — delegates
+/// to sys_modify_ldt_real (run-337): func0 reads ldt_n*8 bytes,
+/// func2 reports the empty default LDT, func1/0x11 write a
+/// user_desc into a slot (useable=0 clears it).
 pub fn sys_modify_ldt(func: u64, ptr: u64, bytecount: u64) -> u64 {
     sys_modify_ldt_real(func, ptr, bytecount)
 }
@@ -11867,6 +11927,146 @@ pub fn sys_get_mempolicy(pol: u64, nmask: u64, maxnode: u64, _a: u64, flags: u64
         unsafe { core::ptr::write_bytes(nmask as *mut u8, 0, (bits.div_ceil(8)) as usize) };
     }
     0
+}
+
+/// migrate_pages(pid, maxnode, old_nodes, new_nodes): move a task's
+/// pages between NUMA nodes. Single-node topology — node 0 is the
+/// only possible node, so after Linux's own argument gates there is
+/// nothing to move and the unmoved count is 0.
+pub fn sys_migrate_pages(pid: u64, maxnode: u64, old: u64, new: u64) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    // One u64 nodemask covers the topology; Linux EINVALs beyond its
+    // MAX_NUMNODES.
+    if maxnode > 64 {
+        return EINVAL;
+    }
+    if cur_mut().is_none() {
+        return EINVAL;
+    }
+    let mask_bytes = (maxnode as usize).div_ceil(8).min(8);
+    if mask_bytes != 0
+        && (!range_ok(old, mask_bytes as u64) || !range_ok(new, mask_bytes as u64))
+    {
+        return EFAULT;
+    }
+    let (om, nm) = if mask_bytes == 0 {
+        (0u64, 0u64)
+    } else {
+        // SAFETY: mask windows validated readable.
+        unsafe {
+            let mut m = [0u64; 2];
+            core::ptr::copy_nonoverlapping(
+                old as *const u8,
+                m.as_mut_ptr() as *mut u8,
+                mask_bytes,
+            );
+            core::ptr::copy_nonoverlapping(
+                new as *const u8,
+                (m.as_mut_ptr() as *mut u8).add(8),
+                mask_bytes,
+            );
+            (m[0], m[1])
+        }
+    };
+    if pid != 0 {
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        let Some(i) = task_slot_by_pid(pid) else { return ESRCH_ };
+        let Some(r) = tasks[i].as_ref() else { return ESRCH_ };
+        // Moving another task's pages is ptrace_may_access-gated in
+        // Linux — uid==0 or uid-match here like kcmp.
+        let Some(t) = cur_mut() else { return EINVAL };
+        if t.uid != 0 && t.uid != r.uid {
+            return EPERM_;
+        }
+    }
+    // old must name node 0 (no pages live elsewhere); new must not
+    // ask for a node that doesn't exist — Linux's EINVALs here on a
+    // one-node box.
+    if om & 1 == 0 || nm & !1 != 0 {
+        return EINVAL;
+    }
+    0
+}
+
+/// move_pages(pid, count, pages, nodes, status, flags): Linux's
+/// per-page NUMA query/move. Query mode (nodes=NULL) reports each
+/// page's node in status[] — 0 for present, -ENOENT for unmapped.
+/// Move mode can only target node 0; pages are already there so it
+/// returns the unmoved count (0) after Linux's own validation.
+pub fn sys_move_pages(
+    pid: u64,
+    count: u64,
+    pages: u64,
+    nodes: u64,
+    status: u64,
+    flags: u64,
+) -> u64 {
+    const ESRCH_: u64 = (-3i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
+    const ENODEV_: u64 = (-19i64) as u64;
+    // MPOL_MF_MOVE | MPOL_MF_MOVE_ALL are the only legal flags.
+    if flags & !(1 << 1 | 1 << 2) != 0 {
+        return EINVAL;
+    }
+    // Bounded walk — Linux has no cap but is preemptible; an
+    // IF-masked syscall must bound its per-page loop (16384
+    // entries ≈ the process_vm iovec precedent scaled to pages).
+    if count > 16384 {
+        return EINVAL;
+    }
+    if count == 0 {
+        return 0;
+    }
+    if !range_ok(pages, count.saturating_mul(8))
+        || !range_ok_w(status, count.saturating_mul(4))
+        || (nodes != 0 && !range_ok(nodes, count.saturating_mul(4)))
+    {
+        return EFAULT;
+    }
+    let Some(t) = cur_mut() else { return EINVAL };
+    // MPOL_MF_MOVE_ALL (also move pages shared with other tasks)
+    // is CAP_SYS_NICE-gated in Linux — uid==0 here.
+    if flags & (1 << 2) != 0 && t.uid != 0 {
+        return EPERM_;
+    }
+    let tgt = if pid == 0 {
+        t.pml4
+    } else {
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        let Some(i) = task_slot_by_pid(pid) else { return ESRCH_ };
+        let Some(r) = tasks[i].as_ref() else { return ESRCH_ };
+        // Linux gates page queries AND moves on
+        // ptrace_may_access(CAP_SYS_NICE) — the uid-model stand-in
+        // is uid==0 or uid-match like kcmp.
+        if t.uid != 0 && t.uid != r.uid {
+            return EPERM_;
+        }
+        r.pml4
+    };
+    let mut unmoved = 0u64;
+    for i in 0..count {
+        // SAFETY: array windows validated above (caller's space).
+        let va = unsafe { ((pages + i * 8) as *const u64).read_unaligned() };
+        if nodes == 0 {
+            // Query: node 0 for a present page, -ENOENT unmapped.
+            let st = if translate_r(tgt, va).is_some() { 0i32 } else { -2 };
+            unsafe { ((status + i * 4) as *mut i32).write_unaligned(st) };
+        } else {
+            let node = unsafe { ((nodes + i * 4) as *const i32).read_unaligned() };
+            if !(0..=63).contains(&node) {
+                return EINVAL;
+            }
+            if node != 0 {
+                return ENODEV_;
+            }
+            if translate_r(tgt, va).is_none() {
+                // Nothing there to move — Linux counts these, not fails.
+                unmoved += 1;
+            }
+        }
+    }
+    unmoved
 }
 
 /// munmap(addr, len): Linux never fails on an aligned range — holes
@@ -12781,15 +12981,18 @@ fn parse_user_desc(u_info: u64) -> Option<(u32, u64, u64)> {
     Some((entry, desc, base as u64))
 }
 
-/// set_thread_area(u_info): i386 TLS install — Linux's GDT TLS-entry
-/// scheme. Keeps the descriptor in the task's TLS slot array and
-/// installs it in the GDT, then writes the chosen entry NUMBER back
-/// (glibc derives the %gs selector as entry*8+3 itself). Compat-only:
-/// 64-bit TLS is arch_prctl's MSR.
+/// set_thread_area(u_info): GDT TLS-entry install — Linux's scheme on
+/// both ABIs (x86_64 keeps it for %gs userspace; glibc x86_64 prefers
+/// arch_prctl's fs MSR but the syscall is real). Keeps the descriptor
+/// in the task's TLS slot array, installs it in the GDT, then writes
+/// the chosen entry NUMBER back (glibc derives the %gs selector as
+/// entry*8+3 itself).
 pub fn sys_set_thread_area(u_info: u64) -> u64 {
     const ESRCH: u64 = (-3i64) as u64;
     let Some(t) = cur_mut() else { return ESRCH };
-    if !t.is_compat || !range_ok_w(u_info, 4) {
+    // Reads 16 bytes, writes back just the entry number (Linux's
+    // exact footprint — a 4-byte-writable tail is legal).
+    if !range_ok_w(u_info, 4) {
         return EINVAL;
     }
     let Some((entry, desc, base)) = parse_user_desc(u_info) else {
@@ -12810,6 +13013,12 @@ pub fn sys_set_thread_area(u_info: u64) -> u64 {
         return EINVAL;
     };
     t.tls[slot] = desc;
+    // SAFETY: parse_user_desc validated the 16-byte readable range.
+    t.tls_raw[slot] = unsafe {
+        core::slice::from_raw_parts(u_info as *const u8, 16)
+            .try_into()
+            .unwrap_unchecked()
+    };
     cpu::install_tls(slot, desc);
     let num = (cpu::TLS_SLOT_BASE + slot) as u32;
     t.gs_sel = (num * 8 + 3) as u16;
@@ -12821,6 +13030,35 @@ pub fn sys_set_thread_area(u_info: u64) -> u64 {
     t.gs_base = base;
     // SAFETY: validated writable user range (entry_number).
     unsafe { (u_info as *mut u32).write_unaligned(num) };
+    0
+}
+
+/// get_thread_area(u_info): the reverse of set_thread_area — reads
+/// entry_number, must name a TLS slot (else EINVAL like Linux), and
+/// writes the stored user_desc back verbatim (zeros for a slot that
+/// was never installed). Real on x86_64 too (syscall 211).
+pub fn sys_get_thread_area(u_info: u64) -> u64 {
+    const EFAULT_: u64 = (-14i64) as u64;
+    const ESRCH: u64 = (-3i64) as u64;
+    let Some(t) = cur_mut() else { return ESRCH };
+    if !range_ok_w(u_info, 16) {
+        return EFAULT_;
+    }
+    // SAFETY: validated readable u32.
+    let entry = unsafe { (u_info as *const u32).read_unaligned() };
+    if !(cpu::TLS_SLOT_BASE..cpu::TLS_SLOT_BASE + cpu::TLS_SLOTS)
+        .contains(&(entry as usize))
+    {
+        return EINVAL;
+    }
+    let raw = t.tls_raw[entry as usize - cpu::TLS_SLOT_BASE];
+    // SAFETY: validated writable 16-byte range.
+    unsafe {
+        core::ptr::copy_nonoverlapping(raw.as_ptr(), u_info as *mut u8, 16);
+        // Linux echoes the requested entry back even over an
+        // otherwise-zero descriptor.
+        (u_info as *mut u32).write_unaligned(entry);
+    }
     0
 }
 
@@ -20600,6 +20838,7 @@ pub fn nt_thread_create(
         is_compat: p.is_compat,
         gs_base: teb,
         tls: [0; 4],
+        tls_raw: [[0; 16]; 4],
         gs_sel: 0,
         ds_sel: cpu::UD_SEL,
         es_sel: cpu::UD_SEL,
@@ -38286,6 +38525,7 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     t.gs_sel = 0;
     t.ldt_n = 0;
     t.tls = [0; 4]; // compat TLS descriptors die with the image too
+    t.tls_raw = [[0; 16]; 4];
     cpu::load_ds_es(cpu::UD_SEL, cpu::UD_SEL);
     cpu::load_gs(0);
     load_ldt_of(t);
@@ -39557,6 +39797,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         is_compat: p.is_compat,
         gs_base: p.gs_base,
         tls: p.tls,
+        tls_raw: p.tls_raw,
         ldt: p.ldt,
         ldt_n: p.ldt_n,
         gs_sel: p.gs_sel,
@@ -39775,6 +40016,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         is_compat: p.is_compat,
         gs_base: p.gs_base,
         tls: p.tls,
+        tls_raw: p.tls_raw,
         ldt: p.ldt,
         ldt_n: p.ldt_n,
         gs_sel: p.gs_sel,
@@ -39833,6 +40075,15 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
             };
             if let Some(slot) = slot {
                 c.tls[slot] = desc;
+                // get_thread_area serves the verbatim user_desc —
+                // keep the raw copy in step with the descriptor.
+                // SAFETY: parse_user_desc validated the 16-byte
+                // readable range (in the parent's space).
+                c.tls_raw[slot] = unsafe {
+                    core::slice::from_raw_parts(tls as *const u8, 16)
+                        .try_into()
+                        .unwrap_unchecked()
+                };
                 c.gs_sel = (((cpu::TLS_SLOT_BASE + slot) * 8 + 3) as u32) as u16;
                 c.gs_base = base;
             }
@@ -42262,7 +42513,11 @@ fn seg_desc(t: &Task, sel: u16) -> Option<u64> {
 fn load_data_sels(t: &Task) {
     let ok = |sel: u16| -> bool {
         match seg_desc(t, sel) {
-            Some(0) => true, // null selector
+            // Only sel<=3 is the null selector. A NONZERO selector
+            // naming an all-zero descriptor (an LDT slot the task
+            // cleared under a live register) is #GP at any CPL —
+            // it must fail validation so pick() substitutes 0.
+            Some(0) => sel <= 3,
             Some(d) => {
                 let present = d & (1 << 47) != 0;
                 let dpl = (d >> 45) & 3;

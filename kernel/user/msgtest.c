@@ -11,6 +11,9 @@
 #include <sys/wait.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
+#ifndef MSG_COPY
+#define MSG_COPY 040000
+#endif
 
 static int fails;
 #define check(c, msg) do { \
@@ -89,6 +92,34 @@ int main(void) {
     errno = 0;
     check(msgrcv(q, &m, 4, -1, MSG_EXCEPT) == -1 && errno == EINVAL,
           "msgrcv EXCEPT type<=0 EINVAL");
+
+    // --- MSG_COPY: ordinal-index peek, no dequeue (checkpoint/
+    // restore semantics — Linux requires IPC_NOWAIT, forbids EXCEPT)
+    int qcopy = msgget(IPC_PRIVATE, 0600);
+    check(qcopy >= 0, "msgget for MSG_COPY");
+    m.mtype = 1; strcpy(m.text, "alpha"); msgsnd(qcopy, &m, 6, 0);
+    m.mtype = 3; strcpy(m.text, "beta");  msgsnd(qcopy, &m, 5, 0);
+    memset(&m, 0, sizeof m);
+    check(msgrcv(qcopy, &m, sizeof(m.text), 0, IPC_NOWAIT | MSG_COPY) == 6
+          && m.mtype == 1 && !strcmp(m.text, "alpha"), "MSG_COPY ordinal 0");
+    memset(&m, 0, sizeof m);
+    check(msgrcv(qcopy, &m, sizeof(m.text), 1, IPC_NOWAIT | MSG_COPY) == 5
+          && m.mtype == 3 && !strcmp(m.text, "beta"), "MSG_COPY ordinal 1");
+    errno = 0;
+    check(msgrcv(qcopy, &m, sizeof(m.text), 2, IPC_NOWAIT | MSG_COPY) == -1
+          && errno == ENOMSG, "MSG_COPY past end ENOMSG");
+    errno = 0;
+    check(msgrcv(qcopy, &m, sizeof(m.text), 0, MSG_COPY) == -1
+          && errno == EINVAL, "MSG_COPY sans NOWAIT EINVAL");
+    errno = 0;
+    check(msgrcv(qcopy, &m, sizeof(m.text), 1,
+                 IPC_NOWAIT | MSG_COPY | MSG_EXCEPT) == -1
+          && errno == EINVAL, "MSG_COPY+EXCEPT EINVAL");
+    memset(&m, 0, sizeof m);
+    check(msgrcv(qcopy, &m, sizeof(m.text), 0, IPC_NOWAIT) == 6
+          && m.mtype == 1 && !strcmp(m.text, "alpha"),
+          "MSG_COPY left queue intact");
+    check(msgctl(qcopy, IPC_RMID, 0) == 0, "qcopy RMID");
 
     // --- msgctl IPC_STAT / IPC_SET / IPC_RMID
     struct msqid_ds ds;

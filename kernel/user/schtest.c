@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #include <sched.h>
 
 static int fails;
@@ -33,6 +34,8 @@ static int fails;
 #define SYS_get_mempolicy         239
 #define SYS_ioprio_set            251
 #define SYS_ioprio_get            252
+#define SYS_migrate_pages         256
+#define SYS_move_pages            279
 #endif
 
 int main(void) {
@@ -186,6 +189,44 @@ int main(void) {
     errno = 0;
     r = syscall(SYS_get_mempolicy, (void *)0x100, 0, 0, 0, 0);
     check(r == -1 && errno == EFAULT, "get_mempolicy bad ptr EFAULT");
+
+    // --- NUMA tail: migrate_pages(256)/move_pages(279) — single
+    // node: query reports node 0 / -ENOENT, moves to node 0 no-op.
+    unsigned long om = 1, nm = 1;
+    check(syscall(SYS_migrate_pages, 0, 64, &om, &nm) == 0,
+          "migrate_pages node0->node0");
+    om = 0; nm = 1;
+    errno = 0;
+    r = syscall(SYS_migrate_pages, 0, 64, &om, &nm);
+    check(r == -1 && errno == EINVAL, "migrate_pages empty old EINVAL");
+    om = 1; nm = 2;
+    errno = 0;
+    r = syscall(SYS_migrate_pages, 0, 64, &om, &nm);
+    check(r == -1 && errno == EINVAL, "migrate_pages ghost node EINVAL");
+    om = 1; nm = 1;
+    errno = 0;
+    r = syscall(SYS_migrate_pages, 99999, 64, &om, &nm);
+    check(r == -1 && errno == ESRCH, "migrate_pages bad pid ESRCH");
+    void *pg = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(pg != MAP_FAILED, "mmap for move_pages");
+    *(volatile char *)pg = 1;
+    void *addrs[2] = { pg, (void *)0xdead0000UL };
+    int sts[2] = { -99, -99 };
+    check(syscall(SYS_move_pages, 0, 2, addrs, 0, sts, 0) == 0
+          && sts[0] == 0 && sts[1] == -2,
+          "move_pages query node0/-ENOENT");
+    int tgt[2] = { 0, 0 };
+    check(syscall(SYS_move_pages, 0, 1, addrs, tgt, sts, 0) == 0,
+          "move_pages to node0 no-op");
+    errno = 0;
+    r = syscall(SYS_move_pages, 0, 1, addrs, 0, sts, 8);
+    check(r == -1 && errno == EINVAL, "move_pages bad flags EINVAL");
+    tgt[0] = 5;
+    errno = 0;
+    r = syscall(SYS_move_pages, 0, 1, addrs, tgt, sts, 0);
+    check(r == -1 && errno == ENODEV, "move_pages ghost node ENODEV");
+    munmap(pg, 4096);
 
     printf("schtest: %d failures\n", fails);
     return fails;

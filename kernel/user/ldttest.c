@@ -125,6 +125,26 @@ int main(void) {
     waitpid(p, &st, 0);
     check(WIFEXITED(st) && WEXITSTATUS(st) == 0, "fork: child sees LDT");
 
+    // --- x86_64 set_thread_area(205)/get_thread_area(211): the same
+    // GDT TLS scheme, real on the 64-bit ABI too.
+    struct udesc tls = { 0xffffffffu, 0x12345000u, 0xfffffu,
+                         (1u << 0) | (1u << 4) | (1u << 6) };
+    check(syscall(205, &tls) == 0 && tls.entry >= 8 && tls.entry < 12,
+          "set_thread_area64 picks a TLS slot");
+    struct udesc got = { tls.entry, 0, 0, 0 };
+    check(syscall(211, &got) == 0 && got.base == 0x12345000u
+          && got.limit == 0xfffffu && (got.flags & 1)
+          && ((got.flags >> 4) & 1) && ((got.flags >> 6) & 1),
+          "get_thread_area64 round-trips user_desc");
+    struct udesc bad2 = { 99, 0, 0, 0 };
+    check(syscall(211, &bad2) == -1 && errno == EINVAL,
+          "get_thread_area64 bad entry EINVAL");
+    uint32_t e = tls.entry == 8 ? 11 : 8;
+    struct udesc empty = { e, 9, 9, 9 };
+    check(syscall(211, &empty) == 0 && empty.base == 0 && empty.limit == 0
+          && empty.entry == e,
+          "get_thread_area64 empty slot -> zeros+entry");
+
     printf("ldttest: %d failures\n", fails);
     return fails;
 }

@@ -703,9 +703,13 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         427 => user::sys_io_uring_register(a1, a2, a3, a4),
         187 => user::sys_readahead(a1, a2 as i64, a3),
         200 => user::sys_tkill(a1, a2),
+        205 => user::sys_set_thread_area(a1),
+        211 => user::sys_get_thread_area(a1),
         237 => user::sys_mbind(a1, a2, a3, a4, a5, a6),
         238 => user::sys_set_mempolicy(a1, a2, a3),
         239 => user::sys_get_mempolicy(a1, a2, a3, a4, a5),
+        256 => user::sys_migrate_pages(a1, a2, a3, a4),
+        279 => user::sys_move_pages(a1, a2, a3, a4, a5, a6),
         251 => user::sys_ioprio_set(a1, a2, a3),
         252 => user::sys_ioprio_get(a1, a2),
         // The credentials block — uid stores to t.uid, gid and
@@ -1014,6 +1018,7 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         // i386 TLS install — glibc's startup calls this before it
         // touches %gs-based errno/TCB.
         243 => user::sys_set_thread_area(a1),
+        211 => user::sys_get_thread_area(a1),
         // i386 robust-futex list head is 12 bytes (3 x u32).
         311 => user::sys_set_robust_list32(a1, a2),
         // i386 readlinkat — same dirfd/path/buf/len shape.
