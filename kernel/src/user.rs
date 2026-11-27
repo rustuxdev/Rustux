@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 122;
+const MAX_TASKS: usize = 123;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -25001,8 +25001,24 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                                 }
                                 i
                             }
-                            // /dev/console — same driver.
-                            1 => i,
+                            // /dev/console — same driver. A session
+                            // leader whose session owns no ctty adopts
+                            // an unowned console on open — Linux's
+                            // ctty-acquire path (vhangup's re-arm).
+                            1 => {
+                                if t.pid == t.sid
+                                    && unsafe {
+                                        *core::ptr::addr_of!(CONSOLE_SID)
+                                    } == u64::MAX
+                                {
+                                    unsafe {
+                                        *core::ptr::addr_of_mut!(
+                                            CONSOLE_SID
+                                        ) = t.sid;
+                                    }
+                                }
+                                i
+                            }
                             // /dev/ptmx — mint a pair; the OFD names
                             // the private master node, not the mux.
                             2 => match ptmx_open() {
@@ -41683,6 +41699,53 @@ pub fn sys_io_uring_register(fd: u64, opcode: u64, arg: u64, nr_args: u64) -> u6
         0 | 1 | 2 | 3 | 6 | 9 | 10 => ENXIO_, // fixed tables n/a
         _ => EINVAL,
     }
+}
+
+/// vhangup(): simulate a hangup on the caller's controlling tty —
+/// Linux requires CAP_SYS_TTY_CONFIG; a caller whose session owns no
+/// tty returns 0 silently. Our model has one ctty (the console,
+/// owned by CONSOLE_SID with FG_PGID its foreground group): a hangup
+/// SIGHUP+SIGCONTs the foreground group and each session leader of the
+/// owning session, then drops ownership — the console sits unowned
+/// until a ctty-less session leader re-acquires it on open.
+pub fn sys_vhangup() -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    let Some(t) = cur_mut() else { return EPERM_ };
+    let (uid, sid) = (t.uid, t.sid);
+    let _ = t;
+    if uid != 0 {
+        return EPERM_;
+    }
+    let csid = unsafe { *core::ptr::addr_of!(CONSOLE_SID) };
+    if sid != csid {
+        return 0;
+    }
+    let fg = unsafe { *core::ptr::addr_of!(FG_PGID) };
+    if fg != 0 {
+        kill_pgrp(fg, 1);  // SIGHUP
+        kill_pgrp(fg, 18); // SIGCONT
+    }
+    // check_leader: every session leader in the owning session gets
+    // SIGHUP+SIGCONT too — its own pgrp, distinct from fg's.
+    let leader: u64 = {
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        tasks
+            .iter()
+            .flatten()
+            .filter(|x| x.sid == csid && x.pid == x.sid)
+            .map(|x| x.pgid)
+            .next()
+            .unwrap_or(0)
+    };
+    if leader != 0 && leader != fg {
+        kill_pgrp(leader, 1);
+        kill_pgrp(leader, 18);
+    }
+    unsafe {
+        *core::ptr::addr_of_mut!(FG_PGID) = 0;
+        *core::ptr::addr_of_mut!(CONSOLE_SID) = u64::MAX;
+    }
+    0
 }
 
 /// End of the scheduling run: reap whatever tasks remain — the last

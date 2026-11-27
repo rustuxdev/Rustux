@@ -845,6 +845,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         458 => user::sys_listmount(a1, a2, a3, a4),
         272 => user::sys_unshare(a1),
         154 => user::sys_modify_ldt(a1, a2, a3),
+        153 => user::sys_vhangup(),
         329..=331 => user::sys_pkey(a1, a2, a3),
         135 => user::sys_personality(a1),
         159 => user::sys_adjtimex(a1),
