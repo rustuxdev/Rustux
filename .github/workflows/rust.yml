@@ -40,6 +40,12 @@ jobs:
       run: |
         rustup target add x86_64-unknown-uefi
         rustup component add clippy
+    - name: Install mke2fs (generates include_bytes! test images)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y e2fsprogs
+    - name: Generate include_bytes! inputs
+      run: make kernel/src/ext2_test.img kernel/src/ext3_test.img kernel/src/ext4_test.img kernel/user/hello.elf
     - name: Clippy
       run: cargo clippy --release --target x86_64-unknown-uefi
 
