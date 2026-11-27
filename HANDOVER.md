@@ -8726,3 +8726,23 @@ checked_add; generic -EINTR wake no longer writes a parked
 faulter's live rax; esp.img gotcha — mcopy fails silently on
 existing BOOTX64.EFI, mdel first (stale kernel masqueraded as a
 nonblock hang).
+
+run-339 perf_event_open(298) — counting-mode perf subset, the last
+real unwired NR. PERFS[8] behind FdKind::Perf; attr validated as the
+real layout (size 64..4096, sample_type/read_format==0, only
+attr.disabled honored — other bitfield bits EINVAL, not ignore).
+SW events read real task state: PAGE_FAULTS (new t.pfaults, billed
+by note_pfault on cpu.rs's v==14 route), CTX_SWITCHES (t.nswitch,
+bumped at both activate paths), TASK_CLOCK (utime+stime), CPU_CLOCK
+(TICKS), CPU_MIGRATIONS honestly 0; HW cfg0 = rdtsc. pid>0 targets
+another task (slot+pid double-check), pid=-1&&cpu=0 sums live tasks
+system-wide, groups EINVAL. acc/base: reads fold the delta so a
+mid-window target death keeps counted work; perf_task_died at
+task_exit freezes; DISABLE/ENABLE/RESET/REFRESH via '$'(0x24) ioctl
+type arm in sys_ioctl. pftest.c new task -> MAX_TASKS 125->126,
+lstest floor 98->99. In-run catch: pid/cpu/group_fd are C ints
+arriving zero-extended — -1 = 0xFFFFFFFF EINVAL'd every call (the
+AT_FDCWD class); sign-extend `as u32 as i32`. Audit run-98:
+0 confirmed — CVE-2013-2094 config-index closed (no index use),
+group races absent (EINVAL), privesc TOCTOU absent (no setuid),
+kernel-record perms absent (no sampling).
