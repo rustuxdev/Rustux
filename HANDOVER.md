@@ -9329,3 +9329,48 @@ scope.
   maps (hits were unrelated subsystems).
 - Gates: 2x PASS 127 tasks zero leak; the remainder-window check
   green.
+
+## run-351 — poll/ppoll/pselect6 restart-remainder semantics
+- Linux splits the family: poll stashes the expiry kernel-side
+  (restart_block->poll -> do_restart_poll), while pselect6/ppoll/
+  select write REMAINING time into the user tsp/tv before
+  -ERESTARTNOHAND (poll_select_copy_remaining) — the replay re-reads
+  the mutated buffer. epoll_wait's int timeout full-restarts — ours
+  already matched, no work.
+- poll: WaitOn::Poll joins the restart_at stash at the pend_one arm
+  (rt=false; relative ms deadline can't be REALTIME-anchored);
+  fd_poll + fd_ppoll call restart_deadline() at entry — rip-matched
+  take substitutes the stashed expiry for the arg-derived deadline.
+  An indefinite wait stashes 0 -> consume returns None -> falls back
+  to arg-derived -1 -> still indefinite; no fabricated deadline.
+- pselect6/ppoll: Task gains wait_tv_ns (nsec vs usec unit flag);
+  fd_pselect + fd_ppoll arm wait_tv=ts / wait_tv_dl=deadline /
+  ns=true; wb_ticket (extracted from psel_restore's tail) writes
+  remaining to tsp on every exit — early returns inline, blocked
+  resumes via psel_restore. fd_select keeps its timeval arm
+  (ns=false), guarded `wait_tv == 0` so its pre-armed ticket isn't
+  overwritten by the shared pselect path.
+- Measured-vs-Linux note: the writeback is INVISIBLE through glibc
+  wrappers — pselect/ppoll copy timeout to a local exactly because
+  Linux mutates it (verified on host: glibc {2,0} unchanged, raw
+  syscall tsp -> {1,~6e8}; glibc select DOES expose the timeval
+  writeback). pgtest checks use raw SYS_pselect6/SYS_ppoll.
+- Test (pgtest +5 checks): SA_RESTART poll resumes remainder (2s
+  poll EINTR'd ~400ms -> replay totals ~1.6s, not 2s); same for
+  ppoll; poll-restart disarm (EINTR without SA_RESTART leaves the
+  stash consumed-or-clear so a later poll isn't spurious); pselect
+  + ppoll EINTR write remaining tsp via raw syscalls.
+- cve-now sweep: restart_block/poll-select writeback class — empty.
+- Gates: pgtest 0 failures incl. all 5 new checks, PASS 127 tasks,
+  zero leak. Three pgtest flakes in gate-351a (sigtimedwait/
+  signalfd-cascade/waitpid-group) re-passed 351b — unrelated to
+  diff (no shared state paths).
+- Audit (run-109, scoped quick): FIX-BEFORE-COMMIT — all fixed
+  in-run: C1 wait_tv_ns leaked nsec format into a later select()'s
+  timeval (fd_select arm now resets it); C2 the ticket armed BEFORE
+  the sigmask-validation EFAULT/EINVAL returns — a stale armed
+  ticket suppressed the next call's arm and would write to a dead
+  VA (arm moved below the last fallible gate); C3 exec now clears
+  the wait_tv trio. INFO: fd_ppoll gained fd_poll's post-arm
+  readiness recheck (pre-existing scan->arm wake race); tsp now
+  range_ok_w (Linux EFAULTs an unwritable tsp); comments corrected.
