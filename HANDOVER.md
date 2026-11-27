@@ -9271,6 +9271,18 @@ scope.
 
 ## run-350 — SA_RESTART restart_block remainder (nanosleep family)
 
+> CORRECTED at run-352: the premise below was wrong. Handler'd
+> signals NEVER restart sleeps/poll/select/futex/SysV waits on real
+> Linux regardless of SA_RESTART (handle_signal converts
+> -ERESTART_RESTARTBLOCK/-ERESTARTNOHAND to -EINTR unconditionally —
+> verified in kernel source + on-host). The restart_block machinery
+> this rung emulated only serves the no-handler stop/cont path.
+> What remains of this rung: the stash machinery itself (now armed
+> only for default-stop signals), the rem fill, and the
+> frame-push/exec hygiene. The SA_RESTART remainder-resume the
+> checks asserted is semantics Linux doesn't have; the checks were
+> rewritten to assert EINTR.
+
 - Closes the run-348 audit F-item: an SA_RESTART replay of an
   interrupted WaitOn::Timer wait re-dispatched the syscall with the
   original req — the sleeper waited FULL duration + elapsed instead
@@ -9331,6 +9343,12 @@ scope.
   green.
 
 ## run-351 — poll/ppoll/pselect6 restart-remainder semantics
+> CORRECTED at run-352: same wrong premise — handler'd signals
+> never restart poll/ppoll/pselect (all -EINTR under SA_RESTART,
+> host-verified). What remains valid: the wait_tv/writeback
+> machinery — Linux's poll_select_copy_remaining DOES write the
+> remaining time to tsp on the -EINTR return, and the stop/cont
+> replay re-reads it; that part survives unchanged.
 - Linux splits the family: poll stashes the expiry kernel-side
   (restart_block->poll -> do_restart_poll), while pselect6/ppoll/
   select write REMAINING time into the user tsp/tv before
@@ -9374,3 +9392,111 @@ scope.
   the wait_tv trio. INFO: fd_ppoll gained fd_poll's post-arm
   readiness recheck (pre-existing scan->arm wake race); tsp now
   range_ok_w (Linux EFAULTs an unwritable tsp); comments corrected.
+
+## run-352 — signal-restart semantics correction: handler'd signals NEVER restart
+
+- PIVOTED mid-rung. Original scope was extending the run-350/351
+  remainder-resume to futex/futex_waitv/semtimedop. Empirical host
+  testing + kernel source proved the entire premise wrong: on real
+  Linux a signal that runs a handler NEVER restarts a sleep/poll/
+  select/futex/SysV-IPC wait — SA_RESTART or not. handle_signal
+  (arch/x86/kernel/signal.c) maps -ERESTART_RESTARTBLOCK and
+  -ERESTARTNOHAND to -EINTR unconditionally once a handler ran;
+  only -ERESTARTSYS+SA_RESTART and -ERESTARTNOINTR replay orig
+  args. The restart_block machinery serves ONLY the no-handler
+  path — arch_do_signal_or_restart's bottom branch replays on
+  SIGSTOP->SIGCONT resume (that's the restart_syscall strace line).
+- Host-verified semantics (each measured on this machine):
+  * nanosleep/poll/ppoll/pselect/epoll/TIMED-futex_wait/
+    semtimedop/msgrcv/msgsnd under SA_RESTART handler -> -1 EINTR
+    ~400ms (never restarted; strace shows ERESTART_RESTARTBLOCK
+    armed but no restart_syscall).
+  * The futex class splits: UNTIMED futex_wait is -ERESTARTSYS
+    (SA_RESTART DOES restart it — host-measured r=0 past the
+    signal) and futex_waitv is -ERESTARTSYS unconditionally
+    (restarted too — orig-args replay re-reads the abstime and
+    lands the same expiry). Only a TIMED futex_wait arms the
+    restart_block that never restarts under a handler.
+  * read/recv on pipes/sockets DO restart under SA_RESTART
+    (ERESTARTSYS class — unchanged, already correct).
+  * semtimedop expiry errno is -EAGAIN (pre-existing -ETIME
+    divergence fixed in poll_expire; host-verified).
+  * glibc pselect/ppoll shield tsp by copying to a local —
+    the kernel writeback hits the wrapper's private buffer;
+    only raw syscalls observe it (verified).
+  * Stop/cont (NO handler) differs: nanosleep/poll/futex/
+    msgrcv RESUME on SIGCONT; epoll/semop/semtimedop and
+    socket-timeout waits get EINTR.
+- What landed: wait_restartable trimmed to the ERESTARTSYS set
+  (sockets/pipes/wait4/mq/locks/devices + FutexV + untimed Futex
+  via a wait_deadline==0 arm-site guard — unchanged Linux-correct
+  replay); NEW wait_stop_resumable = {Timer, Poll, Pselect,
+  timed-Futex, MsgRcv, MsgSnd} arms restart_nr + the deadline stash
+  ONLY for default-stop signals (deliverable_now && SIG_DFL &&
+  sig_default_stop) — exactly where Linux's restart_block applies.
+  Epoll/SemOp excluded from both sets: they resume into the
+  pre-deposited -EINTR on CONT, matching Linux's stop-EINTR list.
+- Stash machinery retained from 350/351 (restart_at/rt/rip/knr,
+  timer_restart for the nanosleep family, restart_deadline for
+  fd_poll/fd_ppoll/sys_futex/futex_wait + sleep_ms) — re-armed
+  under the stop-only gate. Replays resume to the ORIGINAL
+  absolute expiry (Linux restart_block stores expires), so a
+  2s wait stopped at ~400ms completes ~2s from entry, not +2s.
+- CORRECTNESS FIX beyond the reversal: a handler'd signal pushed
+  over an already-applied stop replay (CONT resumed the task and
+  restart_apply rewound rip, then a pending caught signal
+  delivered before the replayed insn ran) previously left the
+  saved UCtx rewound -> sigreturn re-ran a fresh full wait. Both
+  frame-push sites now convert exactly like handle_signal: the
+  frame's saved ctx gets rip advanced past the insn + rax=-EINTR,
+  and the stash disarms (nested same-insn sleep can't steal it).
+- Tests rewritten to the measured semantics (pgtest/ft2test/
+  semtest): SA_RESTART nanosleep/poll/ppoll/futex/futex_waitv/
+  semtimedop all assert -1 EINTR at ~400ms (the old remainder-
+  window assertions asserted semantics Linux lacks); nanosleep
+  EINTR still fills rem (the -EINTR-path remainder fill IS real
+  Linux). NEW stop/cont checks: poll+nanosleep stopped ~400ms,
+  CONT'd at ~600ms, assert r==0 at ~2s total — discriminates
+  resume (correct) vs EINTR (no arm) vs ~2.6s orig-args replay.
+- cve-now sweep: futex/semtimedop/signal-restart classes — no
+  applicable CVEs (CVE-2026-93241 is memcg/oom-reaper, structurally
+  absent).
+- Gates: PASS 127 tasks zero leak, zero FAIL, all rewritten + new
+  checks green (gate-352e).
+- Audit (run-110, scoped quick): FIX-BEFORE-COMMIT — hunter found
+  F1 (futex_waitv consumed stash after fallible validation ->
+  hoisted, matching every other site) and F2 (SemOp made
+  restartable deviated from Linux — empirically confirmed
+  never-restart, reverted). The F2 investigation is what exposed
+  the whole premise error; the remainder-resume design was then
+  re-scoped to the stop/cont path as described above.
+- Audit tail on the final diff: hunter pass 2 found F1-HIGH —
+  restart_apply recorded restart_rip on EVERY replay incl.
+  orig-args replays with no consume site, so the frame-push
+  -EINTR conversion could fire on a stale rip and corrupt the
+  saved ctx (fixed: rip recorded only when restart_at != 0 —
+  restart_rip != 0 now <=> an applied stash replay); F2-MEDIUM —
+  the futex class split (untimed -ERESTARTSYS, waitv always
+  -ERESTARTSYS, timed restart_block) host-re-verified and
+  re-classified; F3-LOW elapsed stash slept one extra tick in
+  poll/ppoll (prompt-0 returns added); F4-LOW NT sleep_ms armed a
+  stash with no consumer (timer_restart consume added; NT's ()
+  ABI discards the EINTR — signal still delivers on exit);
+  F5-LOW documented (insn-read failure during a stop degrades a
+  legal resume to -EINTR — exotic munmap-during-stop edge).
+  Coverage-critic PASS (all fixes verified in code; noted the
+  conversion path needed a test — added: cont+pending-handler
+  poll -> EINTR, plus stop/cont epoll -> EINTR). Fresh verifier
+  found one more MEDIUM — a siglongjmp-abandoned handler leaks the
+  armed restart_nr, and a LATER frame's sigreturn replayed the
+  stale nr onto foreign args (pre-existing hole this diff widened:
+  never-restart waits no longer overwrite the slot). Fixed by
+  Task.restart_asite — the arm records the interrupted ctx's
+  post-insn rip and restart_apply refuses on a mismatched frame
+  (a same-site later frame is same-nr by libc's per-wrapper insns,
+  so legitimate replay is preserved).
+- Gates: PASS 127 tasks zero leak, zero FAIL, all rewritten + new
+  checks green (gate-352j); the earlier "pause() interrupted"
+  hang was a pre-existing test race (handler landing in the
+  >20ms fork->pause window) — hardened to skip pause when the
+  handler already ran.

@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**495 unique CVEs recorded.**
+**496 unique CVEs recorded.**
 
 ## klib ports
 
@@ -765,6 +765,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-90305 | POSIX per-process timers (timer_create 222 / timer_settime 223 / timer_gettime 224 / time… | audit run-75 scoped quick (security-audit skill): 0 confirmed, 4 in-run fixes (expire tgid guard vs pid reuse, orphaned-slot release at exec+reap, disarmed-gettime stale deadline,… |
 | CVE-2026-93191 | SysV message queues (msgget 68 / msgsnd 69 / msgrcv 70 / msgctl 71): gen<<16 | ), E2BIG consumes like Linux, MSG_NOERROR truncates, ENOMSG NOWAIT, buffer range_ok_w'd up-front. msgctl — IPC_STAT writes msqid_ds fields into range_ok_w'd buf, IPC_SET accepts m… |
 | CVE-2026-93191 | SysV message queues (msgget 68 / msgsnd 69 / msgrcv 70 / msgctl 71): gen<<16 | ), E2BIG consumes like Linux, MSG_NOERROR truncates, ENOMSG NOWAIT, buffer range_ok_w'd up-front. msgctl — IPC_STAT writes msqid_ds fields into range_ok_w'd buf, IPC_SET accepts m… |
+| CVE-2026-93241 | signal-restart semantics CORRECTION — runs 350/351's remainder-resume premise was wrong:… | audit run-110 scoped quick (security-audit skill): hunter VERDICT FIX — F1 futex_waitv stash consumed after fallible validation (hoisted to entry, matching all other sites), F2 Se… |
 | CVE-2026-93243 | Small-classics trio: getdents(78) + setrlimit(160) + syslog(103). getdents: fd_getdents g… | audit run-79 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-74359, CVE-2025-38051, CVE-2017-1000365, CVE-2008-1294, CVE-2026-98127, CVE-2026-93243 — c… |
 | CVE-2026-93243 | Small-classics trio: getdents(78) + setrlimit(160) + syslog(103). getdents: fd_getdents g… | audit run-79 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-74359, CVE-2025-38051, CVE-2017-1000365, CVE-2008-1294, CVE-2026-98127, CVE-2026-93243 — c… |
 | CVE-2026-97986 | virtio-input rung (/dev/input/event0 device events): virtio.rs gains virtio-input — DEV_V… | audit run-38 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2026-97986, CVE-2026-97987, CVE-2026-13216 — handled or n/a. Verified: make run exit 33, 78 tas… |
