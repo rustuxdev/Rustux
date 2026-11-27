@@ -186,16 +186,37 @@ int main(void) {
 
     // --- ETIMEDOUT on a blocking receive
     struct timespec dl;
-    clock_gettime(CLOCK_REALTIME, &dl);
-    dl.tv_nsec += 30 * 1000000L;
+    struct sigaction al;
+    memset(&al, 0, sizeof al);
+    al.sa_sigaction = handler;
+    al.sa_flags = SA_SIGINFO;
+    sigaction(SIGALRM, &al, NULL);
     mq_getattr(q, &at);
     while (at.mq_curmsgs > 0) { // drain leftovers for the empty case
         mq_receive(q, buf, sizeof buf, &prio);
         mq_getattr(q, &at);
     }
-    errno = 0;
-    check(mq_timedreceive(q, buf, sizeof buf, &prio, &dl) == -1
-          && errno == ETIMEDOUT, "empty + abstime ETIMEDOUT");
+    /* SIGALRM-bounded: a concurrent writer's backward clock jump
+       legitimately stretches an epoch abstime (Linux's realtime
+       rebase) — the alarm interrupts the wait and the retry
+       re-anchors on the settled wall. */
+    int trc = -1;
+    for (int tr = 0; tr < 4; tr++) {
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += 30 * 1000000L;
+        if (dl.tv_nsec >= 1000000000L) {
+            dl.tv_sec++;
+            dl.tv_nsec -= 1000000000L;
+        }
+        alarm(1);
+        errno = 0;
+        trc = mq_timedreceive(q, buf, sizeof buf, &prio, &dl);
+        alarm(0);
+        if (!(trc < 0 && errno == EINTR))
+            break;
+    }
+    check(trc == -1 && errno == ETIMEDOUT,
+          "empty + abstime ETIMEDOUT");
 
     // --- mq_notify edge + once semantics
     struct sigaction sa;

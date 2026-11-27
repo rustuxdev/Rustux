@@ -107,9 +107,11 @@ int main(void) {
     check(syscall(SYS_futex_waitv, v, 2, 0, &ts, 1) < 0
           && errno == ETIMEDOUT, "waitv 60ms deadline ETIMEDOUT");
     // ---- REALTIME deadline ----
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 50000000;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    /* epoch-past arm: deterministic ETIMEDOUT under any suite-written
+       wall — a forward arm legitimately slides on a concurrent
+       writer's backward jump (Linux's realtime rebase). */
+    ts.tv_sec = 1;
+    ts.tv_nsec = 0;
     errno = 0;
     check(syscall(SYS_futex_waitv, v, 2, 0, &ts, 0) < 0
           && errno == ETIMEDOUT, "waitv REALTIME deadline ETIMEDOUT");

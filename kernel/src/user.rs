@@ -1060,6 +1060,10 @@ struct Timerfd {
     expirations: u64,
     nonblock: bool,
     clockid: u64,
+    /// TFD_TIMER_CANCEL_ON_SET: a discontinuous clock change cancels
+    /// the armed timer — read() then answers ECANCELED until re-armed.
+    cancel_on_set: bool,
+    canceled: bool,
 }
 
 static mut TIMERFDS: [Option<Timerfd>; MAX_TIMERFDS] =
@@ -2581,6 +2585,12 @@ pub struct Task {
 
     /// apic::TICKS deadline for a timed Poll wait — 0 means none.
     wait_deadline: u64,
+    /// wait_deadline's anchor: true = converted from a CLOCK_REALTIME
+    /// epoch abstime (slide_realtime_deadlines shifts it on
+    /// clock_settime jumps like Linux's realtime-hrtimer rebase);
+    /// false = relative/MONOTONIC (immune). Written at every
+    /// Timer/Futex-arm site so it can never go stale.
+    wait_rt: bool,
     /// Syscall nr to replay when an SA_RESTART-handled (or
     /// default-stop) signal interrupted a restartable wait —
     /// u64::MAX = none. The sleeper still gets -EINTR deposited so
@@ -8467,6 +8477,7 @@ fn load(img: &[u8]) -> Option<Task> {
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
+        wait_rt: false,
         restart_nr: u64::MAX,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
@@ -10820,8 +10831,30 @@ pub fn sys_clock_settime(clk: u64, ts: u64) -> u64 {
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return EINVAL;
     }
-    crate::rtc::set_wall(sec as u64);
+    wall_set(sec as u64);
     0
+}
+
+/// Shared wall-clock write: rtc::set_wall plus the realtime
+/// deadline rebase a discontinuous set owes every CLOCK_REALTIME
+/// abstime armed against the old epoch (Linux slides its realtime
+/// hrtimer bases; an armed deadline keeps pointing at the same
+/// epoch instant across the jump).
+fn wall_set(sec: u64) {
+    let (old, _) = crate::rtc::wall_now();
+    crate::rtc::set_wall(sec);
+    let (new, _) = crate::rtc::wall_now();
+    // Sec-resolution delta in 100 Hz ticks, i128-clamped so an
+    // absurd epoch can't wrap the i64 slide.
+    let d = (new.min(i64::MAX as u64) as i128)
+        - (old.min(i64::MAX as u64) as i128);
+    slide_realtime_deadlines(
+        (d * 100).clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+    );
+    // A forward jump can push armed deadlines into the past —
+    // service them now rather than at the next tick.
+    timerfd_expire();
+    ptimer_expire();
 }
 
 /// process_vm_readv/writev shared walk: copy between the caller's
@@ -11208,7 +11241,7 @@ pub fn sys_settimeofday(tv: u64, tz: u64) -> u64 {
     if sec < 0 || !(0..1_000_000).contains(&usec) {
         return EINVAL;
     }
-    crate::rtc::set_wall(sec as u64);
+    wall_set(sec as u64);
     0
 }
 
@@ -15516,6 +15549,7 @@ pub fn sys_nanosleep32(ctx: &mut UCtx, req: u64, rem: u64) -> u64 {
     t.wait_on = WaitOn::Timer;
     t.wait_ptr = 0; // no 64-bit remainder buffer to fill
     t.wait_ptr2 = 0;
+    t.wait_rt = false; // relative ticks — no clock_settime slide
     t.wait_deadline = crate::apic::TICKS
         .load(core::sync::atomic::Ordering::Relaxed)
         .saturating_add(ticks);
@@ -19402,6 +19436,7 @@ pub fn sys_nanosleep(ctx: &mut UCtx, req: u64, rem: u64) -> u64 {
     // deadline wake leaves it untouched.
     t.wait_ptr = rem;
     t.wait_ptr2 = 0; // kernel-style -errno returns
+    t.wait_rt = false; // relative ticks — no clock_settime slide
     t.wait_deadline = crate::apic::TICKS
         .load(core::sync::atomic::Ordering::Relaxed)
         .saturating_add(ticks);
@@ -19464,6 +19499,9 @@ pub fn sys_clock_nanosleep(
     t.wait_on = WaitOn::Timer;
     t.wait_ptr = rem;
     t.wait_ptr2 = 0; // kernel-style -errno wake
+    t.wait_rt = flags & 1 != 0 && clk == 0; // RT abstime follows wall jumps
+                                            // (relative-RT sleeps not slid —
+                                            // divergence vs Linux's base rebase)
     t.wait_deadline = now.saturating_add(ticks);
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
@@ -21101,6 +21139,7 @@ pub fn nt_thread_create(
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
+        wait_rt: false,
         restart_nr: u64::MAX,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
@@ -22176,6 +22215,7 @@ pub fn sleep_ms(ctx: &mut UCtx, ms: u64) {
     t.wait_on = WaitOn::Timer;
     t.wait_ptr = 0;
     t.wait_ptr2 = 0;
+    t.wait_rt = false; // NT delays are relative
     t.wait_deadline = crate::apic::TICKS
         .load(core::sync::atomic::Ordering::Relaxed)
         .saturating_add(ticks);
@@ -28889,7 +28929,9 @@ fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
                 Some(tf) => {
                     let now = crate::apic::TICKS
                         .load(core::sync::atomic::Ordering::Relaxed);
-                    if tf.expirations > 0 || (tf.armed && tf.deadline <= now) {
+                    if tf.canceled {
+                        POLLERR // canceled on a discontinuous clock set
+                    } else if tf.expirations > 0 || (tf.armed && tf.deadline <= now) {
                         POLLIN
                     } else {
                         0
@@ -29207,6 +29249,9 @@ pub fn sys_futex(
                 return (-4i64) as u64; // -EINTR before sleep
             }
             t.wait_on = WaitOn::Futex(uaddr);
+            // BITSET under FUTEX_CLOCK_REALTIME(0x100) carries an
+            // epoch deadline that must follow clock_settime jumps.
+            t.wait_rt = deadline != 0 && op & 0x7f == 9 && op & 0x100 != 0;
             t.wait_deadline = deadline;
             t.ctx = *ctx;
             t.state = TaskState::Blocked;
@@ -29306,6 +29351,7 @@ pub fn sys_futex_waitv(
     t.wait_on = WaitOn::FutexV;
     t.wait_ptr = waiters;
     t.wait_len = nr;
+    t.wait_rt = deadline != 0 && clockid == 0; // REALTIME abstime
     t.wait_deadline = deadline;
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
@@ -29371,6 +29417,7 @@ pub fn sys_futex_wait(
         return (-4i64) as u64; // -EINTR before sleep
     }
     t.wait_on = WaitOn::Futex(uaddr);
+    t.wait_rt = deadline != 0 && clockid == 0; // REALTIME abstime
     t.wait_deadline = deadline;
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
@@ -31375,6 +31422,8 @@ pub fn fd_timerfd_create(clockid: u64, flags: u64) -> u64 {
         expirations: 0,
         nonblock: flags & TFD_NONBLOCK != 0,
         clockid,
+        cancel_on_set: false,
+        canceled: false,
     });
     let fd = anon_fd(FdKind::Timerfd(i), flags & TFD_CLOEXEC != 0);
     if (fd as i64) < 0 {
@@ -31436,7 +31485,9 @@ fn abstime_deadline(clockid: u64, sec: i64, nsec: i64) -> u64 {
 /// absolute ns-since-boot deadline.
 pub fn fd_timerfd_settime(fd: u64, flags: u64, new: u64, old: u64) -> u64 {
     const TFD_ABSTIME: u64 = 1;
-    if flags & !TFD_ABSTIME != 0 {
+    // TFD_TIMER_ABSTIME(1) | TFD_TIMER_CANCEL_ON_SET(2); Linux
+    // rejects CANCEL_ON_SET without ABSTIME.
+    if flags & !3 != 0 || (flags & 2 != 0 && flags & 1 == 0) {
         return EINVAL;
     }
     if new == 0 {
@@ -31471,6 +31522,11 @@ pub fn fd_timerfd_settime(fd: u64, flags: u64, new: u64, old: u64) -> u64 {
     let Some(tf) = tfs.get_mut(i).and_then(|s| s.as_mut()) else {
         return EINVAL;
     };
+    // TFD_TIMER_CANCEL_ON_SET only exists on CLOCK_REALTIME fds —
+    // Linux EINVALs it on MONOTONIC (nothing can jump).
+    if flags & 2 != 0 && tf.clockid != 0 {
+        return EINVAL;
+    }
     if old != 0 {
         // Prior interval + remaining time to the old deadline.
         let rem = if tf.armed { tf.deadline.saturating_sub(now) } else { 0 };
@@ -31485,6 +31541,8 @@ pub fn fd_timerfd_settime(fd: u64, flags: u64, new: u64, old: u64) -> u64 {
         }
     }
     tf.interval = ns_to_ticks(isec, insec);
+    tf.cancel_on_set = flags & 2 != 0;
+    tf.canceled = false; // a re-arm clears a prior cancellation
     if vsec == 0 && vnsec == 0 {
         tf.armed = false; // disarm — pending expirations survive
     } else {
@@ -31547,6 +31605,12 @@ fn timerfd_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
     let Some(tf) = tfs.get_mut(i).and_then(|s| s.as_mut()) else {
         return EBADF;
     };
+    if tf.canceled {
+        // TFD_TIMER_CANCEL_ON_SET: a discontinuous clock change
+        // marked this armed timer — reads report the cancellation
+        // until a settime re-arms (Linux's ECANCELED contract).
+        return (-125i64) as u64;
+    }
     if tf.expirations == 0 {
         if tf.nonblock {
             return EAGAIN;
@@ -32811,6 +32875,7 @@ pub fn sys_mq_getsetattr(fd: u64, new: u64, old: u64) -> u64 {
 
 pub fn timerfd_expire() {
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let mut fired = false;
     {
         let tfs = unsafe { &mut *core::ptr::addr_of_mut!(TIMERFDS) };
         for (ti, tf) in tfs.iter_mut().enumerate() {
@@ -32818,6 +32883,7 @@ pub fn timerfd_expire() {
             if !tf.armed || tf.deadline > now {
                 continue;
             }
+            fired = true;
             if tf.interval == 0 {
                 tf.expirations = tf.expirations.saturating_add(1);
                 tf.armed = false;
@@ -32856,6 +32922,90 @@ pub fn timerfd_expire() {
         t.wait_on = WaitOn::None;
         t.state = TaskState::Runnable;
     }
+    if fired {
+        // A fresh expiration makes the fd POLLIN — wake blocked
+        // poll/pselect/epoll waiters (gated: this runs every tick).
+        wake_pollers();
+    }
+}
+
+/// clock_settime/settimeofday's discontinuous wall change: slide
+/// every CLOCK_REALTIME-anchored deadline by the epoch delta,
+/// matching Linux's realtime-hrtimer rebase. delta_ticks > 0 = the
+/// clock moved forward (deadlines come due sooner, past ones fire
+/// next tick); < 0 = backward (deadlines stretch later). Armed
+/// CANCEL_ON_SET timerfds are instead marked canceled and their
+/// blocked readers woken with -ECANCELED. MONOTONIC- and
+/// relative-anchored waits never move.
+fn slide_realtime_deadlines(delta: i64) {
+    // No delta==0 early-out: Linux's clock_was_set fires on EVERY
+    // clock_settime(CLOCK_REALTIME) — even a no-change set cancels
+    // CANCEL_ON_SET timerfds.
+    let slide = |d: u64| -> u64 {
+        if delta > 0 {
+            d.saturating_sub(delta as u64)
+        } else {
+            d.saturating_add(delta.unsigned_abs())
+        }
+    };
+    {
+        let tfs = unsafe { &mut *core::ptr::addr_of_mut!(TIMERFDS) };
+        for (ti, tf) in tfs.iter_mut().enumerate() {
+            let Some(tf) = tf.as_mut() else { continue };
+            if !tf.armed || tf.clockid != 0 {
+                continue;
+            }
+            if tf.cancel_on_set {
+                tf.canceled = true;
+                tf.armed = false;
+                // Readiness flipped to POLLERR — unlatch level-triggered
+                // epoll entries so they re-report it.
+                epoll_edge(&FdKind::Timerfd(ti));
+            } else {
+                tf.deadline = slide(tf.deadline);
+            }
+        }
+        let pts = unsafe { &mut *core::ptr::addr_of_mut!(PTIMERS) };
+        for p in pts.iter_mut().flatten() {
+            if p.armed && p.clockid == 0 {
+                p.deadline = slide(p.deadline);
+            }
+        }
+    }
+    // Task waits: mq_timed* waits are ALWAYS CLOCK_REALTIME abstime;
+    // Timer/Futex waits flag their epoch anchor in wait_rt at arm.
+    // Blocked Timerfd readers of a canceled fd get -ECANCELED.
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let tfs = unsafe { &*core::ptr::addr_of!(TIMERFDS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked {
+            continue;
+        }
+        match t.wait_on {
+            WaitOn::Timerfd(i) => {
+                if tfs.get(i).and_then(|x| x.as_ref()).is_some_and(|f| f.canceled) {
+                    t.ctx.rax = (-125i64) as u64; // -ECANCELED
+                    t.wait_on = WaitOn::None;
+                    t.state = TaskState::Runnable;
+                }
+            }
+            WaitOn::MqSnd(_) | WaitOn::MqRcv(_) => {
+                if t.wait_deadline != 0 {
+                    t.wait_deadline = slide(t.wait_deadline);
+                }
+            }
+            WaitOn::Timer | WaitOn::Futex(_) | WaitOn::FutexV
+                if t.wait_rt && t.wait_deadline != 0 =>
+            {
+                t.wait_deadline = slide(t.wait_deadline);
+            }
+            _ => {}
+        }
+    }
+    // POLLERR on a canceled timerfd wakes blocked poll/pselect/epoll
+    // waiters just like a newly-ready fd does.
+    wake_pollers();
 }
 
 /// Scan one task's three pselect fd_sets through ITS page tables,
@@ -40746,6 +40896,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
+        wait_rt: false,
         restart_nr: u64::MAX,
         // Dispositions inherit across fork (the Linux semantic);
         // the pending set does not.
@@ -40964,6 +41115,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
+        wait_rt: false,
         restart_nr: u64::MAX,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],

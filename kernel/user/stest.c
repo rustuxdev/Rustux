@@ -131,14 +131,21 @@ int main(void) {
           "bad head ptr -> EFAULT");
 
     // --- settimeofday: same wall write as clock_settime.
+    struct timespec save;
+    clock_gettime(CLOCK_REALTIME, &save);
     struct timeval tv = { .tv_sec = 1740000000, .tv_usec = 500000 };
     check(syscall(SYS_settimeofday, &tv, 0) == 0, "settimeofday ok");
     struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
-    // pmvtest also writes the shared wall clock (1730000000) —
-    // cover either epoch so the check is order-independent.
-    check(now.tv_sec >= 1730000000 && now.tv_sec < 1740000100,
-          "wall clock moved");
+    /* pmvtest writes 1730000000 and iotest jumps wall-relative —
+       a foreign write can land between our set and this read.
+       Re-write + re-read until it lands in the writer window. */
+    int epoch_ok = 0;
+    for (int tr = 0; tr < 4 && !epoch_ok; tr++) {
+        syscall(SYS_settimeofday, &tv, 0);
+        clock_gettime(CLOCK_REALTIME, &now);
+        epoch_ok = now.tv_sec >= 1730000000 && now.tv_sec < 1740000100;
+    }
+    check(epoch_ok, "wall clock moved");
     struct timeval bad = { .tv_sec = 1, .tv_usec = 1000000 };
     errno = 0;
     check(syscall(SYS_settimeofday, &bad, 0) == -1 && errno == EINVAL,
@@ -146,6 +153,12 @@ int main(void) {
     struct timezone tz = { .tz_minuteswest = 0, .tz_dsttime = 0 };
     check(syscall(SYS_settimeofday, 0, &tz) == 0,
           "tv NULL tz-only form -> 0");
+    // restore a sane wall clock — an armed CLOCK_REALTIME abstime
+    // elsewhere in the suite keeps tracking its epoch instant, so
+    // leaving the wall at 1740000000 stretches every forward arm.
+    syscall(SYS_settimeofday,
+            &(struct timeval){ .tv_sec = save.tv_sec,
+                               .tv_usec = save.tv_nsec / 1000 }, 0);
 
     // --- syncfs: fd gate + inert.
     fd = open("/tmp_st_syncfs", O_CREAT | O_RDWR, 0644);

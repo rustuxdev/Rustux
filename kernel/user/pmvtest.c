@@ -125,12 +125,17 @@ int main(void) {
     struct timespec want = { .tv_sec = 1730000000, .tv_nsec = 0 };
     check(syscall(SYS_clock_settime, CLOCK_REALTIME, &want) == 0,
           "clock_settime REALTIME ok");
-    clock_gettime(CLOCK_REALTIME, &now);
-    // stest also writes the shared wall clock (1740000000) — its
-    // write can land between our settime and this read, so the
-    // window covers either epoch.
-    check(now.tv_sec >= 1730000000 && now.tv_sec < 1740000100,
-          "wall clock reports the new epoch");
+    /* stest writes 1740000000 and iotest jumps the wall by its own
+       epoch-relative deltas — a foreign write can land between our
+       settime and this read. Re-write + re-read until it lands in
+       the writer window: converges on a settled wall. */
+    int epoch_ok = 0;
+    for (int tr = 0; tr < 4 && !epoch_ok; tr++) {
+        syscall(SYS_clock_settime, CLOCK_REALTIME, &want);
+        clock_gettime(CLOCK_REALTIME, &now);
+        epoch_ok = now.tv_sec >= 1730000000 && now.tv_sec < 1740000100;
+    }
+    check(epoch_ok, "wall clock reports the new epoch");
     errno = 0;
     check(syscall(SYS_clock_settime, CLOCK_MONOTONIC, &want) == -1
               && errno == EINVAL,

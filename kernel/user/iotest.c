@@ -469,6 +469,17 @@ int main(void) {
         struct timespec aw;
         clock_gettime(CLOCK_MONOTONIC, &aw);
         memset(&its, 0, sizeof(its));
+        its.it_value.tv_sec = aw.tv_sec + 2;
+        its.it_value.tv_nsec = aw.tv_nsec;
+        check(timerfd_settime(tfd, TFD_TIMER_ABSTIME, &its, NULL) == 0,
+              "timerfd mono ABSTIME arm +2s");
+        /* gettime must show remaining > 0 -- a REALTIME collapse
+           reads mono-now as epoch-past, fires at once, disarms.
+           +2s margin: a host-side VM pause must not expire
+           the probe deadline. */
+        check(timerfd_gettime(tfd, &cur) == 0 &&
+              (cur.it_value.tv_sec > 0 || cur.it_value.tv_nsec > 0),
+              "mono abstime still pending");
         its.it_value.tv_sec = aw.tv_sec;
         its.it_value.tv_nsec = aw.tv_nsec + 40000000;
         if (its.it_value.tv_nsec >= 1000000000L) {
@@ -477,17 +488,28 @@ int main(void) {
         }
         check(timerfd_settime(tfd, TFD_TIMER_ABSTIME, &its, NULL) == 0,
               "timerfd mono ABSTIME +40ms");
-        /* gettime must show remaining > 0 -- a REALTIME collapse
-           reads mono-now as epoch-past, fires at once, disarms. */
-        check(timerfd_gettime(tfd, &cur) == 0 &&
-              (cur.it_value.tv_sec > 0 || cur.it_value.tv_nsec > 0),
-              "mono abstime still pending");
         ev = 0;
-        check(read(tfd, &ev, 8) == 8 && ev == 1,
+        /* a pending SIGCHLD (the suite forks constantly) can EINTR
+           the blocking read -- the timer already fired, so a retry
+           returns the count at once. */
+        long rd = -1;
+        for (int tr = 0; tr < 4; tr++) {
+            errno = 0;
+            rd = read(tfd, &ev, 8);
+            if (rd >= 0 || errno != EINTR)
+                break;
+        }
+        check(rd == 8 && ev == 1,
               "timerfd mono abstime fires");
+        /* CANCEL_ON_SET is only valid on CLOCK_REALTIME fds --
+           a MONOTONIC clock cannot jump, Linux EINVALs. */
+        errno = 0;
+        check(timerfd_settime(tfd, TFD_TIMER_ABSTIME |
+              TFD_TIMER_CANCEL_ON_SET, &its, NULL) < 0 &&
+              errno == EINVAL, "CANCEL_ON_SET on mono EINVAL");
         close(tfd);
 
-        int rtfd = timerfd_create(CLOCK_REALTIME, 0);
+        int rtfd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
         check(rtfd >= 0, "timerfd_create REALTIME");
         clock_gettime(CLOCK_REALTIME, &aw);
         memset(&its, 0, sizeof(its));
@@ -499,9 +521,30 @@ int main(void) {
         }
         check(timerfd_settime(rtfd, TFD_TIMER_ABSTIME, &its, NULL) == 0,
               "timerfd RT ABSTIME +40ms");
+        /* A concurrent writer jumping the wall backward legitimately
+           stretches an epoch abstime (Linux's realtime rebase) --
+           re-anchor fresh each try so the probe converges instead of
+           hanging on a sliding deadline. */
+        int fired = 0;
+        for (int tr = 0; tr < 4 && !fired; tr++) {
+            struct pollfd rpfd = { rtfd, POLLIN, 0 };
+            fired = (poll(&rpfd, 1, 300) == 1);
+            if (!fired) {
+                clock_gettime(CLOCK_REALTIME, &aw);
+                memset(&its, 0, sizeof(its));
+                its.it_value.tv_sec = aw.tv_sec;
+                its.it_value.tv_nsec = aw.tv_nsec + 40000000;
+                if (its.it_value.tv_nsec >= 1000000000L) {
+                    its.it_value.tv_sec++;
+                    its.it_value.tv_nsec -= 1000000000L;
+                }
+                timerfd_settime(rtfd, TFD_TIMER_ABSTIME, &its, NULL);
+            }
+        }
+        check(fired, "timerfd RT abstime fires");
         ev = 0;
-        check(read(rtfd, &ev, 8) == 8 && ev == 1,
-              "timerfd RT abstime fires");
+        check(read(rtfd, &ev, 8) == 8 && ev >= 1,
+              "timerfd RT abstime count");
         /* An epoch instant already past expires immediately —
            pre-fix this slept for ~54 years of boot ticks. */
         its.it_value.tv_sec = aw.tv_sec - 5;
@@ -512,6 +555,92 @@ int main(void) {
         check(read(rtfd, &ev, 8) == 8 && ev == 1,
               "timerfd RT past fires at once");
         close(rtfd);
+
+        /* Discontinuous clock_settime rebases armed REALTIME
+           abstime deadlines (Linux's realtime-hrtimer rebase) and
+           cancels TFD_TIMER_CANCEL_ON_SET arms. pmvtest/stest also
+           write the shared wall -- the checks are built so an
+           interleaved writer can only perturb remaining, not the
+           verdict. */
+        int wfd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
+        check(wfd >= 0, "timerfd_create for clock jump");
+        struct timespec w0;
+        clock_gettime(CLOCK_REALTIME, &w0);
+        memset(&its, 0, sizeof(its));
+        its.it_value.tv_sec = w0.tv_sec + 3600;
+        errno = 0;
+        check(timerfd_settime(wfd, TFD_TIMER_CANCEL_ON_SET, &its,
+                              NULL) < 0 && errno == EINVAL,
+              "CANCEL_ON_SET w/o ABSTIME -> EINVAL");
+        check(timerfd_settime(wfd, TFD_TIMER_ABSTIME|
+                              TFD_TIMER_CANCEL_ON_SET, &its,
+                              NULL) == 0, "arm CANCEL_ON_SET");
+        struct timespec jump = { w0.tv_sec + 5, 0 };
+        check(syscall(SYS_clock_settime, CLOCK_REALTIME, &jump) == 0,
+              "clock_settime jump");
+        errno = 0;
+        ev = 0;
+        int rr = read(wfd, &ev, 8);
+        int rerr = errno;
+        check(rr < 0 && rerr == ECANCELED,
+              "canceled timerfd read -> ECANCELED");
+        /* A re-arm clears the cancellation, then a +120s jump makes
+           the +60s abstime already past: read fires at once. A
+           FOREIGN writer jumping the wall mid-sequence can re-future
+           the deadline -- each retry re-anchors on the settled wall. */
+        int rebased = 0;
+        for (int tr = 0; tr < 4 && !rebased; tr++) {
+            clock_gettime(CLOCK_REALTIME, &w0);
+            memset(&its, 0, sizeof(its));
+            its.it_value.tv_sec = w0.tv_sec + 60;
+            int armrc =
+                timerfd_settime(wfd, TFD_TIMER_ABSTIME, &its, NULL);
+            if (tr == 0)
+                check(armrc == 0, "re-arm clears cancel");
+            jump.tv_sec = w0.tv_sec + 120;
+            int jrc =
+                syscall(SYS_clock_settime, CLOCK_REALTIME, &jump);
+            if (tr == 0)
+                check(jrc == 0, "forward jump +120s");
+            ev = 0;
+            rebased = read(wfd, &ev, 8) == 8 && ev >= 1;
+        }
+        check(rebased, "RT abstime rebased -> fired early");
+        /* Backward jump stretches: a +30ms abstime must still show
+           ~3s remaining on gettime, then fire after the restore.
+           Retry-anchored -- a foreign write mid-sequence out-slides
+           the window; each retry re-reads the wall. */
+        int stretched = 0, backfired = 0, jumpok = 0;
+        struct timespec w1;
+        for (int tr = 0; tr < 4 && !(stretched && backfired); tr++) {
+            clock_gettime(CLOCK_REALTIME, &w1);
+            memset(&its, 0, sizeof(its));
+            its.it_value = w1;
+            its.it_value.tv_nsec += 30000000;
+            if (its.it_value.tv_nsec >= 1000000000L) {
+                its.it_value.tv_sec++;
+                its.it_value.tv_nsec -= 1000000000L;
+            }
+            int armrc =
+                timerfd_settime(wfd, TFD_TIMER_ABSTIME, &its, NULL);
+            if (tr == 0)
+                check(armrc == 0, "arm +30ms for backward jump");
+            struct timespec j2 = { w1.tv_sec - 3, 0 };
+            jumpok |= syscall(SYS_clock_settime, CLOCK_REALTIME,
+                              &j2) == 0;
+            timerfd_gettime(wfd, &cur);
+            stretched |= cur.it_value.tv_sec >= 1;
+            j2.tv_sec = w1.tv_sec;
+            syscall(SYS_clock_settime, CLOCK_REALTIME, &j2);
+            struct pollfd wpfd = { .fd = wfd, .events = POLLIN };
+            ev = 0;
+            backfired = poll(&wpfd, 1, 500) == 1 &&
+                        read(wfd, &ev, 8) == 8 && ev >= 1;
+        }
+        check(jumpok, "backward jump -3s");
+        check(stretched, "backward jump stretches deadline");
+        check(backfired, "stretched deadline fires after restore");
+        close(wfd);
         errno = 0;
         check(read(ep, &ec, 1) < 0 && errno == EINVAL,
               "epoll read -> EINVAL");

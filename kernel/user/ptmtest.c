@@ -140,7 +140,22 @@ int main(void) {
     hits = 0;
     check(timer_settime(tid, TIMER_ABSTIME, &it, NULL) == 0,
           "RT ABSTIME arm +30ms");
-    msleep(90);
+    /* A concurrent writer jumping the wall backward legitimately
+       stretches an epoch abstime (Linux's realtime rebase) —
+       re-anchor fresh each try so the probe converges instead of
+       flaking on a slid deadline. */
+    for (int tr = 0; tr < 4 && !hits; tr++) {
+        clock_gettime(CLOCK_REALTIME, &now);
+        memset(&it, 0, sizeof it);
+        it.it_value.tv_sec = now.tv_sec;
+        it.it_value.tv_nsec = now.tv_nsec + 30 * 1000 * 1000;
+        if (it.it_value.tv_nsec >= 1000000000L) {
+            it.it_value.tv_sec++;
+            it.it_value.tv_nsec -= 1000000000L;
+        }
+        timer_settime(tid, TIMER_ABSTIME, &it, NULL);
+        msleep(90);
+    }
     check(hits >= 1, "RT ABSTIME fired");
 
     // --- ABSTIME epoch-past fires immediately (pre-fix semantics
@@ -162,6 +177,17 @@ int main(void) {
           "create mono timer");
     check(clock_gettime(CLOCK_MONOTONIC, &now) == 0, "clock_gettime mono");
     memset(&it, 0, sizeof it);
+    it.it_value.tv_sec = now.tv_sec + 2;
+    it.it_value.tv_nsec = now.tv_nsec;
+    check(timer_settime(tid2, TIMER_ABSTIME, &it, NULL) == 0,
+          "mono ABSTIME arm +2s");
+    // gettime must show remaining > 0 — a REALTIME collapse reads
+    // mono-now as epoch-past, fires at once, disarms. +2s margin:
+    // a host-side VM pause must not expire the probe deadline.
+    check(timer_gettime(tid2, &cur) == 0 &&
+          (cur.it_value.tv_sec > 0 || cur.it_value.tv_nsec > 0),
+          "mono abstime still pending");
+    // re-arm +30ms for the fire check
     it.it_value.tv_sec = now.tv_sec;
     it.it_value.tv_nsec = now.tv_nsec + 30 * 1000 * 1000;
     if (it.it_value.tv_nsec >= 1000000000L) {
@@ -171,11 +197,6 @@ int main(void) {
     hits = 0;
     check(timer_settime(tid2, TIMER_ABSTIME, &it, NULL) == 0,
           "mono ABSTIME arm +30ms");
-    // gettime must show remaining > 0 — a REALTIME collapse reads
-    // mono-now as epoch-past, fires at once, disarms.
-    check(timer_gettime(tid2, &cur) == 0 &&
-          (cur.it_value.tv_sec > 0 || cur.it_value.tv_nsec > 0),
-          "mono abstime still pending");
     msleep(90);
     check(hits >= 1, "mono ABSTIME fired");
     check(timer_delete(tid2) == 0, "delete mono timer");
@@ -187,14 +208,23 @@ int main(void) {
     now.tv_nsec = 0;
     check(clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &now,
                           NULL) == 0, "cns RT abstime past -> 0");
-    clock_gettime(CLOCK_REALTIME, &now);
-    now.tv_nsec += 30 * 1000 * 1000;
-    if (now.tv_nsec >= 1000000000L) {
-        now.tv_sec++;
-        now.tv_nsec -= 1000000000L;
+    /* SIGALRM-bounded: a concurrent writer's backward jump stretches
+       an epoch abstime — the alarm interrupts the wait (EINTR) and
+       the retry re-anchors on the settled wall. */
+    int slept = 0;
+    for (int tr = 0; tr < 4 && !slept; tr++) {
+        clock_gettime(CLOCK_REALTIME, &now);
+        now.tv_nsec += 30 * 1000 * 1000;
+        if (now.tv_nsec >= 1000000000L) {
+            now.tv_sec++;
+            now.tv_nsec -= 1000000000L;
+        }
+        alarm(1);
+        slept = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME,
+                                &now, NULL) == 0;
+        alarm(0);
     }
-    check(clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &now,
-                          NULL) == 0, "cns RT abstime +30ms");
+    check(slept, "cns RT abstime +30ms");
     errno = 0;
     check(clock_nanosleep(9, 0, &now, NULL) == EINVAL,
           "cns bad clock EINVAL");
