@@ -750,6 +750,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_FUTEX_WAIT => user::sys_futex_wait(ctx, a1, a2, a3, a4, a5, a6),
         NR_FUTEX_REQUEUE => user::sys_futex_requeue(a1, a2, a3, a4),
         NR_MEMBARRIER => user::sys_membarrier(a1, a2, a3),
+        323 => user::sys_userfaultfd(a1),
         NR_MLOCK | NR_MUNLOCK => user::sys_mlock(a1, a2),
         NR_MLOCKALL => user::sys_mlockall(a1),
         NR_MUNLOCKALL => 0, // no args — rdi is user garbage

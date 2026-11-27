@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 124;
+const MAX_TASKS: usize = 125;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -383,6 +383,14 @@ enum WaitOn {
     /// the send waker delivers the highest-prio message through
     /// the sleeper's pml4 like MsgRcv.
     MqRcv(usize),
+    /// Blocked in fault_signal on a registered-missing page — the
+    /// faulting ctx is in t.ctx, the fault page in wait_ptr; a
+    /// UFFDIO_COPY/ZEROPAGE resolves + wakes, WAKE re-faults.
+    Uffd(usize),
+    /// read() on an empty userfaultfd event ring: wait_ptr is the
+    /// user msg buffer, wait_len its byte count — the event-post
+    /// waker deposits messages through the sleeper's pml4.
+    UffdRead(usize),
     /// mq_timedsend() on a full queue: the message was staged at
     /// arm — wait_ptr the kernel buf holding [prio][len][data],
     /// wait_len the staged size. A receive waker links it when
@@ -606,6 +614,9 @@ enum FdKind {
     /// URINGS[id]; the rings themselves are user memory (mapped
     /// private off this fd, VA recorded at mmap time).
     Uring(usize),
+    /// A userfaultfd — the range set + event ring live in UFFDS[id];
+    /// registration keys on the registering task's pml4.
+    Uffd(usize),
     /// A signalfd — the wait mask lives in SIGNALFDS[id]; reads
     /// dequeue the READER's pending signals in that mask.
     Signalfd(usize),
@@ -1635,10 +1646,23 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
 /// the fault-time context (re-faulting if unfixed, exactly like
 /// Linux). A default or ignored disposition dies synchronously —
 /// IGN on a synchronous fault can't resume (Linux force_sig).
-pub fn fault_signal(signo: u64, code: i32, addr: u64, ctx: &mut UCtx) -> (u64, u64, u64) {
+pub fn fault_signal(
+    signo: u64,
+    code: i32,
+    addr: u64,
+    pf_write: bool,
+    ctx: &mut UCtx,
+) -> (u64, u64, u64) {
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
     if let Some(t) = tasks.get_mut(cur).and_then(|s| s.as_mut()) {
+        // userfaultfd route: a registered-missing #PF posts a
+        // monitor event and sleeps the faulter instead of raising
+        // SIGSEGV — the resolver's UFFDIO_* wakes it to re-run.
+        // Diverges via block_switch on a route; MAPERR only.
+        if signo == 11 && code == 1 {
+            uffd_fault(t, addr, pf_write, ctx);
+        }
         // Caught dispositions take the frame path for both ABIs —
         // maybe_deliver builds the x86_64 frame or the i386 one.
         // A traced task takes the same route regardless of
@@ -1855,7 +1879,11 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
                 rax = 4;
             }
         }
-        t.ctx.rax = rax;
+        if !matches!(t.wait_on, WaitOn::Uffd(_)) {
+            // A uffd wait parks the FAULTING ctx — rax is a live
+            // user register there, not a syscall return slot.
+            t.ctx.rax = rax;
+        }
         // SigWait (pause/sigsuspend) ordering matters: the waking
         // signal must be DELIVERED while the temporary mask is still
         // installed — Linux runs the handler inside the suspend, then
@@ -3316,6 +3344,7 @@ impl Task {
         // A shared mm (CLONE_VM) outlives its users — only the last
         // one frees the mappings and the pml4 frame itself.
         if mm_release(self.pml4) {
+            uffd_drop_mm(self.pml4);
             self.free_user_mappings();
             kalloc::free_frame(self.pml4);
         }
@@ -14299,6 +14328,7 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 }
                 FdKind::Console => 0u64,
                 FdKind::Uring(_) => 0u64,
+                FdKind::Uffd(_) => 0u64,
                 FdKind::Mount(_) | FdKind::FsCtx(_) => 0u64,
                 FdKind::File(d) => d.len().saturating_sub(o.pos) as u64,
                 FdKind::Proc { len, .. } => {
@@ -14495,6 +14525,16 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             let v = unsafe { (arg as *const u32).read_unaligned() };
             o.nonblock = v != 0;
             0
+        }
+        // UFFDIO_* — the userfaultfd surface; the request type byte
+        // 0xAA selects it, the fd must be a Uffd like Linux's file-
+        // ops gate (ENOTTY on the wrong kind).
+        r if r >> 8 & 0xff == 0xAA => {
+            let uidx = match &o.kind {
+                FdKind::Uffd(i) => *i,
+                _ => return ENOTTY_,
+            };
+            uffd_ioctl(t, uidx, req, arg)
         }
         _ => ENOTTY_,
     }
@@ -15186,6 +15226,7 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         | FdKind::Signalfd(_)
         | FdKind::Inotify(_)
         | FdKind::Uring(_)
+        | FdKind::Uffd(_)
         | FdKind::Pidfd(_) => (0o20600, 0, 0),
         // mqds stat as fifos — the mqueue fs mints S_IFIFO inodes.
         FdKind::MQueue(_) => (0o10600, 0, 0),
@@ -22055,6 +22096,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         // pidfds are poll-only endpoints — same EINVAL.
         FdKind::Pidfd(_) => EINVAL,
         FdKind::Uring(_) => EINVAL, // io_uring fds don't carry data
+        FdKind::Uffd(i) => uffd_read(ctx, *i, buf, len, o.nonblock),
         // mqds move messages through the mq_* calls — no read.
         FdKind::MQueue(_) => EINVAL,
         FdKind::Mount(_) | FdKind::FsCtx(_) => EBADF, // no data side
@@ -22326,6 +22368,9 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     }
     if let FdKind::MQueue(_) = &o.kind {
         return EINVAL; // mqds aren't byte-stream writable either
+    }
+    if let FdKind::Uffd(_) = &o.kind {
+        return EINVAL; // uffds move messages through read only
     }
     if let FdKind::Dev(i) = &o.kind {
         if o.accmode == 0 {
@@ -24777,6 +24822,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         }
         FdKind::Uring(_) => {
             s.puts(b"anon_inode:[io_uring]");
+        }
+        FdKind::Uffd(_) => {
+            s.puts(b"anon_inode:[userfaultfd]");
         }
         FdKind::MQueue(_) => {
             s.puts(b"anon_inode:[mqueue]");
@@ -27313,6 +27361,9 @@ fn ofd_release(oi: usize) {
     if let FdKind::Eventfd(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(EVENTFDS))[i] = None };
     }
+    if let FdKind::Uffd(i) = kind {
+        uffd_release(i);
+    }
     if let FdKind::Uring(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(URINGS))[i] = None };
     }
@@ -28011,6 +28062,20 @@ fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
                     if u.cq_va != 0
                         && urg_rd32(u, u.cq_va) != urg_rd32(u, u.cq_va + 4)
                     {
+                        POLLIN
+                    } else {
+                        0
+                    }
+                }
+            }
+        }
+        // uffd: readable while the event ring holds messages.
+        FdKind::Uffd(i) => {
+            let us = unsafe { &*core::ptr::addr_of!(UFFDS) };
+            match us.get(*i).and_then(|s| s.as_ref()) {
+                None => POLLNVAL,
+                Some(u) => {
+                    if u.ev_r != u.ev_w {
                         POLLIN
                     } else {
                         0
@@ -41886,6 +41951,477 @@ pub fn sys_modify_ldt_real(func: u64, ptr: u64, bytecount: u64) -> u64 {
             0
         }
         _ => EINVAL,
+    }
+}
+
+/// userfaultfd(323): a real missing-page monitor. UFFDIO_REGISTER
+/// keys a range set on the caller's pml4; a #PF that misses inside a
+/// registered range posts a uffd_msg on the object's event ring and
+/// sleeps the faulter instead of raising SIGSEGV (WaitOn::Uffd —
+/// faulting ctx parked in t.ctx, fault page in wait_ptr). The monitor
+/// resolves with UFFDIO_COPY / UFFDIO_ZEROPAGE (frames mapped into
+/// the FAULER's pml4, contents written through the frame's kernel
+/// alias) or UFFDIO_WAKE / UNREGISTER (re-fault -> real disposition).
+/// Divergence: registration keys on pml4 so fork's fresh mm doesn't
+/// inherit (Linux binds to the mm); CLONE_VM siblings share it.
+struct Uffd {
+    ranges: [(u64, u64, u64); 8], // start, len, owner pml4
+    ev: [u64; 16],
+    ev_r: u8,
+    ev_w: u8,
+}
+static mut UFFDS: [Option<Uffd>; 8] = [None, None, None, None, None, None, None, None];
+fn uffds() -> &'static mut [Option<Uffd>; 8] {
+    // SAFETY: single CPU, IRQ-masked syscalls — one borrower at a time.
+    unsafe { &mut *core::ptr::addr_of_mut!(UFFDS) }
+}
+/// Supported ioctl bitmask for API/REGISTER answers.
+const UFFD_IOCTLS: u64 = 0x1f; // REGISTER|UNREGISTER|WAKE|COPY|ZEROPAGE
+
+/// userfaultfd(flags): O_CLOEXEC|O_NONBLOCK only.
+pub fn sys_userfaultfd(flags: u64) -> u64 {
+    const ENOMEM_: u64 = (-12i64) as u64;
+    if flags & !0o2004000 != 0 {
+        return EINVAL;
+    }
+    let us = uffds();
+    let Some(i) = us.iter().position(|s| s.is_none()) else {
+        return ENOMEM_;
+    };
+    us[i] = Some(Uffd {
+        ranges: [(0, 0, 0); 8],
+        ev: [0; 16],
+        ev_r: 0,
+        ev_w: 0,
+    });
+    let fd = anon_fd(FdKind::Uffd(i), flags & 0o2000000 != 0);
+    if (fd as i64) < 0 {
+        us[i] = None;
+        return fd;
+    }
+    // O_NONBLOCK lives on the open file like Linux file->f_flags.
+    if flags & 0o4000 != 0 {
+        if let Some(t) = cur_mut() {
+            if let Some(oi) = fdt(t).fds[fd as usize] {
+                let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+                if let Some(o) = ofds.get_mut(oi as usize).and_then(|x| x.as_mut()) {
+                    o.nonblock = true;
+                }
+            }
+        }
+    }
+    fd
+}
+
+/// Deposit pending events into a blocked UffdRead sleeper's buffer
+/// through its own pml4, then wake it — the MsgRcv pattern.
+fn uffd_ev_wake(i: usize) {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked || t.wait_on != WaitOn::UffdRead(i) {
+            continue;
+        }
+        let mut n = 0u64;
+        {
+            let us = uffds();
+            let Some(u) = us.get_mut(i).and_then(|x| x.as_mut()) else {
+                continue;
+            };
+            while u.ev_r != u.ev_w && n + 32 <= t.wait_len {
+                let e = u.ev[(u.ev_r % 16) as usize];
+                u.ev_r += 1;
+                let msg = [0u64, e >> 63 & 1, e & 0x7fff_ffff_ffff_f000, 0];
+                if !write_task_bytes(t.pml4, t.wait_ptr + n, unsafe {
+                    core::slice::from_raw_parts(msg.as_ptr() as *const u8, 32)
+                }) {
+                    break;
+                }
+                n += 32;
+            }
+        }
+        if n > 0 {
+            t.ctx.rax = n;
+            t.wait_on = WaitOn::None;
+            t.state = TaskState::Runnable;
+        }
+    }
+}
+
+/// The #PF route: true when the fault landed in a registered-missing
+/// range — an event posts (page address | write bit63) and the
+/// faulter sleeps on WaitOn::Uffd until a resolver maps the page.
+/// Diverges via block_switch like the Stopped path above. A full
+/// ring falls through to SIGSEGV rather than deadlock.
+fn uffd_fault(t: &mut Task, addr: u64, write: bool, ctx: &mut UCtx) -> bool {
+    let us = uffds();
+    let Some(i) = us.iter().position(|s| {
+        s.as_ref().is_some_and(|u| {
+            u.ranges
+                .iter()
+                .any(|&(a, l, p)| a != 0 && p == t.pml4 && addr >= a && addr < a + l)
+        })
+    }) else {
+        return false;
+    };
+    {
+        let u = us[i].as_mut().unwrap();
+        if u.ev_w - u.ev_r >= 16 {
+            return false;
+        }
+        u.ev[(u.ev_w % 16) as usize] = (addr & !0xfff) | ((write as u64) << 63);
+        u.ev_w += 1;
+    }
+    uffd_ev_wake(i);
+    t.wait_on = WaitOn::Uffd(i);
+    t.wait_ptr = addr & !0xfff;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch();
+}
+
+/// read(uffd): each event is the 32-byte uffd_msg — event=PAGEFAULT
+/// at 0, arg.pagefault.flags at 8 (bit0 = write fault), address at
+/// 16. Empty + nonblock -> EAGAIN; empty + block arms UffdRead.
+fn uffd_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64, nb: bool) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    if len < 32 {
+        return EINVAL;
+    }
+    if !range_ok_w(buf, len) {
+        return EFAULT;
+    }
+    let mut n = 0u64;
+    {
+        let us = uffds();
+        let Some(u) = us.get_mut(i).and_then(|s| s.as_mut()) else {
+            return EBADF;
+        };
+        while u.ev_r != u.ev_w && n + 32 <= len {
+            let e = u.ev[(u.ev_r % 16) as usize];
+            u.ev_r += 1;
+            let msg = [0u64, e >> 63 & 1, e & 0x7fff_ffff_ffff_f000, 0];
+            // SAFETY: buf is a validated writable window under the
+            // current cr3; msg is a 32-byte stack source.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    msg.as_ptr() as *const u8,
+                    (buf + n) as *mut u8,
+                    32,
+                )
+            };
+            n += 32;
+        }
+    }
+    if n > 0 {
+        return n;
+    }
+    if nb {
+        return EAGAIN_;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    if deliverable(t) {
+        return (-4i64) as u64; // EINTR
+    }
+    t.wait_on = WaitOn::UffdRead(i);
+    t.wait_ptr = buf;
+    t.wait_len = len;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch();
+}
+
+/// Map+fill one faulter page: phys backing goes into the FAULER's
+/// pml4 (map_page takes the task), content through the frame alias.
+fn uffd_fill(i: usize, va0: u64, va1: u64, src: u64, zero: bool, wake: bool) -> u64 {
+    const ENOMEM_: u64 = (-12i64) as u64;
+    // Iterate parked faulters, not pages: only a page a task is
+    // blocked on can be resolved, and a huge registered range must
+    // not turn one ioctl into a len/4096-step task-table scan on a
+    // non-preemptible CPU.
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let mut done = 0u64;
+    for s in tasks.iter_mut() {
+        let Some(ft) = s.as_mut() else { continue };
+        if ft.state != TaskState::Blocked
+            || !matches!(ft.wait_on, WaitOn::Uffd(j) if j == i)
+            || ft.wait_ptr < va0
+            || ft.wait_ptr >= va1
+        {
+            continue;
+        }
+        let pos = ft.wait_ptr;
+        let Some(phys) = map_page(ft, pos, USER | WRITE) else {
+            return if done > 0 { done } else { ENOMEM_ };
+        };
+        if zero {
+            // SAFETY: phys is a fresh frame behind the kernel alias.
+            unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096) };
+        } else {
+            // SAFETY: src window range_ok'd under the caller's cr3;
+            // phys is the freshly mapped frame.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (src + (pos - va0)) as *const u8,
+                    phys as *mut u8,
+                    4096,
+                )
+            };
+        }
+        done += 4096;
+        if wake {
+            ft.wait_on = WaitOn::None;
+            ft.state = TaskState::Runnable;
+        }
+    }
+    done
+}
+
+/// Wake faulters on uffd i whose fault page lies in [va0, va1):
+/// they re-run the faulting insn — resolved pages proceed, still-
+/// missing re-post an event, unregistered goes to SIGSEGV.
+fn uffd_wake_range(i: usize, va0: u64, va1: u64) {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state == TaskState::Blocked
+            && matches!(t.wait_on, WaitOn::Uffd(j) if j == i)
+            && t.wait_ptr >= va0
+            && t.wait_ptr < va1
+        {
+            t.wait_on = WaitOn::None;
+            t.state = TaskState::Runnable;
+        }
+    }
+}
+
+/// The UFFDIO_* surface — sys_ioctl gates these on FdKind::Uffd.
+pub fn uffd_ioctl(t: &mut Task, i: usize, req: u64, arg: u64) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const ENOMEM_: u64 = (-12i64) as u64;
+    const UFFDIO_API: u64 = 0xC018_AA3F;
+    const UFFDIO_REGISTER: u64 = 0xC020_AA00;
+    const UFFDIO_UNREGISTER: u64 = 0x8010_AA01;
+    const UFFDIO_WAKE: u64 = 0x8010_AA02;
+    const UFFDIO_COPY: u64 = 0xC028_AA03;
+    const UFFDIO_ZEROPAGE: u64 = 0xC020_AA04;
+    match req {
+        UFFDIO_API => {
+            if !range_ok(arg, 24) {
+                return EFAULT;
+            }
+            // SAFETY: arg is a validated user window.
+            let api = unsafe { (arg as *const u64).read() };
+            if api != 0xAA {
+                return EINVAL;
+            }
+            if !range_ok_w(arg, 24) {
+                return EFAULT;
+            }
+            // SAFETY: validated writable window; uffdio_api{api,
+            // features, ioctls} is three qwords.
+            unsafe {
+                (arg as *mut u64).add(1).write(0);
+                (arg as *mut u64).add(2).write(UFFD_IOCTLS);
+            }
+            0
+        }
+        UFFDIO_REGISTER => {
+            if !range_ok(arg, 32) {
+                return EFAULT;
+            }
+            // SAFETY: arg validated for uffdio_register{range,mode}.
+            let (start, len, mode) = unsafe {
+                (
+                    (arg as *const u64).read(),
+                    (arg as *const u64).add(1).read(),
+                    (arg as *const u64).add(2).read(),
+                )
+            };
+            if mode != 1 || len == 0 || len % 4096 != 0
+                || start % 4096 != 0
+                || start
+                    .checked_add(len)
+                    .is_none_or(|end| end >= crate::elf::USER_VA_HI)
+            {
+                return EINVAL;
+            }
+            let us = uffds();
+            let Some(u) = us.get_mut(i).and_then(|s| s.as_mut()) else {
+                return EBADF;
+            };
+            if u.ranges.iter().any(|&(a, l, _)| {
+                a != 0 && start < a + l && a < start + len
+            }) {
+                return EINVAL; // overlapping registration
+            }
+            let Some(free) = u.ranges.iter().position(|&(a, _, _)| a == 0) else {
+                return ENOMEM_;
+            };
+            u.ranges[free] = (start, len, t.pml4);
+            if !range_ok_w(arg, 32) {
+                return EFAULT;
+            }
+            // SAFETY: validated writable window — ioctls mask out
+            // at +24, past {range, mode}.
+            unsafe { (arg as *mut u64).add(3).write(UFFD_IOCTLS) };
+            0
+        }
+        UFFDIO_UNREGISTER => {
+            if !range_ok(arg, 16) {
+                return EFAULT;
+            }
+            // SAFETY: arg validated for uffdio_range{start,len}.
+            let (start, len) = unsafe {
+                (
+                    (arg as *const u64).read(),
+                    (arg as *const u64).add(1).read(),
+                )
+            };
+            let us = uffds();
+            let Some(u) = us.get_mut(i).and_then(|s| s.as_mut()) else {
+                return EBADF;
+            };
+            let mut n = 0;
+            for r in u.ranges.iter_mut() {
+                if r.0 != 0 && r.2 == t.pml4
+                    && start < r.0 + r.1 && r.0 < start + len
+                {
+                    *r = (0, 0, 0);
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                return EINVAL;
+            }
+            // Blocked faulters in the dropped window re-fault into a
+            // normal disposition.
+            uffd_wake_range(i, start, start + len);
+            0
+        }
+        UFFDIO_WAKE => {
+            if !range_ok(arg, 16) {
+                return EFAULT;
+            }
+            // SAFETY: arg validated for uffdio_range{start,len}.
+            let (start, len) = unsafe {
+                (
+                    (arg as *const u64).read(),
+                    (arg as *const u64).add(1).read(),
+                )
+            };
+            uffd_wake_range(i, start, start + len);
+            0
+        }
+        UFFDIO_COPY => {
+            if !range_ok(arg, 40) {
+                return EFAULT;
+            }
+            // SAFETY: arg validated for uffdio_copy{dst,src,len,mode}.
+            let (dst, src, len, mode) = unsafe {
+                (
+                    (arg as *const u64).read(),
+                    (arg as *const u64).add(1).read(),
+                    (arg as *const u64).add(2).read(),
+                    (arg as *const u64).add(3).read(),
+                )
+            };
+            if len == 0 || len % 4096 != 0 || dst % 4096 != 0
+                || mode & !1 != 0 || dst + len >= crate::elf::USER_VA_HI
+            {
+                return EINVAL;
+            }
+            if !range_ok(src, len) {
+                return EFAULT;
+            }
+            let us = uffds();
+            if us.get(i).and_then(|s| s.as_ref()).is_none() {
+                return EBADF;
+            }
+            if us[i].as_ref().unwrap().ranges.iter().all(|&(a, l, _)| {
+                a == 0 || dst < a || dst + len > a + l
+            }) {
+                return EAGAIN_; // outside every registered range
+            }
+            let n = uffd_fill(i, dst, dst + len, src, false, mode & 1 == 0);
+            if !range_ok_w(arg, 40) {
+                return EFAULT;
+            }
+            // SAFETY: validated writable window — copy result out.
+            unsafe { (arg as *mut u64).add(4).write(n as i64 as u64) };
+            0
+        }
+        UFFDIO_ZEROPAGE => {
+            if !range_ok(arg, 32) {
+                return EFAULT;
+            }
+            // SAFETY: arg validated for uffdio_zeropage{range,mode}.
+            let (start, len, mode) = unsafe {
+                (
+                    (arg as *const u64).read(),
+                    (arg as *const u64).add(1).read(),
+                    (arg as *const u64).add(2).read(),
+                )
+            };
+            if len == 0 || len % 4096 != 0 || start % 4096 != 0
+                || mode & !1 != 0 || start + len >= crate::elf::USER_VA_HI
+            {
+                return EINVAL;
+            }
+            let us = uffds();
+            if us.get(i).and_then(|s| s.as_ref()).is_none() {
+                return EBADF;
+            }
+            if us[i].as_ref().unwrap().ranges.iter().all(|&(a, l, _)| {
+                a == 0 || start < a || start + len > a + l
+            }) {
+                return EAGAIN_;
+            }
+            let n = uffd_fill(i, start, start + len, 0, true, mode & 1 == 0);
+            if !range_ok_w(arg, 32) {
+                return EFAULT;
+            }
+            // SAFETY: validated writable window — zeropage out.
+            unsafe { (arg as *mut u64).add(3).write(n as i64 as u64) };
+            0
+        }
+        _ => EINVAL,
+    }
+}
+
+/// Last member of an mm dies: its registered ranges die with it —
+/// otherwise a recycled pml4 frame would alias a dead task's window
+/// onto an innocent newcomer.
+fn uffd_drop_mm(pml4: u64) {
+    for s in uffds().iter_mut() {
+        let Some(u) = s.as_mut() else { continue };
+        for r in u.ranges.iter_mut() {
+            if r.2 == pml4 {
+                *r = (0, 0, 0);
+            }
+        }
+    }
+}
+
+/// fd close: drop the object; blocked readers get EIO, blocked
+/// faulters wake to re-fault into normal disposition.
+fn uffd_release(i: usize) {
+    const EIO_: u64 = (-5i64) as u64;
+    uffds()[i] = None;
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state != TaskState::Blocked {
+            continue;
+        }
+        if t.wait_on == WaitOn::UffdRead(i) {
+            t.ctx.rax = EIO_;
+            t.wait_on = WaitOn::None;
+            t.state = TaskState::Runnable;
+        } else if t.wait_on == WaitOn::Uffd(i) {
+            t.wait_on = WaitOn::None;
+            t.state = TaskState::Runnable;
+        }
     }
 }
 

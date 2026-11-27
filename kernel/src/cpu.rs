@@ -409,8 +409,13 @@ extern "win64" fn report_frame(f: &mut TrapFrame, regs: *mut SavedRegs) {
                         7 => (1, f.rip),  // BUS_ADRALN
                         _ => (0x80, f.rip), // SI_KERNEL
                     };
-                    let (rip, rsp, rdi) =
-                        crate::user::fault_signal(signo, code, addr, &mut ctx);
+                    let (rip, rsp, rdi) = crate::user::fault_signal(
+                        signo,
+                        code,
+                        addr,
+                        v == 14 && f.err & 2 != 0,
+                        &mut ctx,
+                    );
                     f.rip = rip;
                     f.rsp = rsp;
                     // SAFETY: regs names the dispatch-saved block on
