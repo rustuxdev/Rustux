@@ -8671,3 +8671,15 @@ mask=0 -> avail capped 1); params sq_off is at 40 not 48; probe op
 flags are a u16 at +2; masks read from user ring replaced with
 kernel-side entries. Audit run-94: 0 confirmed — io_uring class sweep
 mapped, all absent-class (synchronous, no fixed tables, bounded idx).
+
+run-336 vhangup(153) — the last unwired classic NR. uid==0 gate
+(CAP_SYS_TTY_CONFIG), no-ctty silent 0, real hangup = SIGHUP+SIGCONT
+to fg pgrp + session leaders, then CONSOLE_SID drops to unowned. New
+piece: /dev/console open by a ctty-less session leader adopts an
+unowned console (re-login semantics — TIOCSCTTY stays the console-
+session no-op). vhtest.c new task -> MAX_TASKS 122->123, lstest floor
+95->96. Suite note: the destructive path is gated to the minimal image
+(low pid) — a faithful hangup on the shared console orphans every
+sid-1 member's ctty, which broke pgtest's SIGTTIN check when it ran
+concurrently. Audit run-95: 0 confirmed — tty-hangup CVEs are all
+driver/ldisc races, absent by construction.
