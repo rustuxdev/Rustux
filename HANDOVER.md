@@ -8703,3 +8703,26 @@ sees the hardware-set A bit (0xf3 vs stored 0xf2). Audit run-96:
 0 confirmed — cve-now: CVE-2010-3698 (KVM-LDT, absent), CVE-2015-3290
 (espfix, no NMI path). Type-formula fix in-run: 0b1010|x<<1 shared
 bit1 so read_exec_only was a no-op -> Linux contents table now.
+
+run-338 userfaultfd(323) — real missing-page monitor, the last
+substantial unwired NR. UFFDS[8] objects: 8 pml4-keyed ranges +
+16-event ring behind FdKind::Uffd. REGISTER keys (start,len,pml4)
+on the caller's mm — fork doesn't inherit (divergence: Linux binds
+the mm). fault_signal's MAPERR route parks the faulter on
+WaitOn::Uffd (ctx saved + block_switch, proven pattern) and posts
+uffd_msg to the ring (full ring -> SIGSEGV). read drains msgs /
+EAGAIN / UffdRead sleep with write_task_bytes deposit into the
+reader's pml4. COPY/ZEROPAGE require registered-range containment
+and map+fill into the FAULER's pml4 only at parked wait_ptr pages;
+WAKE/UNREGISTER re-fault into normal disposition; uffd_drop_mm at
+mm_release frees dead-mm ranges; release EIOs readers. uffdtest.c
+new task -> MAX_TASKS 124->125, lstest floor 97->98. Audit run-97:
+1 confirmed + fixed — uffd_fill scanned the task table per 4K of
+range (one ZEROPAGE on a huge registered range = non-preemptible
+livelock); now iterates blocked faulters. cve-now: MOVE/uffd-wp/
+tmpfs-holes/uprobes classes all absent. In-run: bit63 write-flag
+masked at deposits; O_NONBLOCK wired to the ofd; register
+checked_add; generic -EINTR wake no longer writes a parked
+faulter's live rax; esp.img gotcha — mcopy fails silently on
+existing BOOTX64.EFI, mdel first (stale kernel masqueraded as a
+nonblock hang).
