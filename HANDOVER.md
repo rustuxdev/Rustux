@@ -8654,3 +8654,20 @@ In-run fixes: GETSIGINFO needed a wait4-surviving si_signo field;
 PTRACE_KILL must work on a running tracee. Audit run-93: 0 confirmed
 — 19 ptrace CVEs mapped, all absent-class (no setuid, bounded
 translate windows, no utrace/coredump objects, no compat arm).
+
+run-335 io_uring(425/426/427) — synchronous-completion io_uring with
+real user-memory rings. FdKind::Uring fd + URINGS[8] table; mmap on the
+fd returns zeroed private pages at the real IORING_OFF_* offsets and
+records sq/cq/sqes VAs (kernel-side Uring is authoritative for
+mask/entries — never the user-writable ring words). io_uring_enter
+drains the SQ inline (NOP/READV/WRITEV/FSYNC/POLL_ADD/SENDMSG/RECVMSG/
+READ/WRITE, wild array idx skipped, unknown op EINVAL cqe), posts cqes,
+bumps a registered eventfd. register: EVENTFD/UNREGISTER/PROBE real,
+fixed tables ENXIO. Synchronous model kills the entire
+async-request-lifetime CVE cluster by construction. urtest.c new task
+-> MAX_TASKS 121->122, lstest floor 94->95. In-run fixes: ring
+mask/entries kernel-init at map time (zeroed pages otherwise mean
+mask=0 -> avail capped 1); params sq_off is at 40 not 48; probe op
+flags are a u16 at +2; masks read from user ring replaced with
+kernel-side entries. Audit run-94: 0 confirmed — io_uring class sweep
+mapped, all absent-class (synchronous, no fixed tables, bounded idx).
