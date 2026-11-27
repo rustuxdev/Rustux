@@ -1724,6 +1724,15 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                         add |= 1u32 << i;
                     }
                     t.sigmask |= add;
+                    // A frame pushed over an applied replay would
+                    // let the nested handler's same-insn nanosleep
+                    // steal the stash — disarm; the replay falls
+                    // back to a plain full-req arm.
+                    if t.restart_rip != 0 {
+                        t.restart_at = 0;
+                        t.restart_rt = false;
+                        t.restart_rip = 0;
+                    }
                     ctx.rip = handler;
                     ctx.rsp = frame;
                     return;
@@ -1793,6 +1802,13 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                     add |= 1u32 << i;
                 }
                 t.sigmask |= add;
+                if t.restart_rip != 0 {
+                    // Same nested-handler stash-steal guard as the
+                    // compat frame above.
+                    t.restart_at = 0;
+                    t.restart_rt = false;
+                    t.restart_rip = 0;
+                }
                 ctx.rsp = frame;
                 ctx.rip = handler;
                 ctx.rdi = sig64;
@@ -2124,6 +2140,11 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
                     t.restart_at = 0;
                     t.restart_rt = false;
                 }
+                // Only a successful apply may key the consume —
+                // a stale rip from a prior replay could otherwise
+                // match a nanosleep entering through the same libc
+                // syscall insn in the arm->apply window.
+                t.restart_rip = 0;
             }
         }
         if !matches!(t.wait_on, WaitOn::Uffd(_)) {
@@ -10584,6 +10605,9 @@ fn sem_op(
             }
         }
     }
+    #[allow(clippy::never_loop)] // single-pass by design: a blocked
+    // semop wakes resolved — the waker applied the op or left the
+    // errno in ctx.rax; every path here returns.
     loop {
         let ss = unsafe { &mut *core::ptr::addr_of_mut!(SEMSETS) };
         let Some(set) = ss.get_mut(slot).and_then(|x| x.as_mut()) else {
@@ -19451,10 +19475,17 @@ fn timer_restart(t: &mut Task, ctx: &mut UCtx, rem_va: u64) -> Option<u64> {
     let deadline = core::mem::replace(&mut t.restart_at, 0);
     let rt = core::mem::replace(&mut t.restart_rt, false);
     t.restart_rip = 0;
-    if deliverable(t) {
-        return Some((-4i64) as u64); // EINTR — a fresh signal pends
-    }
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    if deliverable(t) {
+        // Restart-block EINTR reports the remainder like the
+        // signal-wake path does (rem unspecified for ABSTIME).
+        if rem_va != 0 {
+            let left = deadline.saturating_sub(now);
+            write_task_bytes(t.pml4, rem_va, &(left / 100).to_le_bytes());
+            write_task_bytes(t.pml4, rem_va + 8, &((left % 100) * 10_000_000).to_le_bytes());
+        }
+        return Some((-4i64) as u64);
+    }
     if deadline <= now {
         return Some(0); // remainder elapsed while the handler ran
     }
@@ -33055,6 +33086,12 @@ fn slide_realtime_deadlines(delta: i64) {
     let tfs = unsafe { &*core::ptr::addr_of!(TIMERFDS) };
     for s in tasks.iter_mut() {
         let Some(t) = s.as_mut() else { continue };
+        // A stashed restart_block deadline is a live RT expiry even
+        // though its task already woke — Linux's timerqueue rebase
+        // covers armed restart expiries the same way.
+        if t.restart_at != 0 && t.restart_rt {
+            t.restart_at = slide(t.restart_at);
+        }
         if t.state != TaskState::Blocked {
             continue;
         }
