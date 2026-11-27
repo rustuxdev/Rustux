@@ -8908,3 +8908,57 @@ Gate: 3 PASSes, 127 tasks (MAX_TASKS 126->136 — fanotest was the
 refused 127th), frames zero leak. fanotest 0 failures: gates
 ladder, FID record parse, 5 event types, ONDIR, ON_CHILD subtree,
 REMOVE/FLUSH, overflow record. audit run-101: CLEAN, 0 confirmed.
+
+run-344 — SA_RESTART syscall-restart semantics. The flag was stored
+per-signal since the rt_sigaction table existed but nothing ever
+read it: every signal wake on a blocked syscall deposited -EINTR
+unconditionally. Now pend_one's blocked-wake records the nr into
+Task.restart_nr when the wait is restartable AND the signal warrants
+it (SA_RESTART in sa_flags, or a default-stop disposition — stops
+never surface EINTR at all); the -EINTR deposit still lands so all
+in-kernel Runnable-recheck paths behave exactly as before. The
+replay turn happens where Linux does it — at signal-return
+boundaries: restart_apply() in rt_sigreturn + rt_sigreturn32 rewinds
+the frame's saved rip onto the 2-byte syscall insn and restores
+rax=nr, and pend_one's SIGCONT-resume does the same rewind directly
+on the stopped task's armed ctx. Guards: frame rax must still hold
+the -EINTR sentinel (a consumed/partial result never replays) and
+rip-2 must decode a real 0F05/CD80 gate (forged frames aim rip
+anywhere — the rewind stays on a genuine syscall boundary).
+wait_restartable() names Linux's ERESTARTSYS/RESTART_BLOCK set —
+device/pipe/file io, socket recv/accept, poll/select/epoll, sleep,
+wait4/waitid, F_SETLKW, inotify/fanotify/signalfd-ish/eventfd/
+timerfd/mq/aio/kmsg/tun — and deliberately excludes SysV IPC
+(ERESTARTNOHAND), futex (EINTR is its ABI), connect (EINTR+EALREADY
+contract), pause/sigtimedwait (exist to be interrupted), Vfork
+(uninterruptible), Uffd (parks a fault ctx), NT object waits.
+Divergences: relative nanosleep replays the original req (oversleep
+by elapsed; Linux restart_block resumes to the absolute expiry);
+signals already pending at syscall entry still EINTR; nested
+interruptions restart only the innermost (one slot vs per-frame
+regs). pgtest covers: SA_RESTART read on an empty pipe replays and
+returns the late-arriving byte, the same setup without the flag
+yields EINTR, and SIGSTOP+SIGCONT across a blocked read replays
+transparently.
+
+run-344 audit (run-102): hunter found 2 confirmed + fixes landed.
+(1) restart_apply consumed the arm before its rax/insn gates — a
+nested handler's sigreturn ate the replay, and the SIGCONT path
+applied the rewind to a mid-handler ctx with no gates; now
+consume-on-success, and SIGCONT runs the same restart_apply gates
+(the insn check reads through the subject's pml4 via
+read_task_bytes — pend_one's stopped task is usually not current,
+so range_ok/raw-deref would have validated the wrong space).
+(2) PRE-EXISTING adjacent: the FLock arms (fcntl F_SETLKW and
+flock LOCK_EX without NB) never stored t.ctx — a lock sleeper
+resumed from its last IRQ preemption snapshot, and flock_wake_all
+deposited into that stale ctx. ctx threaded through both arms +
+deliverable pre-check. Also: Aio dropped from the restartable set
+(io_getevents drains a partial batch before arming — a full replay
+would silently overwrite those completions), the arm is gated on
+the signal being unmasked (SIGSTOP exempt — unblockable), and the
+masked-wake amplification residue is gone. cve-now: sigreturn
+frame-forgery class (CVE-2026-80560, CVE-2017-1000255,
+CVE-2019-13648, CVE-2026-46063) all structurally absent — cs/ss
+pinned, no privileged-bit restoration, replay gated to a real
+syscall insn.
