@@ -8773,3 +8773,44 @@ hvctest starve for input. Clean PASS taken from gate340b:
 exit 33, 126 tasks, zero leak. The flake looks like a win32-
 subsystem/scheduler tail race (winthr seen fault-looping at a
 fixed RIP) — a rung of its own.
+
+run-341 — tail-of-suite stall flake RESOLVED (2 of 3 stuck shapes):
+
+ROOT CAUSE A (ia32test +0x50000 corruption): DS/ES were never
+saved/restored on task switch — only cs/ss ride the UCtx iret
+frame, FS/GS ride MSR+gs_sel. ldttest's `mov ds, <LDT sel>`
+(base=0x50000) left its cached descriptor base installed; lldt
+does NOT invalidate loaded segments, so the next compat task
+scheduled inherited DS.base=0x50000 and every data access
+biased +0x50000 (parent `mov 0x804c044,%ecx` -> cr2=0x809c044;
+child get_pc_thunk's `mov (%esp),%esi` — a DS read, not SS —
+misread its own pushed ret-addr). FIX: Task gains ds_sel/es_sel;
+rd_ds_es captures outgoing in switch_to+resume_ctx before CUR_I
+flips; load_data_sels validates (present, DPL>=RPL, code/data,
+null only for idx0/TI0 — TI=1 idx0 is a real LDT slot) and
+reloads AFTER install_tls+load_ldt_of at all three resume sites.
+SAME-CLASS GAPS also closed: resume_ctx was missing install_tls
++ load_gs entirely (IRQ-path resumes kept the previous task's
+TLS descriptors AND hidden gs base); launch() likewise; exec
+now resets ds/es/gs_sel/ldt_n and reloads the live registers
+in place. ia32test asserts ds==es==0x2b at start (regression).
+
+ROOT CAUSE B (busybox-wget DNS wedge): environmental — slirp
+occasionally drops the UDP query to 10.0.2.3:53. Kernel provably
+sent it (utx=12 utxf=0) and delivers every datagram it receives
+(udemux/urx=5 udrop=0, frames frozen = nothing arrives); busybox
+polls with no SIGALRM backstop (-T covers TCP only). Suite-side
+fix: wgettest parents its child with bounded WNOHANG (45s) +
+SIGKILL + up to 3 retries — a real kernel wedge still fails all
+three.
+
+Instrumentation KEPT: stall-watch in tick() (no-runnable 3s ->
+per-task WaitOn/deadline/pend/mask/itimer0 + fd/pollfd/pipe/tcp/
+udp/e1000-counter dump) — it found both root causes and only
+prints on a real wedge. fault_dbg/ripbytes/clone_vm prints were
+stripped after the fix verified. e1000 RX/UDP counters power the
+watchdog line.
+
+Gate: 10 consecutive clean runs (5 fix loop + 3 stripped final +
+2 post-seg_desc-fix) — 126 tasks, frames zero leak, PASS exit 33;
+vs ~2/3 stall rate pre-fix. rung closed.
