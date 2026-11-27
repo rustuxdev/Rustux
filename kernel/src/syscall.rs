@@ -523,6 +523,10 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         294 => user::fd_inotify_init1(a1),
         254 => sys_inotify_add(a1, a2, a3),
         255 => user::inotify_rm_watch(a1, a2),
+        // fanotify: NOTIF|FID groups — init is all flags, mark
+        // resolves dirfd+path like openat (FAN_NOFD = cwd).
+        300 => user::fd_fanotify_init(a1, a2),
+        301 => sys_fanotify_mark(a1, a2, a3, a4, a5),
         283 => user::fd_timerfd_create(a1, a2),
         286 => user::fd_timerfd_settime(a1, a2, a3, a4),
         287 => user::fd_timerfd_gettime(a1, a2),
@@ -1165,6 +1169,40 @@ fn sys_inotify_add(fd: u64, path: u64, mask: u64) -> u64 {
         Err(e) => return e,
     };
     user::inotify_add_watch(fd, &cb[..cn], mask as u32)
+}
+
+/// fanotify_mark(fd, flags, mask, dirfd, pathname): the path
+/// resolves like openat — dirfd-relative, FAN_NOFD(-1) = cwd, an
+/// empty pathname marks the dirfd's own object like AT_EMPTY_PATH.
+fn sys_fanotify_mark(fd: u64, mflags: u64, mask: u64, dfd: u64, path: u64) -> u64 {
+    let mut name = [0u8; 257];
+    let n = match copy_user_path(path, &mut name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    // FAN_NOFD arrives sign-extended (-1) or u32-truncated from a
+    // compat table — both mean cwd-relative.
+    let dfd = if dfd == u64::MAX || dfd as u32 as i32 == -1 {
+        u64::MAX
+    } else {
+        dfd
+    };
+    if n == 0 {
+        // Empty pathname: the dirfd itself is the marked object.
+        if dfd == u64::MAX {
+            return EINVAL;
+        }
+        let (b, bn) = match user::ofd_flat_path(dfd) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        return user::fano_mark(fd, mflags, mask, &b[..bn]);
+    }
+    let (cb, cn) = match user::canon_path(dfd, &name[..n]) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    user::fano_mark(fd, mflags, mask, &cb[..cn])
 }
 
 fn sys_open(path: u64, flags: u64, mode: u64) -> u64 {

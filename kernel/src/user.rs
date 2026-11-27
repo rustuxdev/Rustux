@@ -266,8 +266,9 @@ fn shm_pin_all(t: &Task) {
 /// for the 39-task suite + concurrent children (observed on VM);
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
-/// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 126;
+/// until shmtest became the refused 97th, 126 until fanotest
+/// became the refused 127th.
+const MAX_TASKS: usize = 136;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -507,6 +508,9 @@ enum WaitOn {
     /// inotify read on an empty queue — ino_report wakes the sleeper
     /// by depositing the head event's record like PipeRead.
     Inotify(usize),
+    /// fanotify read on an empty ring — fano_push drains whole
+    /// event blobs into the sleeper's buffer like Inotify.
+    Fano(usize),
     /// CREATE_SUSPENDED NT thread — created Blocked and only
     /// NtResumeThread flips it Runnable; nothing else wakes it.
     NtSuspend,
@@ -652,6 +656,8 @@ enum FdKind {
     /// An fs_context (fsopen): slot into FSCS. The OFD is the only
     /// handle, so the index is safe to reuse after close.
     FsCtx(usize),
+    /// A fanotify notification group — marks + event ring in FANOS[id].
+    Fano(usize),
 }
 
 /// Max concurrent pipes — a hard bound on kernel frame pressure,
@@ -1674,6 +1680,7 @@ fn kind_tag(k: &FdKind) -> &'static str {
         FdKind::Perf(_) => "Perf",
         FdKind::Signalfd(_) => "Signalfd",
         FdKind::Inotify(_) => "Inotify",
+        FdKind::Fano(_) => "Fano",
         FdKind::Timerfd(_) => "Timerfd",
         FdKind::Pidfd(_) => "Pidfd",
         FdKind::MQueue(_) => "MQueue",
@@ -14805,6 +14812,23 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                             n
                         })
                 }
+                // fanotify: sum of queued event blobs, plus 24 for
+                // a pending overflow record (metadata only).
+                FdKind::Fano(i) => {
+                    let ins = unsafe { &*core::ptr::addr_of!(FANOS) };
+                    ins.get(*i)
+                        .and_then(|s| s.as_ref())
+                        .map_or(0, |s| {
+                            let mut n = 0u64;
+                            for e in s.q.iter().flatten() {
+                                n += e.len as u64;
+                            }
+                            if s.overflow {
+                                n += 24;
+                            }
+                            n
+                        })
+                }
             };
             // SAFETY: arg validated writable for 4 bytes.
             unsafe {
@@ -15534,6 +15558,7 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         | FdKind::Timerfd(_)
         | FdKind::Signalfd(_)
         | FdKind::Inotify(_)
+        | FdKind::Fano(_)
         | FdKind::Uring(_)
         | FdKind::Uffd(_)
         | FdKind::Perf(_)
@@ -18963,6 +18988,30 @@ pub fn fd_link_target(fd: i32, out: &mut [u8]) -> Option<usize> {
     let t = cur_mut()?;
     let o = ofd(t, fd as u64)?;
     Some(fd_link_name(&o.kind, out))
+}
+
+/// The canonical flat path an OFD names — fanotify_mark's
+/// empty-pathname arm resolves the dirfd itself. Dir and RAM
+/// files carry their names; everything else answers EINVAL like
+/// a markable-object miss.
+pub fn ofd_flat_path(fd: u64) -> Result<([u8; 128], usize), u64> {
+    let Some(t) = cur_mut() else { return Err(EBADF) };
+    let Some(o) = ofd(t, fd) else { return Err(EBADF) };
+    let mut b = [0u8; 128];
+    let n = match &o.kind {
+        FdKind::Dir(dp) => {
+            let p = dp.bytes();
+            b[..p.len()].copy_from_slice(p);
+            p.len()
+        }
+        FdKind::Ram(i) => {
+            let Some(v) = vfile(*i) else { return Err(ENOENT) };
+            b[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+            v.nlen
+        }
+        _ => return Err(EINVAL),
+    };
+    Ok((b, n))
 }
 
 /// sched_getaffinity(pid, size, mask): one CPU — the mask is 1,
@@ -22420,6 +22469,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Timerfd(i) => timerfd_read(ctx, *i, buf, len),
         FdKind::Signalfd(i) => signalfd_read(ctx, *i, buf, len),
         FdKind::Inotify(i) => inotify_read(ctx, *i, buf, len),
+        FdKind::Fano(i) => fano_read(ctx, *i, buf, len),
         FdKind::Udp(i) => udp_recv_or_block(ctx, *i, buf, len, 0, o.nonblock),
         FdKind::Packet(i) => {
             pkt_recv_or_block(ctx, *i, buf, len, 0, o.nonblock)
@@ -22534,6 +22584,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             let mut nm = [0u8; 128];
             nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
             ino_report(&nm[..v.nlen], IN_ACCESS, 0);
+            fano_emit(&nm[..v.nlen], FAN_ACCESS);
             n as u64
         }
         FdKind::Pipe { id, write } => {
@@ -22682,6 +22733,9 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     if let FdKind::Inotify(_) = &o.kind {
         return EINVAL;
     }
+    if let FdKind::Fano(_) = &o.kind {
+        return EINVAL; // fanotify groups aren't byte-stream writable
+    }
     if let FdKind::MQueue(_) = &o.kind {
         return EINVAL; // mqds aren't byte-stream writable either
     }
@@ -22811,6 +22865,7 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         let mut nm = [0u8; 128];
         nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
         ino_report(&nm[..v.nlen], IN_MODIFY, 0);
+        fano_emit(&nm[..v.nlen], FAN_MODIFY);
         return len;
     }
     if matches!(o.kind, FdKind::File(_)) {
@@ -25137,6 +25192,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         FdKind::Inotify(_) => {
             s.puts(b"anon_inode:[inotify]");
         }
+        FdKind::Fano(_) => {
+            s.puts(b"anon_inode:[fanotify]");
+        }
         FdKind::Pidfd(_) => {
             s.puts(b"anon_inode:[pidfd]");
         }
@@ -25572,6 +25630,7 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
     fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, flags & O_CLOEXEC != 0);
     ino_report(path, IN_OPEN, 0);
+    fano_emit(path, FAN_OPEN);
     fi as u64
 }
 
@@ -27702,6 +27761,9 @@ fn ofd_release(oi: usize) {
     if let FdKind::Inotify(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(INOTIFY))[i] = None };
     }
+    if let FdKind::Fano(i) = kind {
+        unsafe { (*core::ptr::addr_of_mut!(FANOS))[i] = None };
+    }
     if let FdKind::MQueue(i) = kind {
         mq_release(i); // an unlinked queue dies at last close
     }
@@ -27850,11 +27912,20 @@ fn ofd_release(oi: usize) {
                 IN_CLOSE_NOWRITE
             };
             ino_report(&nm[..v.nlen], m, 0);
+            let fm = if accmode != 0 { FAN_CLOSE_WRITE } else {
+                FAN_CLOSE_NOWRITE
+            };
+            fano_emit(&nm[..v.nlen], fm);
         }
         // unlinked-while-open storage dies with its last OFD; a
         // still-linked file is owned by the VFS slot and stays —
         // and hard aliases keep an unlinked inode alive by name.
         vfile_free_if_dead(i);
+    }
+    if let FdKind::Dir(dp) = &kind {
+        // fanotify reports dir closes too (always NOWRITE — dirs
+        // open read-only here like Linux).
+        fano_emit(dp.bytes(), FAN_CLOSE_NOWRITE);
     }
 }
 
@@ -28421,6 +28492,21 @@ fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
         // overflow record that drains as one).
         FdKind::Inotify(i) => {
             let ins = unsafe { &*core::ptr::addr_of!(INOTIFY) };
+            match ins.get(*i).and_then(|s| s.as_ref()) {
+                None => POLLNVAL,
+                Some(s) => {
+                    if s.q.iter().any(|e| e.is_some()) || s.overflow {
+                        POLLIN
+                    } else {
+                        0
+                    }
+                }
+            }
+        }
+        // fanotify: same readiness rule — queued events or a
+        // pending overflow record.
+        FdKind::Fano(i) => {
+            let ins = unsafe { &*core::ptr::addr_of!(FANOS) };
             match ins.get(*i).and_then(|s| s.as_ref()) {
                 None => POLLNVAL,
                 Some(s) => {
@@ -29728,6 +29814,400 @@ fn inotify_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
     block_switch()
 }
 
+// --- fanotify ---------------------------------------------------------
+// Bounded FAN_CLASS_NOTIF | FAN_REPORT_FID groups: path-scoped
+// inode marks and a 16-event ring. Events carry the run-322 file
+// handle (fsid + file_handle) so no per-event fd is minted — the
+// permission classes and DFID_NAME records are EOPNOTSUPP, an
+// honest bound like signalfd's.
+const MAX_FANOS: usize = 8;
+const FANO_MARKS: usize = 16;
+const FANO_EVS: usize = 16;
+
+const FAN_ACCESS: u64 = 0x1;
+const FAN_MODIFY: u64 = 0x2;
+const FAN_CLOSE_WRITE: u64 = 0x8;
+const FAN_CLOSE_NOWRITE: u64 = 0x10;
+const FAN_OPEN: u64 = 0x20;
+const FAN_Q_OVERFLOW: u64 = 0x4000;
+const FAN_ONDIR: u64 = 0x4000_0000;
+const FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
+/// Subscribable event bits — the rest of the mask space is
+/// permission/dir-extra machinery we don't carry.
+const FAN_ALL_EVENTS: u64 = FAN_ACCESS | FAN_MODIFY
+    | FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE | FAN_OPEN;
+
+struct FanoMark {
+    /// Canonical flat path the mark names.
+    path: [u8; 128],
+    plen: u8,
+    /// Subscribed event bits (FAN_ALL_EVENTS only).
+    mask: u64,
+    /// FAN_ONDIR was in the mark mask — dir objects only.
+    only_dir: bool,
+    /// FAN_EVENT_ON_CHILD and the mark names a dir.
+    on_child: bool,
+}
+
+/// A staged record blob: fanotify_event_metadata (24B) + the FID
+/// info record (hdr + fsid + file_handle). 208 fits a 128-byte
+/// path dir handle (24+4+8+8+129 = 173).
+#[derive(Clone, Copy)]
+struct FanoEv {
+    buf: [u8; 208],
+    len: u16,
+}
+
+struct Fano {
+    marks: [Option<FanoMark>; FANO_MARKS],
+    q: [Option<FanoEv>; FANO_EVS],
+    overflow: bool,
+    nonblock: bool,
+}
+
+static mut FANOS: [Option<Fano>; MAX_FANOS] = [const { None }; MAX_FANOS];
+
+/// One mark's verdict on event path `p` under mask `evmask`.
+fn fano_mark_hit(m: &FanoMark, p: &[u8], evmask: u64, is_dir: bool) -> bool {
+    if evmask & m.mask == 0 || (m.only_dir && !is_dir) {
+        return false;
+    }
+    let mp = &m.path[..m.plen as usize];
+    if mp == p {
+        return true;
+    }
+    // EVENT_ON_CHILD: children of a marked dir qualify — a root
+    // mark ("") parents every path.
+    m.on_child
+        && (mp.is_empty()
+            || (p.len() > mp.len()
+                && &p[..mp.len()] == mp
+                && p[mp.len()] == b'/'))
+}
+
+/// Render one event blob: metadata + FID info record. `enc` is
+/// the handle_encode output — enc[0] is the handle_type byte and
+/// enc[1..n] the f_handle payload.
+fn fano_record(mask: u64, enc: &[u8; 129], enc_n: usize, mid: u32) -> Option<FanoEv> {
+    let info = 4 + 8 + 8 + (enc_n - 1); // hdr + fsid + fh hdr + bytes
+    let total = 24 + info;
+    if total > 208 {
+        return None;
+    }
+    let mut ev = FanoEv { buf: [0; 208], len: 0 };
+    let b = &mut ev.buf;
+    b[..4].copy_from_slice(&(total as u32).to_le_bytes());
+    b[4] = 3; // FANOTIFY_METADATA_VERSION
+    b[6..8].copy_from_slice(&24u16.to_le_bytes()); // metadata_len
+    b[8..16].copy_from_slice(&mask.to_le_bytes());
+    b[16..20].copy_from_slice(&(-1i32).to_le_bytes()); // fd: FID group — none
+    b[20..24].copy_from_slice(&(cur_mut().map_or(0, |t| t.pid) as i32).to_le_bytes());
+    b[24] = 2; // FAN_EVENT_INFO_TYPE_FID
+    b[26..28].copy_from_slice(&(info as u16).to_le_bytes());
+    b[28..32].copy_from_slice(&(mid as i32).to_le_bytes()); // fsid
+    b[36..40].copy_from_slice(&((enc_n - 1) as u32).to_le_bytes());
+    b[40..44].copy_from_slice(&(enc[0] as i32).to_le_bytes());
+    b[44..44 + enc_n - 1].copy_from_slice(&enc[1..enc_n]);
+    ev.len = total as u16;
+    Some(ev)
+}
+
+/// Fire `evmask` (FAN_OPEN/ACCESS/MODIFY/CLOSE_*) on canonical
+/// `path`: every group holding a subscribing mark gets one event —
+/// Linux's per-group fanout. Hot-path bail is the empty-group scan.
+fn fano_emit(path: &[u8], evmask: u64) {
+    let insts = unsafe { &mut *core::ptr::addr_of_mut!(FANOS) };
+    if insts.iter().all(Option::is_none) {
+        return;
+    }
+    let is_dir = dir_exists(path) && !is_file(path);
+    for (gi, g) in insts.iter().enumerate() {
+        let hit = g.as_ref().is_some_and(|inst| {
+            inst.marks
+                .iter()
+                .flatten()
+                .any(|m| fano_mark_hit(m, path, evmask, is_dir))
+        });
+        if !hit {
+            continue;
+        }
+        let mask = if is_dir { evmask | FAN_ONDIR } else { evmask };
+        let Ok((hn, enc, mid)) = handle_encode(path) else { continue };
+        let Some(ev) = fano_record(mask, &enc, hn, mid) else { continue };
+        fano_push(gi, ev);
+    }
+}
+
+/// Queue `ev` on group `gi`, edge-trigger epoll interests, and
+/// drain into any blocked reader's buffer.
+fn fano_push(gi: usize, ev: FanoEv) {
+    let Some(inst) = (unsafe { &mut *core::ptr::addr_of_mut!(FANOS) })
+        .get_mut(gi)
+        .and_then(|s| s.as_mut())
+    else {
+        return;
+    };
+    if let Some(s) = inst.q.iter_mut().find(|s| s.is_none()) {
+        *s = Some(ev);
+    } else {
+        inst.overflow = true;
+    }
+    epoll_edge(&FdKind::Fano(gi));
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut() {
+        let Some(t) = s.as_mut() else { continue };
+        if t.state == TaskState::Blocked && t.wait_on == WaitOn::Fano(gi) {
+            fano_deposit(t, gi);
+        }
+    }
+}
+
+/// Drain whole events into sleeper `t`'s buffer (Linux packs as
+/// many records as fit per read), then wake with the byte count —
+/// or EINVAL when the head record can never fit.
+fn fano_deposit(t: &mut Task, gi: usize) {
+    let Some(inst) = (unsafe { &mut *core::ptr::addr_of_mut!(FANOS) })
+        .get_mut(gi)
+        .and_then(|s| s.as_mut())
+    else {
+        return;
+    };
+    let mut off = 0usize;
+    while let Some(hi) = inst.q.iter().position(|e| e.is_some()) {
+        let ev = *inst.q[hi].as_ref().unwrap();
+        if ev.len as usize > (t.wait_len as usize).saturating_sub(off) {
+            break;
+        }
+        write_task_bytes(t.pml4, t.wait_ptr + off as u64, &ev.buf[..ev.len as usize]);
+        off += ev.len as usize;
+        inst.q[hi] = None;
+        inst.q.copy_within(hi + 1.., hi);
+        inst.q[FANO_EVS - 1] = None;
+    }
+    let rc = if off > 0 {
+        off as u64
+    } else if inst.q.iter().any(|e| e.is_some()) {
+        EINVAL // head record can never fit the sleeper's buffer
+    } else {
+        return; // nothing drained — stay asleep
+    };
+    t.ctx.rax = rc;
+    t.wait_on = WaitOn::None;
+    t.wait_ptr = 0;
+    t.wait_len = 0;
+    t.state = TaskState::Runnable;
+}
+
+/// fanotify_init(flags, event_f_flags): uid==0 gate like Linux's
+/// CAP_SYS_ADMIN; NOTIF|FID only — non-FID groups mint fds we
+/// don't model, so they EOPNOTSUPP rather than half-answer.
+pub fn fd_fanotify_init(flags: u64, event_flags: u64) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const EOPNOTSUPP_: u64 = (-95i64) as u64;
+    const ENFILE_: u64 = (-23i64) as u64;
+    const FAN_CLOEXEC: u64 = 0x1;
+    const FAN_NONBLOCK: u64 = 0x2;
+    const FAN_CLASS_MASK: u64 = 0xc;
+    const FAN_UNLIMITED: u64 = 0x30; // QUEUE | MARKS
+    const FAN_REPORT_TID: u64 = 0x100;
+    const FAN_REPORT_FID: u64 = 0x200;
+    const KNOWN: u64 = FAN_CLASS_MASK | FAN_CLOEXEC | FAN_NONBLOCK
+        | FAN_UNLIMITED | FAN_REPORT_TID | FAN_REPORT_FID;
+    let Some(t) = cur_mut() else { return EBADF };
+    if t.uid != 0 {
+        return EPERM_;
+    }
+    if flags & !KNOWN != 0 {
+        return EINVAL;
+    }
+    if flags & FAN_CLASS_MASK != 0 || flags & FAN_REPORT_FID == 0 {
+        return EOPNOTSUPP_;
+    }
+    const EF_KNOWN: u64 = O_ACCMODE | O_CLOEXEC | O_NONBLOCK | O_LARGEFILE;
+    let acc = event_flags & O_ACCMODE;
+    if event_flags & !EF_KNOWN != 0 || acc == 1 {
+        return EINVAL; // O_WRONLY event fds are meaningless
+    }
+    let insts = unsafe { &mut *core::ptr::addr_of_mut!(FANOS) };
+    let Some(i) = insts.iter().position(Option::is_none) else {
+        return ENFILE_;
+    };
+    insts[i] = Some(Fano {
+        marks: [const { None }; FANO_MARKS],
+        q: [const { None }; FANO_EVS],
+        overflow: false,
+        nonblock: flags & FAN_NONBLOCK != 0 || event_flags & O_NONBLOCK != 0,
+    });
+    let clo = flags & FAN_CLOEXEC != 0 || event_flags & O_CLOEXEC != 0;
+    let fd = anon_fd(FdKind::Fano(i), clo);
+    if (fd as i64) < 0 {
+        insts[i] = None;
+    }
+    fd
+}
+
+/// fanotify_mark(fd, mflags, mask, path): `path` arrives canonical
+/// (the wrapper's canon_path, or the dirfd's own path for an empty
+/// pathname). INODE marks only — MOUNT/FILESYSTEM are EOPNOTSUPP.
+/// ADD on an existing mark merges the bits like Linux.
+pub fn fano_mark(fd: u64, mflags: u64, mask: u64, path: &[u8]) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const EOPNOTSUPP_: u64 = (-95i64) as u64;
+    const ENOSPC_: u64 = (-28i64) as u64;
+    const ENOTDIR_: u64 = (-20i64) as u64;
+    const ADD: u64 = 0x1;
+    const REMOVE: u64 = 0x2;
+    const ONLYDIR: u64 = 0x8;
+    const FLUSH: u64 = 0x80;
+    const TYPE: u64 = 0x10 | 0x100; // MOUNT | FILESYSTEM
+    const KNOWN_MF: u64 = ADD | REMOVE | 0x4 | ONLYDIR | TYPE | FLUSH | 0x60;
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let FdKind::Fano(gi) = o.kind else { return EINVAL };
+    if t.uid != 0 {
+        return EPERM_;
+    }
+    if mflags & !KNOWN_MF != 0 {
+        return EINVAL;
+    }
+    if mflags & TYPE != 0 {
+        return EOPNOTSUPP_;
+    }
+    let op = mflags & (ADD | REMOVE | FLUSH);
+    if op.count_ones() != 1 {
+        return EINVAL; // exactly one of ADD/REMOVE/FLUSH
+    }
+    let insts = unsafe { &mut *core::ptr::addr_of_mut!(FANOS) };
+    let Some(inst) = insts.get_mut(gi).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    if op == FLUSH {
+        inst.marks = [const { None }; FANO_MARKS];
+        return 0;
+    }
+    if mask & FAN_ALL_EVENTS == 0 || mask & !FAN_MARK_EVENTS != 0 {
+        return EINVAL;
+    }
+    if path.len() > 128 || !fs_exists(path) {
+        return ENOENT;
+    }
+    let is_dir = dir_exists(path) && !is_file(path);
+    if mflags & ONLYDIR != 0 && !is_dir {
+        return ENOTDIR_;
+    }
+    let evbits = mask & FAN_ALL_EVENTS;
+    let on_child = mask & FAN_EVENT_ON_CHILD != 0 && is_dir;
+    let only_dir = mask & FAN_ONDIR != 0;
+    let pos = inst.marks.iter().position(|m| {
+        m.as_ref().is_some_and(|m| &m.path[..m.plen as usize] == path)
+    });
+    if op == REMOVE {
+        let Some(mi) = pos else { return ENOENT };
+        let m = inst.marks[mi].as_mut().unwrap();
+        m.mask &= !evbits;
+        m.on_child &= !on_child;
+        m.only_dir &= !only_dir;
+        if m.mask == 0 {
+            inst.marks[mi] = None; // Linux drops an empty mark
+        }
+        return 0;
+    }
+    // ADD
+    if let Some(mi) = pos {
+        let m = inst.marks[mi].as_mut().unwrap();
+        m.mask |= evbits;
+        m.on_child |= on_child;
+        m.only_dir |= only_dir;
+        return 0;
+    }
+    let Some(mi) = inst.marks.iter().position(Option::is_none) else {
+        return ENOSPC_;
+    };
+    let mut mk = FanoMark {
+        path: [0; 128],
+        plen: path.len() as u8,
+        mask: evbits,
+        only_dir,
+        on_child,
+    };
+    mk.path[..path.len()].copy_from_slice(path);
+    inst.marks[mi] = Some(mk);
+    0
+}
+
+const FAN_MARK_EVENTS: u64 = FAN_ALL_EVENTS | FAN_ONDIR | FAN_EVENT_ON_CHILD;
+
+/// read() on a fanotify group — drains whole event blobs while
+/// they fit, else blocks/EAGAINs like inotify_read.
+fn fano_read(ctx: &mut UCtx, gi: usize, buf: u64, len: u64) -> u64 {
+    const EAGAIN_: u64 = (-11i64) as u64;
+    const EINTR_: u64 = (-4i64) as u64;
+    if len < 24 {
+        return EINVAL; // one metadata record must always fit
+    }
+    if !range_ok_w(buf, len.min(8192)) {
+        return EFAULT;
+    }
+    let insts = unsafe { &mut *core::ptr::addr_of_mut!(FANOS) };
+    let Some(inst) = insts.get_mut(gi).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    let mut off = 0usize;
+    while let Some(hi) = inst.q.iter().position(|e| e.is_some()) {
+        let ev = *inst.q[hi].as_ref().unwrap();
+        if ev.len as usize > (len as usize) - off {
+            break;
+        }
+        // SAFETY: buf validated writable for len bytes; off+ev.len
+        // <= len by the fit test.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ev.buf.as_ptr(),
+                (buf + off as u64) as *mut u8,
+                ev.len as usize,
+            )
+        };
+        off += ev.len as usize;
+        inst.q[hi] = None;
+        inst.q.copy_within(hi + 1.., hi);
+        inst.q[FANO_EVS - 1] = None;
+    }
+    if off > 0 {
+        return off as u64;
+    }
+    if inst.q.iter().any(|e| e.is_some()) {
+        return EINVAL; // head record can't fit this buffer
+    }
+    if inst.overflow {
+        inst.overflow = false;
+        let mut r = [0u8; 24];
+        r[..4].copy_from_slice(&24u32.to_le_bytes());
+        r[4] = 3;
+        r[6..8].copy_from_slice(&24u16.to_le_bytes());
+        r[8..16].copy_from_slice(&FAN_Q_OVERFLOW.to_le_bytes());
+        r[16..20].copy_from_slice(&(-1i32).to_le_bytes());
+        // SAFETY: buf validated writable for >= 24 bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(r.as_ptr(), buf as *mut u8, 24)
+        };
+        return 24;
+    }
+    if inst.nonblock {
+        return EAGAIN_;
+    }
+    let Some(t) = cur_mut() else { return EBADF };
+    if deliverable(t) {
+        return EINTR_;
+    }
+    t.wait_on = WaitOn::Fano(gi);
+    t.wait_ptr = buf;
+    t.wait_len = len;
+    t.wait_deadline = 0;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
 // --- epoll -----------------------------------------------------------
 // Interest sets pin the OFD (Linux's file*), so readiness survives
 // the registering fd closing while a dup lives on; ofd_release
@@ -29810,6 +30290,7 @@ fn epoll_edge(k: &FdKind) {
             | (FdKind::Packet(x), FdKind::Packet(y))
             | (FdKind::Tun(x), FdKind::Tun(y))
             | (FdKind::Inotify(x), FdKind::Inotify(y))
+            | (FdKind::Fano(x), FdKind::Fano(y))
             | (FdKind::Timerfd(x), FdKind::Timerfd(y))
             | (FdKind::Signalfd(x), FdKind::Signalfd(y))
             | (FdKind::MQueue(x), FdKind::MQueue(y)) => x == y,
