@@ -730,7 +730,27 @@ fn ptmx_open() -> Result<usize, u64> {
     const ENFILE_: u64 = (-23i64) as u64;
     const ENOMEM_: u64 = (-12i64) as u64;
     let ptys = unsafe { &mut *core::ptr::addr_of_mut!(PTYS) };
-    let Some(id) = ptys.iter().position(Option::is_none) else {
+    // A free pair slot is usable only while no stale end still pins
+    // its minor: a stale OFD's node keeps carrying the pair's rdev,
+    // and recycling the minor would let its late release decrement
+    // the NEW pair's counts (and cross-wire the rings). Keyed on
+    // live OFDs rather than node existence — a hand-mknod'd rdev
+    // 136 node or a hardlink alias is a legitimate slave reference
+    // (it opens whatever pair owns the minor, like devpts) and must
+    // not veto allocation.
+    let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
+    let Some(id) = (0..ptys.len()).find(|&id| {
+        ptys[id].is_none()
+            && !ofds.iter().flatten().any(|o| {
+                matches!(o.kind, FdKind::Dev(j) if {
+                    vfile(j).is_some_and(|v| {
+                        v.fmt == 0o20000
+                            && matches!(v.rdev >> 8, 128 | 136)
+                            && (v.rdev & 0xff) as usize == id
+                    })
+                })
+            })
+    }) else {
         return Err(ENFILE_);
     };
     let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
@@ -760,6 +780,12 @@ fn ptmx_open() -> Result<usize, u64> {
         vfile_create(&nm[..9])
     };
     if (mv as i64) < 0 || (sv as i64) < 0 {
+        if (mv as i64) >= 0 {
+            vfile_remove(mv as usize);
+        }
+        if (sv as i64) >= 0 {
+            vfile_remove(sv as usize);
+        }
         kalloc::free_frame(b1);
         kalloc::free_frame(b2);
         return Err(ENFILE_);
@@ -778,6 +804,55 @@ fn ptmx_open() -> Result<usize, u64> {
     }
     ptys[id] = Some(Pty { m2s, s2m, locked: true, mopen: 1, sopen: 0 });
     Ok(mv as usize)
+}
+
+/// Roll back a just-minted pty pair when the master open's shared
+/// tail still fails after ptmx_open (O_DIRECTORY, EMFILE): the pair
+/// exists but no fd ever landed. Only the virgin signature —
+/// locked, one master, no slaves — is touched, which a live pair
+/// can never present (its own master OFD keeps mopen >= 1, and the
+/// id allocator never recycles a live or stale minor).
+fn pty_abort_master(i: usize) {
+    let Some(v) = vfile(i) else { return };
+    if v.fmt != 0o20000 || v.rdev >> 8 != 128 {
+        return;
+    }
+    let n = (v.rdev & 0xff) as usize;
+    let ptys = unsafe { &mut *core::ptr::addr_of_mut!(PTYS) };
+    let Some(p) = ptys.get_mut(n).and_then(|s| s.as_mut()) else {
+        return;
+    };
+    if !p.locked || p.mopen != 1 || p.sopen != 0 {
+        return;
+    }
+    let (a, b) = (p.m2s, p.s2m);
+    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
+    for r in [a, b] {
+        if let Some(pi) = pipes.get_mut(r).and_then(|s| s.take()) {
+            kalloc::free_frame(pi.buf);
+        }
+    }
+    ptys[n] = None;
+    if let Some(v) = vfile(i) {
+        v.unlinked = true;
+    }
+    vfile_free_if_dead(i);
+    // Slot-index form: flatten().position() counts only live
+    // entries — a hole in VFILES would hand back a different slot
+    // and unlink an innocent file.
+    let sv = (unsafe { &*core::ptr::addr_of!(VFILES) })
+        .iter()
+        .position(|v| {
+            v.as_ref().is_some_and(|v| {
+                v.fmt == 0o20000 && v.rdev == ((136 << 8) | n as u32)
+            })
+        });
+    if let Some(j) = sv {
+        if let Some(v) = vfile(j) {
+            v.unlinked = true;
+        }
+        vfile_free_if_dead(j);
+    }
 }
 
 /// read() on a pty end — pipe semantics except peer-closed is EIO
@@ -25734,7 +25809,10 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                             _ => return ENXIO,
                         },
                         // dev/pts/N — Linux's EIO on a still-locked
-                        // or never-allocated slave.
+                        // or never-allocated slave. sopen is NOT
+                        // bumped here: the shared mint tail can still
+                        // fail (EMFILE/ENOTDIR), which would leak the
+                        // count forever — the bump rides post-mint.
                         136 => {
                             let n = (v.rdev & 0xff) as usize;
                             let ok = unsafe { &*core::ptr::addr_of!(PTYS) }
@@ -25743,12 +25821,6 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
                                 .is_some_and(|p| !p.locked);
                             if !ok {
                                 return (-5i64) as u64; // EIO
-                            }
-                            unsafe {
-                                (*core::ptr::addr_of_mut!(PTYS))[n]
-                                    .as_mut()
-                                    .unwrap()
-                                    .sopen += 1;
                             }
                             i
                         }
@@ -25869,6 +25941,9 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         if let FdKind::Tun(ti) = kind {
             unsafe { (*core::ptr::addr_of_mut!(TUNS))[ti] = None };
         }
+        if let FdKind::Dev(i) = kind {
+            pty_abort_master(i);
+        }
         return ENOTDIR;
     }
     let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
@@ -25879,6 +25954,9 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         if let FdKind::Tun(ti) = kind {
             unsafe { (*core::ptr::addr_of_mut!(TUNS))[ti] = None };
         }
+        if let FdKind::Dev(i) = kind {
+            pty_abort_master(i);
+        }
         return EMFILE;
     };
     let Some(fi) = fdt(t).fds.iter().position(Option::is_none) else {
@@ -25888,7 +25966,19 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         if let FdKind::Tun(ti) = kind {
             unsafe { (*core::ptr::addr_of_mut!(TUNS))[ti] = None };
         }
+        if let FdKind::Dev(i) = kind {
+            pty_abort_master(i);
+        }
         return EMFILE;
+    };
+    // A slave-node OFD owns one sopen slot — counted only once the
+    // mint can't fail, so a failed open never strands the pair.
+    let slave_minor = match &kind {
+        FdKind::Dev(i) => vfile(*i).and_then(|v| {
+            (v.fmt == 0o20000 && v.rdev >> 8 == 136)
+                .then_some((v.rdev & 0xff) as usize)
+        }),
+        _ => None,
     };
     ofds[oi] = Some(OpenFile {
         kind,
@@ -25898,6 +25988,16 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         nonblock: flags & O_NONBLOCK != 0,
         accmode: acc as u8,
     });
+    if let Some(n) = slave_minor {
+        if let Some(p) = unsafe {
+            &mut *core::ptr::addr_of_mut!(PTYS)
+        }
+        .get_mut(n)
+        .and_then(|s| s.as_mut())
+        {
+            p.sopen += 1;
+        }
+    }
     fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, flags & O_CLOEXEC != 0);
     ino_report(path, IN_OPEN, 0);
@@ -28126,12 +28226,27 @@ fn ofd_release(oi: usize) {
             let ptys = unsafe { &mut *core::ptr::addr_of_mut!(PTYS) };
             if let Some(p) = ptys.get_mut(n).and_then(|s| s.as_mut()) {
                 if master {
+                    if p.mopen == 0 {
+                        // A release with no count left means an
+                        // open went uncounted — trip loudly rather
+                        // than silently retire the pair early.
+                        crate::log::printk(format_args!(
+                            "pty: mopen underflow on pair {}\n",
+                            n
+                        ));
+                    }
                     p.mopen = p.mopen.saturating_sub(1);
                     if p.mopen == 0 {
                         wake_pipe_waiters(WaitOn::PipeRead(p.m2s), (-5i64) as u64);
                         wake_pipe_waiters(WaitOn::PipeWrite(p.s2m), (-5i64) as u64);
                     }
                 } else {
+                    if p.sopen == 0 {
+                        crate::log::printk(format_args!(
+                            "pty: sopen underflow on pair {}\n",
+                            n
+                        ));
+                    }
                     p.sopen = p.sopen.saturating_sub(1);
                     if p.sopen == 0 {
                         wake_pipe_waiters(WaitOn::PipeRead(p.s2m), (-5i64) as u64);
@@ -28155,12 +28270,17 @@ fn ofd_release(oi: usize) {
                     // The peer node (master's ptm/N or slave's
                     // dev/pts/N) is unreachable now too.
                     let peer = if master { 136 } else { 128 };
+                    // Slot-index form — flatten().position() counts
+                    // only live entries, so a hole in VFILES would
+                    // hand back a different slot and unlink an
+                    // innocent file.
                     let pv = (unsafe { &*core::ptr::addr_of!(VFILES) })
                         .iter()
-                        .flatten()
                         .position(|v| {
-                            v.fmt == 0o20000
-                                && v.rdev == ((peer << 8) | n as u32)
+                            v.as_ref().is_some_and(|v| {
+                                v.fmt == 0o20000
+                                    && v.rdev == ((peer << 8) | n as u32)
+                            })
                         });
                     if let Some(pi) = pv {
                         if let Some(v) = vfile(pi) {

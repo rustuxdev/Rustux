@@ -108,6 +108,33 @@ int main(void) {
     check(m2 >= 0 && unlockpt(m2) == 0, "second pair opens");
     if (m2 >= 0) close(m2);
 
+    /* a master open that fails AFTER the pair is minted must roll
+       it back — a leaked pair (mopen=1 forever) never retires, and
+       four leaks exhaust the pty table plus its vfile nodes. */
+    for (int i = 0; i < 6; i++) {
+        errno = 0;
+        int r = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_DIRECTORY);
+        check(r < 0 && errno == ENOTDIR, "ptmx O_DIRECTORY -> ENOTDIR");
+    }
+    for (int i = 0; i < 6; i++) {
+        int dummies[16], nd = 0;
+        while (nd < 16) {
+            int d = open("/dev/null", O_RDONLY);
+            if (d < 0) break;
+            dummies[nd++] = d;
+        }
+        errno = 0;
+        int r = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+        check(r < 0 && errno == EMFILE, "ptmx with full fdt -> EMFILE");
+        for (int j = 0; j < nd; j++) close(dummies[j]);
+    }
+    int m3 = posix_openpt(O_RDWR | O_NOCTTY);
+    check(m3 >= 0, "ptmx opens after failed opens");
+    if (m3 >= 0) {
+        check(unlockpt(m3) == 0, "unlockpt after aborts");
+        close(m3);
+    }
+
     say(fails ? "ptytest: FAILURES\n" : "ptytest: all ok\n");
     return fails;
 }
