@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,8 +45,12 @@ static int nic_up(void) {
     return r >= 0;
 }
 
-/* Run busybox with the given argv; wait for exit code. */
-static int bb_run(char *const argv[]) {
+/* Run busybox with the given argv; wait up to `secs` for exit.
+   busybox's -T only covers the TCP/HTTP phase — its resolver polls
+   with no backstop, so one dropped slirp DNS datagram wedges the
+   child forever. A bounded WNOHANG wait + SIGKILL keeps the suite
+   resilient; a real kernel wedge still fails every retry. */
+static int bb_run(char *const argv[], int secs) {
     pid_t pid = fork();
     if (pid == 0) {
         execve("/busybox", argv, NULL);
@@ -53,8 +58,15 @@ static int bb_run(char *const argv[]) {
     }
     if (pid < 0) return -1;
     int st = 0;
+    for (int i = 0; i < secs * 10; i++) {
+        pid_t w = waitpid(pid, &st, WNOHANG);
+        if (w == pid)
+            return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        usleep(100000);
+    }
+    kill(pid, SIGKILL);
     waitpid(pid, &st, 0);
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    return -1;
 }
 
 int main(void) {
@@ -65,11 +77,17 @@ int main(void) {
         return 0;
     }
 
-    /* The real fetch: DNS via resolv.conf, TCP :80, O_CREAT output. */
-    unlink("/wget_out");
+    /* The real fetch: DNS via resolv.conf, TCP :80, O_CREAT output.
+       Up to 3 attempts — a transient slirp DNS drop wedges one
+       attempt but not three. */
     char *a[] = {"wget", "-T", "15", "-q", "-O", "/wget_out",
                  "http://deb.debian.org/debian/", NULL};
-    int code = bb_run(a);
+    int code = -1;
+    for (int try = 0; try < 3 && code != 0; try++) {
+        if (try > 0) say("wgettest: retrying fetch\n");
+        unlink("/wget_out");
+        code = bb_run(a, 45);
+    }
     check(code == 0, "wget exit 0");
 
     int f = open("/wget_out", O_RDONLY);

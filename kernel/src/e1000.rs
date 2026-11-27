@@ -342,6 +342,19 @@ pub fn on_irq() {
 /// RX-caused MSI count — the IRQ-side proof a packet triggered it.
 pub static RX_IRQS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+/// Stall-dump counters: frames drained, UDP demux attempts/drops,
+/// socket-table hits/drops, and TX results — disambiguates "reply
+/// never arrived" from "arrived but dropped" from "never sent".
+pub static RX_FRAMES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static UDP_DEMUX: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static UDP_CSUM_BAD: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static UDP_TX_OK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static UDP_TX_FAIL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Interrupt-driven receive: enable MSI-X (per-vector message writes
 /// to the LAPIC instead of an IOAPIC line), IVAR-map the RXQ0 cause to
@@ -1944,6 +1957,7 @@ fn drain_desc(d: usize) -> Option<([u8; 4], [u8; 6])> {
     if sta & RXD_STA_DD == 0 {
         return None;
     }
+    RX_FRAMES.fetch_add(1, Ordering::Relaxed);
     let mut out = None;
     if sta & RXD_STA_EOP != 0 && len >= 14 && len as usize <= RX_BUF {
         let p = unsafe { bufs.add(d * RX_BUF) };
@@ -2116,6 +2130,7 @@ pub fn ip_demux(pkt: &[u8], src_mac: [u8; 6]) {
     let our = our_ip();
     if ip.proto == crate::net::NH_UDP && for_us(ip.dst, our, our_mask()) {
         if let Some(u) = crate::net::parse_udp(ip.payload) {
+            UDP_DEMUX.fetch_add(1, Ordering::Relaxed);
             if u.cksum_field == 0
                 || crate::net::csum6_ok(crate::net::csum4(
                     ip.src,
@@ -2125,6 +2140,8 @@ pub fn ip_demux(pkt: &[u8], src_mac: [u8; 6]) {
                 ))
             {
                 crate::user::udp_rx(ip.src, u.sport, u.dport, u.payload);
+            } else {
+                UDP_CSUM_BAD.fetch_add(1, Ordering::Relaxed);
             }
         }
     } else if ip.proto == crate::net::NH_TCP
@@ -2365,5 +2382,11 @@ pub fn udp_tx(dst_mac: [u8; 6], dst_ip: [u8; 4], sport: u16, dport: u16, payload
     m.copy_from_slice(&mac[2..8]);
     let mut f = [0u8; 1600];
     let n = crate::net::build_udp4(&mut f, dst_mac, m, our_ip(), dst_ip, sport, dport, payload);
-    n != 0 && tx_eth(&mut f[..n.max(60)])
+    let ok = n != 0 && tx_eth(&mut f[..n.max(60)]);
+    if ok {
+        UDP_TX_OK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        UDP_TX_FAIL.fetch_add(1, Ordering::Relaxed);
+    }
+    ok
 }

@@ -98,6 +98,65 @@ pub fn load_gs(sel: u16) {
     }
 }
 
+/// The flat user data selector (GDT slot 5, DPL3, D/B=1) — the ds/es
+/// default every task starts with. In IA-32e compat mode the CPU
+/// HONORS ds/es bases (unlike 64-bit mode), so a task that loads a
+/// non-flat selector (a modify_ldt consumer doing `mov ds, ldt_sel`)
+/// leaves its cached base installed for the next compat task unless
+/// the switch path saves and restores these registers per task.
+pub const UD_SEL: u16 = 0x28 | 3;
+
+/// GDT entry count — bounds for selector validation on restore.
+pub const GDT_LEN: usize = 14;
+
+/// The descriptor at GDT index `i` (0 for out-of-range) — lets the
+/// switch path validate a task's saved ds/es before reloading them.
+pub fn gdt_entry(i: usize) -> u64 {
+    if i >= GDT_LEN {
+        return 0;
+    }
+    // SAFETY: i is bounded; the GDT is a live static.
+    unsafe { (*core::ptr::addr_of!(GDT))[i] }
+}
+
+/// Read the live ds/es selectors — called at switch-out so a compat
+/// task's segment state survives preemption. Only the selector value
+/// is captured: the base re-derives from the task's own LDT/GDT when
+/// it's reloaded on the way back in.
+pub fn rd_ds_es() -> (u16, u16) {
+    let d: u64;
+    let e: u64;
+    // SAFETY: reading ds/es is always valid; the registers hold the
+    // interrupted task's values in every switch context.
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, ds",
+            "mov {1}, es",
+            out(reg) d, out(reg) e,
+            options(nostack, preserves_flags));
+    }
+    (d as u16, e as u16)
+}
+
+/// Restore a task's ds/es — must run AFTER load_ldt_of so an LDT
+/// selector re-decodes against the incoming task's table. CPL0 may
+/// load a DPL3 data segment when RPL <= DPL (same rule load_gs
+/// relies on); a selector the descriptor check rejects raises
+/// #GP here rather than in user context, matching Linux's
+/// loadsegment-on-switch behavior.
+pub fn load_ds_es(ds: u16, es: u16) {
+    // SAFETY: selectors are task-tracked values (UD_SEL by default,
+    // or a GDT/LDT selector the task itself loaded); the LDT slot is
+    // already pointed at this task's table.
+    unsafe {
+        core::arch::asm!(
+            "mov ds, {0:x}",
+            "mov es, {1:x}",
+            in(reg) ds as u64, in(reg) es as u64,
+            options(nostack, preserves_flags));
+    }
+}
+
 /// x86_64 task state segment. Only the IST entries matter today: no
 /// privilege transitions exist yet, so the rsp fields stay zeroed. iopb
 /// past the struct end disables the I/O bitmap.

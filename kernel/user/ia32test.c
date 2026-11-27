@@ -118,6 +118,18 @@ __attribute__((naked)) void _start(void) {
 }
 
 void main32(void) {
+    // Segment regression (run-341): a compat task's ds/es must be
+    // the flat user selector 0x2b on every resume — the scheduler
+    // saves/restores them per task now. A foreign selector (an LDT
+    // descriptor left loaded by another task) would silently bias
+    // every data access by that descriptor's cached base; reading
+    // the selector itself is base-independent so it's reliable
+    // even when the base is poisoned.
+    unsigned short cur_ds, cur_es;
+    __asm__ volatile("mov %%ds, %0\n\tmov %%es, %1"
+                     : "=r"(cur_ds), "=r"(cur_es));
+    check(cur_ds == 0x2b && cur_es == 0x2b);
+
     check(abi_argc == 1);
     check(abi_argv0 != 0);
     check(*(volatile char *)abi_argv0 == 'i'); // "ia32test"

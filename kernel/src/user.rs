@@ -338,7 +338,7 @@ impl UCtx {
 /// ones persist as zombies until their parent's wait4 collects them
 /// (or they're orphaned); Blocked tasks sleep inside a syscall whose
 /// resume ctx is already saved — a matching child exit wakes them.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TaskState {
     Runnable,
     Exited,
@@ -352,7 +352,7 @@ enum TaskState {
 /// What a Blocked task sleeps on — wait4's child, or a pipe's
 /// read/write side. The waker writes the syscall result into
 /// `ctx.rax` and marks the task Runnable.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WaitOn {
     None,
     /// wait4(-1): any child of this task.
@@ -1652,6 +1652,39 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
 /// delivery: cpu.rs rebuilt the interrupted UCtx from the trap
 /// stubs' saved registers, we pend the signo and run it through the
 /// same maybe_deliver frame-push/redirect a kill() would get. The
+/// One-word tag for an fd's kind — stall-dump readability.
+fn kind_tag(k: &FdKind) -> &'static str {
+    match k {
+        FdKind::Stdin => "Stdin",
+        FdKind::Console => "Console",
+        FdKind::File(_) => "File",
+        FdKind::Ram(_) => "Ram",
+        FdKind::Dir(_) => "Dir",
+        FdKind::Pipe { .. } => "Pipe",
+        FdKind::Udp(_) => "Udp",
+        FdKind::Tcp(_) => "Tcp",
+        FdKind::Packet(_) => "Packet",
+        FdKind::Unix(_) => "Unix",
+        FdKind::Nl(_) => "Nl",
+        FdKind::Tun(_) => "Tun",
+        FdKind::Epoll(_) => "Epoll",
+        FdKind::Eventfd(_) => "Eventfd",
+        FdKind::Uring(_) => "Uring",
+        FdKind::Uffd(_) => "Uffd",
+        FdKind::Perf(_) => "Perf",
+        FdKind::Signalfd(_) => "Signalfd",
+        FdKind::Inotify(_) => "Inotify",
+        FdKind::Timerfd(_) => "Timerfd",
+        FdKind::Pidfd(_) => "Pidfd",
+        FdKind::MQueue(_) => "MQueue",
+        FdKind::Proc { .. } => "Proc",
+        FdKind::Dev(_) => "Dev",
+        FdKind::Mount(_) => "Mount",
+        FdKind::FsCtx(_) => "FsCtx",
+    }
+}
+
+
 /// returned (rip, rsp, rdi) is spliced into the trap frame so the
 /// exception iretq lands in the handler — sigreturn later restores
 /// the fault-time context (re-faulting if unfixed, exactly like
@@ -2437,6 +2470,13 @@ pub struct Task {
     /// Compat task's %gs selector (0 = none), reloaded on switch so
     /// the hidden descriptor base matches the task's TLS entry.
     gs_sel: u16,
+    /// Compat task's %ds/%es selectors, saved/restored on switch —
+    /// IA-32e compat mode honors their cached descriptor bases, so a
+    /// task that loads a non-flat selector (modify_ldt consumers)
+    /// would otherwise leak its base into the NEXT compat task's
+    /// data accesses (lldt does not invalidate loaded segments).
+    ds_sel: u16,
+    es_sel: u16,
     /// NT handle table — small indices like the real one; slots
     /// hold nt::NTH_* object tags. Fork copies it (a cloned
     /// handle stays open in the child like DuplicateHandle).
@@ -8244,6 +8284,8 @@ fn load(img: &[u8]) -> Option<Task> {
         gs_base: 0,
         tls: [0; 4],
         gs_sel: 0,
+        ds_sel: cpu::UD_SEL,
+        es_sel: cpu::UD_SEL,
         nth: [0; crate::nt::MAX_NTH],
         nth_fd: [0xff; crate::nt::MAX_NTH],
         nth_dirpat: [[0; 96]; crate::nt::MAX_NTH],
@@ -20559,6 +20601,8 @@ pub fn nt_thread_create(
         gs_base: teb,
         tls: [0; 4],
         gs_sel: 0,
+        ds_sel: cpu::UD_SEL,
+        es_sel: cpu::UD_SEL,
         // Windows handles are process objects: the table lives on
         // the leader only (mm_owner routes there), so a thread's
         // own nth must stay empty — a copied snapshot could be
@@ -32158,11 +32202,19 @@ fn ephemeral_port() -> Option<u16> {
 /// A blocked recvfrom gets the datagram copied straight into its
 /// buffer (through ITS tables); otherwise it queues one deep —
 /// a second arrival displaces it, honest UDP loss.
+/// Stall-dump counters for the UDP socket demux — see e1000's set.
+pub static UDP_RX_HIT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static UDP_RX_DROP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub fn udp_rx(src_ip: [u8; 4], sport: u16, dport: u16, p: &[u8]) {
+    use core::sync::atomic::Ordering::Relaxed;
     let socks = unsafe { &mut *core::ptr::addr_of_mut!(UDPSOCKS) };
     let Some(si) = socks.iter().position(|s| {
         s.as_ref().is_some_and(|k| k.port == dport)
     }) else {
+        UDP_RX_DROP.fetch_add(1, Relaxed);
         return; // nobody bound to this port — drop
     };
     // A connect()ed socket only accepts its peer's datagrams —
@@ -32171,8 +32223,10 @@ pub fn udp_rx(src_ip: [u8; 4], sport: u16, dport: u16, p: &[u8]) {
         .as_ref()
         .is_some_and(|k| k.peer.is_some_and(|(pp, pip)| sport != pp || src_ip != pip))
     {
+        UDP_RX_DROP.fetch_add(1, Relaxed);
         return;
     }
+    UDP_RX_HIT.fetch_add(1, Relaxed);
     // A blocked receiver first: payload + sockaddr straight through
     // the sleeper's tables, count into its rax — same wake shape as
     // the pipe paths.
@@ -36508,7 +36562,7 @@ const TCP_BACKLOG: usize = 4;
 /// connect() timeout, ~10s at 100Hz ticks.
 const TCP_CONN_TICKS: u64 = 1000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TcpState {
     /// Fresh socket — bound or not, never connected.
     Init,
@@ -38222,6 +38276,19 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     t.nranges = 0;
     t.stack_top = 0;
     t.fs_base = 0; // TLS dies with the old image — new one SET_FSs
+    // Segment state dies with the old image too: a compat task that
+    // exec'd still holds its ds/es/gs selectors and LDT in the live
+    // registers — reset both the tracked fields and the hardware so
+    // the new image can't inherit a non-flat cached base. Running at
+    // CPL0 in the exec'ing task's context, so reload directly.
+    t.ds_sel = cpu::UD_SEL;
+    t.es_sel = cpu::UD_SEL;
+    t.gs_sel = 0;
+    t.ldt_n = 0;
+    t.tls = [0; 4]; // compat TLS descriptors die with the image too
+    cpu::load_ds_es(cpu::UD_SEL, cpu::UD_SEL);
+    cpu::load_gs(0);
+    load_ldt_of(t);
     t.rseq_va = 0; // exec implicitly unregisters rseq
     t.did_exec = true; // pgid/sid persist; parent setpgid now EACCES
     if let Some(p) = &pe_img {
@@ -38489,8 +38556,16 @@ pub fn launch() {
         // SAFETY: MSR write of a task-owned user FS base.
         unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
         unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
+        // i386 TLS + %gs: same restore set as switch_to — a compat
+        // task launched here needs its own descriptors in the GDT
+        // TLS slots and its selector reloaded so the hidden base
+        // matches (this path was missing both).
+        for (i, &d) in t.tls.iter().enumerate() {
+            cpu::install_tls(i, d);
+        }
         cpu::load_iomap(iop_map(t.tgid));
         load_ldt_of(t);
+        load_data_sels(t);
         let pid = t.pid;
         let rip = t.ctx.rip;
         let ex = core::str::from_utf8(
@@ -38516,9 +38591,15 @@ fn switch_to(n: usize) -> ! {
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     if let Some(t) = unsafe { (*core::ptr::addr_of_mut!(TASKS))[cur].as_mut() } {
         fxsave(t);
+        // The outgoing task's ds/es are live in the registers —
+        // capture them so a non-flat selector survives preemption
+        // instead of leaking into the next compat task.
+        let (d, e) = cpu::rd_ds_es();
+        t.ds_sel = d;
+        t.es_sel = e;
     }
     unsafe { *core::ptr::addr_of_mut!(CUR_I) = n };
-    let (ctx, pml4, kst, gs_sel) = {
+    let (ctx, pml4, kst) = {
         let t = unsafe { (*core::ptr::addr_of_mut!(TASKS))[n].as_mut().unwrap() };
         t.nswitch += 1;
         fxrstor(&t.fx);
@@ -38533,11 +38614,9 @@ fn switch_to(n: usize) -> ! {
         }
         cpu::load_iomap(iop_map(t.tgid));
         load_ldt_of(t);
-        (&t.ctx as *const UCtx, t.pml4, t.kstack_top, t.gs_sel)
+        load_data_sels(t);
+        (&t.ctx as *const UCtx, t.pml4, t.kstack_top)
     };
-    // 0 clears the segment: harmless in 64-bit mode (the MSR base
-    // governs there) and correct for a compat task with no TLS yet.
-    cpu::load_gs(gs_sel);
     syscall::set_kstack(kst);
     unsafe { syscall::sched_iret(ctx, pml4) }
 }
@@ -38885,6 +38964,15 @@ fn block_switch() -> ! {
 /// ctx for the dispatch stub to pop+iret.
 fn resume_ctx(n: usize) -> *const UCtx {
     CTXT_SW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // The outgoing task's ds/es are live in the registers — capture
+    // them before CUR_I flips, same as switch_to.
+    if let Some(t) = unsafe {
+        (*core::ptr::addr_of_mut!(TASKS))[*core::ptr::addr_of!(CUR_I)].as_mut()
+    } {
+        let (d, e) = cpu::rd_ds_es();
+        t.ds_sel = d;
+        t.es_sel = e;
+    }
     unsafe { *core::ptr::addr_of_mut!(CUR_I) = n };
     let t = unsafe { (*core::ptr::addr_of_mut!(TASKS))[n].as_mut().unwrap() };
     t.nswitch += 1;
@@ -38902,8 +38990,16 @@ fn resume_ctx(n: usize) -> *const UCtx {
     // the task across switches, same as launch/switch_to.
     unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
     unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, t.gs_base) };
+    // i386 TLS + %gs selector: this path was missing the GDT-slot
+    // install and the selector reload switch_to does — a compat
+    // task resumed by the timer IRQ kept the previous task's TLS
+    // descriptors and hidden gs base.
+    for (i, &d) in t.tls.iter().enumerate() {
+        cpu::install_tls(i, d);
+    }
     cpu::load_iomap(iop_map(t.tgid));
     load_ldt_of(t);
+    load_data_sels(t);
     &t.ctx
 }
 
@@ -38946,6 +39042,148 @@ pub fn tick(img: &mut UCtx) -> *const UCtx {
     crate::e1000::rx_drain(); // feed socket queues from the live ring
     tcp_retx(); // SYN retransmit on the initial-RTO schedule
     stdin_pump(); // feed the tty input queue from the scancode ring
+    // Stall watchdog: 300 consecutive ticks (~3s) with NO runnable
+    // task is a wedge — dump every live task's wait class so a
+    // stuck gate prints its culprit instead of hanging silently.
+    static mut IDLE_TICKS: u32 = 0;
+    {
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        let any_run = tasks
+            .iter()
+            .flatten()
+            .any(|t| t.state == TaskState::Runnable);
+        let it = unsafe { &mut *core::ptr::addr_of_mut!(IDLE_TICKS) };
+        if any_run {
+            *it = 0;
+        } else {
+            *it += 1;
+            if *it == 300 || (*it > 300 && *it % 300 == 0) {
+                crate::log::printk(format_args!(
+                    "rustux: stall-watch: nothing runnable {} ticks",
+                    *it
+                ));
+                for (i, s) in tasks.iter().enumerate() {
+                    let Some(t) = s else { continue };
+                    if t.state == TaskState::Exited {
+                        continue;
+                    }
+                    let nend = t.name
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(16);
+                    let nm = core::str::from_utf8(&t.name[..nend])
+                        .unwrap_or("?");
+                    crate::log::printk(format_args!(
+                        "  [{i}] pid={} {} {:?} {:?} dl={} pend={:#x} mask={:#x}",
+                        t.pid, nm, t.state, t.wait_on, t.wait_deadline,
+                        t.pending, t.sigmask
+                    ));
+                    crate::log::printk(format_args!(
+                        "    itimer0={:?}",
+                        t.itimers[0]
+                    ));
+                    // Per-fd kind tags — what the waiter's table names.
+                    // fdi==FDI_NONE (mid-reap) has no table.
+                    if t.fdi == FDI_NONE {
+                        continue;
+                    }
+                    for fd in 0..MAX_FDS {
+                        let Some(oi) = fdt(t).fds[fd] else { continue };
+                        let ofds = unsafe {
+                            &*core::ptr::addr_of!(OFDS)
+                        };
+                        if let Some(Some(o)) = ofds.get(oi as usize) {
+                            crate::log::printk(format_args!(
+                                "    fd[{}]={}",
+                                fd, kind_tag(&o.kind)
+                            ));
+                        }
+                    }
+                    // Poll/Pselect waiters: decode the pollfd array —
+                    // which fds it's armed on settles "reply lost"
+                    // vs "wrong fd" vs "never sent".
+                    if t.state == TaskState::Blocked
+                        && matches!(
+                            t.wait_on,
+                            WaitOn::Poll | WaitOn::Pselect
+                        )
+                    {
+                        if matches!(t.wait_on, WaitOn::Poll) {
+                            for j in 0..t.wait_len {
+                                let mut b = [0u8; 8];
+                                if read_task_bytes(
+                                    t.pml4,
+                                    t.wait_ptr + j * 8,
+                                    &mut b,
+                                ) {
+                                    let fdi = i32::from_ne_bytes(
+                                        b[..4].try_into().unwrap(),
+                                    );
+                                    let ev = u16::from_ne_bytes(
+                                        b[4..6].try_into().unwrap(),
+                                    );
+                                    crate::log::printk(format_args!(
+                                        "    pollfd[{}] fd={} ev={:#x}",
+                                        j, fdi, ev
+                                    ));
+                                }
+                            }
+                        } else {
+                            crate::log::printk(format_args!(
+                                "    psel rfd={:#x} wfd={:#x} xfd={:#x} n={}",
+                                t.wait_ptr, t.wait_ptr2,
+                                t.wait_ptr3, t.wait_len
+                            ));
+                        }
+                    }
+                }
+                let pipes = unsafe { &*core::ptr::addr_of!(PIPES) };
+                for (i, s) in pipes.iter().enumerate() {
+                    if let Some(p) = s {
+                        crate::log::printk(format_args!(
+                            "  pipe[{}] r={} w={} avail={}",
+                            i, p.readers, p.writers, p.tail - p.head
+                        ));
+                    }
+                }
+                let tcps = unsafe { &*core::ptr::addr_of!(TCPSOCKS) };
+                for (i, s) in tcps.iter().enumerate() {
+                    if let Some(sk) = s {
+                        crate::log::printk(format_args!(
+                            "  tcp[{}] lport={} peer={}.{}.{}.{}:{} st={:?} rxl={} finrx={} dead={} orph={} ctl_at={} tries={} snd_nxt={} rcv_nxt={}",
+                            i, sk.port, sk.peer_ip[0], sk.peer_ip[1],
+                            sk.peer_ip[2], sk.peer_ip[3], sk.peer_port,
+                            sk.state, sk.rxl, sk.fin_rx, sk.dead,
+                            sk.orphan, sk.ctl_at, sk.ctl_tries,
+                            sk.snd_nxt, sk.rcv_nxt
+                        ));
+                    }
+                }
+                let udps = unsafe { &*core::ptr::addr_of!(UDPSOCKS) };
+                for (i, s) in udps.iter().enumerate() {
+                    if let Some(sk) = s {
+                        crate::log::printk(format_args!(
+                            "  udp[{}] port={} peer={:?} q={}",
+                            i, sk.port, sk.peer, sk.q.is_some()
+                        ));
+                    }
+                }
+                crate::log::printk(format_args!(
+                    "  e1000 irqs={} rx_irqs={} frames={} udemux={} ubad={} utx={} utxf={} urx={} udrop={}",
+                    crate::e1000::IRQS.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::e1000::RX_IRQS.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::e1000::RX_FRAMES.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::e1000::UDP_DEMUX.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::e1000::UDP_CSUM_BAD.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::e1000::UDP_TX_OK.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::e1000::UDP_TX_FAIL.load(core::sync::atomic::Ordering::Relaxed),
+                    UDP_RX_HIT.load(core::sync::atomic::Ordering::Relaxed),
+                    UDP_RX_DROP.load(core::sync::atomic::Ordering::Relaxed),
+                ));
+                crate::log::drain_task();
+            }
+        }
+    }
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
     // Bill the tick: a kernel-CS frame means the task was inside a
     // syscall when the timer hit (stime); a CPL3 frame is user time.
@@ -39322,6 +39560,8 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         ldt: p.ldt,
         ldt_n: p.ldt_n,
         gs_sel: p.gs_sel,
+        ds_sel: p.ds_sel,
+        es_sel: p.es_sel,
         nth: p.nth,
         nth_fd: p.nth_fd,
         nth_dirpat: p.nth_dirpat,
@@ -39538,6 +39778,8 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         ldt: p.ldt,
         ldt_n: p.ldt_n,
         gs_sel: p.gs_sel,
+        ds_sel: p.ds_sel,
+        es_sel: p.es_sel,
         nth: p.nth,
         nth_fd: p.nth_fd,
         nth_dirpat: p.nth_dirpat,
@@ -41369,8 +41611,16 @@ fn ptr_regs_apply(t: &mut Task, r: &[u64; 27]) {
     c.rip = r[16];
     c.rflags = (r[18] & !0x3000) | (c.rflags & 0x3000);
     c.rsp = r[19];
-    t.fs_base = r[21];
-    t.gs_base = r[22];
+    // fs/gs_base are CPL0 wrmsr targets on every switch — a tracer
+    // must not hand the kernel a non-canonical value to write
+    // (#GP at CPL0 -> halt). Same rule arch_prctl's SET_FS uses:
+    // 0 or inside the user window, anything else is ignored.
+    if r[21] == 0 || (elf::USER_VA_LO..elf::USER_VA_HI).contains(&r[21]) {
+        t.fs_base = r[21];
+    }
+    if r[22] == 0 || (elf::USER_VA_LO..elf::USER_VA_HI).contains(&r[22]) {
+        t.gs_base = r[22];
+    }
 }
 
 /// CONT/SYSCALL/SINGLESTEP/LISTEN/DETACH's shared tail: repend the
@@ -41976,6 +42226,65 @@ fn load_ldt_of(t: &Task) {
     } else {
         cpu::load_ldt(t.ldt.as_ptr(), t.ldt_n as u16 * 8 - 1);
     }
+}
+
+/// The descriptor `sel` names — null-selector class decodes as
+/// Some(0); an out-of-range index returns None.
+fn seg_desc(t: &Task, sel: u16) -> Option<u64> {
+    if sel <= 3 {
+        // Only index-0/TI-0 is the null selector — index 0 with
+        // TI=1 (sel 4..7) is a real LDT slot and must be bounds-
+        // checked like any other LDT reference.
+        return Some(0);
+    }
+    let i = (sel >> 3) as usize;
+    if sel & 4 != 0 {
+        // TI=1: the task's own LDT.
+        if i >= t.ldt_n as usize {
+            return None;
+        }
+        Some(t.ldt[i])
+    } else {
+        if i >= cpu::GDT_LEN {
+            return None;
+        }
+        Some(cpu::gdt_entry(i))
+    }
+}
+
+/// Restore a task's saved ds/es on switch — must run after
+/// install_tls + load_ldt_of so both selector spaces re-decode
+/// against this task's descriptors. A saved selector that became
+/// unloadable meanwhile (the task shrank or not-present'd its own
+/// LDT slot under a live register) is substituted with the null
+/// selector so the fault lands on the task's next data access in
+/// ring 3 — not inside the switch path at CPL0.
+fn load_data_sels(t: &Task) {
+    let ok = |sel: u16| -> bool {
+        match seg_desc(t, sel) {
+            Some(0) => true, // null selector
+            Some(d) => {
+                let present = d & (1 << 47) != 0;
+                let dpl = (d >> 45) & 3;
+                let code_or_data = d & (1 << 44) != 0;
+                let ty = (d >> 40) & 0xf;
+                // DS/ES accept a data segment or a readable code
+                // segment; a CPL0 load needs DPL >= RPL.
+                present
+                    && code_or_data
+                    && dpl >= (sel as u64 & 3)
+                    && (ty & 8 == 0 || ty & 2 != 0)
+            }
+            None => false,
+        }
+    };
+    let pick = |sel: u16| if ok(sel) { sel } else { 0 };
+    cpu::load_ds_es(pick(t.ds_sel), pick(t.es_sel));
+    // %gs gets the same validation — a set_thread_area descriptor
+    // written seg_not_present leaves an unloadable selector in
+    // gs_sel, and a bare `mov gs` here would #NP at CPL0 (kernel
+    // halt) instead of faulting in the task's ring.
+    cpu::load_gs(pick(t.gs_sel));
 }
 
 /// modify_ldt(func, ptr, bytecount): real per-task LDT — func 0 reads
