@@ -179,6 +179,34 @@ int main(void) {
     for (int i = 0; i < 50 && !done_b; i++) usleep(20000);
     check(done_b == 1, "requeued sleeper woke via B");
 
+    // ---- classic futex WAIT_BITSET absolute timeout (202) ----
+    // BITSET's timespec is ABSOLUTE (MONOTONIC by default —
+    // CLOCK_REALTIME only with flag 0x100), unlike plain WAIT's
+    // relative one. A past instant must return ETIMEDOUT at once.
+    #define FB_WAIT_BITSET 9
+    #define FB_CLK_RT 256
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_sec -= 5; // absolute deadline in the past -> no sleep
+    errno = 0;
+    check(syscall(SYS_futex, (void *)&wb, 9u, 0, &ts, 0, ~0u) < 0
+          && errno == ETIMEDOUT, "BITSET abs mono past ETIMEDOUT");
+    // a REALTIME epoch deadline needs FUTEX_CLOCK_REALTIME —
+    // without it the epoch reads as boot-time (still valid abs:
+    // epoch >> uptime, so it just blocks; use past-instant here)
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec -= 5; // epoch in the past -> immediate ETIMEDOUT
+    errno = 0;
+    check(syscall(SYS_futex, (void *)&wb, 9u | FB_CLK_RT, 0, &ts,
+                  0, ~0u) < 0 && errno == ETIMEDOUT,
+          "BITSET RT past ETIMEDOUT");
+    // Sanity fork: same {5s,0} timespec is ~5s RELATIVE under plain
+    // WAIT but 5-seconds-after-boot ABSOLUTE under BITSET (past ->
+    // ETIMEDOUT). Boot is >5s old by the time ft2test runs.
+    struct timespec tiny = { 5, 0 };
+    errno = 0;
+    check(syscall(SYS_futex, (void *)&wb, 9u, 0, &tiny, 0, ~0u) < 0
+          && errno == ETIMEDOUT, "BITSET {5s} abs past ETIMEDOUT");
+
     // ---- membarrier(324) ----
     long sup = syscall(SYS_membarrier, MBR_QUERY, 0, 0);
     check(sup > 0 && (sup & MBR_GLOBAL) && (sup & MBR_PRVEXP),

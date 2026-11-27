@@ -462,7 +462,56 @@ int main(void) {
         errno = 0;
         check(timerfd_settime(epfd[1], 0, &its, NULL) < 0 &&
               errno == EINVAL, "settime non-timerfd EINVAL");
+
+        /* TFD_TIMER_ABSTIME: on this MONOTONIC fd it_value is a
+           boot-time absolute deadline; on a REALTIME fd it is
+           epoch time — the kernel folds wall->ticks internally. */
+        struct timespec aw;
+        clock_gettime(CLOCK_MONOTONIC, &aw);
+        memset(&its, 0, sizeof(its));
+        its.it_value.tv_sec = aw.tv_sec;
+        its.it_value.tv_nsec = aw.tv_nsec + 40000000;
+        if (its.it_value.tv_nsec >= 1000000000L) {
+            its.it_value.tv_sec++;
+            its.it_value.tv_nsec -= 1000000000L;
+        }
+        check(timerfd_settime(tfd, TFD_TIMER_ABSTIME, &its, NULL) == 0,
+              "timerfd mono ABSTIME +40ms");
+        /* gettime must show remaining > 0 -- a REALTIME collapse
+           reads mono-now as epoch-past, fires at once, disarms. */
+        check(timerfd_gettime(tfd, &cur) == 0 &&
+              (cur.it_value.tv_sec > 0 || cur.it_value.tv_nsec > 0),
+              "mono abstime still pending");
+        ev = 0;
+        check(read(tfd, &ev, 8) == 8 && ev == 1,
+              "timerfd mono abstime fires");
         close(tfd);
+
+        int rtfd = timerfd_create(CLOCK_REALTIME, 0);
+        check(rtfd >= 0, "timerfd_create REALTIME");
+        clock_gettime(CLOCK_REALTIME, &aw);
+        memset(&its, 0, sizeof(its));
+        its.it_value.tv_sec = aw.tv_sec;
+        its.it_value.tv_nsec = aw.tv_nsec + 40000000;
+        if (its.it_value.tv_nsec >= 1000000000L) {
+            its.it_value.tv_sec++;
+            its.it_value.tv_nsec -= 1000000000L;
+        }
+        check(timerfd_settime(rtfd, TFD_TIMER_ABSTIME, &its, NULL) == 0,
+              "timerfd RT ABSTIME +40ms");
+        ev = 0;
+        check(read(rtfd, &ev, 8) == 8 && ev == 1,
+              "timerfd RT abstime fires");
+        /* An epoch instant already past expires immediately —
+           pre-fix this slept for ~54 years of boot ticks. */
+        its.it_value.tv_sec = aw.tv_sec - 5;
+        its.it_value.tv_nsec = 0;
+        check(timerfd_settime(rtfd, TFD_TIMER_ABSTIME, &its, NULL) == 0,
+              "timerfd RT ABSTIME past");
+        ev = 0;
+        check(read(rtfd, &ev, 8) == 8 && ev == 1,
+              "timerfd RT past fires at once");
+        close(rtfd);
         errno = 0;
         check(read(ep, &ec, 1) < 0 && errno == EINVAL,
               "epoll read -> EINVAL");

@@ -126,9 +126,10 @@ int main(void) {
     check(timer_settime(tid, 8, &it, NULL) == -1 && errno == EINVAL,
           "settime bad flags EINVAL");
 
-    // --- TIMER_ABSTIME: absolute = now+30ms fires
+    // --- TIMER_ABSTIME: tid's clockid is REALTIME, so the
+    //     absolute deadline is epoch time — arm at wall-now+30ms.
     struct timespec now;
-    check(clock_gettime(CLOCK_MONOTONIC, &now) == 0, "clock_gettime");
+    check(clock_gettime(CLOCK_REALTIME, &now) == 0, "clock_gettime");
     memset(&it, 0, sizeof it);
     it.it_value.tv_sec = now.tv_sec;
     it.it_value.tv_nsec = now.tv_nsec + 30 * 1000 * 1000;
@@ -138,9 +139,65 @@ int main(void) {
     }
     hits = 0;
     check(timer_settime(tid, TIMER_ABSTIME, &it, NULL) == 0,
-          "ABSTIME arm +30ms");
+          "RT ABSTIME arm +30ms");
     msleep(90);
-    check(hits >= 1, "ABSTIME fired");
+    check(hits >= 1, "RT ABSTIME fired");
+
+    // --- ABSTIME epoch-past fires immediately (pre-fix semantics
+    //     read the epoch as boot ticks -> ~54y sleep). Fixed epoch
+    //     {1,0} — pmvtest/stest race to clock_settime the shared
+    //     wall clock, so "now-5s" can become a future deadline.
+    hits = 0;
+    it.it_value.tv_sec = 1;
+    it.it_value.tv_nsec = 0;
+    check(timer_settime(tid, TIMER_ABSTIME, &it, NULL) == 0,
+          "RT ABSTIME past arm");
+    msleep(40);
+    check(hits >= 1, "RT ABSTIME past fired");
+
+    // --- MONOTONIC abstime is boot-time, not epoch — a mono timer
+    //     armed with epoch would be ~54y out; mono-now+30ms fires.
+    timer_t tid2;
+    check(timer_create(CLOCK_MONOTONIC, NULL, &tid2) == 0,
+          "create mono timer");
+    check(clock_gettime(CLOCK_MONOTONIC, &now) == 0, "clock_gettime mono");
+    memset(&it, 0, sizeof it);
+    it.it_value.tv_sec = now.tv_sec;
+    it.it_value.tv_nsec = now.tv_nsec + 30 * 1000 * 1000;
+    if (it.it_value.tv_nsec >= 1000000000L) {
+        it.it_value.tv_sec++;
+        it.it_value.tv_nsec -= 1000000000L;
+    }
+    hits = 0;
+    check(timer_settime(tid2, TIMER_ABSTIME, &it, NULL) == 0,
+          "mono ABSTIME arm +30ms");
+    // gettime must show remaining > 0 — a REALTIME collapse reads
+    // mono-now as epoch-past, fires at once, disarms.
+    check(timer_gettime(tid2, &cur) == 0 &&
+          (cur.it_value.tv_sec > 0 || cur.it_value.tv_nsec > 0),
+          "mono abstime still pending");
+    msleep(90);
+    check(hits >= 1, "mono ABSTIME fired");
+    check(timer_delete(tid2) == 0, "delete mono timer");
+
+    // --- clock_nanosleep(230): REALTIME ABSTIME is epoch-based —
+    //     a past instant returns at once (pre-fix read the epoch
+    //     as boot ticks -> ~54y sleep); +30ms sleeps briefly.
+    now.tv_sec = 1; // epoch 1970 — past under any suite-set clock
+    now.tv_nsec = 0;
+    check(clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &now,
+                          NULL) == 0, "cns RT abstime past -> 0");
+    clock_gettime(CLOCK_REALTIME, &now);
+    now.tv_nsec += 30 * 1000 * 1000;
+    if (now.tv_nsec >= 1000000000L) {
+        now.tv_sec++;
+        now.tv_nsec -= 1000000000L;
+    }
+    check(clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &now,
+                          NULL) == 0, "cns RT abstime +30ms");
+    errno = 0;
+    check(clock_nanosleep(9, 0, &now, NULL) == EINVAL,
+          "cns bad clock EINVAL");
 
     // --- overrun + delete
     check(timer_getoverrun(tid) == 0, "getoverrun 0");

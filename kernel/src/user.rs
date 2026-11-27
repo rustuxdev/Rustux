@@ -1059,6 +1059,7 @@ struct Timerfd {
     interval: u64,
     expirations: u64,
     nonblock: bool,
+    clockid: u64,
 }
 
 static mut TIMERFDS: [Option<Timerfd>; MAX_TIMERFDS] =
@@ -2077,10 +2078,6 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
                 let rem = t.wait_ptr;
                 write_task_bytes(t.pml4, rem, &(left / 100).to_le_bytes());
                 write_task_bytes(t.pml4, rem + 8, &((left % 100) * 10_000_000).to_le_bytes());
-            }
-            // clock_nanosleep's ABI returns EINTR positive.
-            if t.wait_ptr2 != 0 {
-                rax = 4;
             }
         }
         // SA_RESTART: a restartable wait interrupted by a signal
@@ -13276,8 +13273,8 @@ pub fn sys_get_thread_area(u_info: u64) -> u64 {
 /// utsname's mutable pair — sethostname/setdomainname write these;
 /// every other field is fixed. 64-byte slots + a length like the
 /// ABI's 65-byte fields (trailing NUL is structural).
-static mut UTS_NODE: [u8; 64] = *b"rustux                                                          ";
-static mut UTS_DOMAIN: [u8; 64] = *b"(none)                                                          ";
+static mut UTS_NODE: [u8; 64] = *b"rustux\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+static mut UTS_DOMAIN: [u8; 64] = *b"(none)\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 static mut UTS_NODE_LEN: usize = 6;
 static mut UTS_DOMAIN_LEN: usize = 6;
 
@@ -19414,19 +19411,23 @@ pub fn sys_nanosleep(ctx: &mut UCtx, req: u64, rem: u64) -> u64 {
 }
 
 /// clock_nanosleep(clk, flags, req, rem): glibc's nanosleep() lands
-/// here, not on nr 35. Unlike every other syscall this ABI returns
-/// POSITIVE errno values (EINTR, EINVAL, EFAULT) directly — the
-/// signal-wake path must know that, so wait_ptr2 flags the mode.
+/// here, not on nr 35. The libc-visible API returns errno values
+/// POSITIVE, but the kernel ABI is -errno like every other syscall —
+/// glibc's wrapper negates, so a +EINVAL here would read as success
+/// (found by ptmtest's bad-clock check, run-348).
 /// flags bit0 = TIMER_ABSTIME (req is an absolute deadline).
 pub fn sys_clock_nanosleep(
     ctx: &mut UCtx,
-    _clk: u64,
+    clk: u64,
     flags: u64,
     req: u64,
     rem: u64,
 ) -> u64 {
-    const EFAULT_P: u64 = 14;
-    const EINVAL_P: u64 = 22;
+    const EFAULT_P: u64 = (-14i64) as u64;
+    const EINVAL_P: u64 = (-22i64) as u64;
+    if clk > 1 {
+        return EINVAL_P; // REALTIME/MONOTONIC only
+    }
     if !range_ok(req, 16) {
         return EFAULT_P;
     }
@@ -19437,10 +19438,15 @@ pub fn sys_clock_nanosleep(
     }
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     let ticks = if flags & 1 != 0 {
-        // Absolute deadline measured in boot-time ticks.
-        sec.saturating_mul(100)
-            .saturating_add(nsec.div_ceil(10_000_000))
-            .saturating_sub(now)
+        // Absolute deadline — ticks-since-boot on MONOTONIC, epoch
+        // on REALTIME (abstime_deadline does the wall delta). The
+        // min() keeps a >i64::MAX sec from wrapping negative.
+        abstime_deadline(
+            clk,
+            sec.min(i64::MAX as u64) as i64,
+            nsec as i64,
+        )
+        .saturating_sub(now)
     } else {
         sec.saturating_mul(100)
             .saturating_add(nsec.div_ceil(10_000_000))
@@ -19453,11 +19459,11 @@ pub fn sys_clock_nanosleep(
     }
     let Some(t) = cur_mut() else { return EINVAL_P };
     if deliverable(t) {
-        return 4; // EINTR, positive per this ABI
+        return (-4i64) as u64; // EINTR
     }
     t.wait_on = WaitOn::Timer;
     t.wait_ptr = rem;
-    t.wait_ptr2 = 1; // positive-errno wake
+    t.wait_ptr2 = 0; // kernel-style -errno wake
     t.wait_deadline = now.saturating_add(ticks);
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
@@ -29167,15 +29173,35 @@ pub fn sys_futex(
                             .read_unaligned(),
                     )
                 };
-                let ticks = (sec.max(0) as u64)
-                    .saturating_mul(100)
-                    .saturating_add((nsec.max(0) as u64) / 10_000_000);
-                if ticks == 0 {
-                    return ETIMEDOUT_;
+                if op & 0x7f == 9 {
+                    // FUTEX_WAIT_BITSET's timeout is ABSOLUTE —
+                    // MONOTONIC by default, REALTIME under
+                    // FUTEX_CLOCK_REALTIME(0x100). Plain WAIT is
+                    // relative — the fork the man page warns about.
+                    if sec < 0
+                        || !(0..1_000_000_000).contains(&nsec)
+                    {
+                        return EINVAL;
+                    }
+                    let clockid = if op & 0x100 != 0 { 0 } else { 1 };
+                    deadline = abstime_deadline(clockid, sec, nsec);
+                    if deadline
+                        <= crate::apic::TICKS
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                    {
+                        return ETIMEDOUT_;
+                    }
+                } else {
+                    let ticks = (sec.max(0) as u64)
+                        .saturating_mul(100)
+                        .saturating_add((nsec.max(0) as u64) / 10_000_000);
+                    if ticks == 0 {
+                        return ETIMEDOUT_;
+                    }
+                    deadline = crate::apic::TICKS
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                        .saturating_add(ticks);
                 }
-                deadline = crate::apic::TICKS
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                    .saturating_add(ticks);
             }
             if deliverable(t) {
                 return (-4i64) as u64; // -EINTR before sleep
@@ -29266,22 +29292,9 @@ pub fn sys_futex_waitv(
         if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
             return EINVAL;
         }
-        let ts_ns = (sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(nsec as u64);
         let now =
             crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-        deadline = if clockid == 0 {
-            let (ws, wns) = crate::rtc::wall_now();
-            let wall_ns = ws
-                .saturating_mul(1_000_000_000)
-                .saturating_add(wns);
-            now.saturating_add(
-                ts_ns.saturating_sub(wall_ns).div_ceil(10_000_000),
-            )
-        } else {
-            ts_ns.div_ceil(10_000_000)
-        };
+        deadline = abstime_deadline(clockid, sec, nsec);
         if deadline <= now {
             return ETIMEDOUT_;
         }
@@ -29347,22 +29360,9 @@ pub fn sys_futex_wait(
         if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
             return EINVAL;
         }
-        let ts_ns = (sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(nsec as u64);
         let now =
             crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-        deadline = if clockid == 0 {
-            let (ws, wns) = crate::rtc::wall_now();
-            let wall_ns = ws
-                .saturating_mul(1_000_000_000)
-                .saturating_add(wns);
-            now.saturating_add(
-                ts_ns.saturating_sub(wall_ns).div_ceil(10_000_000),
-            )
-        } else {
-            ts_ns.div_ceil(10_000_000)
-        };
+        deadline = abstime_deadline(clockid, sec, nsec);
         if deadline <= now {
             return ETIMEDOUT_;
         }
@@ -31374,6 +31374,7 @@ pub fn fd_timerfd_create(clockid: u64, flags: u64) -> u64 {
         interval: 0,
         expirations: 0,
         nonblock: flags & TFD_NONBLOCK != 0,
+        clockid,
     });
     let fd = anon_fd(FdKind::Timerfd(i), flags & TFD_CLOEXEC != 0);
     if (fd as i64) < 0 {
@@ -31405,6 +31406,28 @@ fn ns_to_ticks(sec: i64, nsec: i64) -> u64 {
     (sec.max(0) as u64)
         .saturating_mul(100)
         .saturating_add((nsec.max(0) as u64).div_ceil(10_000_000))
+}
+
+/// Absolute {sec,nsec} on clockid {REALTIME=0, MONOTONIC=1} -> a
+/// TICKS deadline: MONOTONIC reads ticks-since-boot directly;
+/// REALTIME converts epoch->ticks by delta from wall_now — a past
+/// instant saturates to `now`, so every caller's `<= now` check
+/// still answers immediately (the mq_abstime shape).
+fn abstime_deadline(clockid: u64, sec: i64, nsec: i64) -> u64 {
+    let now =
+        crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    if clockid == 0 {
+        let (ws, wns) = crate::rtc::wall_now();
+        let wall_ns = ws
+            .saturating_mul(1_000_000_000)
+            .saturating_add(wns);
+        let ts_ns = (sec.max(0) as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec.max(0) as u64);
+        now.saturating_add(ts_ns.saturating_sub(wall_ns).div_ceil(10_000_000))
+    } else {
+        ns_to_ticks(sec, nsec)
+    }
 }
 
 /// timerfd_settime(fd, flags, new, old): arm/disarm + report the
@@ -31467,7 +31490,7 @@ pub fn fd_timerfd_settime(fd: u64, flags: u64, new: u64, old: u64) -> u64 {
     } else {
         let v = ns_to_ticks(vsec, vnsec).max(1);
         tf.deadline = if flags & TFD_ABSTIME != 0 {
-            v
+            abstime_deadline(tf.clockid, vsec, vnsec).max(1)
         } else {
             now.saturating_add(v)
         };
@@ -31737,6 +31760,7 @@ struct PTimer {
     interval: u64, // ticks, 0 = one-shot
     /// Expirations while the last notification still pends.
     overrun: i32,
+    clockid: u64,
 }
 
 static mut PTIMERS: [Option<PTimer>; MAX_PTIMERS] =
@@ -31910,6 +31934,7 @@ pub fn sys_timer_create(clk: u64, sevp: u64, timerid: u64) -> u64 {
         deadline: 0,
         interval: 0,
         overrun: 0,
+        clockid: clk,
     });
     write_task_u32(t.pml4, timerid, i as u32);
     0
@@ -31973,9 +31998,11 @@ pub fn sys_timer_settime(
         p.overrun = 0;
         return 0;
     }
-    // ABSTIME counts down from now; relative adds to it.
+    // ABSTIME counts down from now; relative adds to it. On
+    // CLOCK_REALTIME the deadline is epoch ns — abstime_deadline
+    // folds it back into ticks by the wall-clock delta.
     let dl = if flags & TIMER_ABSTIME != 0 {
-        value.saturating_sub(now)
+        abstime_deadline(p.clockid, nv[2], nv[3]).saturating_sub(now)
     } else {
         value
     };
