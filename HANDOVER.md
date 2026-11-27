@@ -9268,3 +9268,64 @@ scope.
   green; ECANCELED errno corrected via the new test
   (-125 not -89); suite-hang class fixed via abstime-only
   wait_rt + race-immune test arms.
+
+## run-350 — SA_RESTART restart_block remainder (nanosleep family)
+
+- Closes the run-348 audit F-item: an SA_RESTART replay of an
+  interrupted WaitOn::Timer wait re-dispatched the syscall with the
+  original req — the sleeper waited FULL duration + elapsed instead
+  of the unslept remainder (Linux's restart_block stores the expiry
+  and restarts to it; req is never re-read).
+- Task gains restart_at (tick deadline, 0=none), restart_rt (RT
+  abstime slide flag), restart_rip (replay entry rip); initialized
+  at all 4 Task literals, cleared at exec alongside restart_nr.
+- Arm site (pend_one, where restart_nr is set): Timer waits stash
+  wait_deadline + wait_rt into restart_at/restart_rt; non-Timer
+  arms clear both (no stale stash survives a different wait kind).
+- restart_apply stashes c.rip on successful rewind — the rip the
+  replayed entry will see (post-insn on both 0F05 and CD80 gates);
+  timer_restart consumes the stash ONLY when ctx.rip matches, so a
+  signal handler's own nanosleep (or any non-replay call) can't
+  steal the deadline.
+- timer_restart() shared consume helper at the top of
+  sys_nanosleep/sys_nanosleep32/sys_clock_nanosleep: deliverable ->
+  EINTR; deadline<=now -> 0 (remainder elapsed inside the handler);
+  else re-arms the wait to the stashed deadline with the stashed
+  wait_rt — req/rem/range checks all skipped, so an unmapped or
+  rewritten req pointer can't fault or reshape the replay (Linux
+  restart_block likewise never touches req). i386 passes rem_va=0
+  (no 32-bit rem fill, unchanged).
+- Correction to run-348/349 doc claims: relative-RT waits NOT
+  sliding is NOT a divergence — POSIX requires relative
+  CLOCK_REALTIME timers unaffected by clock_settime, and Linux
+  implements it by rebasing rel-RT hrtimers onto MONOTONIC
+  (common_hrtimer_arm kclock switch, commit 48d0c9be). Our
+  raw-tick arm is equivalent. ITIMER_REAL counting TICKS is also
+  already Linux-correct (setitimer is relative-only -> monotonic
+  under the hood on Linux too); the "not slid" HANDOVER note was
+  a mislabeled non-divergence. Stale comments in
+  sys_clock_nanosleep fixed.
+- Test (pgtest +3 checks): 2s nanosleep interrupted at ~400ms by
+  SA_RESTART SIGUSR1 must total [1900,2350)ms — full-replay would
+  land ~2400ms, no-replay ~400ms; both fail the window.
+- Scope note: poll/ppoll/futex restart_remainder (Linux also has
+  restart_block variants for them) stays deferred — same coarse
+  replay class, bigger surface; recorded for a future rung.
+- Audit (run-108, scoped quick): DOCUMENT — all candidates fixed
+  in-run: C1 nested-handler stash steal (a signal pushed between
+  sigreturn-apply and the replayed insn lets the handler's
+  same-insn nanosleep pass the rip gate — both frame-push sites
+  now disarm the stash on push-over-armed-ctx; the replay falls
+  back to a plain full-req arm in that window only); C2 stale
+  restart_rip from a prior non-Timer replay could key a pre-apply
+  steal via a shared libc syscall() gate (arm now clears rip);
+  C3 the armed stash wasn't slid by slide_realtime_deadlines
+  (slide covers restart_at when restart_rt — a Runnable task's
+  armed restart expiry is still a live RT expiry); C4 the
+  consume-EINTR path now fills rem with the remainder like the
+  wake path. C5 (NT sleep_ms arms an inert stash — no consume
+  site reaches it) documented as pre-existing.
+- cve-now sweep: restart_block/signal-replay class — no CVE class
+  maps (hits were unrelated subsystems).
+- Gates: 2x PASS 127 tasks zero leak; the remainder-window check
+  green.
