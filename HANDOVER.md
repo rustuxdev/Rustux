@@ -8633,3 +8633,24 @@ catalog; gate classes reviewed: CAP gate present, bitmap can't
 alias (static slots freed only at group death), deny-all default,
 exec keeps the tgid map (Linux-true) but drops IOPL via the fresh
 ctx — matches rflags semantics.
+
+run-334 — ptrace(101) classic subset (the last big missing subsystem):
+tracer/tracee link via Task.tracer + reparenting (ATTACH reparents so
+WUNTRACED reports ride ordinary child_change; rppid restores on
+DETACH/tracer-death). Signal/fault delivery-stops share one hook in
+maybe_deliver: the pending sig dequeues into `inject`, CONT(0)
+suppresses, CONT(x) re-pends with a one-time bypass; a traced task's
+default-fatal fault stops instead of dying (fault_signal traced
+branch). Syscall entry/exit stops via sys_ph + gate pair in both
+dispatchers — the entry gate rewinds ctx.rip over the 2-byte syscall
+insn so CONT re-executes it under sys_ph, exit gate reports the
+result; SIGTRAP|0x80 stop code. SINGLESTEP arms ctx.rflags TF -> #DB
+-> delivery-stop. GETREGS/SETREGS/PEEKUSER share a 27-slot
+user_regs_struct view (cs/ss kept, rflags IOPL masked — the
+reg-forging escalation class is closed by construction). SIGKILL
+unsuppressible through ptrace. exec-stop at the new image's entry.
+ptrtest.c new task -> MAX_TASKS 120->121, lstest floor 93->94.
+In-run fixes: GETSIGINFO needed a wait4-surviving si_signo field;
+PTRACE_KILL must work on a running tracee. Audit run-93: 0 confirmed
+— 19 ptrace CVEs mapped, all absent-class (no setuid, bounded
+translate windows, no utrace/coredump objects, no compat arm).
