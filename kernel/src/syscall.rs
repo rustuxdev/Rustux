@@ -470,6 +470,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         user::deliver_current(ctx);
         return;
     }
+    user::ptrace_gate_entry(ctx);
     ctx.rax = match nr {
         // fd_read validates the write-target range itself because only
         // it knows how many bytes the source will actually produce.
@@ -696,6 +697,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         146 => user::sys_sched_get_priority_max(a1 as i64),
         147 => user::sys_sched_get_priority_min(a1 as i64),
         148 => user::sys_sched_rr_get_interval(a1, a2),
+        101 => user::sys_ptrace(a1, a2, a3, a4),
         187 => user::sys_readahead(a1, a2 as i64, a3),
         200 => user::sys_tkill(a1, a2),
         237 => user::sys_mbind(a1, a2, a3, a4, a5, a6),
@@ -874,6 +876,7 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
             ENOSYS
         }
     };
+    user::ptrace_gate_exit(ctx);
     // Signals deliver on the way back to user mode — a handler
     // redirects this ctx; a default-fatal signal never returns.
     user::deliver_current(ctx);
@@ -910,6 +913,7 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         user::deliver_current(ctx);
         return;
     }
+    user::ptrace_gate_entry(ctx);
     ctx.rax = match nr {
         1 | 252 => sys_exit(a1),                 // exit / exit_group
         3 => user::fd_read(ctx, a1, a2, a3.min(MAX_READ)),
@@ -1018,6 +1022,7 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
             ENOSYS
         }
     };
+    user::ptrace_gate_exit(ctx);
 
 
 
@@ -1426,6 +1431,9 @@ fn sys_execveat(
         // safely resume. Kill it — the run() loop reaps as usual.
         sys_exit(127);
     }
+    // A traced task stops at the new image's entry — the classic
+    // exec-stop a debugger's TRACEME/attach relies on.
+    user::ptrace_exec_stop(ctx);
     0 // unreachable on success — sysret lands in the new image
 }
 

@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 120;
+const MAX_TASKS: usize = 121;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -1457,6 +1457,28 @@ pub fn rt_sigprocmask32(how: u64, set: u64, old: u64, sigsetsize: u64) -> u64 {
 
 fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
     while let Some(sig) = unmasked_pending(t) {
+        if t.tracer != 0 && t.inject == sig as u8 {
+            // A signal re-pended by PTRACE_CONT consumes its one-time
+            // bypass here — without it resume-delivery would re-stop
+            // on the very signal the tracer injected.
+            t.inject = 0;
+        } else if t.tracer != 0 {
+            // ptrace signal-delivery-stop: the pending signal is
+            // dequeued into `inject` — CONT(0) suppresses it, CONT(x)
+            // replaces it. Covers faults too (fault_signal pends the
+            // fault sig through this same loop).
+            let src = core::mem::replace(&mut t.pend_src[sig - 1], SIGSRC_NONE);
+            t.pending &= !(1u32 << (sig - 1));
+            t.inject = sig as u8;
+            t.si_signo = sig as i32;
+            t.si_code = src.code as i64;
+            t.si_addr = src.aux;
+            t.state = TaskState::Stopped;
+            t.stop_sig = sig as u8;
+            let (cp, cg, cpp) = (t.pid, t.pgid, t.ppid);
+            child_change(cp, cg, cpp, ((sig as u64) << 8) | 0x7f, WUNTRACED);
+            return;
+        }
         t.pending &= !(1u32 << (sig - 1));
         let src = core::mem::replace(&mut t.pend_src[sig - 1], SIGSRC_NONE);
         match sigt(t).handlers.get(sig - 1).copied().unwrap_or(SIG_DFL) {
@@ -1615,7 +1637,11 @@ pub fn fault_signal(signo: u64, code: i32, addr: u64, ctx: &mut UCtx) -> (u64, u
     if let Some(t) = tasks.get_mut(cur).and_then(|s| s.as_mut()) {
         // Caught dispositions take the frame path for both ABIs —
         // maybe_deliver builds the x86_64 frame or the i386 one.
-        let caught = sigt(t)
+        // A traced task takes the same route regardless of
+        // disposition: the fault signal becomes a delivery-stop and
+        // the tracer decides (CONT suppress / re-inject) — Linux's
+        // ptrace-intercepts-fatal-signal semantics.
+        let caught = t.tracer != 0 || sigt(t)
                 .handlers
                 .get(signo.saturating_sub(1) as usize)
                 .copied()
@@ -2407,6 +2433,29 @@ pub struct Task {
     /// Resumed by SIGCONT since the last WCONTINUED report —
     /// consumed once per continue, like stop_sig.
     cont_report: bool,
+    /// pid of the ptrace tracer (0 = untraced). PTRACE_ATTACH
+    /// reparents the tracee so wait4/WUNTRACED reporting rides the
+    /// normal child_change path; rppid holds the real parent for
+    /// DETACH / tracer-death restore.
+    tracer: u64,
+    rppid: u64,
+    /// PTRACE_SYSCALL armed (1 = entry/exit stops in the dispatch
+    /// gates). sys_ph: inside a traced syscall — set by the
+    /// entry-stop, cleared by the exit-stop.
+    ptr_sys: u8,
+    sys_ph: u8,
+    /// Signal carried by a ptrace delivery-stop: CONT(0) suppresses
+    /// it, CONT(x) re-pends x and marks it for a one-time delivery
+    /// bypass so resume-delivery cannot re-stop on it.
+    inject: u8,
+    /// signo/si_code/si_addr captured at the current stop —
+    /// PTRACE_GETSIGINFO's answer. stop_sig gets consumed by the
+    /// wait4 report; this copy survives it.
+    si_signo: i32,
+    si_code: i64,
+    si_addr: u64,
+    /// syscall nr captured at the entry-stop — GETREGS' orig_rax.
+    orig_rax: u64,
     /// apic::TICKS at spawn — /proc/<pid>/stat's starttime (field 22)
     /// is in ticks-since-boot like Linux's jiffies figure.
     start_ticks: u64,
@@ -3238,6 +3287,7 @@ impl Task {
         self.release_fstab();
         aio_release_tgid(self.tgid);
         iop_release_tgid(self.tgid);
+        ptrace_release_tracer(self.pid);
         // NT handle table dies with the Task: refdown whatever its
         // slots still name or the NT_THREADS/NT_PROCS/NT_SECTIONS
         // ledgers leak an entry per abandoned handle. Idempotent —
@@ -8153,6 +8203,15 @@ fn load(img: &[u8]) -> Option<Task> {
         nt_stub: 0,
         stop_sig: 0,
         cont_report: false,
+        tracer: 0,
+        rppid: 0,
+        ptr_sys: 0,
+        sys_ph: 0,
+        inject: 0,
+        si_signo: 0,
+        si_code: 0,
+        si_addr: 0,
+        orig_rax: 0,
         start_ticks: crate::apic::TICKS
             .load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
@@ -20397,6 +20456,15 @@ pub fn nt_thread_create(
         nt_stub: p.nt_stub,
         stop_sig: 0,
         cont_report: false,
+        tracer: 0,
+        rppid: 0,
+        ptr_sys: 0,
+        sys_ph: 0,
+        inject: 0,
+        si_signo: 0,
+        si_code: 0,
+        si_addr: 0,
+        orig_rax: 0,
         start_ticks: crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
         stime: 0,
@@ -38971,6 +39039,15 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         nt_stub: p.nt_stub,
         stop_sig: 0,
         cont_report: false,
+        tracer: 0,
+        rppid: 0,
+        ptr_sys: 0,
+        sys_ph: 0,
+        inject: 0,
+        si_signo: 0,
+        si_code: 0,
+        si_addr: 0,
+        orig_rax: 0,
         start_ticks: crate::apic::TICKS
             .load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
@@ -39174,6 +39251,15 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         nt_stub: p.nt_stub,
         stop_sig: 0,
         cont_report: false,
+        tracer: 0,
+        rppid: 0,
+        ptr_sys: 0,
+        sys_ph: 0,
+        inject: 0,
+        si_signo: 0,
+        si_code: 0,
+        si_addr: 0,
+        orig_rax: 0,
         start_ticks: crate::apic::TICKS
             .load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
@@ -40906,6 +40992,361 @@ pub fn sys_io_pgetevents(
     usig: u64,
 ) -> u64 {
     sys_io_getevents(ctx, ctx_id, min_nr, nr, events, timeout, usig)
+}
+
+/// ---------- ptrace(101): the classic tracer subset ----------
+///
+/// A traced task reports every stop through the ordinary WUNTRACED
+/// child_change path — PTRACE_ATTACH reparents the tracee to the
+/// tracer so wait4 needs no ptrace-specific reporting (rppid keeps
+/// the real parent for DETACH/tracer-death restore). Signal and
+/// fault delivery ride maybe_deliver's traced-stop: the pending
+/// signal is dequeued into `inject`, CONT(0) suppresses it, CONT(x)
+/// re-pends x with a one-time delivery bypass. Syscall stops split
+/// entry/exit via `sys_ph`: the entry gate rewinds ctx.rip over the
+/// 2-byte syscall insn so CONT re-executes it, and the exit gate
+/// stops with the result in rax. SIGKILL is not suppressible —
+/// CONT(0) on a SIGKILL delivery-stop re-pends it.
+const PTRACE_TRACEME: u64 = 0;
+const PTRACE_PEEKTEXT: u64 = 1;
+const PTRACE_PEEKDATA: u64 = 2;
+const PTRACE_PEEKUSER: u64 = 3;
+const PTRACE_POKETEXT: u64 = 4;
+const PTRACE_POKEDATA: u64 = 5;
+const PTRACE_POKEUSER: u64 = 6;
+const PTRACE_CONT: u64 = 7;
+const PTRACE_KILL: u64 = 8;
+const PTRACE_SINGLESTEP: u64 = 9;
+const PTRACE_GETREGS: u64 = 12;
+const PTRACE_SETREGS: u64 = 13;
+const PTRACE_ATTACH: u64 = 16;
+const PTRACE_DETACH: u64 = 17;
+const PTRACE_SYSCALL: u64 = 24;
+const PTRACE_SINGLEBLOCK: u64 = 33;
+const PTRACE_SETOPTIONS: u64 = 0x4200;
+const PTRACE_GETEVENTMSG: u64 = 0x4201;
+const PTRACE_GETSIGINFO: u64 = 0x4202;
+const PTRACE_SETSIGINFO: u64 = 0x4203;
+const PTRACE_SEIZE: u64 = 0x4206;
+const PTRACE_INTERRUPT: u64 = 0x4207;
+const PTRACE_LISTEN: u64 = 0x4208;
+
+/// x86-64 user_regs_struct order (27 slots) — GETREGS/SETREGS and
+/// PEEKUSER/POKEUSER's byte-offset window all index this layout.
+fn ptr_regs(t: &Task) -> [u64; 27] {
+    let c = &t.ctx;
+    [
+        c.r15, c.r14, c.r13, c.r12, c.rbp, c.rbx, c.r11, c.r10, c.r9,
+        c.r8, c.rax, c.rcx, c.rdx, c.rsi, c.rdi, t.orig_rax, c.rip,
+        c.cs, c.rflags, c.rsp, c.ss, t.fs_base, t.gs_base, 0, 0, 0, 0,
+    ]
+}
+
+/// Apply a regs array back onto a stopped tracee — cs/ss stay (a
+/// tracer-forged segment would #GP the tracee's sysret), and rflags
+/// keeps the task's own IOPL like sigreturn's FIX_EFLAGS handling.
+fn ptr_regs_apply(t: &mut Task, r: &[u64; 27]) {
+    let c = &mut t.ctx;
+    c.r15 = r[0];
+    c.r14 = r[1];
+    c.r13 = r[2];
+    c.r12 = r[3];
+    c.rbp = r[4];
+    c.rbx = r[5];
+    c.r11 = r[6];
+    c.r10 = r[7];
+    c.r9 = r[8];
+    c.r8 = r[9];
+    c.rax = r[10];
+    c.rcx = r[11];
+    c.rdx = r[12];
+    c.rsi = r[13];
+    c.rdi = r[14];
+    t.orig_rax = r[15];
+    c.rip = r[16];
+    c.rflags = (r[18] & !0x3000) | (c.rflags & 0x3000);
+    c.rsp = r[19];
+    t.fs_base = r[21];
+    t.gs_base = r[22];
+}
+
+/// CONT/SYSCALL/SINGLESTEP/LISTEN/DETACH's shared tail: repend the
+/// injected signal (or suppress the stopped one), unstop.
+fn ptrace_resume(t: &mut Task, sig: u64) -> u64 {
+    const EIO_: u64 = (-5i64) as u64;
+    if sig > 32 {
+        return EIO_;
+    }
+    if sig == 0 && t.inject == SIGKILL as u8 {
+        // SIGKILL is not suppressible — CONT(0) re-pends it rather
+        // than dropping the death sentence the stop was holding.
+        pend_one(t, SIGKILL as u64, SIGSRC_NONE);
+        t.state = TaskState::Runnable;
+        t.cont_report = true;
+        return 0;
+    }
+    if sig != 0 {
+        t.inject = sig as u8;
+        pend_one(t, sig, SIGSRC_NONE);
+    } else {
+        t.inject = 0;
+    }
+    t.state = TaskState::Runnable;
+    t.cont_report = true;
+    0
+}
+
+/// ptrace syscall-entry gate — called before the nr match in each
+/// dispatcher. An armed tracee stops BEFORE the syscall runs: the
+/// saved ctx rewinds rip over the 2-byte syscall/int insn so CONT
+/// re-executes it (sys_ph marks that re-entry and skips this gate).
+pub fn ptrace_gate_entry(ctx: &mut UCtx) {
+    let Some(t) = cur_mut() else { return };
+    if t.tracer == 0 || t.ptr_sys == 0 || t.sys_ph != 0 {
+        return;
+    }
+    let (pid, pgid, ppid) = (t.pid, t.pgid, t.ppid);
+    t.sys_ph = 1;
+    t.orig_rax = ctx.rax;
+    ctx.rip = ctx.rip.wrapping_sub(2);
+    t.ctx = *ctx;
+    t.state = TaskState::Stopped;
+    t.si_signo = 0x85;
+    t.stop_sig = 0x85; // SIGTRAP|0x80 — the syscall-stop marker
+    child_change(pid, pgid, ppid, 0x857f, WUNTRACED);
+    block_switch();
+}
+
+/// ptrace syscall-exit gate — called after ctx.rax holds the result.
+pub fn ptrace_gate_exit(ctx: &mut UCtx) {
+    let Some(t) = cur_mut() else { return };
+    if t.tracer == 0 || t.sys_ph == 0 {
+        return;
+    }
+    let (pid, pgid, ppid) = (t.pid, t.pgid, t.ppid);
+    t.sys_ph = 0;
+    t.ctx = *ctx;
+    t.state = TaskState::Stopped;
+    t.si_signo = 0x85;
+    t.stop_sig = 0x85;
+    child_change(pid, pgid, ppid, 0x857f, WUNTRACED);
+    block_switch();
+}
+
+/// exec-stop: a traced task stops on its new image's entry — the
+/// classic "stop at first exec" a debugger's attach relies on.
+/// Called after user::exec rewrote ctx for the new image.
+pub fn ptrace_exec_stop(ctx: &mut UCtx) {
+    let Some(t) = cur_mut() else { return };
+    if t.tracer == 0 {
+        return;
+    }
+    let (pid, pgid, ppid) = (t.pid, t.pgid, t.ppid);
+    t.sys_ph = 0;
+    t.ctx = *ctx;
+    t.state = TaskState::Stopped;
+    t.si_signo = 5;
+    t.stop_sig = 5; // SIGTRAP
+    child_change(pid, pgid, ppid, (5 << 8) | 0x7f, WUNTRACED);
+    block_switch();
+}
+
+/// Tracer death: every tracee detaches, reparents back, and resumes
+/// (Linux's orphan-detach; reparents land on init like ordinary
+/// orphans when rppid's owner is also gone).
+fn ptrace_release_tracer(pid: u64) {
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for s in tasks.iter_mut().flatten() {
+        if s.tracer != pid {
+            continue;
+        }
+        s.tracer = 0;
+        s.ptr_sys = 0;
+        s.sys_ph = 0;
+        s.inject = 0;
+        if s.rppid != 0 {
+            s.ppid = s.rppid;
+            s.rppid = 0;
+        }
+        if s.state == TaskState::Stopped {
+            s.state = TaskState::Runnable;
+            s.cont_report = true;
+        }
+    }
+}
+
+/// ptrace(request, pid, addr, data) — the classic subset: TRACEME,
+/// ATTACH/SEIZE (+reparent), DETACH, CONT/KILL/SINGLESTEP/
+/// SINGLEBLOCK/SYSCALL/LISTEN, PEEK/POKE text+data+user, GETREGS/
+/// SETREGS, GETSIGINFO/SETSIGINFO, SETOPTIONS, GETEVENTMSG,
+/// INTERRUPT. GETREGSET/SEIZE-options beyond this answer EIO.
+pub fn sys_ptrace(req: u64, pid: u64, addr: u64, data: u64) -> u64 {
+    const EPERM_: u64 = (-1i64) as u64;
+    const ESRCH_: u64 = (-3i64) as u64;
+    const EIO_: u64 = (-5i64) as u64;
+    const EFAULT_: u64 = (-14i64) as u64;
+    let me = match cur_mut() {
+        Some(t) => (t.pid, t.uid),
+        None => return ESRCH_,
+    };
+    if req == PTRACE_TRACEME {
+        let Some(t) = cur_mut() else { return ESRCH_ };
+        if t.tracer != 0 {
+            return EPERM_;
+        }
+        t.tracer = t.ppid;
+        return 0;
+    }
+    let Some(slot) = task_slot_by_pid(pid) else { return ESRCH_ };
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let Some(t) = tasks.get_mut(slot).and_then(|s| s.as_mut()) else {
+        return ESRCH_;
+    };
+    if t.state == TaskState::Exited {
+        return ESRCH_;
+    }
+    if req == PTRACE_ATTACH || req == PTRACE_SEIZE {
+        if t.pid == me.0 {
+            return EPERM_;
+        }
+        if t.tracer != 0 {
+            return EPERM_; // already traced
+        }
+        if me.1 != 0 && me.1 != t.uid {
+            return EPERM_;
+        }
+        t.tracer = me.0;
+        t.rppid = t.ppid;
+        t.ppid = me.0;
+        if req == PTRACE_ATTACH {
+            // The initial SIGSTOP-stop: pended here, delivered into a
+            // delivery-stop at the tracee's next pick — the wait4
+            // status (SIGSTOP<<8|0x7f) matches Linux's attach.
+            t.inject = 0;
+            pend_one(t, SIGSTOP as u64, SIGSRC_NONE);
+        }
+        return 0;
+    }
+    if t.tracer != me.0 {
+        return ESRCH_; // not our tracee
+    }
+    if req == PTRACE_INTERRUPT {
+        pend_one(t, 5, SIGSRC_NONE); // SIGTRAP
+        return 0;
+    }
+    if req == PTRACE_KILL {
+        // Works on a running tracee too — the SIGKILL pends into a
+        // delivery-stop (unsuppressible: CONT(0) re-pends it).
+        t.inject = 0;
+        pend_one(t, SIGKILL as u64, SIGSRC_NONE);
+        t.state = TaskState::Runnable;
+        return 0;
+    }
+    if t.state != TaskState::Stopped {
+        return ESRCH_; // Linux: tracee must be stopped
+    }
+    match req {
+        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
+            match read_task_u64(t.pml4, addr) {
+                Some(v) => v,
+                None => EFAULT_,
+            }
+        }
+        PTRACE_PEEKUSER => {
+            if !addr.is_multiple_of(8) || addr / 8 >= 27 {
+                return EIO_;
+            }
+            ptr_regs(t)[(addr / 8) as usize]
+        }
+        PTRACE_POKETEXT | PTRACE_POKEDATA => {
+            // read_task_u64 doubles as the mapped-or-EFAULT probe.
+            if read_task_u64(t.pml4, addr).is_none() {
+                return EFAULT_;
+            }
+            write_task_u64(t.pml4, addr, data);
+            0
+        }
+        PTRACE_POKEUSER => {
+            if !addr.is_multiple_of(8) || addr / 8 >= 27 {
+                return EIO_;
+            }
+            let mut r = ptr_regs(t);
+            r[(addr / 8) as usize] = data;
+            ptr_regs_apply(t, &r);
+            0
+        }
+        PTRACE_GETREGS => {
+            if !range_ok_w(data, 27 * 8) {
+                return EFAULT_;
+            }
+            let r = ptr_regs(t);
+            for (i, v) in r.iter().enumerate() {
+                unsafe { ((data as *mut u64).add(i)).write_unaligned(*v) };
+            }
+            0
+        }
+        PTRACE_SETREGS => {
+            if !range_ok(data, 27 * 8) {
+                return EFAULT_;
+            }
+            let mut r = [0u64; 27];
+            for (i, v) in r.iter_mut().enumerate() {
+                *v = unsafe { ((data as *const u64).add(i)).read_unaligned() };
+            }
+            ptr_regs_apply(t, &r);
+            0
+        }
+        PTRACE_GETSIGINFO => {
+            if !range_ok_w(data, 128) {
+                return EFAULT_;
+            }
+            let mut si = [0u8; 128];
+            si[0..4].copy_from_slice(&t.si_signo.to_le_bytes());
+            si[8..12].copy_from_slice(&(t.si_code as i32).to_le_bytes());
+            si[16..24].copy_from_slice(&t.si_addr.to_le_bytes());
+            unsafe {
+                (data as *mut u8).copy_from_nonoverlapping(si.as_ptr(), 128)
+            };
+            0
+        }
+        PTRACE_SETSIGINFO => {
+            if !range_ok(data, 128) {
+                return EFAULT_;
+            }
+            t.si_code = unsafe { ((data as *const i32).add(2)).read_unaligned() } as i64;
+            t.si_addr = unsafe { ((data as *const u64).add(2)).read_unaligned() };
+            0
+        }
+        PTRACE_SETOPTIONS => 0,
+        PTRACE_GETEVENTMSG => {
+            if !range_ok_w(data, 8) {
+                return EFAULT_;
+            }
+            unsafe { (data as *mut u64).write_unaligned(0) };
+            0
+        }
+        PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP
+        | PTRACE_SINGLEBLOCK | PTRACE_LISTEN | PTRACE_DETACH => {
+            if req == PTRACE_DETACH {
+                t.tracer = 0;
+                t.ptr_sys = 0;
+                t.sys_ph = 0;
+                t.inject = 0;
+                if t.rppid != 0 {
+                    t.ppid = t.rppid;
+                    t.rppid = 0;
+                }
+            } else {
+                t.ptr_sys = (req == PTRACE_SYSCALL) as u8;
+            }
+            if req == PTRACE_SINGLESTEP || req == PTRACE_SINGLEBLOCK {
+                t.ctx.rflags |= 0x100; // TF — the next insn #DBs into
+                                       // the delivery-stop
+            }
+            ptrace_resume(t, data)
+        }
+        _ => EIO_,
+    }
 }
 
 /// End of the scheduling run: reap whatever tasks remain — the last
