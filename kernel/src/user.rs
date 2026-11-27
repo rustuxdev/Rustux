@@ -3105,14 +3105,24 @@ pub fn root_copy_up(path: &[u8], data: &[u8]) -> bool {
 }
 
 fn vfile_create(path: &[u8]) -> u64 {
-    const ENOSPC_: u64 = (-28i64) as u64;
-    const ENAMETOOLONG_: u64 = (-36i64) as u64;
     const EROFS_: u64 = (-30i64) as u64;
-    if path.is_empty() || path.len() > 128 {
-        return ENAMETOOLONG_;
-    }
     if mount_ro(path) {
         return EROFS_;
+    }
+    vfile_create_anon(path)
+}
+
+/// Mint a VFile with no mount gate — the anonymous-inode path.
+/// memfd/tmpfile inodes are born unlinked and are never reachable
+/// by their synthetic name, so the longest-prefix mount that name
+/// would resolve to (always the root mount) must not veto creation:
+/// the caller already checked the REAL target's mount, or there is
+/// no filesystem behind a memfd at all.
+fn vfile_create_anon(path: &[u8]) -> u64 {
+    const ENOSPC_: u64 = (-28i64) as u64;
+    const ENAMETOOLONG_: u64 = (-36i64) as u64;
+    if path.is_empty() || path.len() > 128 {
+        return ENAMETOOLONG_;
     }
     let vs = unsafe { &mut *core::ptr::addr_of_mut!(VFILES) };
     let Some(i) = vs.iter().position(Option::is_none) else {
@@ -15620,10 +15630,10 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         FdKind::Ram(i) => {
             let arc_n = (unsafe { *core::ptr::addr_of!(INITRD) })
                 .map_or(0, |a| crate::cpio::entries(a).count());
-            let vidx = unsafe { &*core::ptr::addr_of!(VFILES) }[..*i]
-                .iter()
-                .filter(|s| s.as_ref().is_some_and(|v| !v.unlinked))
-                .count();
+            // Slot-indexed ino: unique across the table AND stable —
+            // the old count-of-live-below rank shifted every higher
+            // file's ino on each unlink and aliased an unlinked slot
+            // onto the next live file.
             let (mode, len) = vfile(*i).map_or((0o644u64, 0usize), |v| {
                 (
                     (if v.is_link { 0o120000 } else { v.fmt as u64 })
@@ -15631,7 +15641,7 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
                     v.len,
                 )
             });
-            (mode, len as u64, (arc_n + vidx) as u64 + 1)
+            (mode, len as u64, (arc_n + *i) as u64 + 1)
         }
         FdKind::Dev(i) => {
             // A device node stats with its stored S_IFMT|mode — the
@@ -15639,15 +15649,11 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
             // ino. The rdev slot is filled by sys_fstat's meta arm.
             let arc_n = (unsafe { *core::ptr::addr_of!(INITRD) })
                 .map_or(0, |a| crate::cpio::entries(a).count());
-            let vidx = unsafe { &*core::ptr::addr_of!(VFILES) }[..*i]
-                .iter()
-                .filter(|s| s.as_ref().is_some_and(|v| !v.unlinked))
-                .count();
             let mode = vfile(*i).map_or(0o20644u64, |v| {
                 (if v.fmt != 0 { v.fmt as u64 } else { 0o20000 })
                     | v.mode as u64
             });
-            (mode, 0, (arc_n + vidx) as u64 + 1)
+            (mode, 0, (arc_n + *i) as u64 + 1)
         }
         // proc files stat as read-only regulars; the rendered
         // length is the honest size of this snapshot.
@@ -22693,10 +22699,15 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             let (ts, tns) = now();
             v.atime = ts;
             v.atime_ns = tns;
-            let mut nm = [0u8; 128];
-            nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
-            ino_report(&nm[..v.nlen], IN_ACCESS, 0);
-            fano_emit(&nm[..v.nlen], FAN_ACCESS);
+            // An unlinked inode has no live name — its events can
+            // only name a dead path (memfd/tmpfile inodes never had
+            // one), so no watch may legitimately match. Skip.
+            if !v.unlinked {
+                let mut nm = [0u8; 128];
+                nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+                ino_report(&nm[..v.nlen], IN_ACCESS, 0);
+                fano_emit(&nm[..v.nlen], FAN_ACCESS);
+            }
             n as u64
         }
         FdKind::Pipe { id, write } => {
@@ -22974,10 +22985,12 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         v.mtime_ns = tns;
         v.ctime = ts;
         v.ctime_ns = tns;
-        let mut nm = [0u8; 128];
-        nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
-        ino_report(&nm[..v.nlen], IN_MODIFY, 0);
-        fano_emit(&nm[..v.nlen], FAN_MODIFY);
+        if !v.unlinked {
+            let mut nm = [0u8; 128];
+            nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+            ino_report(&nm[..v.nlen], IN_MODIFY, 0);
+            fano_emit(&nm[..v.nlen], FAN_MODIFY);
+        }
         return len;
     }
     if matches!(o.kind, FdKind::File(_)) {
@@ -23287,11 +23300,7 @@ pub fn fill_stat(path: &[u8], nofollow: bool) -> Result<[u64; 18], u64> {
             let Some(v) = vfile(i) else { return Err(ENOENT) };
             let arc_n = (unsafe { *core::ptr::addr_of!(INITRD) })
                 .map_or(0, |a| crate::cpio::entries(a).count());
-            let vidx = unsafe { &*core::ptr::addr_of!(VFILES) }[..i]
-                .iter()
-                .filter(|s| s.as_ref().is_some_and(|v| !v.unlinked))
-                .count();
-            st[1] = (arc_n + vidx + 1) as u64; // st_ino — vfile space
+            st[1] = (arc_n + i + 1) as u64; // st_ino — vfile space
             st[2] = 1;
             // S_IFLNK | stored mode — born 0o777 like Linux, and
             // fchmodat2's NOFOLLOW chmod lands on the link inode.
@@ -23366,11 +23375,7 @@ pub fn fill_stat(path: &[u8], nofollow: bool) -> Result<[u64; 18], u64> {
         let Some(v) = vfile(i) else { return Err(ENOENT) };
         let arc_n = (unsafe { *core::ptr::addr_of!(INITRD) })
             .map_or(0, |a| crate::cpio::entries(a).count());
-        let vidx = unsafe { &*core::ptr::addr_of!(VFILES) }[..i]
-            .iter()
-            .filter(|s| s.as_ref().is_some_and(|v| !v.unlinked))
-            .count();
-        st[1] = (arc_n + vidx) as u64 + 1; // st_ino — getdents order
+        st[1] = (arc_n + i) as u64 + 1; // st_ino — getdents order
         // st_nlink: the inode's own name counts only while live —
         // unlinking it with an alias left drops nlink to 1.
         st[2] = (!v.unlinked) as u64 + vfile_aliases(i) as u64;
@@ -25356,6 +25361,7 @@ const O_CLOEXEC: u64 = 0o2000000;
 const O_DIRECTORY: u64 = 0o200000;
 const O_NOFOLLOW: u64 = 0o400000;
 const O_PATH: u64 = 0o10000000;
+const O_TMPFILE_BIT: u64 = 0o20000000;
 const O_LARGEFILE: u64 = 0o100000;
 const O_NOCTTY: u64 = 0o400;
 const O_NONBLOCK: u64 = 0o4000;
@@ -25385,11 +25391,29 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
     const EEXIST: u64 = (-17i64) as u64;
     const KNOWN: u64 = O_ACCMODE | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW
         | O_PATH | O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_LARGEFILE
-        | O_NONBLOCK | O_NOCTTY;
+        | O_NONBLOCK | O_NOCTTY | O_TMPFILE_BIT;
     if flags & !KNOWN != 0 {
         return EINVAL;
     }
-    let acc = flags & O_ACCMODE;
+    // O_TMPFILE flag validation rides before lookup like
+    // build_open_flags: a non-write accmode or O_CREAT is EINVAL
+    // (measured on Linux — O_RDONLY answers EINVAL, never
+    // EOPNOTSUPP). O_PATH takes precedence outright: no tmpfile is
+    // minted, the named path opens as a pure reference and the
+    // accmode is meaningless on it — force acc to 0 so the dir/file
+    // arms mint a read-inert fd like Linux's O_PATH answer.
+    if flags & O_TMPFILE_BIT != 0 && flags & O_PATH == 0
+        && (flags & O_ACCMODE == 0 || flags & O_CREAT != 0)
+    {
+        return EINVAL;
+    }
+    let acc = if flags & (O_TMPFILE_BIT | O_PATH)
+        == (O_TMPFILE_BIT | O_PATH)
+    {
+        0
+    } else {
+        flags & O_ACCMODE
+    };
     let writing = acc != 0;
     let Some(t) = cur_mut() else { return EBADF };
     // Symlink resolution: intermediates always, the final component
@@ -25407,7 +25431,17 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
             return EEXIST;
         }
         if flags & O_NOFOLLOW != 0 {
-            return (-40i64) as u64; // ELOOP
+            // An O_TMPFILE path is the directory itself: under
+            // NOFOLLOW the final component stays the link dentry,
+            // which is no directory — Linux answers ENOTDIR, not
+            // ELOOP.
+            return if flags & O_TMPFILE_BIT != 0
+                && flags & O_PATH == 0
+            {
+                ENOTDIR
+            } else {
+                (-40i64) as u64 // ELOOP
+            };
         }
         match resolve_links(&rb[..rn], true) {
             Ok((b, n, _)) => {
@@ -25418,6 +25452,47 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         }
     }
     let path = &rb[..rn];
+    // O_TMPFILE: an unnamed inode in the naming directory — glibc
+    // passes O_TMPFILE|O_RDWR. Flag validation happened above; the
+    // inode is born unlinked exactly like memfd_create's — never
+    // path-reachable — and mode rides the O_CREAT umask path.
+    // O_EXCL is meaningless on an inode with no name (Linux ignores
+    // it); O_PATH|O_TMPFILE skips this arm entirely.
+    if flags & O_TMPFILE_BIT != 0 && flags & O_PATH == 0 {
+        if !dir_exists(path) {
+            return if is_file(path) { ENOTDIR } else { ENOENT };
+        }
+        if path == b"proc" || path.starts_with(b"proc/") {
+            // procfs dirs aren't writable — inode_permission
+            // answers EACCES on Linux, not EOPNOTSUPP.
+            return (-13i64) as u64; // EACCES
+        }
+        if mount_ro(path) {
+            return EROFS;
+        }
+        // A synthetic name keeps fdinfo/debug readable; `unlinked`
+        // hides it from lookup so nothing can open it by path.
+        let mut vn = [0u8; 128];
+        vn[..8].copy_from_slice(b"tmpfile:");
+        let mut vn_n = 8usize;
+        for d in vgen().to_le_bytes() {
+            vn[vn_n] = b"0123456789abcdef"[(d & 0xf) as usize];
+            vn[vn_n + 1] = b"0123456789abcdef"[(d >> 4) as usize];
+            vn_n += 2;
+        }
+        let i = vfile_create_anon(&vn[..vn_n]);
+        if (i as i64) < 0 {
+            return i;
+        }
+        if let Some(v) = vfile(i as usize) {
+            v.unlinked = true;
+            vfile_stamp(v, mode, fst(t).umask);
+        }
+        return memfd_mint_ofd(
+            t, i as usize,
+            flags & O_CLOEXEC != 0, acc as u8, flags & O_APPEND != 0,
+        );
+    }
     // /proc/<pid>/fd/<n> opens the named open description itself —
     // a cross-task dup: same OFD, same pos, refs+1. Sockets refuse
     // like Linux (ENXIO); an O_WRONLY ask on a read-only OFD is
@@ -25789,7 +25864,7 @@ pub fn fd_memfd_create(name: u64, flags: u64) -> u64 {
     vn[..6].copy_from_slice(b"memfd:");
     let nl = un.min(122);
     vn[6..6 + nl].copy_from_slice(&uname[..nl]);
-    let i = vfile_create(&vn[..6 + nl]);
+    let i = vfile_create_anon(&vn[..6 + nl]);
     if (i as i64) < 0 {
         return i;
     }
@@ -25805,13 +25880,19 @@ pub fn fd_memfd_create(name: u64, flags: u64) -> u64 {
     }
     // Mint the OFD + fd slot — the fd_open tail, minus path lookup.
     let Some(t) = cur_mut() else { return EBADF };
-    memfd_mint_ofd(t, i, flags & MFD_CLOEXEC != 0)
+    memfd_mint_ofd(t, i, flags & MFD_CLOEXEC != 0, 2, false)
 }
 
 /// Mint an O_RDWR OFD + fd slot for an unlinked anonymous inode —
 /// the shared tail of memfd_create/memfd_secret. On EMFILE the
 /// orphan inode dies with its slot: nothing else names it.
-fn memfd_mint_ofd(t: &mut Task, i: usize, cloexec: bool) -> u64 {
+fn memfd_mint_ofd(
+    t: &mut Task,
+    i: usize,
+    cloexec: bool,
+    accmode: u8,
+    append: bool,
+) -> u64 {
     let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
     let Some(oi) = ofds.iter().position(Option::is_none) else {
         let vs = unsafe { &mut *core::ptr::addr_of_mut!(VFILES) };
@@ -25827,9 +25908,9 @@ fn memfd_mint_ofd(t: &mut Task, i: usize, cloexec: bool) -> u64 {
         kind: FdKind::Ram(i),
         pos: 0,
         refs: 1,
-        append: false,
+        append,
         nonblock: false,
-        accmode: 2, // memfd fds are always O_RDWR
+        accmode,
     });
     fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, cloexec);
@@ -25848,7 +25929,7 @@ pub fn fd_memfd_secret(flags: u64) -> u64 {
     if flags != 0 {
         return EINVAL;
     }
-    let i = vfile_create(b"memfd_secret:");
+    let i = vfile_create_anon(b"memfd_secret:");
     if (i as i64) < 0 {
         return i;
     }
@@ -25861,7 +25942,7 @@ pub fn fd_memfd_secret(flags: u64) -> u64 {
         vfile_stamp(v, 0o100777, 0);
     }
     let Some(t) = cur_mut() else { return EBADF };
-    memfd_mint_ofd(t, i, false)
+    memfd_mint_ofd(t, i, false, 2, false)
 }
 
 /// Does `path` name anything in either namespace — access(2)'s only
@@ -28027,16 +28108,18 @@ fn ofd_release(oi: usize) {
         // inotify close events: CLOSE_WRITE iff the file was opened
         // for writing, CLOSE_NOWRITE otherwise (Linux's rule).
         if let Some(v) = vfile(i) {
-            let mut nm = [0u8; 128];
-            nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
-            let m = if accmode != 0 { IN_CLOSE_WRITE } else {
-                IN_CLOSE_NOWRITE
-            };
-            ino_report(&nm[..v.nlen], m, 0);
-            let fm = if accmode != 0 { FAN_CLOSE_WRITE } else {
-                FAN_CLOSE_NOWRITE
-            };
-            fano_emit(&nm[..v.nlen], fm);
+            if !v.unlinked {
+                let mut nm = [0u8; 128];
+                nm[..v.nlen].copy_from_slice(&v.name[..v.nlen]);
+                let m = if accmode != 0 { IN_CLOSE_WRITE } else {
+                    IN_CLOSE_NOWRITE
+                };
+                ino_report(&nm[..v.nlen], m, 0);
+                let fm = if accmode != 0 { FAN_CLOSE_WRITE } else {
+                    FAN_CLOSE_NOWRITE
+                };
+                fano_emit(&nm[..v.nlen], fm);
+            }
         }
         // unlinked-while-open storage dies with its last OFD; a
         // still-linked file is owned by the VFS slot and stays —

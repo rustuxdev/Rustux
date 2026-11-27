@@ -130,6 +130,85 @@ int main(void) {
     check(unlink("/vtmp") == -1 && errno == EISDIR,
           "unlink a dir -> EISDIR");
 
+    /* run-345: O_TMPFILE mints an unnamed inode in the naming
+       directory — writable, stat-able, never path-reachable. */
+    {
+        int tf = open("/vtmp", O_TMPFILE | O_RDWR, 0640);
+        check(tf >= 0, "O_TMPFILE creates unnamed inode");
+        if (tf >= 0) {
+            struct stat ts;
+            ssize_t w = write(tf, "tf", 2);
+            check(w == 2, "O_TMPFILE writable");
+            check(fstat(tf, &ts) == 0 && S_ISREG(ts.st_mode) &&
+                  (ts.st_mode & 0777) == 0640,
+                  "O_TMPFILE fstat: regular, mode honored");
+            check(pread(tf, buf, 2, 0) == 2 && buf[0] == 't',
+                  "O_TMPFILE read-back");
+            close(tf);
+        }
+        errno = 0;
+        check(open("/vtmp", O_TMPFILE | O_RDONLY, 0640) == -1 &&
+              errno == EINVAL,
+              "O_TMPFILE O_RDONLY -> EINVAL");
+        errno = 0;
+        check(open("/vtmp", O_TMPFILE | O_CREAT | O_RDWR, 0640) == -1 &&
+              errno == EINVAL,
+              "O_TMPFILE|O_CREAT -> EINVAL");
+        /* O_EXCL is meaningless on a nameless inode — ignored. */
+        errno = 0;
+        int xf = open("/vtmp", O_TMPFILE | O_EXCL | O_RDWR, 0640);
+        check(xf >= 0, "O_TMPFILE|O_EXCL accepted");
+        if (xf >= 0) close(xf);
+        errno = 0;
+        check(open("/vtmp/nofile", O_TMPFILE | O_RDWR, 0640) == -1 &&
+              errno == ENOENT,
+              "O_TMPFILE missing dir -> ENOENT");
+        /* O_PATH wins outright on Linux: no tmpfile is minted, the
+           dir opens as a write-inert path reference. */
+        errno = 0;
+        int pf = open("/vtmp", O_TMPFILE | O_RDWR | O_PATH, 0640);
+        check(pf >= 0, "O_TMPFILE|O_PATH -> path fd");
+        if (pf >= 0) {
+            struct stat ps;
+            check(fstat(pf, &ps) == 0 && S_ISDIR(ps.st_mode),
+                  "O_TMPFILE|O_PATH fstat: dir");
+            check(write(pf, "x", 1) == -1,
+                  "O_TMPFILE|O_PATH write fails");
+            close(pf);
+        }
+        /* procfs can't host an inode — EACCES on Linux. */
+        errno = 0;
+        check(open("/proc", O_TMPFILE | O_RDWR, 0640) == -1 &&
+              errno == EACCES,
+              "O_TMPFILE /proc -> EACCES");
+        /* A file as the naming path is ENOTDIR. */
+        int rf = open("/vtmp/regf.tmp", O_CREAT | O_RDWR, 0600);
+        check(rf >= 0 && close(rf) == 0, "seed regular file");
+        errno = 0;
+        check(open("/vtmp/regf.tmp", O_TMPFILE | O_RDWR, 0640) == -1 &&
+              errno == ENOTDIR,
+              "O_TMPFILE on file -> ENOTDIR");
+        check(unlink("/vtmp/regf.tmp") == 0, "unlink regf.tmp");
+        /* The unnamed inode never appears in its directory. */
+        int d2 = open("/vtmp", O_RDONLY | O_DIRECTORY);
+        char db[2048];
+        int leaked = 0;
+        long g2;
+        while (d2 >= 0 &&
+               (g2 = syscall(SYS_getdents64, d2, db, sizeof(db))) > 0) {
+            for (long o = 0; o + 19 <= g2; ) {
+                struct { unsigned long ino, off; unsigned short len;
+                         unsigned char type; char name[]; } *e =
+                    (void *)(db + o);
+                if (strncmp(e->name, "tmpfile:", 8) == 0) leaked = 1;
+                o += e->len;
+            }
+        }
+        if (d2 >= 0) close(d2);
+        check(d2 >= 0 && leaked == 0,
+              "unnamed inode stays out of getdents");
+    }
+
     /* Cleanup: rmdir leaf-first, then back to root. */
     check(rmdir("/vtmp/sub") == 0, "rmdir /vtmp/sub");
     check(chdir("/") == 0 && rmdir("/vtmp") == 0,
