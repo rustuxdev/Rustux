@@ -3151,13 +3151,13 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
   first run is implemented, not suppressed). The /dev/null stdin
   redirect stays — it feeds apt's PtyFeed child EOF, orthogonal to
   the dpkg-side pty.
-- Known open item: an intermittent suite flake (~1-in-4 runs) —
-  slave-side write returns EIO before the explicit master close,
-  i.e. the pair's mopen counted to zero early. Reproduced with the
-  checke errno instrumentation; mechanism narrowed to open-count
-  or OFD-lifecycle accounting, not the ring path. Clean runs pass
-  all 24 checks with zero leak; the affected run leaked 2 frames
-  (the two rings). Under investigation for the next rung.
+- RESOLVED at run-347: the ~1-in-4 suite flake (slave EIO early
+  + 2-frame ring leak) was the retire path's peer-node lookup
+  using flatten().position() (live-sequence position, not slot)
+  — it unlinked/freed an INNOCENT vfile, left the real peer node
+  behind, and let a new pair recycle the minor while stale OFDs
+  still decremented into it. Plus the sopen bump-before-mint
+  leak and the ptmx virgin-pair tail-failure leak. See run-347.
 
 ## run-139 — ATA PIO block driver + `/dev/sda` + bootable live/install ISO
 
@@ -3195,7 +3195,8 @@ run-123 — thread-lifetime DllMain notifications (DllMain reason 2/3)
 - Validation: make run-iso both phases PASS; written image
   byte-identical to hd.img (first 24MiB), mtools lists
   EFI/+initrd on target.img; make run exit 33 — but see run-138's
-  flake note (this run hit it: ptytest EIO + 2-frame leak; the
+  flake note (RESOLVED at run-347 — retire peer-lookup's
+  flatten().position() wrong-index; this run hit it: ptytest EIO + 2-frame leak; the
   ata path was inert — 'ata: no disk' on q35).
 
 ## run-140 — install prompt/eject flow + MAX_READ + ATA recovery
@@ -9029,7 +9030,9 @@ CVE-2026-89768 (overlayfs backing — no overlayfs) all absent.
   first-ever failure of that check, no path in this diff explains it
   (file genuinely vanished between access and unlinkat; shared
   global-table/OFD-lifecycle flake family, documented since run-138).
-  Passed in gates 1,2,4,5 and every historical gate.
+  Passed in gates 1,2,4,5 and every historical gate. ROOT-CAUSED
+  at run-347: the pty retire path's wrong-index peer lookup
+  unlinked+free'd an innocent vfile — rel2.tmp was the victim.
 - Docs row appended; ledger regen; impl/docs commits split.
 
 run-346 audit (run-104): scoped quick, one hunter wave — 0
@@ -9044,3 +9047,49 @@ can't upgrade accmode=0. Lows all fail-safe: fsync false-0 and
 open_tree/fspick Path-dirfd rejection fixed in-run; errno-shape
 divergences deferred (fail-strict). No CVE class maps to this
 scope.
+
+## run-347 — pty open-count accounting: the run-138 flake family root-caused and closed
+
+- The documented "~1-in-4 suite flake" (slave EIO early + 2-frame
+  ring leak, open since run-138, "fixed" at run-178 but recurring)
+  is fully explained — THREE defects, all in the pty/vfile
+  lifecycle:
+  1. `/dev/pts/N` bumped `sopen` BEFORE fd_open's shared mint tail
+     — EMFILE/ENOTDIR leaked the count forever; the pair could
+     never retire (leak side). Bump now rides post-mint.
+  2. `ptmx_open` minted the pair inside kind selection; a tail
+     failure (O_DIRECTORY, EMFILE) orphaned the virgin pair.
+     `pty_abort_master` rolls back only the virgin signature
+     (locked && mopen==1 && sopen==0 on an rdev-128 node) — a
+     live pair can never match (master OFD holds its count,
+     unlockpt clears locked).
+  3. ROOT CAUSE of the whole flake family: the retire path's
+     peer-node lookup used `vs.iter().flatten().position()` —
+     live-sequence position, not the VFILES slot (the exact
+     wrong-form index run-178 fixed in TIOCGPTPEER but
+     grep-missed here). With any hole in VFILES the retire
+     marked an INNOCENT file unlinked — and freed it if
+     unreferenced. That is run-346's `rel2.tmp` vanish exactly.
+     The real peer node then lingered; a new pair recycled its
+     minor; two nodes claiming rdev 136<<8|n let stale OFD
+     releases decrement the NEW pair — early-EIO + leak.
+- Hardening on top: ptmx_open's id alloc skips any minor whose
+  nodes still exist (a stale end pins its minor → its late
+  release can only hit ptys[n]==None); mopen/sopen decrements
+  gained underflow tripwires (printk — saturating_sub hid theft).
+- BUILD FIX: ptytest.elf was packed by the literal mkinitrd line
+  but missing from USER_ELFS — initrd.cpio didn't depend on it
+  and ptytest.c edits silently shipped the stale binary.
+- Regression test: ptytest +14 checks — 6x O_DIRECTORY->ENOTDIR
+  and 6x full-fdt->EMFILE must not leak pairs (pre-fix: 4 leaks
+  exhausted the table -> ENFILE), recovery open must succeed.
+- Audit (run-105, scoped quick): no CRITICAL/HIGH — abort can't
+  reach a live pair, every Dev-mint counted once, release
+  once-per-OFD. 1 CONFIRMED MED/LOW fixed in-run: the id-skip
+  keyed on node existence would let mknod'd/hardlinked rdev-136
+  nodes pin minors forever (ptmx ENFILE DoS) — rekeyed on live
+  OFDs, the precise stale-end invariant. Also fixed in-run:
+  ptmx partial-fail leaked dev/ptm/N as a plain file.
+- Gates: 5x PASS 127 tasks zero leak, ptytest all-ok, no
+  underflow printks. Docs row appended; ledger regen (494);
+  impl/docs split.

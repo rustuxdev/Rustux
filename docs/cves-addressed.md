@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**493 unique CVEs recorded.**
+**494 unique CVEs recorded.**
 
 ## klib ports
 
@@ -138,6 +138,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2014-0102 | keyctl trio (add_key 248 / request_key 249 / keyctl 250): a real keys/keyrings subsystem… | audit run-88 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2014-0102, CVE-2016-0728, CVE-2017-7472, CVE-2006-1522, CVE-2010-1437, CVE-2013-1792, CVE-2010-… |
 | CVE-2014-0102 | keyctl trio (add_key 248 / request_key 249 / keyctl 250): a real keys/keyrings subsystem… | audit run-88 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2014-0102, CVE-2016-0728, CVE-2017-7472, CVE-2006-1522, CVE-2010-1437, CVE-2013-1792, CVE-2010-… |
 | CVE-2014-0196 | TOSTOP + SIGTTOU tty write gate: tty_tostop_gate() in sys_write's console arm — backgroun… | run-65 scoped audit: 0 confirmed — irq_save single-threaded critical section kills the TOCTOU class; SIGTTOU-storm DoS bounded (one TASKS sweep + one kill_pgrp sweep per gated wri… |
+| CVE-2014-0196 | pty open-count accounting hardening — the documented run-138 flake family root-caused and… | fd-table/vfile identity-confusion class (an index into the wrong table row reaching a lifecycle op — the flatten().position() class; CLOSED: both remaining sites converted, commen… |
 | CVE-2014-0206 | Linux AIO (io_setup 206 / io_destroy 207 / io_submit 208 / io_cancel 209 / io_getevents 2… | audit run-91 scoped quick (security-audit skill): 0 confirmed; cve-now fs/aio.c class sweep — 14 hits all absent-subsystem or absent-construct. Verified: minimal image aiotest 0 f… |
 | CVE-2014-1895 | mseal+cachestat rung (462/451): sys_mseal — flags!=0/unaligned EINVAL, len0 trivial, ENOE… | gate-coverage class (fixed in-run: four of eight mutator sites lost in an aborted apply — compiled proof caught EPERM checks passing; all sites verified); seal-strip class (RNG_SE… |
 | CVE-2014-2383 | chroot (161): FsTab gains a shared `root` (CLONE_FS-shared like cwd — siblings share the… | audit run-78 scoped quick (security-audit skill): 0 confirmed, 11-item escape checklist verified. cve-now checked: CVE-2026-35368, CVE-2026-102643, CVE-2014-2383, CVE-2026-55554,… |
@@ -368,6 +369,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2023-52772 | recvmsg+SCM_RIGHTS rung (fd passing): recvmsg NR 47 (was a silent =>0 stub in the uid-fam… | audit run-50 scoped quick (security-audit skill): 0 confirmed, 1 fixed in-run; cve-now checked: CVE-2024-26923, CVE-2026-53005, CVE-2024-35970, CVE-2025-38236, CVE-2026-52928, CVE… |
 | CVE-2023-52791 | preemptive round-robin scheduler | every switch is a UCtx resume (15 GPRs + iret frame) — launch/preemption/exit share one path; dedicated 0xf0 stub saves the FULL register file; cs&3==0 ticks never switch (58090 c… |
 | CVE-2023-52839 | virtio-net IRQ-RX rung (MSI-X on the legacy interface): probe_io returns the function's p… | audit run-31 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2021-47613, CVE-2025-38048, CVE-2022-49146, CVE-2023-52839 — handled or n/a. Verified: make run… |
+| CVE-2023-52879 | pty open-count accounting hardening — the documented run-138 flake family root-caused and… | fd-table/vfile identity-confusion class (an index into the wrong table row reaching a lifecycle op — the flatten().position() class; CLOSED: both remaining sites converted, commen… |
 | CVE-2023-53035 | ia32 compat foundation: ELFCLASS32/EM_386 static ELF32 loading + IA-32e compat-mode execu… | audit run-121 quick scoped + cve.now MCP (entities.search on ia32/compat classes — analogs above): verified int80 mask covers nr+a1..a6 (a REX-literate compat task can't smuggle h… |
 | CVE-2023-53035 | physmap rung: supervisor mirror of all phys RAM at PML4 slot 256 (0xFFFF_8000_0000_0000)… | PRESENT |
 | CVE-2023-53052 | mount(165) + umount2(166) + mount table: real MOUNTS table (16 slots, seeded rustux-root… | noexec + devtmpfs) recording point-path/fstype/source/minted mount_id/MS_* flags; longest-prefix coverage drives ST_RDONLY enforcement — mount_ro() gates every mutation under a co… |
