@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <poll.h>
+#include <sys/select.h>
 #include <sys/signalfd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -674,6 +675,152 @@ int main(void) {
         rs2.sa_flags = 0;
         check(sigaction(SIGUSR1, &rs2, NULL) == 0,
               "restart-block disarm");
+    }
+
+    /* run-351: poll()'s SA_RESTART replay resumes the stashed
+       deadline (Linux restart_block->poll) — a 2s nfds=0 sleep
+       interrupted at ~400ms totals ~2s, not ~2.4s. ppoll replays
+       the mutated tsp to the same remainder. */
+    {
+        struct sigaction rs3;
+        memset(&rs3, 0, sizeof(rs3));
+        rs3.sa_handler = usr1_hit;
+        rs3.sa_flags = SA_RESTART;
+        check(sigaction(SIGUSR1, &rs3, NULL) == 0,
+              "poll-restart arms");
+        pid_t pk = fork();
+        if (pk == 0) {
+            struct timespec a, b;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            poll(NULL, 0, 2000); /* replay resumes ~1.6s remainder */
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            long ms = (b.tv_sec - a.tv_sec) * 1000 +
+                      (b.tv_nsec - a.tv_nsec) / 1000000;
+            _exit(ms >= 1900 && ms < 2350 ? 0 : 1);
+        }
+        {
+            struct timespec ts = {0, 400000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(pk, SIGUSR1);
+        int pst = 0;
+        check(waitpid(pk, &pst, 0) == pk && WIFEXITED(pst) &&
+              WEXITSTATUS(pst) == 0,
+              "SA_RESTART poll resumes remainder");
+
+        pk = fork();
+        if (pk == 0) {
+            struct timespec a, b, tmo = {2, 0};
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            ppoll(NULL, 0, &tmo, NULL); /* tsp writeback + replay */
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            long ms = (b.tv_sec - a.tv_sec) * 1000 +
+                      (b.tv_nsec - a.tv_nsec) / 1000000;
+            _exit(ms >= 1900 && ms < 2350 ? 0 : 1);
+        }
+        {
+            struct timespec ts = {0, 400000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(pk, SIGUSR1);
+        check(waitpid(pk, &pst, 0) == pk && WIFEXITED(pst) &&
+              WEXITSTATUS(pst) == 0,
+              "SA_RESTART ppoll resumes remainder");
+        rs3.sa_flags = 0;
+        check(sigaction(SIGUSR1, &rs3, NULL) == 0,
+              "poll-restart disarm");
+    }
+
+    /* run-351: EINTR (no SA_RESTART) still writes the remaining
+       time into tsp — Linux's poll_select_copy_remaining — for
+       both pselect6 and ppoll. */
+    {
+        got_usr1 = 0;
+        pid_t ek = fork();
+        if (ek == 0) {
+            /* Raw syscall — glibc's pselect shields the timeout by
+             * copying it to a local, exactly because Linux mutates
+             * tsp; the writeback only reaches a caller-supplied
+             * buffer. */
+            struct timespec tmo = {2, 0};
+            errno = 0;
+            long r = syscall(SYS_pselect6, 0, NULL, NULL, NULL,
+                             &tmo, NULL);
+            int e = errno;
+            /* Remaining ~1.6s: tsp must differ from {2,0}. */
+            _exit(r == -1 && e == EINTR &&
+                  (tmo.tv_sec != 2 || tmo.tv_nsec != 0) &&
+                  tmo.tv_sec <= 1 ? 0 : 1);
+        }
+        {
+            struct timespec ts = {0, 400000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(ek, SIGUSR1);
+        int est = 0;
+        check(waitpid(ek, &est, 0) == ek && WIFEXITED(est) &&
+              WEXITSTATUS(est) == 0,
+              "pselect EINTR writes remaining tsp");
+
+        ek = fork();
+        if (ek == 0) {
+            /* Raw ppoll for the same glibc-shield reason. */
+            struct timespec tmo = {2, 0};
+            errno = 0;
+            long r = syscall(SYS_ppoll, NULL, 0, &tmo, NULL);
+            int e = errno;
+            _exit(r == -1 && e == EINTR &&
+                  (tmo.tv_sec != 2 || tmo.tv_nsec != 0) &&
+                  tmo.tv_sec <= 1 ? 0 : 1);
+        }
+        {
+            struct timespec ts = {0, 400000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(ek, SIGUSR1);
+        check(waitpid(ek, &est, 0) == ek && WIFEXITED(est) &&
+              WEXITSTATUS(est) == 0,
+              "ppoll EINTR writes remaining tsp");
+
+        /* audit-109 C2: an EINVAL'd pselect6 must not leave the
+           writeback ticket armed — a stale ticket suppresses the
+           next call's own arm (its tsp stays unwritten). */
+        {
+            struct timespec tb = {1, 0};
+            long bad = syscall(SYS_pselect6, 0, NULL, NULL, NULL,
+                               &tb, (void *)0x1);
+            check(bad == -1 && errno == EFAULT,
+                  "pselect6 bad sigmask ptr -> EFAULT");
+            struct timespec t2 = {0, 1};
+            check(syscall(SYS_pselect6, 0, NULL, NULL, NULL,
+                          &t2, NULL) == 0 &&
+                  t2.tv_sec == 0 && t2.tv_nsec == 0,
+                  "stale ticket doesn't suppress next pselect6 arm");
+        }
+
+        /* audit-109 C1: the nsec/usec writeback unit must follow
+           the current call's tsp, not a stale flag — a ppoll()
+           first leaves wait_tv_ns=true; a raw select() must still
+           write tv_usec (<1e6), not (rem%1e6)*1000. A ready fd
+           gives a deterministic early return with ~500ms left. */
+        {
+            struct timespec t3 = {0, 1};
+            syscall(SYS_ppoll, NULL, 0, &t3, NULL);
+            int p2[2];
+            check(pipe(p2) == 0 && write(p2[1], "x", 1) == 1,
+                  "select-unit pipe");
+            fd_set rf;
+            FD_ZERO(&rf);
+            FD_SET(p2[0], &rf);
+            struct timeval tvl = {0, 500000};
+            long r2 = syscall(SYS_select, p2[0] + 1, &rf,
+                              NULL, NULL, &tvl);
+            check(r2 == 1 && tvl.tv_sec == 0 &&
+                  tvl.tv_usec > 0 && tvl.tv_usec < 1000000,
+                  "select writeback stays usec after ppoll");
+            close(p2[0]);
+            close(p2[1]);
+        }
     }
 
     /* run-344: a job-control stop resumes into a syscall replay —

@@ -2649,8 +2649,9 @@ pub struct Task {
     /// rewinds the ctx saved in the signal frame at sigreturn, or
     /// the armed ctx itself when a stopped task resumes on SIGCONT.
     restart_nr: u64,
-    /// restart_block remainder for an interrupted WaitOn::Timer —
-    /// the tick deadline the replay resumes to (0 = none). Linux's
+    /// restart_block remainder for an interrupted WaitOn::Timer or
+    /// WaitOn::Poll — the tick deadline the replay resumes to
+    /// (0 = none). Linux's
     /// restart_block stores the expiry so a SA_RESTART replay of
     /// nanosleep sleeps only the unslept remainder, not the full
     /// req again. restart_rt marks whether the deadline slides on
@@ -19518,7 +19519,8 @@ fn timer_restart(t: &mut Task, ctx: &mut UCtx, rem_va: u64) -> Option<u64> {
 
 /// restart_block deadline consume for non-Timer waits: returns the
 /// stashed deadline iff this entry is the actual replay (rip
-/// matches restart_apply's record), clearing the stash either way.
+/// matches restart_apply's record); a non-replay entry leaves the
+/// stash intact for the real replay.
 /// Unlike timer_restart the caller still runs its normal flow —
 /// Linux's do_restart_poll re-enters do_sys_poll with the stored
 /// expiry, so scan/validation still happens; only the deadline is
@@ -29780,6 +29782,11 @@ pub fn fd_poll(ctx: &mut UCtx, fds: u64, nfds: u64, timeout_ms: i64) -> u64 {
         return EINVAL;
     }
     let Some(t) = cur_mut() else { return EINVAL };
+    // An SA_RESTART replay of an interrupted Poll wait resumes the
+    // stashed deadline — Linux's restart_block->poll — instead of
+    // the original timeout_ms. Taken at entry so a replay that
+    // finds fds already ready still retires the stash.
+    let replay_dl = restart_deadline(t, ctx);
     if nfds > 0 && !range_ok_w(fds, nfds * 8) {
         return EFAULT;
     }
@@ -29793,7 +29800,11 @@ pub fn fd_poll(ctx: &mut UCtx, fds: u64, nfds: u64, timeout_ms: i64) -> u64 {
     t.wait_on = WaitOn::Poll;
     t.wait_ptr = fds;
     t.wait_len = nfds;
-    t.wait_deadline = if timeout_ms < 0 {
+    // The fd rescan above still runs on replay; only the expiry is
+    // substituted.
+    t.wait_deadline = if let Some(d) = replay_dl {
+        d
+    } else if timeout_ms < 0 {
         0
     } else {
         crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed)
@@ -33276,7 +33287,8 @@ pub fn fd_pselect(
     }
     let mut deadline = 0u64;
     if ts != 0 {
-        if !range_ok(ts, 16) {
+        // Write-side: the remaining-time ticket writes tsp back.
+        if !range_ok_w(ts, 16) {
             return EFAULT;
         }
         // SAFETY: validated user timespec under cur cr3.
@@ -33321,22 +33333,36 @@ pub fn fd_pselect(
             t.sigmask = unsafe { (ss as *const u64).read_unaligned() } as u32;
         }
     }
+    // pselect6's tsp gets the remaining-time writeback like Linux's
+    // poll_select_copy_remaining — every exit services the ticket
+    // (early returns inline, blocked resumes via psel_restore).
+    // fd_select pre-arms its own timeval ticket before delegating;
+    // a set ticket isn't overwritten. Arm after the last fallible
+    // gate so a bail-out can't leak a ticket pointing at tsp.
+    if ts != 0 && t.wait_tv == 0 {
+        t.wait_tv = ts;
+        t.wait_tv_dl = deadline;
+        t.wait_tv_ns = true;
+    }
     let mut rout = [0u64; 16];
     let mut wout = [0u64; 16];
     let ready = pselect_eval(t, rfd, wfd, nwords, &mut rout, &mut wout);
     if ready > 0 {
         pselect_write(t, rfd, wfd, efd, nwords, &rout, &wout);
         t.sigmask = saved_mask;
+        wb_ticket(t);
         return ready;
     }
     if ts != 0 && deadline <= crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed) {
         // Timed return still writes the (empty) result sets back.
         pselect_write(t, rfd, wfd, efd, nwords, &rout, &wout);
         t.sigmask = saved_mask;
+        wb_ticket(t);
         return 0;
     }
     if deliverable(t) {
         t.sigmask = saved_mask;
+        wb_ticket(t);
         return EINTR;
     }
     t.psel_mask = saved_mask as u64;
@@ -33359,6 +33385,7 @@ pub fn fd_pselect(
             t.wait_on = WaitOn::None;
             t.wait_deadline = 0;
             t.sigmask = saved_mask;
+            wb_ticket(t);
             t.state = TaskState::Runnable;
             return n;
         }
@@ -33410,6 +33437,7 @@ pub fn fd_select(
         if let Some(t) = cur_mut() {
             t.wait_tv = tv;
             t.wait_tv_dl = deadline;
+            t.wait_tv_ns = false; // timeval wants usec, not nsec
         }
     }
     let r = fd_pselect(ctx, nfds, rfd, wfd, efd, tv, 0);
@@ -33612,12 +33640,23 @@ pub fn fd_ppoll(
         return EINVAL;
     }
     let Some(t) = cur_mut() else { return EINVAL };
+    // An SA_RESTART replay of an interrupted Poll wait substitutes
+    // the stashed deadline (Linux's restart_block->poll stores the
+    // absolute expiry); ppoll's tsp writeback also keeps the
+    // replayed tsp-read on the remainder.
+    let replay_dl = restart_deadline(t, ctx);
     if nfds > 0 && !range_ok_w(fds, nfds * 8) {
         return EFAULT;
     }
-    let Some(deadline) = ts_deadline(ts) else {
+    let Some(parsed) = ts_deadline(ts) else {
         return if ts != 0 && range_ok(ts, 16) { EINVAL } else { EFAULT };
     };
+    // The remaining-time ticket writes tsp back — it must be
+    // writable (Linux's copy_to_user EFAULTs).
+    if ts != 0 && !range_ok_w(ts, 16) {
+        return EFAULT;
+    }
+    let deadline = replay_dl.unwrap_or(parsed);
     let saved_mask = t.sigmask;
     if sigmask != 0 {
         if sigsize != 8 || !range_ok(sigmask, 8) {
@@ -33626,17 +33665,28 @@ pub fn fd_ppoll(
         // SAFETY: validated user sigset under cur cr3.
         t.sigmask = unsafe { (sigmask as *const u64).read_unaligned() } as u32;
     }
+    // Remaining-time writeback into tsp on every exit — Linux's
+    // poll_select_copy_remaining. Arm after the last fallible gate
+    // so a bail-out can't leak a ticket pointing at tsp.
+    if ts != 0 && t.wait_tv == 0 {
+        t.wait_tv = ts;
+        t.wait_tv_dl = deadline;
+        t.wait_tv_ns = true;
+    }
     let ready = if nfds == 0 { 0 } else { poll_scan(t, fds, nfds) };
     if ready > 0 {
         t.sigmask = saved_mask;
+        wb_ticket(t);
         return ready;
     }
     if ts != 0 && deadline <= crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed) {
         t.sigmask = saved_mask;
+        wb_ticket(t);
         return 0;
     }
     if deliverable(t) {
         t.sigmask = saved_mask;
+        wb_ticket(t);
         return EINTR;
     }
     t.psel_mask = saved_mask as u64;
@@ -33646,6 +33696,21 @@ pub fn fd_ppoll(
     t.wait_deadline = deadline;
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
+    // Armed recheck — see fd_pselect: a state change between the
+    // first scan and the arming ran wake_pollers with nobody home.
+    if t.state == TaskState::Blocked {
+        let n = if nfds == 0 { 0 } else { poll_scan(t, fds, nfds) };
+        if n > 0 {
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            t.sigmask = saved_mask;
+            wb_ticket(t);
+            t.state = TaskState::Runnable;
+            return n;
+        }
+    } else {
+        return t.ctx.rax;
+    }
     block_switch()
 }
 
@@ -39818,6 +39883,12 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     t.restart_at = 0;
     t.restart_rt = false;
     t.restart_rip = 0;
+    // Any armed tsp writeback ticket points at the old image's VA —
+    // servicing it in the new space would write a stale deadline
+    // into fresh .data/heap.
+    t.wait_tv = 0;
+    t.wait_tv_dl = 0;
+    t.wait_tv_ns = false;
     t.did_exec = true; // pgid/sid persist; parent setpgid now EACCES
     if let Some(p) = &pe_img {
         if !pe_load_inner(t, p, img) {

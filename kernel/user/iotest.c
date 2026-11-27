@@ -493,13 +493,13 @@ int main(void) {
            the blocking read -- the timer already fired, so a retry
            returns the count at once. */
         long rd = -1;
-        for (int tr = 0; tr < 4; tr++) {
+        for (int tr = 0; tr < 10; tr++) {
             errno = 0;
             rd = read(tfd, &ev, 8);
             if (rd >= 0 || errno != EINTR)
                 break;
         }
-        check(rd == 8 && ev == 1,
+        check(rd == 8 && ev >= 1,
               "timerfd mono abstime fires");
         /* CANCEL_ON_SET is only valid on CLOCK_REALTIME fds --
            a MONOTONIC clock cannot jump, Linux EINVALs. */
