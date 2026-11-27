@@ -8864,3 +8864,47 @@ CLONE_SETTLS now stores tls_raw too; move_pages capped at 16384
 pages per call (non-preemptible loop bound); MOVE_ALL gated
 uid==0; cross-pid migrate/move_pages gate uid==0-or-match; ia32
 get_thread_area(211) wired.
+
+run-343 — bounded fanotify(300/301): FAN_CLASS_NOTIF|FAN_REPORT_FID
+groups, the last real syscall ABI gap under nr 336.
+
+fd_fanotify_init: uid==0 gate (CAP_SYS_ADMIN stand-in), class must
+be NOTIF (0 — CONTENT/PRE_CONTENT are permission machinery,
+EOPNOTSUPP), FAN_REPORT_FID required (non-FID groups mint per-event
+fds we don't model — EOPNOTSUPP not half-answer), UNLIMITED_*
+accepted. Event fd flags O_RDONLY|O_RDWR+CLOEXEC/NONBLOCK/LARGEFILE.
+Group = FANOS[8]: 16 path marks + 16-event ring + overflow flag.
+
+fano_mark: exactly one of ADD/REMOVE/FLUSH, INODE type only
+(MOUNT/FILESYSTEM EOPNOTSUPP — CVE-2025-40072's MNTNS class can't
+exist), mask needs >=1 event bit, path canonical (dirfd-relative
+via sys_fanotify_mark; FAN_NOFD=-1 -> cwd; empty pathname marks the
+dirfd itself via ofd_flat_path). ADD on existing mark merges bits,
+REMOVE subtracts (empty mark drops), FLUSH clears all.
+EVENT_ON_CHILD on a dir mark parents the whole subtree;
+FAN_ONDIR in the mark mask filters dir-only.
+
+Events: metadata{event_len,vers=3,meta_len=24,mask,fd=-1,pid} +
+FID info record (type=2, fsid, file_handle) built on the run-322
+handle_encode — FH_FILE/DIR/ARCH/ROOT all encode. Fire sites:
+fd_open tail (OPEN — openat/openat2 covered), fd_read Ram (ACCESS),
+fd_write Ram (MODIFY), ofd_release Ram+Dir (CLOSE_WRITE per accmode
+or CLOSE_NOWRITE). ONDIR bit added for dir objects. read() packs
+whole blobs until one doesn't fit; overflow -> 24-byte Q_OVERFLOW
+record; blocked readers arm WaitOn::Fano and fano_push deposits
+through their pml4 (ino_deposit shape). poll/epoll POLLIN on
+nonempty ring, FIONREAD sums blob lens, fstat chr, link text
+anon_inode:[fanotify].
+
+Known divergences: File-kind (archive) fds get FAN_OPEN via the
+open path but read/close events skip (no path on the kind); marks
+on un-encodable objects (proc/*, chr/fifo nodes) drop events
+silently; OFD O_NONBLOCK via fcntl doesn't propagate to the group
+(init-time FAN_NONBLOCK|O_NONBLOCK only) — same shape as inotify;
+blocked-deposit EINVALs a head record that can't fit rather than
+queueing forever.
+
+Gate: 3 PASSes, 127 tasks (MAX_TASKS 126->136 — fanotest was the
+refused 127th), frames zero leak. fanotest 0 failures: gates
+ladder, FID record parse, 5 event types, ONDIR, ON_CHILD subtree,
+REMOVE/FLUSH, overflow record. audit run-101: CLEAN, 0 confirmed.
