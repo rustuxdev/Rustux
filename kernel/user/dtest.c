@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 
@@ -181,6 +182,91 @@ int main(void) {
         check(open("/proc", O_TMPFILE | O_RDWR, 0640) == -1 &&
               errno == EACCES,
               "O_TMPFILE /proc -> EACCES");
+
+    /* run-346: real O_PATH — a dentry reference, not a stream.
+       I/O answers EBADF, stat/dirfd/fchdir work through it. */
+    {
+        int op = open("/vtmp", O_PATH | O_DIRECTORY);
+        struct stat os;
+        check(op >= 0, "O_PATH opens a dir");
+        if (op >= 0) {
+            char z[4];
+            errno = 0;
+            check(read(op, z, 1) == -1 && errno == EBADF,
+                  "O_PATH read -> EBADF");
+            errno = 0;
+            check(write(op, z, 1) == -1 && errno == EBADF,
+                  "O_PATH write -> EBADF");
+            errno = 0;
+            check(syscall(SYS_getdents64, op, z, 4) == -1 &&
+                  errno == EBADF,
+                  "O_PATH getdents -> EBADF");
+            check(fstat(op, &os) == 0 && S_ISDIR(os.st_mode),
+                  "O_PATH fstat: dir");
+            check(fcntl(op, F_GETFL) & O_PATH,
+                  "O_PATH F_GETFL bit");
+            /* dirfd use: openat relative to the path fd. */
+            int rf2 = open("/vtmp/opath_tgt", O_CREAT | O_RDWR, 0600);
+            check(rf2 >= 0 && close(rf2) == 0, "seed opath_tgt");
+            int rel = openat(op, "opath_tgt", O_RDONLY);
+            check(rel >= 0, "openat via O_PATH dirfd");
+            if (rel >= 0) close(rel);
+            /* AT_EMPTY_PATH stat through the fd. */
+            errno = 0;
+            check(fstatat(op, "", &os, AT_EMPTY_PATH) == 0 &&
+                  S_ISDIR(os.st_mode),
+                  "O_PATH fstatat EMPTY_PATH");
+            /* fchdir through it, then back. */
+            int sv = open(".", O_PATH | O_DIRECTORY);
+            check(fchdir(op) == 0, "fchdir via O_PATH dir");
+            if (sv >= 0) { fchdir(sv); close(sv); }
+            /* poll says POLLNVAL. */
+            struct pollfd pf2 = { op, POLLIN, 0 };
+            errno = 0;
+            check(poll(&pf2, 1, 0) == 1 && pf2.revents == POLLNVAL,
+                  "O_PATH poll -> POLLNVAL");
+            close(op);
+        }
+        /* O_PATH on a file: stat works, fchdir ENOTDIR. */
+        int fp = open("/vtmp/opath_tgt", O_PATH);
+        check(fp >= 0, "O_PATH opens a file");
+        if (fp >= 0) {
+            struct stat fs2;
+            errno = 0;
+            check(fstat(fp, &fs2) == 0 && S_ISREG(fs2.st_mode),
+                  "O_PATH file fstat: reg");
+            check(fchdir(fp) == -1 && errno == ENOTDIR,
+                  "fchdir O_PATH file -> ENOTDIR");
+            close(fp);
+        }
+        unlink("/vtmp/opath_tgt");
+        /* O_PATH|O_NOFOLLOW on a symlink — lstat view, dangling ok. */
+        check(syscall(SYS_symlink, "/vtmp", "/vtmp/oplnk") == 0,
+              "seed symlink");
+        check(syscall(SYS_symlink, "/vtmp/gone", "/vtmp/opdang") == 0,
+              "seed dangling symlink");
+        int lp = open("/vtmp/oplnk", O_PATH | O_NOFOLLOW);
+        check(lp >= 0, "O_PATH|NOFOLLOW opens link");
+        if (lp >= 0) {
+            struct stat ls;
+            check(fstat(lp, &ls) == 0 && S_ISLNK(ls.st_mode),
+                  "O_PATH|NOFOLLOW fstat: link");
+            close(lp);
+        }
+        int dp = open("/vtmp/opdang", O_PATH | O_NOFOLLOW);
+        check(dp >= 0, "O_PATH|NOFOLLOW dangling mints");
+        if (dp >= 0) {
+            struct stat ds;
+            check(fstat(dp, &ds) == 0 && S_ISLNK(ds.st_mode),
+                  "dangling link fstat: link");
+            close(dp);
+        }
+        unlink("/vtmp/oplnk");
+        unlink("/vtmp/opdang");
+        errno = 0;
+        check(open("/vtmp/nothere", O_PATH) == -1 && errno == ENOENT,
+              "O_PATH missing -> ENOENT");
+    }
         /* A file as the naming path is ENOTDIR. */
         int rf = open("/vtmp/regf.tmp", O_CREAT | O_RDWR, 0600);
         check(rf >= 0 && close(rf) == 0, "seed regular file");

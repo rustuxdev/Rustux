@@ -658,6 +658,12 @@ enum FdKind {
     FsCtx(usize),
     /// A fanotify notification group — marks + event ring in FANOS[id].
     Fano(usize),
+    /// An O_PATH dentry reference — only the canonical path is
+    /// stored (plus whether O_NOFOLLOW pinned it to a symlink's own
+    /// dentry). No object is held: every I/O op answers EBADF, poll
+    /// answers POLLNVAL, and the path re-resolves at each use —
+    /// stat family, dirfd resolution, AT_EMPTY_PATH users, fchdir.
+    Path { p: DirPath, link: bool },
 }
 
 /// Max concurrent pipes — a hard bound on kernel frame pressure,
@@ -1741,6 +1747,7 @@ fn kind_tag(k: &FdKind) -> &'static str {
         FdKind::Signalfd(_) => "Signalfd",
         FdKind::Inotify(_) => "Inotify",
         FdKind::Fano(_) => "Fano",
+        FdKind::Path { .. } => "Path",
         FdKind::Timerfd(_) => "Timerfd",
         FdKind::Pidfd(_) => "Pidfd",
         FdKind::MQueue(_) => "MQueue",
@@ -14730,6 +14737,9 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 return EFAULT;
             }
             let avail = match &o.kind {
+                // A path fd answers every ioctl with EBADF — there
+                // is no stream state to query.
+                FdKind::Path { .. } => return EBADF,
                 // TTY input queue depth — Linux counts the whole
                 // queue here (canonical or not). The write half has
                 // no input side: honest 0 like a tty asked that way.
@@ -15682,6 +15692,10 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         | FdKind::Pidfd(_) => (0o20600, 0, 0),
         // mqds stat as fifos — the mqueue fs mints S_IFIFO inodes.
         FdKind::MQueue(_) => (0o10600, 0, 0),
+        // Path fds route through fill_stat's fresh lookup — a dead
+        // name reports an anonymous regular like a /deleted file.
+        FdKind::Path { p, link } => fill_stat(p.bytes(), *link)
+            .map_or((0o100644, 0, 0), |st| (st[3], st[6], st[1])),
     }
 }
 
@@ -15691,6 +15705,11 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
 pub fn fill_fstat(fd: u64) -> Result<[u64; 18], u64> {
     let Some(t) = cur_mut() else { return Err(EBADF) };
     let Some(o) = ofd(t, fd) else { return Err(EBADF) };
+    // A path fd names a dentry, not an inode — fstat re-resolves the
+    // stored name fresh (lstat view when O_NOFOLLOW pinned a link).
+    if let FdKind::Path { p, link } = &o.kind {
+        return fill_stat(p.bytes(), *link);
+    }
     // ld.so dedupes opened shared objects by (st_dev, st_ino) — a
     // zero ino makes libc look "already mapped" (aliased to ld.so or
     // the main object) and version checks fail. Same idx+1 scheme
@@ -16065,6 +16084,7 @@ fn handle_encode_ofd(
             Ok((8, enc, mid))
         }
         FdKind::Dir(dp) => handle_encode(dp.bytes()),
+        FdKind::Path { p, .. } => handle_encode(p.bytes()),
         FdKind::File(d) => {
             enc[0] = FH_ARCH;
             enc[1..9].copy_from_slice(&(d.as_ptr() as u64).to_le_bytes());
@@ -16773,7 +16793,9 @@ pub fn sys_open_tree(dfd: u64, name: &[u8], flags: u64) -> u64 {
         }
         let Some(o) = ofd(t, dfd) else { return EBADF };
         match &o.kind {
-            FdKind::Dir(dp) => {
+            // O_PATH dirfds resolve like Dir — the fd carries the
+            // path, the mount lookup re-finds it.
+            FdKind::Dir(dp) | FdKind::Path { p: dp, .. } => {
                 let b = dp.bytes();
                 pb[..b.len()].copy_from_slice(b);
                 pn = b.len();
@@ -16873,7 +16895,7 @@ pub fn sys_fspick(dfd: u64, name: &[u8], flags: u64) -> u64 {
                 let Some(x) = mount_by_id(*m) else { return ENOENT_ };
                 mi = x;
             }
-            FdKind::Dir(dp) => {
+            FdKind::Dir(dp) | FdKind::Path { p: dp, .. } => {
                 let Some(x) = mount_exact(dp.bytes()) else {
                     return EINVAL_;
                 };
@@ -16965,7 +16987,10 @@ pub fn sys_move_mount(
             return ENOENT_;
         }
         let Some(o) = ofd(t, tdfd) else { return EBADF };
-        let FdKind::Dir(dp) = &o.kind else { return ENOTDIR_ };
+        let dp = match &o.kind {
+            FdKind::Dir(dp) | FdKind::Path { p: dp, .. } => dp,
+            _ => return ENOTDIR_,
+        };
         let b = dp.bytes();
         tb[..b.len()].copy_from_slice(b);
         b.len()
@@ -17086,7 +17111,7 @@ pub fn sys_mount_setattr(
                     None => return ENOENT_,
                 }
             }
-            FdKind::Dir(dp) => {
+            FdKind::Dir(dp) | FdKind::Path { p: dp, .. } => {
                 match mount_i(dp.bytes()) {
                     Some(x) => x,
                     None => return EINVAL_,
@@ -18661,12 +18686,21 @@ pub fn sys_chdir(path: &[u8]) -> u64 {
 /// fchdir(fd): the fd must name a Dir OFD — its path becomes cwd.
 pub fn sys_fchdir(fd: u64) -> u64 {
     const ENOTDIR_: u64 = (-20i64) as u64;
+    const ENOENT_: u64 = (-2i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF };
+    let Some(o) = ofd(t, fd) else { return EBADF };
+    let is_path = matches!(o.kind, FdKind::Path { .. });
     let Some((pb, pn)) = fd_dir_path(fd) else {
-        let Some(t) = cur_mut() else { return EBADF };
-        return if ofd(t, fd).is_some() { ENOTDIR_ } else { EBADF };
+        return ENOTDIR_;
     };
     if pn > 128 {
         return (-36i64) as u64;
+    }
+    // Path fds carry file names too — fchdir on one is ENOTDIR
+    // like Linux. A dead name ENOENTs under our re-resolve model
+    // (a real dentry pin would let fchdir linger past unlink).
+    if is_path && !dir_exists(&pb[..pn]) {
+        return if is_file(&pb[..pn]) { ENOTDIR_ } else { ENOENT_ };
     }
     let Some(t) = cur_mut() else { return EBADF };
     let f = fst(t);
@@ -19118,6 +19152,11 @@ pub fn ofd_flat_path(fd: u64) -> Result<([u8; 128], usize), u64> {
     let n = match &o.kind {
         FdKind::Dir(dp) => {
             let p = dp.bytes();
+            b[..p.len()].copy_from_slice(p);
+            p.len()
+        }
+        FdKind::Path { p, .. } => {
+            let p = p.bytes();
             b[..p.len()].copy_from_slice(p);
             p.len()
         }
@@ -22572,6 +22611,9 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
             }
         }
         FdKind::Dir(_) => EISDIR,
+        // A path reference carries no byte stream — EBADF like
+        // Linux (read/write/lseek/getdents all answer the same).
+        FdKind::Path { .. } => EBADF,
         // read() on an epoll fd has no stream to read — EINVAL like
         // Linux, not EBADF (the fd is real).
         FdKind::Epoll(_) => EINVAL,
@@ -23484,25 +23526,29 @@ pub fn fill_stat(path: &[u8], nofollow: bool) -> Result<[u64; 18], u64> {
 /// newfstatat's user-facing half: validate statbuf, fill via
 /// fill_stat, copy the 144-byte Linux x86_64 stat out verbatim.
 pub fn newfstatat(path: &[u8], statbuf: u64, nofollow: bool) -> u64 {
+    match fill_stat(path, nofollow) {
+        Err(e) => e,
+        Ok(st) => emit_stat(&st, statbuf),
+    }
+}
+
+/// Write the 144-byte x86_64 stat array to the user statbuf
+/// verbatim — shared by newfstatat's path and dirfd routes.
+pub fn emit_stat(st: &[u64; 18], statbuf: u64) -> u64 {
     const STAT_LEN: u64 = 144;
     if !range_ok_w(statbuf, STAT_LEN) {
         return EFAULT;
     }
-    match fill_stat(path, nofollow) {
-        Err(e) => e,
-        Ok(st) => {
-            // SAFETY: range_ok_w proved statbuf is a writable user
-            // range; st is the stat layout verbatim.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    st.as_ptr() as *const u8,
-                    statbuf as *mut u8,
-                    STAT_LEN as usize,
-                )
-            };
-            0
-        }
-    }
+    // SAFETY: range_ok_w proved statbuf is a writable user range;
+    // st is the stat layout verbatim.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            st.as_ptr() as *const u8,
+            statbuf as *mut u8,
+            STAT_LEN as usize,
+        )
+    };
+    0
 }
 
 /// Write i386's packed 96-byte `struct stat64` from a filled
@@ -23685,7 +23731,13 @@ pub fn canon_path(dfd: u64, path: &[u8]) -> Result<([u8; 256], usize), u64> {
         (root, rootlen, &path[1..])
     } else if dfd_i != -100 && dfd != u64::MAX {
         let Some(o) = ofd(t, dfd_i as u64) else { return Err(EBADF) };
-        let FdKind::Dir(dp) = &o.kind else { return Err(ENOTDIR_) };
+        // Dir OFDs and O_PATH references both carry a base path —
+        // a Path fd naming a non-dir produces a base whose join
+        // fails naturally at lookup, like Linux's ENOTDIR.
+        let dp = match &o.kind {
+            FdKind::Dir(dp) | FdKind::Path { p: dp, .. } => dp,
+            _ => return Err(ENOTDIR_),
+        };
         (dp.b, dp.n as usize, path)
     } else {
         let f = fst(t);
@@ -23781,7 +23833,10 @@ pub fn fd_openat2(
     let (cb, cn) = if resolve & (BENEATH | IN_ROOT) != 0 {
         let Some(t) = cur_mut() else { return EBADF };
         let Some(o) = ofd(t, dirfd) else { return EBADF };
-        let FdKind::Dir(dp) = &o.kind else { return ENOTDIR_ };
+        let dp = match &o.kind {
+            FdKind::Dir(dp) | FdKind::Path { p: dp, .. } => dp,
+            _ => return ENOTDIR_,
+        };
         basen = dp.n as usize;
         baseb[..basen].copy_from_slice(&dp.b[..basen]);
         if resolve & BENEATH != 0 && path[0] == b'/' {
@@ -25281,6 +25336,10 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
             s.putc(b'/');
             s.putmem(&dp.b[..dp.n as usize]);
         }
+        FdKind::Path { p, .. } => {
+            s.putc(b'/');
+            s.putmem(p.bytes());
+        }
         FdKind::Pipe { id, .. } => {
             s.printf(b"pipe:[%u]", &[klib::fmt::Arg::U(*id as u64)]);
         }
@@ -25346,6 +25405,7 @@ pub fn fd_dir_path(fd: u64) -> Option<([u8; 128], usize)> {
     let o = ofd(t, fd)?;
     match &o.kind {
         FdKind::Dir(dp) => Some((dp.b, dp.n as usize)),
+        FdKind::Path { p, .. } => Some((p.b, p.n as usize)),
         _ => None,
     }
 }
@@ -25398,22 +25458,14 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
     // O_TMPFILE flag validation rides before lookup like
     // build_open_flags: a non-write accmode or O_CREAT is EINVAL
     // (measured on Linux — O_RDONLY answers EINVAL, never
-    // EOPNOTSUPP). O_PATH takes precedence outright: no tmpfile is
-    // minted, the named path opens as a pure reference and the
-    // accmode is meaningless on it — force acc to 0 so the dir/file
-    // arms mint a read-inert fd like Linux's O_PATH answer.
+    // EOPNOTSUPP). O_PATH takes precedence outright — it reaches the
+    // Path arm below and mints a path reference, never a tmpfile.
     if flags & O_TMPFILE_BIT != 0 && flags & O_PATH == 0
         && (flags & O_ACCMODE == 0 || flags & O_CREAT != 0)
     {
         return EINVAL;
     }
-    let acc = if flags & (O_TMPFILE_BIT | O_PATH)
-        == (O_TMPFILE_BIT | O_PATH)
-    {
-        0
-    } else {
-        flags & O_ACCMODE
-    };
+    let acc = flags & O_ACCMODE;
     let writing = acc != 0;
     let Some(t) = cur_mut() else { return EBADF };
     // Symlink resolution: intermediates always, the final component
@@ -25427,31 +25479,63 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
         Err(e) => return e,
     };
     if was_link {
-        if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) {
+        // O_PATH strips O_CREAT|O_EXCL out of the flag word like
+        // build_open_flags — a link under O_PATH never EEXISTs.
+        if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL)
+            && flags & O_PATH == 0
+        {
             return EEXIST;
         }
         if flags & O_NOFOLLOW != 0 {
-            // An O_TMPFILE path is the directory itself: under
-            // NOFOLLOW the final component stays the link dentry,
-            // which is no directory — Linux answers ENOTDIR, not
-            // ELOOP.
-            return if flags & O_TMPFILE_BIT != 0
-                && flags & O_PATH == 0
-            {
-                ENOTDIR
+            if flags & O_PATH != 0 {
+                // O_PATH|O_NOFOLLOW pins the fd to the LINK dentry
+                // itself: keep the link's canonical path in rb/rn
+                // and skip both ELOOP and the re-resolve — the
+                // O_PATH arm stores it verbatim.
             } else {
-                (-40i64) as u64 // ELOOP
-            };
-        }
-        match resolve_links(&rb[..rn], true) {
-            Ok((b, n, _)) => {
-                rb = b;
-                rn = n;
+                // An O_TMPFILE path is the directory itself: under
+                // NOFOLLOW the final component stays the link
+                // dentry, which is no directory — ENOTDIR on Linux,
+                // not ELOOP.
+                return if flags & O_TMPFILE_BIT != 0 {
+                    ENOTDIR
+                } else {
+                    (-40i64) as u64 // ELOOP
+                };
             }
-            Err(e) => return e,
+        } else {
+            match resolve_links(&rb[..rn], true) {
+                Ok((b, n, _)) => {
+                    rb = b;
+                    rn = n;
+                }
+                Err(e) => return e,
+            }
         }
     }
     let path = &rb[..rn];
+    // O_PATH: a reference to the named dentry — no inode or stream
+    // semantics attach; every I/O op on the fd answers EBADF and
+    // poll POLLNVAL. What the fd CAN do is carry the path: stat
+    // family, dirfd resolution, AT_EMPTY_PATH users, fchdir.
+    // O_NOFOLLOW on a symlink stored the link's own path above and
+    // marks the fd `link` so stat answers lstat — a DANGLING link
+    // still mints (the dentry is real). Everything else resolves to
+    // the target, which must exist. O_DIRECTORY stays a kind check.
+    if flags & O_PATH != 0 {
+        let link = was_link && flags & O_NOFOLLOW != 0;
+        if !link
+            && !dir_exists(path)
+            && !is_file(path)
+            && proc_parse(path).is_none()
+        {
+            return ENOENT;
+        }
+        if flags & O_DIRECTORY != 0 && (link || !dir_exists(path)) {
+            return ENOTDIR;
+        }
+        return opath_mint(t, path, link, flags & O_CLOEXEC != 0);
+    }
     // O_TMPFILE: an unnamed inode in the naming directory — glibc
     // passes O_TMPFILE|O_RDWR. Flag validation happened above; the
     // inode is born unlinked exactly like memfd_create's — never
@@ -25816,6 +25900,34 @@ pub fn fd_open(path: &[u8], flags: u64, mode: u64) -> u64 {
     });
     fdt(t).fds[fi] = Some(oi as u16);
     cloexec_set(t, fi, flags & O_CLOEXEC != 0);
+    ino_report(path, IN_OPEN, 0);
+    fano_emit(path, FAN_OPEN);
+    fi as u64
+}
+
+/// Mint an O_PATH OFD + fd slot. The OFD stores only the canonical
+/// path text — dentry identity is re-resolved at each use (stat
+/// follows a fresh lookup, dirfd joins re-canon), so a Path fd that
+/// outlives its name ENOENTs where a real dentry pin would linger.
+/// Open events fire like any other open — Linux reports them too.
+fn opath_mint(t: &mut Task, path: &[u8], link: bool, cloexec: bool) -> u64 {
+    let ofds = unsafe { &mut *core::ptr::addr_of_mut!(OFDS) };
+    let Some(oi) = ofds.iter().position(Option::is_none) else {
+        return EMFILE;
+    };
+    let Some(fi) = fdt(t).fds.iter().position(Option::is_none) else {
+        return EMFILE;
+    };
+    ofds[oi] = Some(OpenFile {
+        kind: FdKind::Path { p: DirPath::of(path), link },
+        pos: 0,
+        refs: 1,
+        append: false,
+        nonblock: false,
+        accmode: 0, // Linux's path fds carry no access mode
+    });
+    fdt(t).fds[fi] = Some(oi as u16);
+    cloexec_set(t, fi, cloexec);
     ino_report(path, IN_OPEN, 0);
     fano_emit(path, FAN_OPEN);
     fi as u64
@@ -26997,6 +27109,10 @@ pub fn fd_utimens(fd: u64, ts: Option<[[u64; 2]; 2]>) -> u64 {
 pub fn fd_fsync(fd: u64) -> u64 {
     let Some(t) = cur_mut() else { return EBADF };
     let Some(o) = ofd(t, fd) else { return EBADF };
+    // O_PATH fds have no stream to sync — EBADF like Linux.
+    if matches!(o.kind, FdKind::Path { .. }) {
+        return EBADF;
+    }
     if let FdKind::Dev(i) = &o.kind {
         if let Some(v) = vfile(*i) {
             if v.fmt == 0o60000 && blk_window(v.rdev).is_some() {
@@ -27014,6 +27130,10 @@ pub fn fd_fsync(fd: u64) -> u64 {
 pub fn fd_lseek(fd: u64, off: i64, whence: u64) -> u64 {
     let Some(t) = cur_mut() else { return EBADF };
     let Some(o) = ofd(t, fd) else { return EBADF };
+    // A path fd has no position to move — EBADF like Linux.
+    if matches!(o.kind, FdKind::Path { .. }) {
+        return EBADF;
+    }
     // A directory may only be rewound to the start — dir offsets are
     // opaque cookies, so a nonzero seek target is meaningless here.
     if matches!(o.kind, FdKind::Dir(_)) {
@@ -27099,6 +27219,9 @@ pub fn fd_pread(fd: u64, buf: u64, len: u64, pos: i64) -> u64 {
     let Some(o) = ofd(t, fd) else { return EBADF };
     if o.accmode == 1 {
         return EBADF; // O_WRONLY — fmode check precedes kind checks
+    }
+    if matches!(o.kind, FdKind::Path { .. }) {
+        return EBADF; // path fds carry no stream — EBADF like Linux
     }
     if let FdKind::Dev(i) = &o.kind {
         let i = *i;
@@ -27688,6 +27811,11 @@ pub fn sys_fcntl(ctx: &UCtx, fd: u64, cmd: u64, arg: u64) -> u64 {
             o.accmode as u64
                 | if o.append { O_APPEND } else { 0 }
                 | if o.nonblock { O_NONBLOCK } else { 0 }
+                | if matches!(o.kind, FdKind::Path { .. }) {
+                    O_PATH
+                } else {
+                    0
+                }
         }
         F_SETFL => {
             if fd as usize >= MAX_FDS || fdt(t).fds[fd as usize].is_none() {
@@ -28741,6 +28869,9 @@ fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
                 }
             }
         }
+        // O_PATH fds aren't pollable endpoints — Linux's poll
+        // layer answers POLLNVAL on them.
+        FdKind::Path { .. } => POLLNVAL,
         // pidfd: POLLIN once the named task is dead — a zombie or a
         // fully reaped slot both count, like Linux's exit notice.
         // A detached-mount fd carries no data but polls ready like
@@ -30592,7 +30723,7 @@ pub fn fd_epoll_ctl(epfd: u64, op: u64, fd: u64, ev: u64) -> u64 {
     }) else {
         return EINVAL; // epfd isn't an epoll fd — Linux's answer
     };
-    if fd as u64 == epfd {
+    if fd == epfd {
         return EINVAL; // can't watch itself
     }
     let Some(inst) = eps.get_mut(ei).and_then(|s| s.as_mut()) else {
@@ -30605,6 +30736,8 @@ pub fn fd_epoll_ctl(epfd: u64, op: u64, fd: u64, ev: u64) -> u64 {
         Some(o) => match o.kind {
             FdKind::Dir(_) => return EPERM,
             FdKind::Epoll(_) => return ELOOP,
+            // O_PATH fds aren't pollable — EBADF at ctl like Linux.
+            FdKind::Path { .. } => return EBADF,
             _ => {}
         },
         None => return EBADF,
@@ -38839,7 +38972,13 @@ pub fn fd_getdents(fd: u64, buf: u64, count: u64, legacy: bool) -> u64 {
     let Some(t) = cur_mut() else { return EBADF };
     let Some(o) = ofd(t, fd) else { return EBADF };
     if !matches!(o.kind, FdKind::Dir(_)) {
-        return ENOTDIR;
+        // O_PATH fds aren't streams even when they name a dir —
+        // EBADF like Linux, not ENOTDIR.
+        return if matches!(o.kind, FdKind::Path { .. }) {
+            EBADF
+        } else {
+            ENOTDIR
+        };
     }
     if count == 0 || count > MAX {
         return EINVAL;

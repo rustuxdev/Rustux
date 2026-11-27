@@ -1076,6 +1076,18 @@ fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
         Ok(n) => n,
         Err(e) => return e,
     };
+    if n == 0 {
+        // AT_EMPTY_PATH (0x1000) stats the dirfd itself through the
+        // same route statx uses — FDCWD -> cwd, else fstat. An
+        // empty path without the flag is ENOENT like Linux.
+        if flags & 0x1000 == 0 {
+            return ENOENT;
+        }
+        return match user::statx_dirfd_stat(dirfd, flags & 0x100 != 0) {
+            Ok(st) => user::emit_stat(&st, statbuf),
+            Err(e) => e,
+        };
+    }
     let (cb, cn) = match user::canon_path(dirfd, &name[..n]) {
         Ok(x) => x,
         Err(e) => return e,
