@@ -284,6 +284,65 @@ int main(void) {
             waitpid(kid, NULL, 0);
         }
 
+        /* EPOLLET: an edge delivers once — staying level-ready
+           re-fires nothing until the fd drains (a not-ready
+           sample) and a producer write lands a new edge. */
+        int etfd[2] = {-1, -1};
+        check(pipe(etfd) == 0, "pipe for EPOLLET");
+        if (etfd[0] >= 0) {
+            struct epoll_event te;
+            memset(&te, 0, sizeof(te));
+            te.events = EPOLLIN | EPOLLET;
+            te.data.u64 = 0xe7;
+            check(epoll_ctl(ep, EPOLL_CTL_ADD, etfd[0], &te) == 0,
+                  "epoll_ctl ADD EPOLLET");
+            check(write(etfd[1], "x", 1) == 1 &&
+                  epoll_wait(ep, out, 4, 0) == 1,
+                  "ET first edge fires");
+            check(epoll_wait(ep, out, 4, 0) == 0,
+                  "ET level-ready, no new edge -> 0");
+            check(write(etfd[1], "y", 1) == 1 &&
+                  epoll_wait(ep, out, 4, 0) == 1,
+                  "ET producer write re-arms");
+            char eb[2];
+            check(read(etfd[0], eb, 2) == 2, "drain ET pipe");
+            check(epoll_wait(ep, out, 4, 0) == 0,
+                  "ET drained sample re-arms (still 0)");
+            check(write(etfd[1], "z", 1) == 1 &&
+                  epoll_wait(ep, out, 4, 0) == 1,
+                  "ET post-drain edge fires");
+            read(etfd[0], eb, 1);
+            check(epoll_ctl(ep, EPOLL_CTL_DEL, etfd[0], NULL) == 0,
+                  "epoll_ctl DEL ET ent");
+            close(etfd[0]); close(etfd[1]);
+        }
+
+        /* EPOLLONESHOT: one delivery disarms the ent entirely —
+           new data reports nothing until EPOLL_CTL_MOD re-arms. */
+        int otfd[2] = {-1, -1};
+        check(pipe(otfd) == 0, "pipe for EPOLLONESHOT");
+        if (otfd[0] >= 0) {
+            struct epoll_event oe;
+            memset(&oe, 0, sizeof(oe));
+            oe.events = EPOLLIN | EPOLLONESHOT;
+            check(epoll_ctl(ep, EPOLL_CTL_ADD, otfd[0], &oe) == 0,
+                  "epoll_ctl ADD ONESHOT");
+            check(write(otfd[1], "o", 1) == 1 &&
+                  epoll_wait(ep, out, 4, 0) == 1,
+                  "ONESHOT first delivery");
+            check(write(otfd[1], "s", 1) == 1 &&
+                  epoll_wait(ep, out, 4, 0) == 0,
+                  "ONESHOT disarmed despite data");
+            check(epoll_ctl(ep, EPOLL_CTL_MOD, otfd[0], &oe) == 0 &&
+                  epoll_wait(ep, out, 4, 0) == 1,
+                  "ONESHOT MOD re-arms");
+            char ob[2];
+            read(otfd[0], ob, 2);
+            check(epoll_ctl(ep, EPOLL_CTL_DEL, otfd[0], NULL) == 0,
+                  "epoll_ctl DEL oneshot ent");
+            close(otfd[0]); close(otfd[1]);
+        }
+
         /* fstat type + the read-side EINVAL Linux gives epoll fds. */
         struct stat est;
         check(fstat(ep, &est) == 0 && S_ISCHR(est.st_mode),

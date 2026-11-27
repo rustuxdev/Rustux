@@ -923,6 +923,14 @@ struct EpollEnt {
     ofd: u16,
     events: u32,
     data: u64,
+    /// EPOLLET latch: set when the ent delivers, cleared by an
+    /// observed not-ready scan (the falling edge), an ADD/MOD
+    /// re-arm, or a write-side `epoll_edge` from the object — the
+    /// ready-list requeue modeled over a level-evaluating poll.
+    latched: bool,
+    /// EPOLLONESHOT: set on first delivery, disarming the ent until
+    /// EPOLL_CTL_MOD re-arms it — Linux's EP_ONESHOT flag.
+    spent: bool,
 }
 
 /// An epoll instance's interest set — a bounded array, not a tree.
@@ -22598,6 +22606,7 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         }
     }
     p.tail += wlen;
+    epoll_edge(&FdKind::Pipe { id, write: false });
     pipe_wake(id); // new data may unblock readers
     wlen as u64
 }
@@ -29123,6 +29132,7 @@ fn ino_q_push(i: usize, ev: InoEv) {
     } else {
         inst.overflow = true;
     }
+    epoll_edge(&FdKind::Inotify(i));
 }
 
 /// Emit a filesystem event: `path` is canonical (no leading '/').
@@ -29439,8 +29449,13 @@ fn inotify_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
 // Interest sets pin the OFD (Linux's file*), so readiness survives
 // the registering fd closing while a dup lives on; ofd_release
 // purges interests whose OFD dies, like Linux's file teardown.
-// Divergence: EPOLLET/EPOLLONESHOT accepted but level-triggered;
-// no nested epoll fds (ctl ELOOPs epoll-kind members).
+// EPOLLET is real: a delivered ent latches until a not-ready
+// sample or a producer's epoll_edge re-arms it — data arriving
+// while continuously-level-ready still reports (a scan-side edge
+// needs a sampled fall; a producer-side edge doesn't).
+// EPOLLONESHOT disarms until EPOLL_CTL_MOD. Remaining divergence:
+// EPOLLEXCLUSIVE accepted-but-ignored; no nested epoll fds (ctl
+// ELOOPs epoll-kind members).
 
 /// Scan one epoll instance's interest set, writing epoll_event
 /// records ({u32 events, u64 data} — 12 packed bytes) through t's
@@ -29448,27 +29463,88 @@ fn inotify_read(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
 /// entries (a reused OFD slot can't exist — purge runs at free —
 /// so staleness only means "evaluate", never "trust").
 fn epoll_scan(t: &Task, ei: usize, out: u64, max: u64) -> u64 {
-    let eps = unsafe { &*core::ptr::addr_of!(EPOLLS) };
-    let Some(inst) = eps.get(ei).and_then(|s| s.as_ref()) else {
+    const EPOLLET: u32 = 1 << 31;
+    const EPOLLONESHOT: u32 = 1 << 30;
+    let eps = unsafe { &mut *core::ptr::addr_of_mut!(EPOLLS) };
+    let Some(inst) = eps.get_mut(ei).and_then(|s| s.as_mut()) else {
         return 0;
     };
     let mut n = 0u64;
-    for e in inst.ents.iter().flatten() {
+    for e in inst.ents.iter_mut().flatten() {
         if n == max {
             break;
+        }
+        if e.spent {
+            continue; // ONESHOT fired — MOD re-arms it.
         }
         let r = ofd_revents(t.pending, e.ofd, e.events as u16);
         // NVAL means the interest's OFD is dead — the purge in
         // ofd_release normally beats this; either way Linux would
         // never report EPOLLNVAL to epoll_wait.
         if r == 0 || r & POLLNVAL != 0 {
+            // A not-ready sample is the falling edge — an ET ent
+            // the fd drained out from under re-arms.
+            if r == 0 {
+                e.latched = false;
+            }
             continue;
+        }
+        if e.events & EPOLLET != 0 {
+            if e.latched {
+                continue; // level still ready, no new edge
+            }
+            e.latched = true;
+        }
+        if e.events & EPOLLONESHOT != 0 {
+            e.spent = true;
         }
         write_task_u32(t.pml4, out + n * 12, r as u32);
         write_task_u64(t.pml4, out + n * 12 + 4, e.data);
         n += 1;
     }
     n
+}
+
+/// A rising edge on a pollable object re-arms every ET interest
+/// pinned to an OFD that names it — the write-side half of the
+/// edge model (the scan's not-ready sample is the falling half).
+/// Called by producers: pipe_write, eventfd bump, inotify push,
+/// mq send, unix/tcp packet arrival. Compares FdKind payloads —
+/// same pipe/socket/queue, not same OFD index, so a reader's
+/// interest re-arms when ANY writer's OFD produced.
+fn epoll_edge(k: &FdKind) {
+    let same = |a: &FdKind, b: &FdKind| -> bool {
+        match (a, b) {
+            (
+                FdKind::Pipe { id: x, .. },
+                FdKind::Pipe { id: y, .. },
+            ) => x == y,
+            (FdKind::Eventfd(x), FdKind::Eventfd(y))
+            | (FdKind::Tcp(x), FdKind::Tcp(y))
+            | (FdKind::Udp(x), FdKind::Udp(y))
+            | (FdKind::Unix(x), FdKind::Unix(y))
+            | (FdKind::Nl(x), FdKind::Nl(y))
+            | (FdKind::Packet(x), FdKind::Packet(y))
+            | (FdKind::Tun(x), FdKind::Tun(y))
+            | (FdKind::Inotify(x), FdKind::Inotify(y))
+            | (FdKind::Timerfd(x), FdKind::Timerfd(y))
+            | (FdKind::Signalfd(x), FdKind::Signalfd(y))
+            | (FdKind::MQueue(x), FdKind::MQueue(y)) => x == y,
+            (FdKind::Pidfd(x), FdKind::Pidfd(y)) => x == y,
+            _ => false,
+        }
+    };
+    let ofds = unsafe { &*core::ptr::addr_of!(OFDS) };
+    let eps = unsafe { &mut *core::ptr::addr_of_mut!(EPOLLS) };
+    for inst in eps.iter_mut().flatten() {
+        for e in inst.ents.iter_mut().flatten() {
+            if let Some(o) = ofds.get(e.ofd as usize).and_then(|s| s.as_ref()) {
+                if same(&o.kind, k) {
+                    e.latched = false;
+                }
+            }
+        }
+    }
 }
 
 /// epoll_create(size)/epoll_create1(flags): a bounded interest set
@@ -29597,6 +29673,8 @@ pub fn fd_epoll_ctl(epfd: u64, op: u64, fd: u64, ev: u64) -> u64 {
                 ofd: foi,
                 events,
                 data,
+                latched: false,
+                spent: false,
             });
             0
         }
@@ -29607,6 +29685,8 @@ pub fn fd_epoll_ctl(epfd: u64, op: u64, fd: u64, ev: u64) -> u64 {
                 ofd: foi,
                 events,
                 data,
+                latched: false, // MOD re-arms an ET edge…
+                spent: false,   // …and an ONESHOT discharge.
             });
             0
         }
@@ -29997,6 +30077,7 @@ fn eventfd_write(ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
         block_switch()
     }
     e.count += v;
+    epoll_edge(&FdKind::Eventfd(i));
     eventfd_wake_readers(i);
     8
 }
@@ -30851,6 +30932,7 @@ fn mq_drain(q: &mut MQueue) {
 /// its own pml4 (MsgRcv's discipline), else fire a pending
 /// mq_notify registration on the empty->nonempty edge.
 fn mq_after_link(qi: usize, was_empty: bool) {
+    epoll_edge(&FdKind::MQueue(qi));
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
     for s in tasks.iter_mut() {
         let Some(w) = s.as_mut() else { continue };
@@ -31483,7 +31565,8 @@ pub fn timerfd_expire() {
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     {
         let tfs = unsafe { &mut *core::ptr::addr_of_mut!(TIMERFDS) };
-        for tf in tfs.iter_mut().flatten() {
+        for (ti, tf) in tfs.iter_mut().enumerate() {
+            let Some(tf) = tf.as_mut() else { continue };
             if !tf.armed || tf.deadline > now {
                 continue;
             }
@@ -31497,6 +31580,7 @@ pub fn timerfd_expire() {
                 tf.expirations = tf.expirations.saturating_add(missed);
                 tf.deadline += tf.interval * missed;
             }
+            epoll_edge(&FdKind::Timerfd(ti));
         }
     }
     // Unread expirations wake WaitOn::Timerfd sleepers — deposit
@@ -32126,6 +32210,7 @@ pub fn udp_rx(src_ip: [u8; 4], sport: u16, dport: u16, p: &[u8]) {
         d.data[..n].copy_from_slice(&p[..n]);
         d.len = n as u16;
         sock.q = Some(d);
+        epoll_edge(&FdKind::Udp(si));
     }
     wake_pollers(); // POLLIN may have just become true
 }
@@ -34226,6 +34311,7 @@ fn unix_dgram_push(
     d.data[..n].copy_from_slice(&pay[..n]);
     d.len = n as u16;
     *slot = Some(d);
+    epoll_edge(&FdKind::Unix(di));
     true
 }
 
@@ -36723,6 +36809,7 @@ fn tcp_rx_conn(
         }
         wake_waiter(WaitOn::TcpConn(ci), (-111i64) as u64); // ECONNREFUSED
         wake_tcp_recv(ci);
+        epoll_edge(&FdKind::Tcp(ci));
         wake_pollers();
         return;
     }
@@ -36736,6 +36823,7 @@ fn tcp_rx_conn(
                 k.state = TcpState::Estab;
                 let _ = tcp_seg(k, crate::net::TCP_ACK, &[]);
                 wake_waiter(WaitOn::TcpConn(ci), 0);
+                epoll_edge(&FdKind::Tcp(ci));
                 wake_pollers();
             }
         }
@@ -36757,6 +36845,7 @@ fn tcp_rx_conn(
                 if ok {
                     socks[ci].as_mut().unwrap().state = TcpState::Estab;
                     wake_accept(li);
+                    epoll_edge(&FdKind::Tcp(li));
                     wake_pollers();
                 } else {
                     // Listener gone or backlog full — RST the child.
@@ -36825,6 +36914,7 @@ fn tcp_rx_conn(
                     close_me = k.orphan;
                 }
                 wake_tcp_recv(ci);
+                epoll_edge(&FdKind::Tcp(ci));
                 wake_pollers();
             }
             if close_me {
@@ -36838,6 +36928,7 @@ fn tcp_rx_conn(
                 tcp_free(ci);
             } else {
                 wake_tcp_recv(ci);
+                epoll_edge(&FdKind::Tcp(ci));
                 wake_pollers();
             }
         }
