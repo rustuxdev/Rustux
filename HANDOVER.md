@@ -9580,3 +9580,77 @@ scope.
 - Gates: PASS 127 tasks frames zero leak, zero FAIL; all new
   checks green (gate-353f). gate-353c had the real ptrace-hang
   described above; gate-353a/b/d were stale-qemu/self-pkill noise.
+
+## run-354 — masked posts pend silently; the unblockables can't be masked
+
+- Host-verified semantics (2/2): a signal masked in the target's
+  sigmask posted to a blocked wait leaves it sleeping — Linux just
+  pends the bit (delivery on unmask or a later deliverable post).
+  set_current_blocked strips SIGKILL|SIGSTOP at every mask install
+  — sigprocmask/suspend temp masks/sigreturn saved mask/handler
+  sa_mask can never hold the unblockables.
+- Masked-wake fix: pend_one's generic wake block is now gated on
+  deliverable_now — the posted signal must be unmasked (KILL/STOP
+  force through). A masked post only sets t.pending; the blocked
+  wait (every WaitOn kind) keeps sleeping. Closes the long-
+  documented !ignored masked-wake quirk: previously a masked USR1
+  EINTR'd a nanosleep and a masked SIGTSTP stopped a task it
+  couldn't. SigWait/suspend interplay verified — masked posts
+  leave armed suspends waiting (run-353's sigwait_stop handling
+  subsumed by the gate).
+- Blocked-task mask is sealed: the only mask writers are the
+  task's own syscalls (blocked tasks can't run them) — a pended
+  masked signal can only become deliverable at unmask
+  (sigprocmask/sigreturn/psel_restore — deliver_current runs on
+  every syscall exit) or while the task is Runnable. wait4's
+  child_change wake is signal-independent — masked SIGCHLD can't
+  wedge it.
+- Mask strip: & !PEND_FORCE at all 9 user-derived mask installs —
+  rt_sigprocmask32, rt_sigreturn32 (oldmask), handler-mask add x2
+  (i386 + x86_64 delivery), sys_rt_sigprocmask, sys_sigsuspend,
+  fd_epoll_wait (covers epoll_pwait/pwait2), fd_pselect, fd_ppoll,
+  sys_io_getevents aio_sigset. Linux strips in
+  set_current_blocked — a read-back mask holding KILL/STOP bits
+  was glibc-observable.
+- Audit fix F-1 (HIGH): the aio_sigset install in
+  sys_io_getevents was the one missed site — under the NEW gate a
+  KILL-bit mask made an Aio-blocked task unkillable (the old
+  masked-wake accidentally covered the leak; SIGSTOP escaped via
+  its `||` clause but SIGKILL relied on the strip). Fixed at the
+  site + hardened the gate to `& !PEND_FORCE == 0` — mirrors
+  unmasked_pending's force-through so a future missed site can't
+  wedge. aiotest regression: pgetevents(min_nr=1) child under a
+  KILL-bit mask must die to kill -9 (bounded WNOHANG — a
+  regression fails, never hangs).
+- PRE-EXISTING PANIC FIXED (critic-surfaced): ptrace_resume's
+  inject bound `sig > 32` let sig==32 reach pend_one ->
+  pend_src[31] OOB on [SigSrc; 31] — a kernel panic any tracer
+  could hit via PTRACE_CONT/SYSCALL/DETACH data=32. Bound is now
+  `sig > 31` (EIO like every sibling); ptrtest CONT(32) -> EIO
+  check added.
+- Known pre-existing (hunter-noted, out of diff): io_getevents
+  checks deliverable under the OLD mask before installing the
+  temp mask (ordering quirk); io_uring_enter's sig arg validated
+  but never installed (inert).
+- Tests: pgtest x4 (masked post to nanosleep survives — old quirk
+  exited the child early; masked post keeps pause suspended;
+  pended masked signal delivers after unmask; sigprocmask strips
+  KILL/STOP on read-back) + aiotest KILL-wedge check + ptrtest
+  sig=32 EIO check.
+- cve-now sweep: signal-mask/pending-delivery classes — no
+  applicable CVEs.
+- Audit (run-112, scoped quick): hunter FIX — F1 HIGH
+  (io_getevents' aio_sigset install missed the strip -> under the
+  new gate a KILL-bit mask wedged an Aio-blocked task unkillable;
+  site strip + gate hardened `& !PEND_FORCE` mirroring
+  unmasked_pending). Critic PASS — C1 LOW test nit fixed
+  (unchecked sigprocmask returns), surfaced the pre-existing
+  ptrace sig>32 OOB panic (fixed in-flight: bound now >31 EIO).
+  Verifier FIX — V1 LOW (CONT-family dispatch ran DETACH/TF
+  side-effects before the new EIO; bound hoisted above them),
+  V2/V3 INFOs (dead predicates reworded, test timing margins
+  noted).
+- Gates: gate-354f PASS 127 tasks frames zero leak, zero FAIL;
+  pgtest/ptrtest/aiotest 0 failures (354e hung on a ptrtest
+  test bug — blocking stopped_at re-probe on a consumed stop,
+  replaced with WNOHANG).
