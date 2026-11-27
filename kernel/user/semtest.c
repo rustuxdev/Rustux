@@ -11,8 +11,11 @@
 #include <sys/wait.h>
 #include <sys/ipc.h>
 #include <sys/sem.h>
+#include <signal.h>
+#include <time.h>
 
 static int fails;
+static void on_usr1(int s) { (void)s; }
 #define check(c, msg) do { \
     if (c) printf("semtest: %-44s ok\n", msg); \
     else { printf("semtest: %-44s FAIL\n", msg); fails++; } \
@@ -186,14 +189,15 @@ int main(void) {
     check(waitpid(c, &st, 0) == c && WEXITSTATUS(st) == 0, "undo child ran");
     check(semctl(sc, 0, GETVAL, u) == 2, "SEM_UNDO restored on exit");
 
-    // --- semtimedop ETIME on a dead wait (val 0 makes -1 block)
+    // --- semtimedop EAGAIN on a dead wait (val 0 makes -1 block;
+    //     Linux answers EAGAIN, never ETIME)
     zu.val = 0;
     semctl(sc, 0, SETVAL, zu);
     struct sembuf w = {0, -1, 0};
     struct timespec ts = {0, 20 * 1000 * 1000}; // 20ms
     errno = 0;
-    check(semtimedop(sc, &w, 1, &ts) == -1 && errno == ETIME,
-          "semtimedop 20ms ETIME");
+    check(semtimedop(sc, &w, 1, &ts) == -1 && errno == EAGAIN,
+          "semtimedop 20ms EAGAIN");
     // NULL timeout is plain semop — lands, val 0 -> 1
     w.sem_op = +1;
     check(semtimedop(sc, &w, 1, NULL) == 0 && semctl(sc, 0, GETVAL, u) == 1,
@@ -219,6 +223,42 @@ int main(void) {
     errno = 0;
     check(semop(srd, &w, 1) == -1 && errno == EINVAL,
           "stale id EINVAL after RMID");
+
+    // --- SA_RESTART semtimedop is never restarted: SysV IPC is
+    // in Linux's never-restart set (signal(7)) — an interrupted
+    // wait surfaces EINTR immediately even under SA_RESTART
+    // (host-verified: EINTR at ~400ms, no replay).
+    {
+        int sr = semget(IPC_PRIVATE, 1, 0600);
+        check(sr >= 0, "restart sem mint");
+        struct sigaction rsa = {0};
+        rsa.sa_handler = on_usr1;
+        rsa.sa_flags = SA_RESTART;
+        sigaction(SIGUSR1, &rsa, NULL);
+        pid_t fk = fork();
+        if (fk == 0) {
+            struct sembuf d = { 0, -1, 0 };
+            struct timespec pre, post, tmo = { 2, 0 };
+            clock_gettime(CLOCK_MONOTONIC, &pre);
+            errno = 0;
+            long r = syscall(SYS_semtimedop, sr, &d, 1, &tmo);
+            int e = errno;
+            clock_gettime(CLOCK_MONOTONIC, &post);
+            double ms = (post.tv_sec - pre.tv_sec) * 1000.0 +
+                        (post.tv_nsec - pre.tv_nsec) / 1e6;
+            /* Never-restart EINTR ~400ms; a restart would land
+               ~2s (EAGAIN). */
+            _exit(r < 0 && e == EINTR && ms < 1500 ? 0 : 1);
+        }
+        struct timespec nap = { 0, 400000000 };
+        nanosleep(&nap, NULL);
+        kill(fk, SIGUSR1);
+        int fst = 0;
+        check(waitpid(fk, &fst, 0) == fk && WIFEXITED(fst) &&
+              WEXITSTATUS(fst) == 0,
+              "SA_RESTART semtimedop EINTRs (never restarted)");
+        semctl(sr, 0, IPC_RMID, u);
+    }
 
     // --- cleanup (persistent objects, like SysV semantics)
     semctl(s, 0, IPC_RMID, u);

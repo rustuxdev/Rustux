@@ -14,6 +14,7 @@
 #include <sched.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 static int fails;
 #define check(c, msg) do { \
@@ -43,6 +44,8 @@ static char st1[8192] __attribute__((aligned(16)));
 static char st2[8192] __attribute__((aligned(16)));
 static volatile int armed_a, armed_b, done_a, done_b;
 static volatile long waitret_a;
+
+static void on_usr1(int s) { (void)s; }
 
 static int sleeper_a(void *x) {
     (void)x;
@@ -208,6 +211,109 @@ int main(void) {
     errno = 0;
     check(syscall(SYS_futex, (void *)&wb, 9u, 0, &tiny, 0, ~0u) < 0
           && errno == ETIMEDOUT, "BITSET {5s} abs past ETIMEDOUT");
+
+    // ---- TIMED futex_wait is never-restart (run-352 correction) --
+    // A TIMED FUTEX_WAIT arms -ERESTART_RESTARTBLOCK: an SA_RESTART
+    // handler still surfaces EINTR at the interrupt — the restart
+    // block only serves the no-handler stop/cont resume
+    // (host-verified: EINTR ~400ms). Untimed waits and futex_waitv
+    // are -ERESTARTSYS instead — restarted; checked below.
+    {
+        struct sigaction rsa = {0};
+        rsa.sa_handler = on_usr1;
+        rsa.sa_flags = SA_RESTART;
+        sigaction(SIGUSR1, &rsa, NULL);
+
+        pid_t fk = fork();
+        if (fk == 0) {
+            struct timespec pre, post, tmo = { 2, 0 };
+            clock_gettime(CLOCK_MONOTONIC, &pre);
+            errno = 0;
+            long r = syscall(SYS_futex, (void *)&wa, 0u, 0u, &tmo,
+                             0, 0);
+            int e = errno;
+            clock_gettime(CLOCK_MONOTONIC, &post);
+            double ms = (post.tv_sec - pre.tv_sec) * 1000.0 +
+                        (post.tv_nsec - pre.tv_nsec) / 1e6;
+            /* EINTR ~400ms; a restart would land ~2s+. */
+            _exit(r < 0 && e == EINTR && ms < 1500 ? 0 : 1);
+        }
+        struct timespec nap = { 0, 400000000 };
+        nanosleep(&nap, NULL);
+        kill(fk, SIGUSR1);
+        int fst = 0;
+        check(waitpid(fk, &fst, 0) == fk && WIFEXITED(fst) &&
+              WEXITSTATUS(fst) == 0,
+              "SA_RESTART futex_wait EINTRs (never restarted)");
+
+        // run-352 audit correction (host-verified): the restart
+        // classes split INSIDE futex — an UNTIMED futex_wait is
+        // -ERESTARTSYS (SA_RESTART replays it; the wait survives
+        // the signal), while futex_waitv is -ERESTARTSYS too and
+        // also replays. Only a TIMED futex_wait is never-restart.
+        // A child can't be futex-woken across fork (private queues
+        // are mm-keyed), so the restart proof is negative: EINTR'd
+        // -> exit(3) ~400ms; restarted -> still blocked at ~900ms.
+        fk = fork();
+        if (fk == 0) {
+            errno = 0;
+            long r = syscall(SYS_futex, (void *)&wa, 0u, 0u,
+                             NULL, 0, 0);
+            _exit(r < 0 && errno == EINTR ? 3 : 4);
+        }
+        nanosleep(&nap, NULL);
+        kill(fk, SIGUSR1);
+        { struct timespec d2 = { 0, 500000000 }; nanosleep(&d2, NULL); }
+        fst = 0;
+        int still = (waitpid(fk, &fst, WNOHANG) == 0);
+        if (still) { kill(fk, SIGKILL); waitpid(fk, &fst, 0); }
+        check(still,
+              "SA_RESTART untimed futex_wait restarts (blocks past signal)");
+
+        fk = fork();
+        if (fk == 0) {
+            struct fwv wv =
+                { .val = 0, .uaddr = (uint64_t)&wa,
+                  .flags = FUTEX_32, .res = 0 };
+            struct timespec pre2, at;
+            clock_gettime(CLOCK_MONOTONIC, &pre2);
+            at = pre2;
+            at.tv_sec += 2;
+            errno = 0;
+            long r = syscall(SYS_futex_waitv, &wv, 1, 0, &at, 1);
+            _exit(r < 0 && errno == EINTR ? 3 : 4);
+        }
+        nanosleep(&nap, NULL);
+        kill(fk, SIGUSR1);
+        { struct timespec d2 = { 0, 500000000 }; nanosleep(&d2, NULL); }
+        fst = 0;
+        still = (waitpid(fk, &fst, WNOHANG) == 0);
+        if (still) { kill(fk, SIGKILL); waitpid(fk, &fst, 0); }
+        check(still,
+              "SA_RESTART futex_waitv restarts (blocks past signal)");
+
+        // Without SA_RESTART the same interrupt is also EINTR —
+        // the disposition doesn't change the outcome here.
+        {
+            struct sigaction dfl2 = {0};
+            dfl2.sa_handler = on_usr1;
+            dfl2.sa_flags = 0;
+            sigaction(SIGUSR1, &dfl2, NULL);
+        }
+        fk = fork();
+        if (fk == 0) {
+            errno = 0;
+            long r = syscall(SYS_futex, (void *)&wa, 0u, 0u, NULL,
+                             0, 0);
+            _exit(r < 0 && errno == EINTR ? 0 : 1);
+        }
+        nanosleep(&nap, NULL);
+        kill(fk, SIGUSR1);
+        fst = 0;
+        check(waitpid(fk, &fst, 0) == fk && WIFEXITED(fst) &&
+              WEXITSTATUS(fst) == 0,
+              "futex_wait EINTR without SA_RESTART");
+    }
 
     // ---- membarrier(324) ----
     long sup = syscall(SYS_membarrier, MBR_QUERY, 0, 0);

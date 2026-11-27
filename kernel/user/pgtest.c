@@ -433,7 +433,10 @@ int main(void) {
           "sigsuspend restored the block mask");
     sigprocmask(SIG_SETMASK, &pprev, NULL);
 
-    /* pause(34): a child's signal interrupts the sleep with EINTR. */
+    /* pause(34): a child's signal interrupts the sleep with EINTR.
+       If the handler already ran (a >20ms fork->pause scheduling
+       stall — pre-existing flake, gate hang) the interruption path
+       can't be re-exercised; skip pause so it can't sleep forever. */
     got_usr1 = 0;
     pid_t sc = fork();
     if (sc == 0) {
@@ -443,7 +446,8 @@ int main(void) {
         _exit(0);
     }
     errno = 0;
-    check(sc > 0 && pause() == -1 && errno == EINTR && got_usr1,
+    check(sc > 0 && (got_usr1 || (pause() == -1 && errno == EINTR)) &&
+              got_usr1,
           "pause() interrupted by SIGUSR1 -> EINTR");
     waitpid(sc, &st, 0);
 
@@ -643,25 +647,31 @@ int main(void) {
         close(pp[1]);
     }
 
-    /* run-350: SA_RESTART nanosleep resumes the unslept REMAINDER
-       (Linux restart_block), not the full request again — a 2s
-       sleep interrupted at ~400ms must total ~2s, not ~2.4s. */
+    /* run-352 correction: sleeps are in Linux's never-restart set
+       (signal(7)) — an SA_RESTART handler still surfaces EINTR at
+       the interrupt, and rem carries the unslept remainder for a
+       manual resume (host-verified: -1 EINTR at ~400ms). */
     {
         struct sigaction rs2;
         memset(&rs2, 0, sizeof(rs2));
         rs2.sa_handler = usr1_hit;
         rs2.sa_flags = SA_RESTART;
         check(sigaction(SIGUSR1, &rs2, NULL) == 0,
-              "restart-block arms");
+              "never-restart arms");
         pid_t nk = fork();
         if (nk == 0) {
-            struct timespec a, b, rq = {2, 0};
+            struct timespec a, b, rq = {2, 0}, rm = {0, 0};
             clock_gettime(CLOCK_MONOTONIC, &a);
-            nanosleep(&rq, NULL); /* replay resumes ~1.6s remainder */
+            errno = 0;
+            long r = nanosleep(&rq, &rm);
+            int e = errno;
             clock_gettime(CLOCK_MONOTONIC, &b);
             long ms = (b.tv_sec - a.tv_sec) * 1000 +
                       (b.tv_nsec - a.tv_nsec) / 1000000;
-            _exit(ms >= 1900 && ms < 2350 ? 0 : 1);
+            /* EINTR ~400ms; a restart would total ~2s. rem must
+               carry ~1.6s (Linux fills it on the -EINTR return). */
+            _exit(r == -1 && e == EINTR && ms < 1500 &&
+                  rm.tv_sec == 1 && rm.tv_nsec > 0 ? 0 : 1);
         }
         {
             struct timespec ts = {0, 400000000};
@@ -671,32 +681,35 @@ int main(void) {
         int nst = 0;
         check(waitpid(nk, &nst, 0) == nk && WIFEXITED(nst) &&
               WEXITSTATUS(nst) == 0,
-              "SA_RESTART nanosleep resumes remainder");
+              "SA_RESTART nanosleep EINTRs + rem filled");
         rs2.sa_flags = 0;
         check(sigaction(SIGUSR1, &rs2, NULL) == 0,
-              "restart-block disarm");
+              "never-restart disarm");
     }
 
-    /* run-351: poll()'s SA_RESTART replay resumes the stashed
-       deadline (Linux restart_block->poll) — a 2s nfds=0 sleep
-       interrupted at ~400ms totals ~2s, not ~2.4s. ppoll replays
-       the mutated tsp to the same remainder. */
+    /* run-352 correction: poll/ppoll are never-restart too — the
+       poll multiplexers answer -ERESTART_RESTARTBLOCK/-ERESTARTNOHAND
+       which Linux converts to -EINTR once a handler ran (the armed
+       restart_block only serves stop/cont). SA_RESTART or not, an
+       interrupted poll EINTRs at the signal. */
     {
         struct sigaction rs3;
         memset(&rs3, 0, sizeof(rs3));
         rs3.sa_handler = usr1_hit;
         rs3.sa_flags = SA_RESTART;
         check(sigaction(SIGUSR1, &rs3, NULL) == 0,
-              "poll-restart arms");
+              "poll never-restart arms");
         pid_t pk = fork();
         if (pk == 0) {
             struct timespec a, b;
             clock_gettime(CLOCK_MONOTONIC, &a);
-            poll(NULL, 0, 2000); /* replay resumes ~1.6s remainder */
+            errno = 0;
+            long r = poll(NULL, 0, 2000);
+            int e = errno;
             clock_gettime(CLOCK_MONOTONIC, &b);
             long ms = (b.tv_sec - a.tv_sec) * 1000 +
                       (b.tv_nsec - a.tv_nsec) / 1000000;
-            _exit(ms >= 1900 && ms < 2350 ? 0 : 1);
+            _exit(r == -1 && e == EINTR && ms < 1500 ? 0 : 1);
         }
         {
             struct timespec ts = {0, 400000000};
@@ -706,17 +719,19 @@ int main(void) {
         int pst = 0;
         check(waitpid(pk, &pst, 0) == pk && WIFEXITED(pst) &&
               WEXITSTATUS(pst) == 0,
-              "SA_RESTART poll resumes remainder");
+              "SA_RESTART poll EINTRs (never restarted)");
 
         pk = fork();
         if (pk == 0) {
             struct timespec a, b, tmo = {2, 0};
             clock_gettime(CLOCK_MONOTONIC, &a);
-            ppoll(NULL, 0, &tmo, NULL); /* tsp writeback + replay */
+            errno = 0;
+            long r = ppoll(NULL, 0, &tmo, NULL);
+            int e = errno;
             clock_gettime(CLOCK_MONOTONIC, &b);
             long ms = (b.tv_sec - a.tv_sec) * 1000 +
                       (b.tv_nsec - a.tv_nsec) / 1000000;
-            _exit(ms >= 1900 && ms < 2350 ? 0 : 1);
+            _exit(r == -1 && e == EINTR && ms < 1500 ? 0 : 1);
         }
         {
             struct timespec ts = {0, 400000000};
@@ -725,10 +740,144 @@ int main(void) {
         kill(pk, SIGUSR1);
         check(waitpid(pk, &pst, 0) == pk && WIFEXITED(pst) &&
               WEXITSTATUS(pst) == 0,
-              "SA_RESTART ppoll resumes remainder");
+              "SA_RESTART ppoll EINTRs (never restarted)");
         rs3.sa_flags = 0;
         check(sigaction(SIGUSR1, &rs3, NULL) == 0,
-              "poll-restart disarm");
+              "poll never-restart disarm");
+    }
+
+    /* run-352: stop/cont is the other half of the correction —
+       nanosleep/poll DO resume on SIGSTOP->SIGCONT (no handler
+       ran; the armed restart_block replay applies). Linux's
+       restart_block stores the absolute expiry, so the resume
+       runs to the ORIGINAL deadline — total wall ~2s from entry,
+       not 2s + stop duration and not a fresh 2s on top. */
+    {
+        pid_t sk = fork();
+        if (sk == 0) {
+            struct timespec a, b;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            long r = poll(NULL, 0, 2000);
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            long ms = (b.tv_sec - a.tv_sec) * 1000 +
+                      (b.tv_nsec - a.tv_nsec) / 1000000;
+            /* EINTR -> r=-1; stash-less orig-args replay -> ~2.6s;
+               correct resume -> r=0 at ~2s. */
+            _exit(r == 0 && ms >= 1900 && ms < 2400 ? 0 : 1);
+        }
+        {
+            struct timespec ts = {0, 400000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(sk, SIGSTOP);
+        {
+            struct timespec ts = {0, 200000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(sk, SIGCONT);
+        int sst = 0;
+        check(waitpid(sk, &sst, 0) == sk && WIFEXITED(sst) &&
+              WEXITSTATUS(sst) == 0,
+              "stop/cont poll resumes to original deadline");
+
+        sk = fork();
+        if (sk == 0) {
+            struct timespec a, b, rq = {2, 0};
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            long r = nanosleep(&rq, NULL);
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            long ms = (b.tv_sec - a.tv_sec) * 1000 +
+                      (b.tv_nsec - a.tv_nsec) / 1000000;
+            _exit(r == 0 && ms >= 1900 && ms < 2400 ? 0 : 1);
+        }
+        {
+            struct timespec ts = {0, 400000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(sk, SIGSTOP);
+        {
+            struct timespec ts = {0, 200000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(sk, SIGCONT);
+        check(waitpid(sk, &sst, 0) == sk && WIFEXITED(sst) &&
+              WEXITSTATUS(sst) == 0,
+              "stop/cont nanosleep resumes to original deadline");
+
+        /* A handler'd signal PENDING when CONT resumes converts the
+           armed resume to EINTR — Linux's handle_signal fires before
+           the replay, so poll returns -1 EINTR (~700ms), never the
+           resumed wait. Child: handler'd USR1 disposition inherited. */
+        struct sigaction cs;
+        memset(&cs, 0, sizeof(cs));
+        cs.sa_handler = usr1_hit;
+        cs.sa_flags = 0;
+        check(sigaction(SIGUSR1, &cs, NULL) == 0,
+              "cont-pending arms");
+        got_usr1 = 0;
+        sk = fork();
+        if (sk == 0) {
+            struct timespec a, b;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            errno = 0;
+            long r = poll(NULL, 0, 2000);
+            int e = errno;
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            long ms = (b.tv_sec - a.tv_sec) * 1000 +
+                      (b.tv_nsec - a.tv_nsec) / 1000000;
+            _exit(r == -1 && e == EINTR && ms < 1500 &&
+                  got_usr1 ? 0 : 1);
+        }
+        {
+            struct timespec ts = {0, 400000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(sk, SIGSTOP);
+        {
+            struct timespec ts = {0, 150000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(sk, SIGUSR1); /* pends while stopped */
+        {
+            struct timespec ts = {0, 150000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(sk, SIGCONT);
+        check(waitpid(sk, &sst, 0) == sk && WIFEXITED(sst) &&
+              WEXITSTATUS(sst) == 0,
+              "cont+pending-handler poll -> EINTR (restart converted)");
+
+        /* Epoll is in signal(7)'s fail-EINTR-on-stop list — no
+           resume even with no handler ever running. */
+        sk = fork();
+        if (sk == 0) {
+            struct timespec a, b;
+            char evbuf[64]; /* one epoll_event, raw ABI */
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            errno = 0;
+            long efd = syscall(SYS_epoll_create1, 0);
+            long r = efd >= 0
+                ? syscall(SYS_epoll_wait, efd, evbuf, 8, 2000)
+                : -9;
+            int e = errno;
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            long ms = (b.tv_sec - a.tv_sec) * 1000 +
+                      (b.tv_nsec - a.tv_nsec) / 1000000;
+            _exit(r == -1 && e == EINTR && ms < 1500 ? 0 : 1);
+        }
+        {
+            struct timespec ts = {0, 400000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(sk, SIGSTOP);
+        {
+            struct timespec ts = {0, 200000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(sk, SIGCONT);
+        check(waitpid(sk, &sst, 0) == sk && WIFEXITED(sst) &&
+              WEXITSTATUS(sst) == 0,
+              "stop/cont epoll_wait -> EINTR (never resumes)");
     }
 
     /* run-351: EINTR (no SA_RESTART) still writes the remaining

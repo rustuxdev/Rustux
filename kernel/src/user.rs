@@ -377,7 +377,7 @@ enum WaitOn {
     /// semop() on an op array that can't go: the sembuf list was
     /// staged to kernel memory at arm — wait_ptr the kmalloc'd
     /// buf, wait_len nsops. Any val change on the set re-evaluates
-    /// the whole array; EIDRM/EINTR/ETIME frees it.
+    /// the whole array; EIDRM/EINTR/expiry (EAGAIN) frees it.
     SemOp(usize),
     /// mq_timedreceive() on an empty queue: wait_ptr is the user
     /// msg buffer, wait_len its cap, wait_ptr2 the prio out VA —
@@ -1261,15 +1261,24 @@ fn sig_default_stop(sig: usize) -> bool {
 }
 
 /// WaitOn kinds whose syscalls restart after an SA_RESTART-handled
-/// (or default-stop) signal instead of surfacing -EINTR — Linux's
-/// ERESTARTSYS/ERESTART_RESTARTBLOCK set: device/file reads and
-/// writes, socket recv/accept, poll/select/epoll family, sleeps,
-/// wait4/waitid, lock and notification waits. Deliberately absent:
-/// SysV IPC (ERESTARTNOHAND), futex, connect (BSD EINTR/EALREADY
-/// contract), the signal-waiting calls (their whole job is to
-/// return on a signal), Uffd (parks a fault ctx, not a syscall),
-/// Vfork (uninterruptible), the NT object waits, and Aio —
-/// io_getevents drains a partial batch before arming, so a full
+/// signal instead of surfacing -EINTR — Linux's ERESTARTSYS set:
+/// device/file reads and writes, socket recv/accept, wait4/waitid,
+/// POSIX mqueue, lock and notification waits. The ERESTARTSYS
+/// replay re-enters the syscall with its ORIGINAL args — there is
+/// no remainder resume; abstime args re-derive the same expiry.
+///
+/// Deliberately absent — signal(7)'s never-restart list, whose
+/// waits answer -ERESTART_RESTARTBLOCK/-ERESTARTNOHAND/-EINTR and
+/// ALWAYS fail EINTR once a handler ran (host-verified; the armed
+/// restart_block exists only for the no-handler stop/cont resume):
+/// sleeps (Timer — nanosleep/clock_nanosleep), the poll/select/
+/// epoll family (Poll/Pselect/Epoll), SysV IPC (MsgRcv/MsgSnd/
+/// SemOp), TIMED futex (Futex with a deadline — untimed Futex is
+/// ERESTARTSYS and lives in the restartable set below), the
+/// signal-waiting calls, connect
+/// (BSD EINTR/EALREADY contract), Uffd (parks a fault ctx, not a
+/// syscall), Vfork (uninterruptible), the NT object waits, and Aio
+/// — io_getevents drains a partial batch before arming, so a full
 /// replay would silently overwrite already-consumed completions.
 fn wait_restartable(w: &WaitOn) -> bool {
     matches!(w,
@@ -1279,7 +1288,6 @@ fn wait_restartable(w: &WaitOn) -> bool {
         | WaitOn::Stdin | WaitOn::Evdev | WaitOn::TunRecv(_)
         | WaitOn::Inotify(_) | WaitOn::Fano(_) | WaitOn::UffdRead(_)
         | WaitOn::EventfdR(_) | WaitOn::EventfdW(_) | WaitOn::Timerfd(_)
-        | WaitOn::Timer | WaitOn::Poll | WaitOn::Pselect | WaitOn::Epoll(_)
         | WaitOn::UdpRecv(_) | WaitOn::PktRecv(_) | WaitOn::UnixAccept(_)
         | WaitOn::UnixDgram(_) | WaitOn::UnixDgramM(_)
         | WaitOn::UnixRecvM(..) | WaitOn::UnixRecv(..)
@@ -1287,7 +1295,32 @@ fn wait_restartable(w: &WaitOn) -> bool {
         | WaitOn::NlRecv(_) | WaitOn::NlRecvM(_)
         | WaitOn::TcpAccept(_) | WaitOn::TcpRecv(_)
         | WaitOn::MqRcv(_) | WaitOn::MqSnd(_)
-        | WaitOn::FLock | WaitOn::Kmsg(_))
+        | WaitOn::FLock | WaitOn::Kmsg(_)
+        // Host-verified: untimed __futex_wait answers -ERESTARTSYS
+        // (only the timed variant arms the restart_block — a timed
+        // Futex is never-restart instead, gated at the arm site),
+        // and futex_waitv answers -ERESTARTSYS unconditionally — an
+        // SA_RESTART replay re-reads the abstime timespec and lands
+        // the same expiry.
+        | WaitOn::FutexV)
+}
+
+/// Waits that resume on SIGCONT despite being never-restart under
+/// a handler — Linux's no-handler restart path: sleeps resume to
+/// the restart_block expiry, poll/ppoll via restart_block->poll,
+/// select/pselect replay orig args over the written-back timeout,
+/// TIMED futex waits via futex_wait_restart (host-verified; untimed
+/// Futex and every futex_waitv are -ERESTARTSYS — the restartable
+/// set above — so they never reach here), and
+/// SysV msg waits resume since 2.6.8. Deliberately absent —
+/// signal(7)'s fail-EINTR-on-stop list: epoll_wait/epoll_pwait
+/// (Epoll), semop/semtimedop (SemOp), the signal-waiting calls,
+/// and socket-timeout waits (unimplemented here anyway).
+fn wait_stop_resumable(w: &WaitOn) -> bool {
+    matches!(w,
+        WaitOn::Timer | WaitOn::Poll | WaitOn::Pselect
+        | WaitOn::Futex(_)
+        | WaitOn::MsgRcv(_) | WaitOn::MsgSnd(_))
 }
 
 /// Apply an armed SA_RESTART replay to `c`: rewind rip onto the
@@ -1302,6 +1335,16 @@ fn restart_apply(t: &mut Task, c: &mut UCtx, eintr: u64) {
     if t.restart_nr == u64::MAX || c.rax != eintr {
         return;
     }
+    // The arm belongs to the frame interrupted at restart_asite —
+    // a siglongjmp that abandons the handler's frame leaves the arm
+    // armed, and a LATER frame's sigreturn (a different interrupted
+    // syscall) would otherwise replay the stale nr onto foreign
+    // args. A same-site later frame is a same-nr call by
+    // construction (libc's per-wrapper syscall insns), so applying
+    // there is still correct.
+    if c.rip != t.restart_asite {
+        return;
+    }
     let back = c.rip.wrapping_sub(2);
     // The insn check reads through t's own tables — the SIGCONT
     // caller wakes a task that is usually not current, so range_ok
@@ -1312,11 +1355,18 @@ fn restart_apply(t: &mut Task, c: &mut UCtx, eintr: u64) {
     }
     if (insn[0] == 0x0f && insn[1] == 0x05) || (insn[0] == 0xcd && insn[1] == 0x80) {
         // The replay re-enters the ABI at c.rip (the insn after the
-        // syscall gate) — stash it so the nanosleep family consumes
-        // restart_at only on the actual replayed entry.
-        t.restart_rip = c.rip;
+        // syscall gate) — stash it so deadline-wait consumes fire
+        // only on the actual replayed entry. Record ONLY when a
+        // deadline stash is armed: orig-args replays (restartable
+        // kinds, non-deadline stop-resumable kinds, untimed waits)
+        // have no consumer, so a recorded rip would sit stale until
+        // the next frame push misread it as an applied stash replay.
+        if t.restart_at != 0 {
+            t.restart_rip = c.rip;
+        }
         c.rip = back;
         c.rax = core::mem::replace(&mut t.restart_nr, u64::MAX);
+        t.restart_asite = 0;
     }
 }
 
@@ -1705,6 +1755,22 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                         t.sigmask
                     };
                     t.frame_mask = u64::MAX;
+                    // A frame pushed over an applied stop-resume
+                    // replay means a handler'd signal won the race —
+                    // Linux's handle_signal then converts the armed
+                    // restart to -EINTR before pushing the frame, so
+                    // the saved UCtx resumes AFTER the syscall insn
+                    // with rax=-EINTR (never restarted), not a fresh
+                    // full wait. Clear the stash too — a nested
+                    // same-insn sleep mustn't steal it.
+                    if t.restart_rip != 0 {
+                        ctx.rip = t.restart_rip;
+                        ctx.rax = (-4i64) as u64; // -EINTR
+                        t.restart_at = 0;
+                        t.restart_rt = false;
+                        t.restart_rip = 0;
+                        t.restart_knr = 0;
+                    }
                     let Some(frame) = i386_sigframe_write(
                         t,
                         ctx,
@@ -1724,15 +1790,6 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                         add |= 1u32 << i;
                     }
                     t.sigmask |= add;
-                    // A frame pushed over an applied replay would
-                    // let the nested handler's same-insn nanosleep
-                    // steal the stash — disarm; the replay falls
-                    // back to a plain full-req arm.
-                    if t.restart_rip != 0 {
-                        t.restart_at = 0;
-                        t.restart_rt = false;
-                        t.restart_rip = 0;
-                    }
                     ctx.rip = handler;
                     ctx.rsp = frame;
                     return;
@@ -1777,6 +1834,18 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                     t.sigmask
                 };
                 t.frame_mask = u64::MAX;
+                // Same conversion as the compat frame: a handler'd
+                // signal over an applied stop-resume replay saves
+                // the -EINTR resume (rip back past the syscall insn)
+                // and disarms the stash.
+                if t.restart_rip != 0 {
+                    ctx.rip = t.restart_rip;
+                    ctx.rax = (-4i64) as u64; // -EINTR
+                    t.restart_at = 0;
+                    t.restart_rt = false;
+                    t.restart_rip = 0;
+                    t.restart_knr = 0;
+                }
                 let ok = write_task_bytes(t.pml4, frame, &SIGTRAMP_VA.to_le_bytes())
                     && write_task_bytes(t.pml4, frame + 8, &sig64.to_le_bytes())
                     && write_task_bytes(t.pml4, frame + 16, raw)
@@ -1802,13 +1871,6 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                     add |= 1u32 << i;
                 }
                 t.sigmask |= add;
-                if t.restart_rip != 0 {
-                    // Same nested-handler stash-steal guard as the
-                    // compat frame above.
-                    t.restart_at = 0;
-                    t.restart_rt = false;
-                    t.restart_rip = 0;
-                }
                 ctx.rsp = frame;
                 ctx.rip = handler;
                 ctx.rdi = sig64;
@@ -2094,7 +2156,7 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
     if t.state == TaskState::Blocked && !ignored && !matches!(t.wait_on, WaitOn::Vfork(_)) {
         // A nanosleep interrupted by this signal reports the unslept
         // remainder in rem (stored in wait_ptr) — Linux semantics.
-        let mut rax: u64 = (-4i64) as u64; // -EINTR
+        let rax: u64 = (-4i64) as u64; // -EINTR
         if matches!(t.wait_on, WaitOn::Timer) {
             if t.wait_ptr != 0 {
                 let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
@@ -2112,52 +2174,66 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
         // in-kernel Runnable-recheck path keeps today's semantics,
         // and only sigreturn/SIGCONT turns the deposit into a
         // replay (Linux's ERESTARTSYS turn at signal delivery).
-        if wait_restartable(&t.wait_on) {
-            let i = sig as usize - 1;
-            let (fl, h) = {
-                let s = sigt(t);
-                (
-                    s.flags.get(i).copied().unwrap_or(0),
-                    s.handlers.get(i).copied().unwrap_or(SIG_DFL),
-                )
-            };
-            // A signal the mask defers can't deliver a handler or
-            // reach sigreturn — arming it would leave a stale slot
-            // (the masked-wake itself is the pre-existing !ignored
-            // wake quirk; the arm just doesn't amplify it).
-            if (t.sigmask & (1u32 << i) == 0 || sig as usize == SIGSTOP)
-                && (fl & SA_RESTART != 0
-                    || (h == SIG_DFL && sig_default_stop(sig as usize)))
-            {
-                t.restart_nr = t.ctx.rax;
-                // Timer waits carry the restart_block remainder:
-                // the replay resumes to this deadline, not the
-                // full req (relative req isn't re-read — POSIX).
-                // Poll rides the same slot — Linux arms
-                // restart_block->poll with the absolute expiry;
-                // ppoll's stash is a fallback for its tsp
-                // writeback path (fd_ppoll consumes it too, so no
-                // armed stash can linger past its replay).
-                match t.wait_on {
-                    WaitOn::Timer => {
-                        t.restart_at = t.wait_deadline;
-                        t.restart_rt = t.wait_rt;
-                    }
-                    WaitOn::Poll => {
-                        t.restart_at = t.wait_deadline;
-                        t.restart_rt = false;
-                    }
-                    _ => {
-                        t.restart_at = 0;
-                        t.restart_rt = false;
-                    }
+        // signal(7)'s never-restart waits get no arm for a handler'd
+        // signal — but a default-stop still arms the replay so
+        // SIGCONT resumes the wait like Linux's no-handler restart
+        // (restart_block->nanosleep/poll/futex_wait_restart); the
+        // stash carries the expiry for the remainder-resume.
+        let i = sig as usize - 1;
+        let (fl, h) = {
+            let s = sigt(t);
+            (
+                s.flags.get(i).copied().unwrap_or(0),
+                s.handlers.get(i).copied().unwrap_or(SIG_DFL),
+            )
+        };
+        // A signal the mask defers can't deliver a handler or
+        // reach sigreturn — arming it would leave a stale slot
+        // (the masked-wake itself is the pre-existing !ignored
+        // wake quirk; the arm just doesn't amplify it).
+        let deliverable_now =
+            t.sigmask & (1u32 << i) == 0 || sig as usize == SIGSTOP;
+        let stop = h == SIG_DFL && sig_default_stop(sig as usize);
+        // Untimed Futex is -ERESTARTSYS on Linux (restartable —
+        // orig-args replay re-waits); only a TIMED one arms the
+        // restart_block that never restarts under a handler and
+        // resumes via the stash on CONT.
+        let futex_untimed =
+            matches!(&t.wait_on, WaitOn::Futex(_) if t.wait_deadline == 0);
+        if deliverable_now
+            && (fl & SA_RESTART != 0 || stop)
+            && (wait_restartable(&t.wait_on) || futex_untimed)
+        {
+            t.restart_nr = t.ctx.rax;
+            t.restart_asite = t.ctx.rip;
+        } else if deliverable_now && stop && wait_stop_resumable(&t.wait_on) {
+            t.restart_nr = t.ctx.rax;
+            t.restart_asite = t.ctx.rip;
+            // Only the deadline kinds need the stash — Pselect and
+            // the SysV msg waits replay orig args (their written-
+            // back timeout buffers carry the remainder already).
+            match t.wait_on {
+                WaitOn::Timer | WaitOn::Futex(_) => {
+                    t.restart_at = t.wait_deadline;
+                    t.restart_rt = t.wait_rt;
+                    t.restart_knr = t.ctx.rax;
                 }
-                // Only a successful apply may key the consume —
-                // a stale rip from a prior replay could otherwise
-                // match a nanosleep entering through the same libc
-                // syscall insn in the arm->apply window.
-                t.restart_rip = 0;
+                WaitOn::Poll => {
+                    t.restart_at = t.wait_deadline;
+                    t.restart_rt = false;
+                    t.restart_knr = t.ctx.rax;
+                }
+                _ => {
+                    t.restart_at = 0;
+                    t.restart_rt = false;
+                    t.restart_knr = 0;
+                }
             }
+            // Only a successful apply may key the consume — a stale
+            // rip from a prior replay could otherwise match a sleep
+            // entering through the same libc syscall insn in the
+            // arm->apply window.
+            t.restart_rip = 0;
         }
         if !matches!(t.wait_on, WaitOn::Uffd(_)) {
             // A uffd wait parks the FAULTING ctx — rax is a live
@@ -2649,18 +2725,25 @@ pub struct Task {
     /// rewinds the ctx saved in the signal frame at sigreturn, or
     /// the armed ctx itself when a stopped task resumes on SIGCONT.
     restart_nr: u64,
-    /// restart_block remainder for an interrupted WaitOn::Timer or
-    /// WaitOn::Poll — the tick deadline the replay resumes to
-    /// (0 = none). Linux's
-    /// restart_block stores the expiry so a SA_RESTART replay of
-    /// nanosleep sleeps only the unslept remainder, not the full
-    /// req again. restart_rt marks whether the deadline slides on
-    /// wall sets (RT abstime); restart_rip is the user rip the
-    /// replay re-enters at — the consume gate, so a handler's own
-    /// nanosleep can't steal the stashed deadline.
+    /// The interrupted ctx's post-insn rip at arm time — binds the
+    /// arm to the frame it interrupted: a siglongjmp-abandoned arm
+    /// can't replay its stale nr onto a later frame's ctx
+    /// (restart_apply refuses when c.rip differs).
+    restart_asite: u64,
+    /// restart_block remainder for a stop-resumable wait —
+    /// nanosleep-family Timer waits, poll()/ppoll() Poll waits and
+    /// futex waits resume on SIGCONT to the stashed expiry like
+    /// Linux's restart_block->nanosleep/poll/futex_wait_restart
+    /// (0 = none). Handler'd signals NEVER arm it — those waits
+    /// are in signal(7)'s never-restart set and always answer
+    /// -EINTR. restart_rt marks whether the stash slides on wall
+    /// sets (RT abstime); restart_rip is the replay re-entry rip —
+    /// the consume gate; restart_knr is the nr copy that survives
+    /// restart_apply's consume of restart_nr.
     restart_at: u64,
     restart_rt: bool,
     restart_rip: u64,
+    restart_knr: u64,
     /// Pending signal bitmask — bit (sig-1), sigs 1..=31.
     pending: u32,
     /// si_code/pid/uid/aux behind each pending bit — written on the
@@ -8543,9 +8626,11 @@ fn load(img: &[u8]) -> Option<Task> {
         wait_deadline: 0,
         wait_rt: false,
         restart_nr: u64::MAX,
+        restart_asite: 0,
         restart_at: 0,
         restart_rt: false,
         restart_rip: 0,
+        restart_knr: 0,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: 0,
@@ -10658,7 +10743,7 @@ fn sem_op(
             return EINTR_;
         }
         // Sleep until a val change re-evaluates our array — the
-        // waker applies it or EIDRM/ETIME/EINTR frees the staging.
+        // waker applies it or EIDRM/EAGAIN/EINTR frees the staging.
         t.wait_on = WaitOn::SemOp(slot);
         t.wait_ptr = stage as u64;
         t.wait_len = nsops as u64;
@@ -10670,7 +10755,7 @@ fn sem_op(
             block_switch();
         }
         if t.wait_on == WaitOn::None {
-            return t.ctx.rax; // waker applied, EIDRM, EINTR, ETIME
+            return t.ctx.rax; // waker applied, EIDRM, EINTR, EAGAIN
         }
         // The armed recheck resolved the wait itself.
         t.wait_on = WaitOn::None;
@@ -10696,7 +10781,8 @@ pub fn sys_semop(ctx: &mut UCtx, id: u64, sops: u64, nsops: u64) -> u64 {
 
 /// semtimedop(semid, sops, nsops, timeout): NULL timeout is plain
 /// semop; else {sec,nsec} becomes a wait_deadline — poll_expire's
-/// SemOp arm answers ETIME and frees the staging.
+/// SemOp arm answers EAGAIN (Linux's semtimedop expiry errno)
+/// and frees the staging.
 pub fn sys_semtimedop(
     ctx: &mut UCtx,
     id: u64,
@@ -10705,6 +10791,8 @@ pub fn sys_semtimedop(
     timeout: u64,
 ) -> u64 {
     const EFAULT_: u64 = (-14i64) as u64;
+    // SysV sem waits are in Linux's never-restart set (signal(7)):
+    // an SA_RESTART signal still surfaces -EINTR — no stash arm.
     let deadline = if timeout == 0 {
         0
     } else {
@@ -15596,8 +15684,8 @@ pub fn sys_gettimeofday32(tv: u64, _tz: u64) -> u64 {
 pub fn sys_nanosleep32(ctx: &mut UCtx, req: u64, rem: u64) -> u64 {
     const EINTR: u64 = (-4i64) as u64;
     let Some(t) = cur_mut() else { return EINVAL };
-    // Replay of an interrupted compat nanosleep resumes the
-    // remainder too — rem32 stays unfilled (wait_ptr 0).
+    // A stopped+continued compat nanosleep resumes the remainder
+    // too — rem32 stays unfilled (wait_ptr 0).
     if let Some(r) = timer_restart(t, ctx, 0) {
         return r;
     }
@@ -19479,7 +19567,7 @@ pub fn sys_gettimeofday(tv: u64, _tz: u64) -> u64 {
 }
 
 /// restart_block consume for the nanosleep family: when this entry
-/// is the SA_RESTART replay of an interrupted Timer wait (the rip
+/// is the SIGCONT replay of a stopped Timer wait (the rip
 /// restart_apply recorded matches), re-arm to the stashed deadline
 /// — the unslept remainder — instead of re-reading req (Linux's
 /// restart_block never touches req on restart; the pointer may be
@@ -19487,16 +19575,21 @@ pub fn sys_gettimeofday(tv: u64, _tz: u64) -> u64 {
 /// (rem, or 0 on i386 where no remainder is written). Returns the
 /// early return value, or None for a normal call.
 fn timer_restart(t: &mut Task, ctx: &mut UCtx, rem_va: u64) -> Option<u64> {
-    if t.restart_at == 0 || ctx.rip != t.restart_rip {
+    // rip pins the replay insn, rax pins the nr — a same-insn
+    // different-nr entry (shared libc syscall stub) can't steal a
+    // stash meant for another wait kind.
+    if t.restart_at == 0
+        || ctx.rip != t.restart_rip
+        || ctx.rax != t.restart_knr
+    {
         return None;
     }
     let deadline = core::mem::replace(&mut t.restart_at, 0);
     let rt = core::mem::replace(&mut t.restart_rt, false);
     t.restart_rip = 0;
+    t.restart_knr = 0;
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     if deliverable(t) {
-        // Restart-block EINTR reports the remainder like the
-        // signal-wake path does (rem unspecified for ABSTIME).
         if rem_va != 0 {
             let left = deadline.saturating_sub(now);
             write_task_bytes(t.pml4, rem_va, &(left / 100).to_le_bytes());
@@ -19505,7 +19598,7 @@ fn timer_restart(t: &mut Task, ctx: &mut UCtx, rem_va: u64) -> Option<u64> {
         return Some((-4i64) as u64);
     }
     if deadline <= now {
-        return Some(0); // remainder elapsed while the handler ran
+        return Some(0); // remainder elapsed while the task was stopped
     }
     t.wait_on = WaitOn::Timer;
     t.wait_ptr = rem_va;
@@ -19526,19 +19619,24 @@ fn timer_restart(t: &mut Task, ctx: &mut UCtx, rem_va: u64) -> Option<u64> {
 /// expiry, so scan/validation still happens; only the deadline is
 /// substituted.
 fn restart_deadline(t: &mut Task, ctx: &UCtx) -> Option<u64> {
-    if t.restart_at == 0 || ctx.rip != t.restart_rip {
+    if t.restart_at == 0
+        || ctx.rip != t.restart_rip
+        || ctx.rax != t.restart_knr
+    {
         return None;
     }
     let d = core::mem::replace(&mut t.restart_at, 0);
     t.restart_rt = false;
     t.restart_rip = 0;
+    t.restart_knr = 0;
     Some(d)
 }
 
 /// nanosleep(req, rem): block until the deadline — WaitOn::Timer
 /// ages in poll_expire alongside the other deadline waits. A signal
-/// wake fills rem (wait_ptr) with the unslept remainder; a
-/// SA_RESTART replay resumes the remainder via timer_restart.
+/// wake fills rem (wait_ptr) with the unslept remainder — sleeps are
+/// in Linux's never-restart set, so a handler'd signal surfaces
+/// -EINTR; a stop/CONT resume re-arms the remainder via timer_restart.
 pub fn sys_nanosleep(ctx: &mut UCtx, req: u64, rem: u64) -> u64 {
     const EINTR: u64 = (-4i64) as u64;
     let Some(t) = cur_mut() else { return EINVAL };
@@ -21282,9 +21380,11 @@ pub fn nt_thread_create(
         wait_deadline: 0,
         wait_rt: false,
         restart_nr: u64::MAX,
+        restart_asite: 0,
         restart_at: 0,
         restart_rt: false,
         restart_rip: 0,
+        restart_knr: 0,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: p.sigmask,
@@ -22349,9 +22449,17 @@ pub fn nt_heap_realloc(ptr: u64, size: u64, zero: bool) -> Option<u64> {
 
 /// NtDelayExecution backing: pure deadline wait in 10ms ticks, the
 /// WaitOn::Timer mechanism nanosleep uses. NT sleeps aren't
-/// signal-interruptible on this stack.
+/// signal-interruptible on this stack — but a SIGSTOP still parks
+/// the task and arms the resume stash, so the replayed entry must
+/// consume it (remainder-resume + stash retirement) like the
+/// nanosleep family.
 pub fn sleep_ms(ctx: &mut UCtx, ms: u64) {
     let Some(t) = cur_mut() else { return };
+    if timer_restart(t, ctx, 0).is_some() {
+        // Elapsed stash or a pending handler'd signal — the delay
+        // ends; the signal still delivers on the syscall-exit path.
+        return;
+    }
     let ticks = ms.div_ceil(10);
     if ticks == 0 {
         return;
@@ -29337,6 +29445,10 @@ pub fn sys_futex(
             // wakes us; with one key space every wake reaches us
             // anyway, so the collapse is exact here.
             let Some(t) = cur_mut() else { return EAGAIN_ };
+            // A stopped+continued futex wait resumes the stashed
+            // expiry — Linux's futex_wait_restart — and never
+            // re-reads the user timespec.
+            let replay_dl = restart_deadline(t, ctx);
             if !range_ok(uaddr, 4) {
                 return EFAULT;
             }
@@ -29345,8 +29457,8 @@ pub fn sys_futex(
             if cur != val as u32 {
                 return EAGAIN_;
             }
-            let mut deadline = 0u64;
-            if timeout != 0 {
+            let mut deadline = replay_dl.unwrap_or(0);
+            if timeout != 0 && deadline == 0 {
                 if !range_ok(timeout, 16) {
                     return EFAULT;
                 }
@@ -29388,6 +29500,13 @@ pub fn sys_futex(
                         .load(core::sync::atomic::Ordering::Relaxed)
                         .saturating_add(ticks);
                 }
+            }
+            if deadline != 0
+                && deadline
+                    <= crate::apic::TICKS
+                        .load(core::sync::atomic::Ordering::Relaxed)
+            {
+                return ETIMEDOUT_; // replayed stash already elapsed
             }
             if deliverable(t) {
                 return (-4i64) as u64; // -EINTR before sleep
@@ -29481,12 +29600,12 @@ pub fn sys_futex_waitv(
         if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
             return EINVAL;
         }
-        let now =
-            crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
         deadline = abstime_deadline(clockid, sec, nsec);
-        if deadline <= now {
-            return ETIMEDOUT_;
-        }
+    }
+    if deadline != 0
+        && deadline <= crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return ETIMEDOUT_; // parsed past-abstime
     }
     let Some(t) = cur_mut() else { return EAGAIN_ };
     if deliverable(t) {
@@ -29528,6 +29647,9 @@ pub fn sys_futex_wait(
         return EINVAL;
     }
     let Some(t) = cur_mut() else { return EAGAIN_ };
+    // A stopped+continued futex wait resumes the stashed expiry —
+    // never re-reads the user timespec.
+    let replay_dl = restart_deadline(t, ctx);
     if !range_ok(uaddr, 4) {
         return EFAULT;
     }
@@ -29535,8 +29657,8 @@ pub fn sys_futex_wait(
     if unsafe { (uaddr as *const u32).read_unaligned() } != val as u32 {
         return EAGAIN_;
     }
-    let mut deadline = 0u64;
-    if timeout != 0 {
+    let mut deadline = replay_dl.unwrap_or(0);
+    if timeout != 0 && deadline == 0 {
         if !range_ok(timeout, 16) {
             return EFAULT;
         }
@@ -29550,12 +29672,12 @@ pub fn sys_futex_wait(
         if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
             return EINVAL;
         }
-        let now =
-            crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
         deadline = abstime_deadline(clockid, sec, nsec);
-        if deadline <= now {
-            return ETIMEDOUT_;
-        }
+    }
+    if deadline != 0
+        && deadline <= crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return ETIMEDOUT_; // parsed past-abstime or elapsed stash
     }
     if deliverable(t) {
         return (-4i64) as u64; // -EINTR before sleep
@@ -29732,7 +29854,8 @@ fn poll_expire() {
                     t.ctx.rax = (-110i64) as u64 // ETIMEDOUT
                 }
                 // semtimedop's bound: the staged sembuf array is
-                // ours — free it with the wait, answer ETIME.
+                // ours — free it with the wait. Linux answers
+                // EAGAIN for an expired semtimedop, not ETIME.
                 WaitOn::SemOp(_) => {
                     unsafe {
                         stage_free(
@@ -29740,7 +29863,7 @@ fn poll_expire() {
                             t.wait_ptr as *mut u8,
                         )
                     };
-                    t.ctx.rax = (-62i64) as u64; // ETIME
+                    t.ctx.rax = (-11i64) as u64; // EAGAIN
                 }
                 // mq_timed* deadline: ABSTIME like Linux — a staged
                 // send payload is freed with the wait; the answer
@@ -29782,10 +29905,10 @@ pub fn fd_poll(ctx: &mut UCtx, fds: u64, nfds: u64, timeout_ms: i64) -> u64 {
         return EINVAL;
     }
     let Some(t) = cur_mut() else { return EINVAL };
-    // An SA_RESTART replay of an interrupted Poll wait resumes the
-    // stashed deadline — Linux's restart_block->poll — instead of
-    // the original timeout_ms. Taken at entry so a replay that
-    // finds fds already ready still retires the stash.
+    // A stopped+continued Poll wait resumes the stashed deadline —
+    // Linux's restart_block->poll — instead of the original
+    // timeout_ms. Taken at entry so a replay that finds fds
+    // already ready still retires the stash.
     let replay_dl = restart_deadline(t, ctx);
     if nfds > 0 && !range_ok_w(fds, nfds * 8) {
         return EFAULT;
@@ -29794,14 +29917,19 @@ pub fn fd_poll(ctx: &mut UCtx, fds: u64, nfds: u64, timeout_ms: i64) -> u64 {
     if ready > 0 || timeout_ms == 0 {
         return ready;
     }
+    if let Some(d) = replay_dl {
+        // An expiry that elapsed during the stop answers 0 without
+        // re-sleeping — do_restart_poll with an elapsed deadline.
+        if d <= crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed) {
+            return 0;
+        }
+    }
     if deliverable(t) {
         return EINTR; // a signal landed before we slept
     }
     t.wait_on = WaitOn::Poll;
     t.wait_ptr = fds;
     t.wait_len = nfds;
-    // The fd rescan above still runs on replay; only the expiry is
-    // substituted.
     t.wait_deadline = if let Some(d) = replay_dl {
         d
     } else if timeout_ms < 0 {
@@ -33145,10 +33273,10 @@ fn slide_realtime_deadlines(delta: i64) {
     let tfs = unsafe { &*core::ptr::addr_of!(TIMERFDS) };
     for s in tasks.iter_mut() {
         let Some(t) = s.as_mut() else { continue };
-        // A stashed restart_block deadline is a live RT expiry even
-        // though its task already woke — Linux's timerqueue rebase
-        // covers armed restart expiries the same way.
-        if t.restart_at != 0 && t.restart_rt {
+        // A stashed stop-resume deadline is a live RT expiry even
+        // though the task is Stopped, not Blocked — slide it with
+        // the rest (Linux's rebase covers the restart_block too).
+        if t.restart_rt && t.restart_at != 0 {
             t.restart_at = slide(t.restart_at);
         }
         if t.state != TaskState::Blocked {
@@ -33640,10 +33768,10 @@ pub fn fd_ppoll(
         return EINVAL;
     }
     let Some(t) = cur_mut() else { return EINVAL };
-    // An SA_RESTART replay of an interrupted Poll wait substitutes
-    // the stashed deadline (Linux's restart_block->poll stores the
-    // absolute expiry); ppoll's tsp writeback also keeps the
-    // replayed tsp-read on the remainder.
+    // A stopped+continued Poll wait substitutes the stashed
+    // deadline (restart_block->poll stores the absolute expiry);
+    // ppoll's tsp writeback also keeps the replayed tsp-read on
+    // the remainder.
     let replay_dl = restart_deadline(t, ctx);
     if nfds > 0 && !range_ok_w(fds, nfds * 8) {
         return EFAULT;
@@ -33657,6 +33785,12 @@ pub fn fd_ppoll(
         return EFAULT;
     }
     let deadline = replay_dl.unwrap_or(parsed);
+    if replay_dl.is_some()
+        && deadline
+            <= crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return 0; // expiry elapsed during the stop — do_restart_poll
+    }
     let saved_mask = t.sigmask;
     if sigmask != 0 {
         if sigsize != 8 || !range_ok(sigmask, 8) {
@@ -39880,9 +40014,11 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     // A pending SA_RESTART replay dies with the old image — the nr
     // it held belongs to an address space that no longer exists.
     t.restart_nr = u64::MAX;
+    t.restart_asite = 0;
     t.restart_at = 0;
     t.restart_rt = false;
     t.restart_rip = 0;
+    t.restart_knr = 0;
     // Any armed tsp writeback ticket points at the old image's VA —
     // servicing it in the new space would write a stale deadline
     // into fresh .data/heap.
@@ -41134,9 +41270,11 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         wait_deadline: 0,
         wait_rt: false,
         restart_nr: u64::MAX,
+        restart_asite: 0,
         restart_at: 0,
         restart_rt: false,
         restart_rip: 0,
+        restart_knr: 0,
         // Dispositions inherit across fork (the Linux semantic);
         // the pending set does not.
         pending: 0,
@@ -41357,9 +41495,11 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         wait_deadline: 0,
         wait_rt: false,
         restart_nr: u64::MAX,
+        restart_asite: 0,
         restart_at: 0,
         restart_rt: false,
         restart_rip: 0,
+        restart_knr: 0,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: p.sigmask,
