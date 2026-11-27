@@ -24,9 +24,10 @@ static void check(int ok, const char *what) {
     }
 }
 
-static long sc(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
-    return syscall(nr, a1, a2, a3, a4, a5, a6);
-}
+// syscall() is variadic — forwarding through it lets the call sites
+// pass raw pointers (ctx slots, iocb lists) without a (long) cast
+// that newer gcc flags as -Wint-conversion errors.
+#define sc(...) syscall(__VA_ARGS__)
 
 static void mk_iocb(struct iocb *io, unsigned op, unsigned fd,
                     unsigned long buf, unsigned long n, long off) {

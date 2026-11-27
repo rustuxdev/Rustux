@@ -18,13 +18,17 @@ static void check(int ok, const char *what) {
     }
 }
 
-#define K_THREAD   (-1)
-#define K_PROCESS  (-2)
-#define K_SESSION  (-3)
-#define K_USER     (-4)
-#define K_USESSION (-5)
-#define K_GROUP    (-6)
-#define K_REQAUTH  (-7)
+// KEY_SPEC_* specials — the L suffix matters: keyctl() forwards to
+// syscall() through varargs, where a bare negative int would arrive
+// zero-extended (0xfffffffe) instead of sign-extended (-2), breaking
+// every "resolve my own ring" call. Keep these long-typed.
+#define K_THREAD   (-1L)
+#define K_PROCESS  (-2L)
+#define K_SESSION  (-3L)
+#define K_USER     (-4L)
+#define K_USESSION (-5L)
+#define K_GROUP    (-6L)
+#define K_REQAUTH  (-7L)
 
 static long addkey(const char *t, const char *d,
                    const void *p, unsigned pl, long ring) {
@@ -34,9 +38,10 @@ static long reqkey(const char *t, const char *d,
                    const char *info, long dest) {
     return syscall(249, t, d, info, dest);
 }
-static long keyctl(long cmd, long a2, long a3, long a4, long a5) {
-    return syscall(250, cmd, a2, a3, a4, a5);
-}
+// syscall() is variadic — forwarding through it lets the call sites
+// pass raw pointers (payload buffers, serial strings) without a
+// (long) cast that newer gcc flags as -Wint-conversion errors.
+#define keyctl(...) syscall(250, __VA_ARGS__)
 
 int main(void) {
     // ---- add_key basics --------------------------------------
@@ -171,8 +176,8 @@ int main(void) {
     check(ksk > 0, "search via session spec");
 
     // ---- CHOWN / SETPERM / INVALIDATE --------------------------
-    check(keyctl(4, k3, 1000, -1, 0) == 0, "chown to uid 1000");
-    check(keyctl(4, k3, 0, -1, 0) == 0, "chown back to 0");
+    check(keyctl(4, k3, 1000, -1L, 0) == 0, "chown to uid 1000");
+    check(keyctl(4, k3, 0, -1L, 0) == 0, "chown back to 0");
     check(keyctl(5, k3, 0x3f3f0000, 0, 0) == 0, "setperm");
     errno = 0;
     check(keyctl(21, k3, 0, 0, 0) == 0, "invalidate");
@@ -225,7 +230,7 @@ int main(void) {
             || errno != ENOKEY)
             bad++;
         errno = 0;
-        if (keyctl(4, ksec, 1000, -1, 0) != -1 || errno != EPERM)
+        if (keyctl(4, ksec, 1000, -1L, 0) != -1 || errno != EPERM)
             bad++;
         _exit(bad);
     }

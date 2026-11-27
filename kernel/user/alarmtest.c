@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int fails;
