@@ -9169,3 +9169,102 @@ scope.
   with \0 escapes — byte-identical initializer.
 - Gates: 3x PASS 127 tasks zero leak, ptmtest/iotest/ft2test
   all-ok incl. every new abstime check.
+
+## run-349 — REALTIME deadline rebasing on clock_settime + TFD_TIMER_CANCEL_ON_SET
+
+- Closes the run-348 F2 divergence: armed CLOCK_REALTIME
+  deadlines now RE-SLIDE on discontinuous wall-clock changes,
+  matching Linux's hrtimer rebase of the realtime bases —
+  plus the TFD_TIMER_CANCEL_ON_SET contract for timerfds.
+- `Task.wait_rt: bool` — epoch-anchor flag written at every
+  arm site: WaitOn::Timer (clock_nanosleep sets
+  `flags & 1 && clk == 0`), WaitOn::Futex (BITSET +
+  FUTEX_CLOCK_REALTIME only: `op&0x7f==9 && op&0x100`),
+  futex_wait/waitv (`deadline != 0 && clockid == 0`), and
+  unconditional for WaitOn::MqSnd/MqRcv (mq_timed* are
+  ALWAYS RT abstime). All Timer/Futex arm sites verified to
+  write the flag; the futex REQUEUE path preserves
+  flag+deadline together (Linux carries the original clock
+  base across requeue — correct).
+- `wall_set(sec)` wraps rtc::set_wall: computes an
+  i128-clamped sec delta -> tick delta, calls
+  `slide_realtime_deadlines(delta)`, then timerfd_expire() +
+  ptimer_expire() to service deadlines the jump pulled into
+  the past. Both set_wall callers (sys_clock_settime,
+  settimeofday) route through it.
+- slide_realtime_deadlines (~user.rs:32920): TIMERFDS with
+  clockid==0 — cancel_on_set armed -> canceled=true + disarm
+  (Linux's "timer is marked cancelable"), else deadline
+  slides by delta with saturating add/sub; PTIMERS clockid==0
+  slide; blocked task waits — MqSnd/MqRcv slide
+  unconditionally (wait_deadline!=0 guard so an untimed wait
+  never gets a fabricated deadline), Timer/Futex/FutexV
+  slide only under wait_rt; a blocked WaitOn::Timerfd reader
+  of a canceled fd is woken with rax = -ECANCELED.
+- TFD_TIMER_CANCEL_ON_SET (0x2): fd_timerfd_settime now
+  accepts flags & 3, EINVALs CANCEL_ON_SET without ABSTIME,
+  stores cancel_on_set at arm; a re-arm clears `canceled`.
+  timerfd_read returns -125 (ECANCELED — NOT 89; 89 is
+  EDESTADDRREQ — the errno constant was initially wrong and
+  only the new check caught it), the poll revents site
+  returns POLLERR on a canceled fd.
+- Test-side (iotest +13): EINVAL without ABSTIME, cancel
+  arm, ECANCELED read, re-arm clears, +120s forward jump ->
+  deadline pulled into the past -> immediate fire, -3s
+  backward jump -> deadline stretched -> still pending via
+  gettime, restore + fires after wall restored. TFD_NONBLOCK
+  + poll used so a concurrent clock_settime writer
+  (pmvtest/stest) can never hang the suite.
+- NEW FLAKE FAMILY FOUND + FIXED: the run-348 "still
+  pending" discriminator probes (iotest timerfd +40ms,
+  ptmtest timer +30ms) raced — a >30-40ms host-side VM pause
+  between settime and gettime expires the deadline before
+  the probe reads it (iotest flaked in 349c/349f, ptmtest in
+  349d). Probes now arm +2s for the pending read (a collapse
+  still reads 0) then re-arm the short deadline for the fire
+  check — identical discriminating power, jitter-immune.
+- Audit (run-107, scoped quick): FIX-BEFORE-COMMIT — every
+  finding fixed in-run: slide end now calls wake_pollers +
+  per-fd epoll_edge on cancel (POLLERR must wake blocked
+  pollers like Linux); timerfd_expire gained a fired-gated
+  wake_pollers (pre-existing gap — blocked pollers were
+  never woken by a plain expiry; also de-races iotest's
+  poll(500) check); delta==0 early-out removed (Linux's
+  clock_was_set cancels CANCEL_ON_SET on EVERY REALTIME set,
+  even no-change); CANCEL_ON_SET EINVAL on MONOTONIC
+  clockids (Linux: EINVAL — nothing can jump).
+- SUITE HANG FOUND + FIXED: broadening wait_rt to cover
+  relative-RT sleeps (audit item C suggestion — glibc's
+  nanosleep/usleep IS clock_nanosleep(CLOCK_REALTIME,0))
+  made every relative sleep slide on the writers' ±1e7s
+  ping-pong — a 200ms usleep stretched ~115 days, ft2test's
+  +40ms REALTIME abstime futex_wait ~2 years. Reverted
+  wait_rt to abstime-only (relative-RT sleeps not slid —
+  documented divergence; Linux does slide them but the
+  suite slams the wall). Forward-RT-abstime test arms
+  hardened against the now-real slide semantics: ft2test +
+  fxvtest use epoch{1,0} arms (instant ETIMEDOUT under any
+  wall); iotest rtfd went NONBLOCK + re-arm/poll(300)
+  retry loop; ptmtest RT +30ms arm + mqtest's +30ms
+  mq_timedreceive re-anchor per retry (SIGALRM watchdog for
+  the blocking syscalls); stest learned pmvtest's
+  save/restore pattern so the writers leave the wall where
+  they found it (a backward-then-forward pair self-heals
+  armed epoch deadlines).
+- Documented divergences: ITIMER_REAL counts raw TICKS
+  (pre-existing, not slid); FIONREAD on a canceled fd can
+  report stale 8.
+- cve-now sweep: CVE-2026-64560, CVE-2026-98258,
+  CVE-2026-98256 — posix-cpu-timer/sighand exec races,
+  structurally absent (no CPU timers, no RCU'd sighand,
+  cooperative kernel, PTIMERS tgid-owned dropped at exec).
+- Flake note: msgtest 'blocked rcv sees EIDRM' failed once
+  (child's blocked msgrcv returned !=EIDRM — the parent's
+  usleep(40ms) raced the child's entry into the wait, or a
+  stray EINTR; SysV MsgRcv isn't in the slid set and no
+  wake path here touches it — cross-interleave flake class,
+  first-ever observation).
+- Gates: 7x PASS 127 tasks zero leak; all clock-jump checks
+  green; ECANCELED errno corrected via the new test
+  (-125 not -89); suite-hang class fixed via abstime-only
+  wait_rt + race-immune test arms.

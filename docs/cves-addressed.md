@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**494 unique CVEs recorded.**
+**495 unique CVEs recorded.**
 
 ## klib ports
 
@@ -671,6 +671,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-64400 | hierarchical VFS: per-task cwd in FsTab, canon_path resolution (. .. rel/abs, root-clampe… | 64400 structurally absent: canon clamps .. AT root with no retry/reconstruct path, and there are no mount/share boundaries to escape through (cwd is the only base). getdents-leak… |
 | CVE-2026-64496 | CLONE_FILES: shared fd table via FDTABS (users refcount) ledger — files_struct analogue;… | fd_install-then-touch race family: a shared-table close() UAFs the post-install kernel access — structurally absent: IF-masked single-CPU syscalls make slot-fill to syscall-return… |
 | CVE-2026-64560 | POSIX per-process timers (timer_create 222 / timer_settime 223 / timer_gettime 224 / time… | audit run-75 scoped quick (security-audit skill): 0 confirmed, 4 in-run fixes (expire tgid guard vs pid reuse, orphaned-slot release at exec+reap, disarmed-gettime stale deadline,… |
+| CVE-2026-64560 | REALTIME deadline rebasing on clock_settime + TFD_TIMER_CANCEL_ON_SET — the run-348 docum… | audit run-107 scoped quick (security-audit skill): VERDICT FIX-BEFORE-COMMIT — all findings addressed in-run: slide end now calls wake_pollers (POLLERR must wake blocked pollers l… |
 | CVE-2026-66484 | sh-resolves-dash + initrd-integrity rung: /bin/sh is now real Debian dash on live AND ins… | audit run-261 scoped quick (security-audit skill): verify_payload bounds and fail-closed abort verified; manifest unverified-by-construction recorded; applet surface widening inte… |
 | CVE-2026-68120 | ipv6/ndp/icmpv6 | no direct CVEs; frag-header CVEs reinforce the no-extension-headers/no-fragments design; hop==255 + solicited-dst + target==us enforced; pseudo-header csum validated (neg-zero res… |
 | CVE-2026-68124 | terminal ABI: ioctl(16) dispatch — TCGETS/TCSETS-family on the console pair, TIOCGWINSZ r… | every ioctl arg extent is range_ok(_w)-gated with the exact struct size BEFORE any copy (36/8/4B) — the run-68 translate bound already confines arg to the user window; termios is… |
@@ -779,6 +780,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2026-98163 | CLONE_SIGHAND+CLONE_THREAD: SIGTABS shared-disposition ledger (users refcount, sighand_st… | cgroup dying-task iteration UAF class — structurally absent: no cgroups, no resurrect-able task refs, slot free is synchronous under the IF-masked sweep; DEAD_THREADS flag + cur-g… |
 | CVE-2026-98205 | /dev/input/event0 evdev + DOOM keyboard input: PS/2 decoder now emits Linux keycode press… | audit run-118 quick scoped + cve.now MCP live (entities.search on evdev/input classes — analogs above): verified ev_push bounded to EVR_SIZE with drop-on-full; ev_pop memmove stay… |
 | CVE-2026-98256 | POSIX per-process timers (timer_create 222 / timer_settime 223 / timer_gettime 224 / time… | audit run-75 scoped quick (security-audit skill): 0 confirmed, 4 in-run fixes (expire tgid guard vs pid reuse, orphaned-slot release at exec+reap, disarmed-gettime stale deadline,… |
+| CVE-2026-98256 | REALTIME deadline rebasing on clock_settime + TFD_TIMER_CANCEL_ON_SET — the run-348 docum… | audit run-107 scoped quick (security-audit skill): VERDICT FIX-BEFORE-COMMIT — all findings addressed in-run: slide end now calls wake_pollers (POLLERR must wake blocked pollers l… |
+| CVE-2026-98258 | REALTIME deadline rebasing on clock_settime + TFD_TIMER_CANCEL_ON_SET — the run-348 docum… | audit run-107 scoped quick (security-audit skill): VERDICT FIX-BEFORE-COMMIT — all findings addressed in-run: slide end now calls wake_pollers (POLLERR must wake blocked pollers l… |
 | CVE-2026-98260 | process_vm+cfr+clock+affinity rung (310/311/326/227/221/203): process_vm — shared engine… | kernel/src/user.rs (process_vm + sys_process_vm_readv/writev + CfrSrc + sys_copy_file_range + sys_clock_settime + sys_fadvise64 + sys_sched_setaffinity), kernel/src/rtc.rs (set_wa… |
 | CVE-2026-98260 | process_vm+cfr+clock+affinity rung (310/311/326/227/221/203): process_vm — shared engine… | kernel/src/user.rs (process_vm + sys_process_vm_readv/writev + CfrSrc + sys_copy_file_range + sys_clock_settime + sys_fadvise64 + sys_sched_setaffinity), kernel/src/rtc.rs (set_wa… |
 | CVE-2026-98655 | perf_event_open(298): counting-mode subset — PERFS[8] objects behind FdKind::Perf; attr i… | audit run-98 scoped quick (security-audit skill): 0 confirmed; cve-now perf_event_open class sweep — group-lifecycle, privesc-race, ptrace-may-access, kernel-record-permission cla… |
