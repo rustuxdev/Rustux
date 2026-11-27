@@ -50,6 +50,10 @@ const CMD_CR: u32 = 1 << 15;
 const TFD_ERR: u32 = 1 << 0;
 const TFD_DRQ: u32 = 1 << 3;
 const TFD_BSY: u32 = 1 << 7;
+/// PxIS.TFES — task file error status, set on error completions.
+/// Errored commands never clear PxCI, so this is how a failure is
+/// detected before the poll budget runs out.
+const IS_TFES: u32 = 1 << 30;
 
 /// ATA commands we issue.
 const ATA_IDENTIFY: u8 = 0xec;
@@ -176,10 +180,22 @@ fn zero(p: u64, n: usize) {
 /// Bring one port out of reset and park it idle.
 fn port_stop(p: usize) -> bool {
     let cmd = port_reg(p, PXCMD);
-    w32(cmd, r32(cmd) & !(CMD_ST | CMD_FRE));
+    // Spec §10.3.1 order: clear ST and drain CR first, then clear
+    // FRE and drain FR — stopping the FIS engine mid-post can
+    // otherwise drop a received FIS.
+    w32(cmd, r32(cmd) & !CMD_ST);
     for _ in 0..100_000u32 {
-        let c = r32(cmd);
-        if c & (CMD_CR | CMD_FR) == 0 {
+        if r32(cmd) & CMD_CR == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if r32(cmd) & CMD_CR != 0 {
+        return false;
+    }
+    w32(cmd, r32(cmd) & !CMD_FRE);
+    for _ in 0..100_000u32 {
+        if r32(cmd) & CMD_FR == 0 {
             return true;
         }
         core::hint::spin_loop();
@@ -190,6 +206,13 @@ fn port_stop(p: usize) -> bool {
 /// Issue one ATA command and wait for it to finish. `write` selects
 /// the direction for the DMA setup.
 fn issue(p: usize, m: &PortMem, cmd: u8, lba: u64, count: u16, write: bool) -> bool {
+    // Stop the engine BEFORE touching the command structures — while
+    // ST/FRE are set the HBA owns the command list and receive-FIS
+    // buffer (D2H FIS writes into m.fis land asynchronously), so the
+    // old order could zero/fill them under a still-draining engine.
+    if !port_stop(p) {
+        return false;
+    }
     zero(m.cl, 1024);
     zero(m.fis, 256);
     zero(m.ct, 256);
@@ -242,36 +265,38 @@ fn issue(p: usize, m: &PortMem, cmd: u8, lba: u64, count: u16, write: bool) -> b
 
     // Per spec the command-list and FIS base registers may only be
     // written while the port is STOPPED (PxCMD.ST = 0 and CR clear);
-    // writes while ST is set are ignored. Stop, program, then start
-    // once — the previous order set ST and rewrote the bases on every
-    // command.
+    // writes while ST is set are ignored — port_stop above already
+    // drained CR. Program the bases, then start once.
     let cmd_r = port_reg(p, PXCMD);
-    w32(cmd_r, r32(cmd_r) & !CMD_ST);
-    for _ in 0..100_000u32 {
-        if r32(cmd_r) & CMD_CR == 0 {
-            break;
-        }
-        core::hint::spin_loop();
-    }
     w32(port_reg(p, PXCLB), m.cl as u32);
     w32(port_reg(p, PXCLB) + 4, (m.cl >> 32) as u32);
     w32(port_reg(p, PXFB), m.fis as u32);
     w32(port_reg(p, PXFB) + 4, (m.fis >> 32) as u32);
     w32(cmd_r, r32(cmd_r) | CMD_FRE | CMD_ST);
-    // Clear pending status, then ring the doorbell for slot 0.
+    // Clear pending status, wait BSY|DRQ clear per spec, then ring
+    // the doorbell for slot 0.
     w32(port_reg(p, PXIS), 0xffff_ffff);
+    let tfd_r = port_reg(p, PXTFD);
+    for _ in 0..100_000u32 {
+        if r32(tfd_r) & (TFD_BSY | TFD_DRQ) == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
     w32(port_reg(p, PXCI), 1);
 
-    // Wait for the command to retire (PxCI bit 0 clear) or an error.
-    let tfd_r = port_reg(p, PXTFD);
+    // Wait for the command to retire (PxCI bit 0 clear). PxTFD.STS is
+    // only final once the D2H register FIS posts — reading ERR while
+    // in flight can see the PREVIOUS command's sticky error bit.
+    // Errors never clear PxCI, so watch PxIS.TFES instead.
     let ci_r = port_reg(p, PXCI);
+    let is_r = port_reg(p, PXIS);
     for _ in 0..2_000_000u32 {
-        let tfd = r32(tfd_r);
-        if tfd & TFD_ERR != 0 {
+        if r32(is_r) & IS_TFES != 0 {
             return false;
         }
         if r32(ci_r) & 1 == 0 {
-            return !write || true;
+            return r32(tfd_r) & TFD_ERR == 0;
         }
         core::hint::spin_loop();
     }
@@ -479,6 +504,11 @@ fn atapi_mem() -> Option<&'static PortMem> {
 /// LBA mid/high FIS fields, and returned data DMAs into buf then
 /// copies out to `din`. din.len() <= 4096 is enforced by callers.
 fn issue_packet(p: usize, m: &PortMem, cdb: &[u8; 12], din: &mut [u8]) -> bool {
+    // Same ordering rule as issue(): park the engine before the
+    // command structures are rewritten.
+    if !port_stop(p) {
+        return false;
+    }
     zero(m.cl, 1024);
     zero(m.fis, 256);
     zero(m.ct, 256);
@@ -522,32 +552,34 @@ fn issue_packet(p: usize, m: &PortMem, cdb: &[u8; 12], din: &mut [u8]) -> bool {
         }
     }
 
-    // Same stop/program/start sequence as the disk path — the
-    // base registers latch only while the port is stopped.
+    // Same program/start sequence as the disk path — the base
+    // registers latch only while the port is stopped (done above).
     let cmd_r = port_reg(p, PXCMD);
-    w32(cmd_r, r32(cmd_r) & !CMD_ST);
-    for _ in 0..100_000u32 {
-        if r32(cmd_r) & CMD_CR == 0 {
-            break;
-        }
-        core::hint::spin_loop();
-    }
     w32(port_reg(p, PXCLB), m.cl as u32);
     w32(port_reg(p, PXCLB) + 4, (m.cl >> 32) as u32);
     w32(port_reg(p, PXFB), m.fis as u32);
     w32(port_reg(p, PXFB) + 4, (m.fis >> 32) as u32);
     w32(cmd_r, r32(cmd_r) | CMD_FRE | CMD_ST);
     w32(port_reg(p, PXIS), 0xffff_ffff);
+    let tfd_r = port_reg(p, PXTFD);
+    for _ in 0..100_000u32 {
+        if r32(tfd_r) & (TFD_BSY | TFD_DRQ) == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
     w32(port_reg(p, PXCI), 1);
 
-    let tfd_r = port_reg(p, PXTFD);
     let ci_r = port_reg(p, PXCI);
+    let is_r = port_reg(p, PXIS);
     for _ in 0..2_000_000u32 {
-        let tfd = r32(tfd_r);
-        if tfd & TFD_ERR != 0 {
+        if r32(is_r) & IS_TFES != 0 {
             return false;
         }
         if r32(ci_r) & 1 == 0 {
+            if r32(tfd_r) & TFD_ERR != 0 {
+                return false;
+            }
             if !din.is_empty() {
                 // SAFETY: the device DMA'd into our 4KiB buf;
                 // copy back exactly what we advertised.

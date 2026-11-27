@@ -2133,12 +2133,24 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
                 // Timer waits carry the restart_block remainder:
                 // the replay resumes to this deadline, not the
                 // full req (relative req isn't re-read — POSIX).
-                if matches!(t.wait_on, WaitOn::Timer) {
-                    t.restart_at = t.wait_deadline;
-                    t.restart_rt = t.wait_rt;
-                } else {
-                    t.restart_at = 0;
-                    t.restart_rt = false;
+                // Poll rides the same slot — Linux arms
+                // restart_block->poll with the absolute expiry;
+                // ppoll's stash is a fallback for its tsp
+                // writeback path (fd_ppoll consumes it too, so no
+                // armed stash can linger past its replay).
+                match t.wait_on {
+                    WaitOn::Timer => {
+                        t.restart_at = t.wait_deadline;
+                        t.restart_rt = t.wait_rt;
+                    }
+                    WaitOn::Poll => {
+                        t.restart_at = t.wait_deadline;
+                        t.restart_rt = false;
+                    }
+                    _ => {
+                        t.restart_at = 0;
+                        t.restart_rt = false;
+                    }
                 }
                 // Only a successful apply may key the consume —
                 // a stale rip from a prior replay could otherwise
@@ -2598,9 +2610,13 @@ pub struct Task {
     psel_mask: u64,
     /// select() remaining-time writeback: user timeval ptr +
     /// deadline ticks — armed by fd_select, serviced by
-    /// psel_restore on every resume path.
+    /// psel_restore on every resume path. wait_tv_ns marks the
+    /// sub-second unit: false = timeval usec (select), true =
+    /// timespec nsec (pselect6/ppoll — Linux writes remaining
+    /// into tsp the same way via poll_select_copy_remaining).
     wait_tv: u64,
     wait_tv_dl: u64,
+    wait_tv_ns: bool,
     /// Mask a delivered signal frame should restore on sigreturn
     /// when it differs from t.sigmask at push time — set for
     /// in-wake deliveries where a psel restore is owed (the
@@ -8516,6 +8532,7 @@ fn load(img: &[u8]) -> Option<Task> {
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        wait_tv_ns: false,
         uid: 0,
         sig_sp: 0,
         sig_size: 0,
@@ -19499,6 +19516,23 @@ fn timer_restart(t: &mut Task, ctx: &mut UCtx, rem_va: u64) -> Option<u64> {
     block_switch()
 }
 
+/// restart_block deadline consume for non-Timer waits: returns the
+/// stashed deadline iff this entry is the actual replay (rip
+/// matches restart_apply's record), clearing the stash either way.
+/// Unlike timer_restart the caller still runs its normal flow —
+/// Linux's do_restart_poll re-enters do_sys_poll with the stored
+/// expiry, so scan/validation still happens; only the deadline is
+/// substituted.
+fn restart_deadline(t: &mut Task, ctx: &UCtx) -> Option<u64> {
+    if t.restart_at == 0 || ctx.rip != t.restart_rip {
+        return None;
+    }
+    let d = core::mem::replace(&mut t.restart_at, 0);
+    t.restart_rt = false;
+    t.restart_rip = 0;
+    Some(d)
+}
+
 /// nanosleep(req, rem): block until the deadline — WaitOn::Timer
 /// ages in poll_expire alongside the other deadline waits. A signal
 /// wake fills rem (wait_ptr) with the unslept remainder; a
@@ -21236,6 +21270,7 @@ pub fn nt_thread_create(
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        wait_tv_ns: false,
         uid: p.uid,
         sig_sp: 0,
         sig_size: 0,
@@ -29862,15 +29897,28 @@ fn psel_restore(t: &mut Task) {
         t.sigmask = t.psel_mask as u32;
         t.psel_mask = u64::MAX;
     }
-    if t.wait_tv != 0 {
-        // select()'s timeval writeback — the deadline was captured
-        // at arm time because wait_deadline clears before restore.
-        let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-        let rem_us = t.wait_tv_dl.saturating_sub(now).saturating_mul(10_000);
-        write_task_u64(t.pml4, t.wait_tv, rem_us / 1_000_000);
-        write_task_u64(t.pml4, t.wait_tv + 8, rem_us % 1_000_000);
-        t.wait_tv = 0;
+    wb_ticket(t);
+}
+
+/// Service an armed remaining-time writeback ticket — psel_restore
+/// runs it on wake paths, the pselect-family early returns run it
+/// inline (Linux's poll_select_copy_remaining writes remaining on
+/// every exit, not just the slept one). select() wants timeval
+/// usec; pselect6/ppoll's tsp wants nsec.
+fn wb_ticket(t: &mut Task) {
+    if t.wait_tv == 0 {
+        return;
     }
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let rem = t.wait_tv_dl.saturating_sub(now).saturating_mul(10_000);
+    if t.wait_tv_ns {
+        write_task_u64(t.pml4, t.wait_tv, rem / 1_000_000);
+        write_task_u64(t.pml4, t.wait_tv + 8, (rem % 1_000_000) * 1000);
+    } else {
+        write_task_u64(t.pml4, t.wait_tv, rem / 1_000_000);
+        write_task_u64(t.pml4, t.wait_tv + 8, rem % 1_000_000);
+    }
+    t.wait_tv = 0;
 }
 
 // --- synchronous signals: sigwait*, signalfd -------------------------
@@ -41005,6 +41053,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        wait_tv_ns: false,
         uid: p.uid,
         sig_sp: 0,
         sig_size: 0,
@@ -41227,6 +41276,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         psel_mask: u64::MAX,
         wait_tv: 0,
         wait_tv_dl: 0,
+        wait_tv_ns: false,
         uid: p.uid,
         sig_sp: 0,
         sig_size: 0,

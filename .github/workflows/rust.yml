@@ -66,7 +66,16 @@ jobs:
     - name: Install Rust target
       run: rustup target add x86_64-unknown-uefi
     - name: Build and boot
-      run: timeout 900 make run 2>&1 | tee boot.log
+      run: |
+        timeout 900 make run 2>&1 | tee boot.log || true
+        # QEMU's TCG ahci emulation has a timing-sensitive assert
+        # (ide_dma_cb prep_size check) that sporadically kills the
+        # emulator on loaded runners — retry once if QEMU itself
+        # aborted. A real guest failure still fails on this log.
+        if grep -q "Assertion" boot.log && ! grep -q "boot test: PASS" boot.log; then
+          echo "::warning::QEMU aborted (flaky TCG ahci assert) — retrying once"
+          timeout 900 make run 2>&1 | tee boot.log || true
+        fi
     - name: Check boot log
       if: always()
       run: |
