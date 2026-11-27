@@ -8746,3 +8746,30 @@ AT_FDCWD class); sign-extend `as u32 as i32`. Audit run-98:
 0 confirmed — CVE-2013-2094 config-index closed (no index use),
 group races absent (EINVAL), privesc TOCTOU absent (no setuid),
 kernel-record perms absent (no sampling).
+
+run-340 epoll EPOLLET+EPOLLONESHOT — kills the last documented
+readiness divergence ("accepted but level-triggered"). EpollEnt
+gains latched/spent; epoll_scan mutates: a delivered ET ent
+latches until a not-ready sample (falling edge) or a producer
+epoll_edge(kind) unlatches it — write-side edges keyed on the
+FdKind payload at pipe_write, eventfd_write, ino_q_push,
+mq_after_link, unix_dgram_push, udp_rx, tcp_rx_conn (5 sites:
+connect, listen backlog on li, rx data, fin, rst), timerfd_expire.
+ONESHOT spends until EPOLL_CTL_MOD. Gap noted: unix-stream has no
+conn->sock backref -> scan-only edges; Stdin/Console same;
+EPOLLEXCLUSIVE still ignored. iotest.c +14 checks in the existing
+task (no suite-count change). Audit run-99: 0 confirmed — epoll
+CVEs are all nesting/lifetime classes (CVE-2011-1082/-1083/-2012-
+3375 nested loops; CVE-2013-7446 af_unix UAF; CVE-2025-38017
+expired-timeout loop) absent in the OFD-pin/no-nest model.
+
+run-340 gate note — tail-of-suite stall flake, PRE-EXISTING: 4 of
+7 full-suite runs wedged after the last task exit (idle hlt CPU;
+win*/wgettest/termtest stragglers never wake), and two of those
+runs were a PRE-DIFF baseline — same signature without this code.
+Feeder hygiene matters for manual runs: hvcfeed/kbdfeed/
+balloonfeed die with qemu — relaunch all three or vintest and
+hvctest starve for input. Clean PASS taken from gate340b:
+exit 33, 126 tasks, zero leak. The flake looks like a win32-
+subsystem/scheduler tail race (winthr seen fault-looping at a
+fixed RIP) — a rung of its own.
