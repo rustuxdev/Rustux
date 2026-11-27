@@ -552,8 +552,8 @@ extern "win64" fn handle_syscall(c: *mut user::UCtx) {
         NR_OPENAT => sys_openat(a1, a2, a3, a4),
         NR_PREAD64 => user::fd_pread(a1, a2, a3, a4 as i64),
         NR_PWRITE64 => user::fd_pwrite(a1, a2, a3, a4 as i64),
-        NR_FCNTL => user::sys_fcntl(a1, a2, a3),
-        NR_FLOCK => user::sys_flock(a1, a2),
+        NR_FCNTL => user::sys_fcntl(ctx, a1, a2, a3),
+        NR_FLOCK => user::sys_flock(ctx, a1, a2),
         NR_LINK => sys_linkat(u64::MAX, a1, u64::MAX, a2, 0),
         NR_LINKAT => sys_linkat(a1, a2, a3, a4, a5),
         NR_DUP3 => user::fd_dup3(a1, a2, a3),
@@ -948,7 +948,7 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         42 => user::fd_pipe(a1, 0),
         45 => user::sys_brk(a1),
         54 => user::sys_ioctl(a1, a2, a3),
-        55 => user::sys_fcntl(a1, a2, a3),
+        55 => user::sys_fcntl(ctx, a1, a2, a3),
         60 => user::sys_umask(a1),
         63 => user::fd_dup2(a1, a2),
         64 => user::getppid(),
@@ -981,7 +981,7 @@ extern "win64" fn handle_int80(c: *mut user::UCtx) {
         168 => user::fd_poll(ctx, a1, a2, a3 as i32 as i64),
         // fcntl64: modern i386 (glibc/busybox) uses it for
         // F_DUPFD_CLOEXEC, which the old 32-bit fcntl cannot express.
-        221 => user::sys_fcntl(a1, a2, a3),
+        221 => user::sys_fcntl(ctx, a1, a2, a3),
         // pipe2: modern i386 (glibc/busybox) creates pipeline pairs
         // with it; flags carry O_CLOEXEC/O_NONBLOCK.
         331 => user::fd_pipe(a1, a2),

@@ -1119,6 +1119,7 @@ const CLD_CONTINUED: i32 = 6;
 const SA_NODEFER: u32 = 0x4000_0000;
 const SA_RESETHAND: u32 = 0x0800_00000;
 const SA_ONSTACK: u32 = 0x0800_0000;
+const SA_RESTART: u32 = 0x1000_0000;
 /// sigaltstack ss_flags + minimum.
 const SS_ONSTACK: u64 = 1;
 const SS_DISABLE: u64 = 2;
@@ -1171,6 +1172,62 @@ fn sig_default_ignore(sig: usize) -> bool {
 /// uncatchable/unblockable), SIGTSTP(20), SIGTTIN(21), SIGTTOU(22).
 fn sig_default_stop(sig: usize) -> bool {
     matches!(sig, 19 | 20 | 21 | 22)
+}
+
+/// WaitOn kinds whose syscalls restart after an SA_RESTART-handled
+/// (or default-stop) signal instead of surfacing -EINTR — Linux's
+/// ERESTARTSYS/ERESTART_RESTARTBLOCK set: device/file reads and
+/// writes, socket recv/accept, poll/select/epoll family, sleeps,
+/// wait4/waitid, lock and notification waits. Deliberately absent:
+/// SysV IPC (ERESTARTNOHAND), futex, connect (BSD EINTR/EALREADY
+/// contract), the signal-waiting calls (their whole job is to
+/// return on a signal), Uffd (parks a fault ctx, not a syscall),
+/// Vfork (uninterruptible), the NT object waits, and Aio —
+/// io_getevents drains a partial batch before arming, so a full
+/// replay would silently overwrite already-consumed completions.
+fn wait_restartable(w: &WaitOn) -> bool {
+    matches!(w,
+        WaitOn::Any | WaitOn::Child(_) | WaitOn::Group(_)
+        | WaitOn::WaitIdAny | WaitOn::WaitIdChild(_) | WaitOn::WaitIdGroup(_)
+        | WaitOn::PipeRead(_) | WaitOn::PipeWrite(_)
+        | WaitOn::Stdin | WaitOn::Evdev | WaitOn::TunRecv(_)
+        | WaitOn::Inotify(_) | WaitOn::Fano(_) | WaitOn::UffdRead(_)
+        | WaitOn::EventfdR(_) | WaitOn::EventfdW(_) | WaitOn::Timerfd(_)
+        | WaitOn::Timer | WaitOn::Poll | WaitOn::Pselect | WaitOn::Epoll(_)
+        | WaitOn::UdpRecv(_) | WaitOn::PktRecv(_) | WaitOn::UnixAccept(_)
+        | WaitOn::UnixDgram(_) | WaitOn::UnixDgramM(_)
+        | WaitOn::UnixRecvM(..) | WaitOn::UnixRecv(..)
+        | WaitOn::UnixSend(..) | WaitOn::UnixSendK(..)
+        | WaitOn::NlRecv(_) | WaitOn::NlRecvM(_)
+        | WaitOn::TcpAccept(_) | WaitOn::TcpRecv(_)
+        | WaitOn::MqRcv(_) | WaitOn::MqSnd(_)
+        | WaitOn::FLock | WaitOn::Kmsg(_))
+}
+
+/// Apply an armed SA_RESTART replay to `c`: rewind rip onto the
+/// syscall insn and restore the nr. Only fires when the frame's
+/// saved rax is still the -EINTR the wake deposited AND rip-2
+/// points at a real 2-byte syscall gate (0F 05 / CD 80) — a forged
+/// sigreturn frame can aim rip anywhere, and a nested handler's
+/// sigreturn carries a live rax, so the arm is consumed ONLY on a
+/// successful apply: a frame that isn't the interrupted syscall
+/// leaves it for the outer frame that is.
+fn restart_apply(t: &mut Task, c: &mut UCtx, eintr: u64) {
+    if t.restart_nr == u64::MAX || c.rax != eintr {
+        return;
+    }
+    let back = c.rip.wrapping_sub(2);
+    // The insn check reads through t's own tables — the SIGCONT
+    // caller wakes a task that is usually not current, so range_ok
+    // and a raw deref would validate the wrong address space.
+    let mut insn = [0u8; 2];
+    if !read_task_bytes(t.pml4, back, &mut insn) {
+        return;
+    }
+    if (insn[0] == 0x0f && insn[1] == 0x05) || (insn[0] == 0xcd && insn[1] == 0x80) {
+        c.rip = back;
+        c.rax = core::mem::replace(&mut t.restart_nr, u64::MAX);
+    }
 }
 
 /// Write `data` into `pml4`'s user space byte-wise — each byte
@@ -1399,6 +1456,9 @@ pub fn rt_sigreturn32(ctx: &mut UCtx) -> u64 {
     ctx.rsp = r32(68); // sp_at_signal
     ctx.ss = 0x2b | 3; // pinned
     t.sigmask = r32(80) as u32; // oldmask
+    // SA_RESTART replay — the i386 sigcontext's eax is the -EINTR
+    // the wake deposited, zero-extended off a u32 field.
+    restart_apply(t, ctx, 0xffff_fffc);
     0
 }
 
@@ -1863,6 +1923,17 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
             t.state = TaskState::Runnable;
             t.cont_report = true;
             contd = Some((t.pid, t.pgid, t.ppid));
+            // A restartable wait interrupted by the stop replays the
+            // syscall — no handler frame ever ran, so the replay
+            // rewinds the armed ctx itself and the sleeper never
+            // surfaces an -EINTR. Same gates as the sigreturn path:
+            // a stop taken mid-handler leaves t.ctx = the handler's
+            // frame (rax live, not -EINTR) — the arm stays armed
+            // for the outer frame's sigreturn instead of mangling
+            // the handler's resume ctx.
+            let mut c = t.ctx;
+            restart_apply(t, &mut c, (-4i64) as u64);
+            t.ctx = c;
         }
     } else {
         if sig as usize == SIGSTOP {
@@ -1928,6 +1999,34 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
             // clock_nanosleep's ABI returns EINTR positive.
             if t.wait_ptr2 != 0 {
                 rax = 4;
+            }
+        }
+        // SA_RESTART: a restartable wait interrupted by a signal
+        // whose handler took SA_RESTART — or by a default-stop
+        // signal (which never produces an -EINTR at all; the
+        // syscall replays on SIGCONT) — records the nr t.ctx.rax
+        // still holds. The -EINTR deposit below still runs: every
+        // in-kernel Runnable-recheck path keeps today's semantics,
+        // and only sigreturn/SIGCONT turns the deposit into a
+        // replay (Linux's ERESTARTSYS turn at signal delivery).
+        if wait_restartable(&t.wait_on) {
+            let i = sig as usize - 1;
+            let (fl, h) = {
+                let s = sigt(t);
+                (
+                    s.flags.get(i).copied().unwrap_or(0),
+                    s.handlers.get(i).copied().unwrap_or(SIG_DFL),
+                )
+            };
+            // A signal the mask defers can't deliver a handler or
+            // reach sigreturn — arming it would leave a stale slot
+            // (the masked-wake itself is the pre-existing !ignored
+            // wake quirk; the arm just doesn't amplify it).
+            if (t.sigmask & (1u32 << i) == 0 || sig as usize == SIGSTOP)
+                && (fl & SA_RESTART != 0
+                    || (h == SIG_DFL && sig_default_stop(sig as usize)))
+            {
+                t.restart_nr = t.ctx.rax;
             }
         }
         if !matches!(t.wait_on, WaitOn::Uffd(_)) {
@@ -2284,6 +2383,10 @@ pub fn sigreturn(ctx: &mut UCtx) -> u64 {
         // SAFETY: validated user range in the caller's space.
         let m = unsafe { ((frame + 296) as *const u64).read_unaligned() };
         t.sigmask = m as u32;
+        // SA_RESTART replay: the signal's handler ran; the syscall
+        // the frame returns into re-executes instead of surfacing
+        // the deposited -EINTR.
+        restart_apply(t, &mut saved, (-4i64) as u64);
     }
     *ctx = saved;
     ctx.rax // restored rax IS the return value
@@ -2399,6 +2502,13 @@ pub struct Task {
 
     /// apic::TICKS deadline for a timed Poll wait — 0 means none.
     wait_deadline: u64,
+    /// Syscall nr to replay when an SA_RESTART-handled (or
+    /// default-stop) signal interrupted a restartable wait —
+    /// u64::MAX = none. The sleeper still gets -EINTR deposited so
+    /// every in-kernel recheck path stays unchanged; the replay
+    /// rewinds the ctx saved in the signal frame at sigreturn, or
+    /// the armed ctx itself when a stopped task resumes on SIGCONT.
+    restart_nr: u64,
     /// Pending signal bitmask — bit (sig-1), sigs 1..=31.
     pending: u32,
     /// si_code/pid/uid/aux behind each pending bit — written on the
@@ -8268,6 +8378,7 @@ fn load(img: &[u8]) -> Option<Task> {
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
+        restart_nr: u64::MAX,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: 0,
@@ -20864,6 +20975,7 @@ pub fn nt_thread_create(
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
+        restart_nr: u64::MAX,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: p.sigmask,
@@ -27273,6 +27385,7 @@ fn flock_range(
 /// request's accmode (WRLCK needs a writable fd, RDLCK a readable
 /// one), then either conflicts (EAGAIN or block) or records it.
 fn fcntl_lock(
+    ctx: &UCtx,
     t: &mut Task,
     fd: u64,
     arg: u64,
@@ -27326,7 +27439,11 @@ fn fcntl_lock(
         if !blocking {
             return EAGAIN;
         }
+        if deliverable(t) {
+            return (-4i64) as u64;
+        }
         t.wait_lock = req;
+        t.ctx = *ctx;
         t.wait_on = WaitOn::FLock;
         t.state = TaskState::Blocked;
         block_switch();
@@ -27403,7 +27520,7 @@ fn o_len(o: &OpenFile) -> u64 {
 /// flock(fd, op): BSD whole-file locks — OFD-namespace records over
 /// [0, MAX) keyed by the fd's open description, LOCK_NB returning
 /// EWOULDBLOCK (== EAGAIN here) like Linux.
-pub fn sys_flock(fd: u64, op: u64) -> u64 {
+pub fn sys_flock(ctx: &UCtx, fd: u64, op: u64) -> u64 {
     const LOCK_SH: u64 = 1;
     const LOCK_EX: u64 = 2;
     const LOCK_NB: u64 = 4;
@@ -27434,7 +27551,11 @@ pub fn sys_flock(fd: u64, op: u64) -> u64 {
                 if op & LOCK_NB != 0 {
                     return EAGAIN;
                 }
+                if deliverable(t) {
+                    return (-4i64) as u64;
+                }
                 t.wait_lock = req;
+                t.ctx = *ctx;
                 t.wait_on = WaitOn::FLock;
                 t.state = TaskState::Blocked;
                 block_switch();
@@ -27448,7 +27569,7 @@ pub fn sys_flock(fd: u64, op: u64) -> u64 {
     }
 }
 
-pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+pub fn sys_fcntl(ctx: &UCtx, fd: u64, cmd: u64, arg: u64) -> u64 {
     const F_DUPFD: u64 = 0;
     const F_GETFD: u64 = 1;
     const F_SETFD: u64 = 2;
@@ -27512,11 +27633,11 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             r
         }
         F_GETLK => fcntl_getlk(t, fd, arg, true),
-        F_SETLK => fcntl_lock(t, fd, arg, true, false),
-        F_SETLKW => fcntl_lock(t, fd, arg, true, true),
+        F_SETLK => fcntl_lock(ctx, t, fd, arg, true, false),
+        F_SETLKW => fcntl_lock(ctx, t, fd, arg, true, true),
         F_OFD_GETLK => fcntl_getlk(t, fd, arg, false),
-        F_OFD_SETLK => fcntl_lock(t, fd, arg, false, false),
-        F_OFD_SETLKW => fcntl_lock(t, fd, arg, false, true),
+        F_OFD_SETLK => fcntl_lock(ctx, t, fd, arg, false, false),
+        F_OFD_SETLKW => fcntl_lock(ctx, t, fd, arg, false, true),
         F_ADD_SEALS => {
             const EPERM_: u64 = (-1i64) as u64;
             let Some(o) = ofd(t, fd) else { return EBADF };
@@ -39011,6 +39132,9 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     cpu::load_gs(0);
     load_ldt_of(t);
     t.rseq_va = 0; // exec implicitly unregisters rseq
+    // A pending SA_RESTART replay dies with the old image — the nr
+    // it held belongs to an address space that no longer exists.
+    t.restart_nr = u64::MAX;
     t.did_exec = true; // pgid/sid persist; parent setpgid now EACCES
     if let Some(p) = &pe_img {
         if !pe_load_inner(t, p, img) {
@@ -40253,6 +40377,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
+        restart_nr: u64::MAX,
         // Dispositions inherit across fork (the Linux semantic);
         // the pending set does not.
         pending: 0,
@@ -40470,6 +40595,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         frame_mask: u64::MAX,
         wait_len: 0,
         wait_deadline: 0,
+        restart_nr: u64::MAX,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: p.sigmask,

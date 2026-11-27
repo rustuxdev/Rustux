@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <time.h>
 
 static int fails;
 static volatile sig_atomic_t got_usr1;
@@ -590,6 +591,85 @@ int main(void) {
               wi.si_value.sival_int == 0x99,
               "queued payload stays with parent");
         sigprocmask(SIG_UNBLOCK, &sm2, NULL);
+    }
+
+    /* run-344: SA_RESTART replays an interrupted blocking read —
+       the handler runs, the syscall re-executes, no EINTR shows.
+       Without the flag the identical setup surfaces EINTR. */
+    {
+        int pp[2];
+        check(pipe(pp) == 0, "SA_RESTART pipe");
+        struct sigaction rs;
+        memset(&rs, 0, sizeof(rs));
+        rs.sa_handler = usr1_hit;
+        rs.sa_flags = SA_RESTART;
+        check(sigaction(SIGUSR1, &rs, NULL) == 0, "SA_RESTART arms");
+        got_usr1 = 0;
+        pid_t rk = fork();
+        if (rk == 0) {
+            struct timespec ts = {0, 20000000};
+            nanosleep(&ts, NULL);
+            kill(getppid(), SIGUSR1);
+            nanosleep(&ts, NULL);
+            {
+                char r = 'R';
+                ssize_t _w = write(pp[1], &r, 1);
+                (void)_w;
+            }
+            _exit(0);
+        }
+        char rc = 0;
+        errno = 0;
+        check(read(pp[0], &rc, 1) == 1 && rc == 'R' && got_usr1,
+              "SA_RESTART read replays, handler ran");
+
+        rs.sa_flags = 0;
+        check(sigaction(SIGUSR1, &rs, NULL) == 0,
+              "no-RESTART arms");
+        got_usr1 = 0;
+        rk = fork();
+        if (rk == 0) {
+            struct timespec ts = {0, 20000000};
+            nanosleep(&ts, NULL);
+            kill(getppid(), SIGUSR1);
+            _exit(0);
+        }
+        errno = 0;
+        check(read(pp[0], &rc, 1) == -1 && errno == EINTR &&
+              got_usr1, "no SA_RESTART: read -> EINTR");
+        waitpid(rk, &st, 0);
+        close(pp[0]);
+        close(pp[1]);
+    }
+
+    /* run-344: a job-control stop resumes into a syscall replay —
+       SIGSTOP/SIGCONT never surface -EINTR to the sleeper. */
+    {
+        int pp2[2];
+        check(pipe(pp2) == 0, "stop/restart pipe");
+        pid_t sk = fork();
+        if (sk == 0) {
+            struct timespec ts = {0, 15000000};
+            nanosleep(&ts, NULL);
+            kill(getppid(), SIGSTOP);
+            nanosleep(&ts, NULL);
+            nanosleep(&ts, NULL);
+            kill(getppid(), SIGCONT);
+            nanosleep(&ts, NULL);
+            {
+                char r = 'S';
+                ssize_t _w2 = write(pp2[1], &r, 1);
+                (void)_w2;
+            }
+            _exit(0);
+        }
+        char sc2 = 0;
+        errno = 0;
+        check(read(pp2[0], &sc2, 1) == 1 && sc2 == 'S',
+              "SIGSTOP/SIGCONT replays read (no EINTR)");
+        waitpid(sk, &st, 0);
+        close(pp2[0]);
+        close(pp2[1]);
     }
 
     printf("pgtest: %d failures, done\n", fails);
