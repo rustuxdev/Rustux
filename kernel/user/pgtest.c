@@ -451,6 +451,107 @@ int main(void) {
           "pause() interrupted by SIGUSR1 -> EINTR");
     waitpid(sc, &st, 0);
 
+    /* --- run-353: stop/cont silently resumes a signal-waiting call
+       (host-verified: pause/sigsuspend keep waiting across
+       STOP->CONT; sigtimedwait EINTRs instead) ----------------- */
+    {
+        struct timespec t2 = {0, 300000000}; /* 300ms */
+        int still;
+        pid_t sw = fork();
+        if (sw == 0) {
+            sigset_t e;
+            sigemptyset(&e);
+            sigsuspend(&e); /* must stay suspended across stop/cont */
+            _exit(9);       /* EINTR'd out — wrong */
+        }
+        nanosleep(&t2, NULL);
+        kill(sw, SIGSTOP);
+        nanosleep(&t2, NULL);
+        kill(sw, SIGCONT);
+        nanosleep(&t2, NULL);
+        /* alive AND not left Stopped — a CONT that never resumed
+           still reports WIFSTOPPED under WUNTRACED|WNOHANG */
+        still = waitpid(sw, &st, WNOHANG) == 0 &&
+                !(waitpid(sw, &st, WNOHANG | WUNTRACED) == sw &&
+                  WIFSTOPPED(st));
+        check(still, "stop/cont: sigsuspend silently resumes its wait");
+        kill(sw, SIGKILL);
+        waitpid(sw, &st, 0);
+
+        sw = fork();
+        if (sw == 0) {
+            pause(); /* must stay suspended across stop/cont */
+            _exit(9);
+        }
+        nanosleep(&t2, NULL);
+        kill(sw, SIGSTOP);
+        nanosleep(&t2, NULL);
+        kill(sw, SIGCONT);
+        nanosleep(&t2, NULL);
+        still = waitpid(sw, &st, WNOHANG) == 0 &&
+                !(waitpid(sw, &st, WNOHANG | WUNTRACED) == sw &&
+                  WIFSTOPPED(st));
+        check(still, "stop/cont: pause silently resumes its wait");
+        kill(sw, SIGKILL);
+        waitpid(sw, &st, 0);
+
+        /* sigtimedwait DOES EINTR on stop/cont (host-verified) —
+           locks in the asymmetric split. Bounded waitpid: a
+           regression that leaves the child waiting must fail, not
+           hang the gate. */
+        sigset_t w2;
+        sigemptyset(&w2);
+        sigaddset(&w2, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &w2, &pprev);
+        sw = fork();
+        if (sw == 0) {
+            siginfo_t si;
+            _exit(sigtimedwait(&w2, &si, NULL) == -1 && errno == EINTR
+                      ? 0
+                      : 8);
+        }
+        nanosleep(&t2, NULL);
+        kill(sw, SIGSTOP);
+        nanosleep(&t2, NULL);
+        kill(sw, SIGCONT);
+        int done = 0, tries = 0;
+        while (tries++ < 30 && (done = waitpid(sw, &st, WNOHANG)) == 0)
+            nanosleep(&t2, NULL);
+        check(done == sw && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+              "stop/cont: sigtimedwait returns EINTR");
+        kill(sw, SIGKILL);
+        waitpid(sw, &st, 0);
+        sigprocmask(SIG_SETMASK, &pprev, NULL);
+
+        /* A caught signal pended while stopped ends the suspend with
+           EINTR and restores the saved mask (the frame carries the
+           restore — run-353). Child suspends with an empty temp
+           mask; its saved mask {USR2} must be back after EINTR. */
+        got_usr1 = 0;
+        sigprocmask(SIG_BLOCK, &w2, &pprev);
+        sw = fork();
+        if (sw == 0) {
+            sigset_t e, cur;
+            sigemptyset(&e);
+            sigsuspend(&e); /* USR1 lands while stopped -> EINTR */
+            sigprocmask(SIG_SETMASK, NULL, &cur);
+            _exit(got_usr1 && sigismember(&cur, SIGUSR2) ? 0 : 7);
+        }
+        nanosleep(&t2, NULL);
+        kill(sw, SIGSTOP);
+        nanosleep(&t2, NULL);
+        kill(sw, SIGUSR1); /* caught, unmasked under the temp mask */
+        kill(sw, SIGCONT);
+        done = 0;
+        tries = 0;
+        while (tries++ < 30 && (done = waitpid(sw, &st, WNOHANG)) == 0)
+            nanosleep(&t2, NULL);
+        check(done == sw && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+              "stop/cont+caught sig: suspend EINTRs, mask restored");
+        kill(sw, SIGKILL);
+        waitpid(sw, &st, 0);
+        sigprocmask(SIG_SETMASK, &pprev, NULL);
+    }
 
     /* --- run-101: queued signals, SA_SIGINFO, si fields -------- */
     q_signo = q_code = q_pid = q_val = 0;

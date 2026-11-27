@@ -12,6 +12,7 @@
 #include <sys/user.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <time.h>
 
 static int fails;
 static void check(int ok, const char *what) {
@@ -242,6 +243,64 @@ int main(int argc, char **argv) {
         wait_child_ready();
         check(waitpid(c, &st, 0) == c && WIFEXITED(st)
               && WEXITSTATUS(st) == 0, "suppress: child exits clean");
+    }
+
+    // ---------- reinjection: CONT(sig) re-delivers a replacement --
+    {
+        pid_t c = fork();
+        if (c == 0) {
+            ptrace(PT_TRACEME, 0, 0, 0);
+            raise(SIGUSR1);      /* delivery-stop; gets replaced */
+            _exit(0);
+        }
+        int st;
+        check(stopped_at(c, &st) && stop_sig(st) == SIGUSR1,
+              "reinject: SIGUSR1 delivery-stop");
+        /* reinject a different default-fatal signal — the tracee
+           must die by SIGUSR2, not stay stopped (bounded poll: a
+           regression that leaves it Stopped fails, not hangs). */
+        ptrace(PT_CONT, c, 0, (void *)SIGUSR2);
+        struct timespec tp = {0, 100000000};
+        int done = 0, tr = 0;
+        while (tr++ < 50 && (done = waitpid(c, &st, WNOHANG)) == 0)
+            nanosleep(&tp, NULL);
+        check(done == c && WIFSIGNALED(st) && WTERMSIG(st) == SIGUSR2,
+              "reinject: CONT(SIGUSR2) delivers fatal replacement");
+        kill(c, SIGKILL);
+        waitpid(c, &st, 0);
+    }
+
+    // ---------- delivery-stop on an armed suspend ends it ---------
+    {
+        pipe(pipe_fds);
+        pid_t c = fork();
+        if (c == 0) {
+            ptrace(PT_TRACEME, 0, 0, 0);
+            tell_parent();
+            pause();            /* the SIGSTOP interrupts this wait */
+            tell_parent();      /* suspend must EINTR out, not re-block */
+            _exit(0);
+        }
+        wait_child_ready();
+        int st;
+        /* tiny race: SIGSTOP can land in the child's write->pause
+           window, delivering before the suspend arms — then CONT
+           resumes into a FRESH pause and this fails (bounded), so a
+           flake here is the race, not necessarily a regression. */
+        kill(c, SIGSTOP);       /* delivery-stop while suspended */
+        check(stopped_at(c, &st) && stop_sig(st) == SIGSTOP,
+              "suspend-stop: delivery-stop reported");
+        ptrace(PT_CONT, c, 0, 0); /* suppress — suspend returns EINTR */
+        /* bounded: the child exits only if the suspend EINTR'd —
+           a wrongly re-blocked wait fails here instead of hanging */
+        struct timespec tp = {0, 100000000};
+        int done = 0, tr = 0;
+        while (tr++ < 50 && (done = waitpid(c, &st, WNOHANG)) == 0)
+            nanosleep(&tp, NULL);
+        check(done == c && WIFEXITED(st),
+              "suspend-stop: CONT ends suspend with EINTR");
+        kill(c, SIGKILL);
+        waitpid(c, &st, 0);
     }
 
     // ---------- error surface ----------

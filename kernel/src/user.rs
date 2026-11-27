@@ -1421,11 +1421,70 @@ fn write_task_bytes_force(pml4: u64, va: u64, data: &[u8]) -> bool {
 /// and SIGSTOP are always deliverable — the mask can't stop them
 /// (Linux semantics: sig_kernel_only signals ignore the blocked
 /// set on delivery).
+/// Signals that deliver regardless of the blocked mask — the
+/// uncatchable/unblockable pair.
+const PEND_FORCE: u32 = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
+
 #[inline]
 fn unmasked_pending(t: &Task) -> Option<usize> {
-    const FORCE: u32 = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
-    let unmasked = t.pending & (!t.sigmask | FORCE);
+    let unmasked = t.pending & (!t.sigmask | PEND_FORCE);
     (unmasked != 0).then(|| unmasked.trailing_zeros() as usize + 1)
+}
+
+/// Every signal whose delivery could act is either masked or
+/// ignored — the pending set holds only non-events (SIG_DFL-ignored
+/// CONT/CHLD/URG/WINCH, SIG_IGN). Used by the resume paths that let
+/// an armed sigsuspend/pause keep waiting across a stop.
+fn pend_harmless(t: &Task) -> bool {
+    let unmasked = t.pending & (!t.sigmask | PEND_FORCE);
+    (0..32).all(|i| unmasked & (1u32 << i) == 0 || sig_ignored(t, i as u64 + 1))
+}
+
+/// End an armed sigsuspend/pause the way a normal wake would:
+/// deliver under the temporary mask with the owed restore riding
+/// in the frame (the handler's sigreturn is the suspend's -EINTR
+/// return point), then tear the wait down. Runs on the resume
+/// paths where a pending caught/fatal signal ends a stopped
+/// suspend — maybe_deliver may leave the task Exited.
+fn sigwait_end(t: &mut Task) {
+    // The suspend ends EINTR like every interrupted wait — deposit
+    // up front so the outcome doesn't hinge on who ran earlier.
+    t.ctx.rax = (-4i64) as u64;
+    t.frame_mask = t.psel_mask;
+    let mut c = t.ctx;
+    maybe_deliver(t, &mut c);
+    t.ctx = c;
+    if t.frame_mask == u64::MAX && t.psel_mask != u64::MAX {
+        // A frame consumed the owed restore — nothing left for
+        // psel_restore to do below.
+        t.psel_mask = u64::MAX;
+    }
+    t.frame_mask = u64::MAX;
+    t.wait_on = WaitOn::None;
+    t.wait_ptr = 0;
+    t.wait_len = 0;
+    t.wait_deadline = 0;
+    t.wait_ptr2 = 0;
+    psel_restore(t);
+}
+
+/// A maybe_deliver inside pend_one/sigwait_end/ptrace paths can
+/// take the task straight to Exited (a delivered fatal default) —
+/// run the exit side now like deliver_for's Exited path, or a
+/// wait4-blocked parent sleeps forever and the dying task's fds
+/// stay pinned.
+fn pend_exit_sweep(t: &mut Task) {
+    if t.state != TaskState::Exited {
+        return;
+    }
+    if t.pers == PERS_NT {
+        let code = nt_sig_ntstatus(t.exit_status & 0x7f);
+        nt_thread_dead(t.pid, code);
+        nt_proc_dead(t.tgid, t.pid, code);
+    }
+    if let Some(n) = task_slot_by_pid(t.pid) {
+        exit_bookkeeping(n);
+    }
 }
 
 /// A signal that can be delivered NOW — pending and unmasked.
@@ -2089,20 +2148,47 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
         }
         t.pending |= 1u32 << (SIGCONT - 1);
         if t.state == TaskState::Stopped {
-            t.state = TaskState::Runnable;
-            t.cont_report = true;
-            contd = Some((t.pid, t.pgid, t.ppid));
-            // A restartable wait interrupted by the stop replays the
-            // syscall — no handler frame ever ran, so the replay
-            // rewinds the armed ctx itself and the sleeper never
-            // surfaces an -EINTR. Same gates as the sigreturn path:
-            // a stop taken mid-handler leaves t.ctx = the handler's
-            // frame (rax live, not -EINTR) — the arm stays armed
-            // for the outer frame's sigreturn instead of mangling
-            // the handler's resume ctx.
-            let mut c = t.ctx;
-            restart_apply(t, &mut c, (-4i64) as u64);
-            t.ctx = c;
+            // A stopped sigsuspend/pause resumes its wait silently —
+            // Linux never surfaces -EINTR for a no-handler stop/cont
+            // (only a CAUGHT or fatal signal ends the suspend). The
+            // just-pended CONT is SIG_DFL-ignored; any pending signal
+            // whose delivery would act (handler'd or fatal) ends the
+            // suspend here — the wake-block choreography runs inline
+            // so the owed mask restore rides the delivered frame
+            // instead of leaking into a later wait. inject!=0 marks a
+            // ptrace DELIVERY-stop — the signal already interrupted
+            // the wait, so it ends rather than re-blocking.
+            let sigwait = matches!(t.wait_on, WaitOn::SigWait);
+            if sigwait && t.inject == 0 && pend_harmless(t) {
+                t.state = TaskState::Blocked;
+            } else {
+                if sigwait {
+                    sigwait_end(t);
+                }
+                // A delivery that consumed into the tracer's inject
+                // re-stops — only a plain resume runs Runnable.
+                if t.state == TaskState::Stopped && t.inject == 0 {
+                    t.state = TaskState::Runnable;
+                    // A restartable wait interrupted by the stop
+                    // replays the syscall — no handler frame ever
+                    // ran, so the replay rewinds the armed ctx itself
+                    // and the sleeper never surfaces an -EINTR. Same
+                    // gates as the sigreturn path: a stop taken
+                    // mid-handler leaves t.ctx = the handler's frame
+                    // (rax live, not -EINTR) — the arm stays armed
+                    // for the outer frame's sigreturn instead of
+                    // mangling the handler's resume ctx.
+                    let mut c = t.ctx;
+                    restart_apply(t, &mut c, (-4i64) as u64);
+                    t.ctx = c;
+                }
+            }
+            // WCONTINUED only on a real resume — a consumed delivery-
+            // stop or an inline death isn't a continue.
+            if t.state != TaskState::Stopped {
+                t.cont_report = true;
+                contd = Some((t.pid, t.pgid, t.ppid));
+            }
         }
     } else {
         if sig as usize == SIGSTOP {
@@ -2279,18 +2365,32 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
             },
             _ => {}
         }
-        t.wait_on = WaitOn::None;
-        t.wait_ptr = 0;
-        t.wait_len = 0;
-        t.wait_deadline = 0;
-        t.wait_ptr2 = 0;
-        psel_restore(t);
+        // A default-stop on a sigsuspend/pause leaves the suspend
+        // ARMED — Linux keeps the syscall alive across the stop and
+        // silently resumes it on CONT; only a caught/fatal signal
+        // ends it. The temp mask stays installed and psel_restore
+        // stays owed, matching a suspend that never returned.
+        let sigwait_stop = stop && matches!(t.wait_on, WaitOn::SigWait);
+        if !sigwait_stop {
+            t.wait_on = WaitOn::None;
+            t.wait_ptr = 0;
+            t.wait_len = 0;
+            t.wait_deadline = 0;
+            t.wait_ptr2 = 0;
+            psel_restore(t);
+        }
         // maybe_deliver can take the task straight to Exited or
         // Stopped (fatal/stop default) — only resume the survivors.
-        if t.state == TaskState::Blocked {
+        // sigwait_stop keeps Blocked too: a masked stop signal that
+        // couldn't deliver leaves the suspend waiting, like Linux.
+        if t.state == TaskState::Blocked && !sigwait_stop {
             t.state = TaskState::Runnable;
         }
     }
+    // A default-fatal delivery inside a maybe_deliver above (the
+    // wake-block's or sigwait_end's on a stopped task) can take the
+    // task straight to Exited — run the exit side now.
+    pend_exit_sweep(t);
     contd
 }
 
@@ -30132,7 +30232,7 @@ fn sig_wait(ctx: &mut UCtx, set: u64, info: u64, ts: u64, timed: bool) -> u64 {
         }
         return sig;
     }
-    if timed && deadline <= crate::apic::TICKS
+    if timed && ts != 0 && deadline <= crate::apic::TICKS
         .load(core::sync::atomic::Ordering::Relaxed)
     {
         return EAGAIN; // ts={0,0} polls once — no sleep
@@ -43401,13 +43501,59 @@ fn ptrace_resume(t: &mut Task, sig: u64) -> u64 {
         return 0;
     }
     if sig != 0 {
-        t.inject = sig as u8;
+        // inject is the delivery-stop's held-signal slot — only a
+        // still-traced task may carry it; a detached-with-signal
+        // resume pends the sig for NORMAL delivery instead, or the
+        // stale marker would masquerade as a delivery-stop on every
+        // later job-control stop.
+        if t.tracer != 0 {
+            t.inject = sig as u8;
+        }
         pend_one(t, sig, SIGSRC_NONE);
     } else {
         t.inject = 0;
     }
-    t.state = TaskState::Runnable;
-    t.cont_report = true;
+    // A re-injected default-stop signal whose delivery already ran
+    // inline lands a REAL stop — same-sig reinjection leaves
+    // stop_sig unchanged, so this class is checked explicitly.
+    let reinj_stop = sig != 0 && {
+        let s = sigt(t);
+        s.handlers
+            .get(sig as usize - 1)
+            .copied()
+            .unwrap_or(SIG_DFL)
+            == SIG_DFL
+            && sig_default_stop(sig as usize)
+    };
+    // A delivery-stop already interrupted an armed sigsuspend/pause
+    // — it ends with -EINTR like any wake (a re-injected signal
+    // rides the frame; a suppressed one just returns EINTR). Never
+    // re-blocks: the wait was interrupted when the stop landed.
+    let mut restopped = false;
+    if matches!(t.wait_on, WaitOn::SigWait) {
+        let was_stop = t.stop_sig;
+        sigwait_end(t);
+        restopped = t.state == TaskState::Stopped && t.inject == 0
+            && (t.stop_sig != was_stop || reinj_stop);
+    }
+    // Resume gates: inject==0 means every delivery already ran (a
+    // fresh delivery-stop inside sigwait_end lands a DIFFERENT sig
+    // in inject and keeps the task stopped); inject==sig is this
+    // call's own reinjection still pended — it consumes lazily at
+    // pick. A delivery that landed a real stop stays Stopped.
+    if t.state == TaskState::Stopped
+        && ((t.inject == 0 && !restopped)
+            || (t.tracer != 0 && t.inject == sig as u8))
+    {
+        t.state = TaskState::Runnable;
+    }
+    // The inline delivery may have killed the task outright.
+    pend_exit_sweep(t);
+    // A task still stopped (fresh delivery-stop or a real stop)
+    // didn't continue — no WCONTINUED.
+    if t.state != TaskState::Stopped {
+        t.cont_report = true;
+    }
     0
 }
 
@@ -43484,8 +43630,23 @@ fn ptrace_release_tracer(pid: u64) {
             s.rppid = 0;
         }
         if s.state == TaskState::Stopped {
-            s.state = TaskState::Runnable;
-            s.cont_report = true;
+            // A delivery-stop that interrupted an armed suspend
+            // ends it like CONT would — deliver any pending under
+            // the temp mask, tear the wait down, resume EINTR. A
+            // delivered real stop keeps the task Stopped.
+            if matches!(s.wait_on, WaitOn::SigWait) {
+                let was = s.stop_sig;
+                sigwait_end(s);
+                pend_exit_sweep(s);
+                if s.state == TaskState::Stopped && s.stop_sig == was {
+                    s.state = TaskState::Runnable;
+                }
+            } else {
+                s.state = TaskState::Runnable;
+            }
+            if s.state != TaskState::Stopped {
+                s.cont_report = true;
+            }
         }
     }
 }
