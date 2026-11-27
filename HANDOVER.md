@@ -8683,3 +8683,23 @@ session no-op). vhtest.c new task -> MAX_TASKS 122->123, lstest floor
 sid-1 member's ctty, which broke pgtest's SIGTTIN check when it ran
 concurrently. Audit run-95: 0 confirmed — tty-hangup CVEs are all
 driver/ldisc races, absent by construction.
+
+run-337 modify_ldt(154) — real per-task LDT, the last stubbed classic
+NR. GDT[12..13] holds the 16-byte LDT system descriptor (selector
+0x60); load_ldt_of() sets base=&t.ldt/limit=ldt_n*8-1 and lldt's at
+all three switch sites (lldt 0 unloads). Task.ldt[16]+ldt_n are raw
+descriptor bytes, fork-copied. sys_modify_ldt_real: func0 readback
+(ldt_n*8, EFAULT), func2 empty, func1/0x11 writes a user_desc —
+entry=-1 first-free alloc with writeback, useable=0 clears, flags
+decoded to Linux's type table (contents 0-3 + read_exec_only bit),
+DPL3+S1 forced so only CPL3 code/data exists (no call gates -> the
+forging class is closed). lldt is re-issued inside the write path —
+LDTR caches base+limit so a fresh ldt_n must reload it, not just the
+descriptor memory. ldttest.c new task -> MAX_TASKS 123->124, lstest
+floor 96->97. Oracles: lsl/verw/mov ds against real LDT selectors
+(lsl/verw don't check P on qemu64 — NP needs a real load -> #NP ->
+SIGSEGV via in-parent sigsetjmp handler, fork-free); func0 readback
+sees the hardware-set A bit (0xf3 vs stored 0xf2). Audit run-96:
+0 confirmed — cve-now: CVE-2010-3698 (KVM-LDT, absent), CVE-2015-3290
+(espfix, no NMI path). Type-formula fix in-run: 0b1010|x<<1 shared
+bit1 so read_exec_only was a no-op -> Linux contents table now.

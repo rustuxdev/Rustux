@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**466 unique CVEs recorded.**
+**467 unique CVEs recorded.**
 
 ## klib ports
 
@@ -92,6 +92,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2010-3081 | physmap rung: supervisor mirror of all phys RAM at PML4 slot 256 (0xFFFF_8000_0000_0000)… | PRESENT |
 | CVE-2010-3301 | ia32 compat foundation: ELFCLASS32/EM_386 static ELF32 loading + IA-32e compat-mode execu… | audit run-121 quick scoped + cve.now MCP (entities.search on ia32/compat classes — analogs above): verified int80 mask covers nr+a1..a6 (a REX-literate compat task can't smuggle h… |
 | CVE-2010-3301 | physmap rung: supervisor mirror of all phys RAM at PML4 slot 256 (0xFFFF_8000_0000_0000)… | PRESENT |
+| CVE-2010-3698 | modify_ldt(154): real per-task LDT — GDT grows to 14 slots (12-13 = 16-byte LDT system de… | audit run-96 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2010-3698 (KVM-LDT reload — absent), CVE-2015-3290 (espfix — no NMI/16-bit-SS path), descriptor… |
+| CVE-2010-3698 | modify_ldt(154): real per-task LDT — GDT grows to 14 slots (12-13 = 16-byte LDT system de… | audit run-96 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2010-3698 (KVM-LDT reload — absent), CVE-2015-3290 (espfix — no NMI/16-bit-SS path), descriptor… |
 | CVE-2010-3698 | unshare(272) + modify_ldt(154) + pkey trio (329-331): unshare dissociates shared task tab… | audit run-83 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2020-29534, CVE-2017-17053, CVE-2019-13233, CVE-2014-9090, CVE-2010-3698 — absent-subsystem cla… |
 | CVE-2010-3698 | unshare(272) + modify_ldt(154) + pkey trio (329-331): unshare dissociates shared task tab… | audit run-83 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2020-29534, CVE-2017-17053, CVE-2019-13233, CVE-2014-9090, CVE-2010-3698 — absent-subsystem cla… |
 | CVE-2010-5328 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
@@ -143,6 +145,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2015-0247 | installed-apt rung: glibc DNS/NSS chain shipped (libnss_dns/libnss_files/libresolv + etc/… | audit run-259 scoped quick (security-audit skill): cve-now e2fsprogs class — CVE-2022-1304, CVE-2019-5188, CVE-2019-5094, CVE-2015-0247, CVE-2015-1572, CVE-2007-5497 all crafted-i… |
 | CVE-2015-1572 | installed-apt rung: glibc DNS/NSS chain shipped (libnss_dns/libnss_files/libresolv + etc/… | audit run-259 scoped quick (security-audit skill): cve-now e2fsprogs class — CVE-2022-1304, CVE-2019-5188, CVE-2019-5094, CVE-2015-0247, CVE-2015-1572, CVE-2007-5497 all crafted-i… |
 | CVE-2015-1862 | chroot (161): FsTab gains a shared `root` (CLONE_FS-shared like cwd — siblings share the… | audit run-78 scoped quick (security-audit skill): 0 confirmed, 11-item escape checklist verified. cve-now checked: CVE-2026-35368, CVE-2026-102643, CVE-2014-2383, CVE-2026-55554,… |
+| CVE-2015-3290 | modify_ldt(154): real per-task LDT — GDT grows to 14 slots (12-13 = 16-byte LDT system de… | audit run-96 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2010-3698 (KVM-LDT reload — absent), CVE-2015-3290 (espfix — no NMI/16-bit-SS path), descriptor… |
+| CVE-2015-3290 | modify_ldt(154): real per-task LDT — GDT grows to 14 slots (12-13 = 16-byte LDT system de… | audit run-96 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2010-3698 (KVM-LDT reload — absent), CVE-2015-3290 (espfix — no NMI/16-bit-SS path), descriptor… |
 | CVE-2015-5364 | udp/dhcp (ipv4) | csum field zeroed before csum4 (CVE-2025-38432 fix shape); no MSG_PEEK/socket layer — 2016-10229 n/a; malformed csums dropped-and-reposted not error-looped (2015-5364/66 class abs… |
 | CVE-2015-5366 | udp/dhcp (ipv4) | csum field zeroed before csum4 (CVE-2025-38432 fix shape); no MSG_PEEK/socket layer — 2016-10229 n/a; malformed csums dropped-and-reposted not error-looped (2015-5364/66 class abs… |
 | CVE-2015-5706 | file-I/O ABI: openat(257)+dirfd int32 semantics, pread64(17), fcntl(72) FD flags, dup(32)… | RUN-TIME BUG CAUGHT BY THE REAL BINARY: glibc passes dirfd as a 32-bit int (mov edi,-100 zero-extends to 0xffffff9c) so a u64 compare vs sign-extended AT_FDCWD never matched -- ev… |
