@@ -9093,3 +9093,79 @@ scope.
 - Gates: 5x PASS 127 tasks zero leak, ptytest all-ok, no
   underflow printks. Docs row appended; ledger regen (494);
   impl/docs split.
+
+## run-348 — CLOCK_REALTIME absolute-deadline semantics (+ a real ABI sign bug)
+
+- Scope: four ABI sites accepted CLOCK_REALTIME but silently
+  treated the deadline as boot-time ticks — a REALTIME abstime
+  (~1.7e18 ns epoch) read as ticks lands ~54 years out:
+  `sys_clock_nanosleep` (clk arg ignored outright),
+  `fd_timerfd_settime` TFD_TIMER_ABSTIME, `sys_timer_settime`
+  ITIMER_ABSTIME, and classic `sys_futex` FUTEX_WAIT_BITSET
+  (op 9, whose timeout Linux treats as ABSOLUTE — MONOTONIC, or
+  REALTIME under FUTEX_CLOCK_REALTIME=0x100 — while it shared
+  the relative WAIT op-0 path).
+- Shared `abstime_deadline(clockid, sec, nsec) -> ticks`
+  (~user.rs:31419): MONOTONIC = sec*HZ+nsec/10ms via new
+  `ns_to_ticks`; REALTIME = `now + (ts_ns - wall_now())`,
+  saturating a past instant to `now` so callers' `<= now`
+  checks fire immediately (same shape as mq_abstime). The two
+  pre-existing epoch->tick conversions in sys_futex_wait /
+  sys_futex_waitv folded into it (pure dedup).
+- Timerfd + PTimer each gained a `clockid` field stored at
+  create (`fd_timerfd_create`/`sys_timer_create` now reject
+  clockid>1 with EINVAL) and consulted at settime; both
+  abstime arms convert via the helper.
+- REAL BUG FOUND BY THE NEW TESTS: `sys_clock_nanosleep`
+  historically returned POSITIVE errnos in rax (+EINVAL,
+  +EFAULT, +4 EINTR via wait_ptr2) — but the kernel ABI is
+  -errno like every syscall, and glibc's clock_nanosleep
+  wrapper computes INTERNAL_SYSCALL_ERRNO(-r), so +22 read
+  back as SUCCESS. Every EINVAL/EFAULT/EINTR from nr 230 was
+  invisible to userspace (and EINTR'd nanosleep — which glibc
+  routes here — silently returned early-success). Flipped to
+  -errno throughout; the wait_ptr2 positive-EINTR branch in
+  pend_one deleted (dead).
+- Also fixed in-run: `sys_futex` op decode — `op & 0x80`
+  (PRIVATE) and `op & 0x100` (CLOCK_REALTIME) now masked
+  before the WAIT/WAIT_BITSET arm split; BITSET takes
+  clockid = (op&0x100 ? 0 : 1).
+- Test-side (ptmtest +6, iotest +2 timerfd, ft2test +4):
+  RT/mono ABSTIME arms fire, epoch-past arms fire at once,
+  clockid>1 EINVALs, BITSET past-deadline ETIMEDOUT on both
+  clocks, private-bit and CLOCK_REALTIME-flagged forms.
+- RACE NOTE: the "past deadline" checks use epoch {1,0}
+  (1970) not now-5s — pmvtest/stest concurrently
+  clock_settime the shared wall epoch (1730000000/1740000000);
+  a backward jump between gettime and arm correctly converts
+  "5s ago" into a far-future deadline (REALTIME abstime
+  follows clock jumps — Linux semantics).
+- Divergence recorded: abstime_deadline converts epoch->ticks
+  ONCE at arm; a later clock_settime does not re-slide a
+  pending REALTIME deadline the way Linux's rebase does
+  (bounded: arms are short; document, don't fix this rung).
+- Gate note: pkttest 'cooked strips l2' flaked once (unbound
+  ETH_P_ALL cooked socket can capture a stray ARP/IPv6 frame
+  before tx_udp's — cross-traffic race on the shared slirp
+  tap, unrelated to this diff; clean on rerun).
+- Audit (run-106, scoped quick): DOCUMENT — no CRIT/HIGH/MED.
+  Divergences recorded: REALTIME abstime deadline does not
+  re-slide on a post-arm clock_settime (Linux rebases its
+  realtime hrtimer bases; ours freezes the tick conversion at
+  arm — bounded, forward jump = late fire, backward = early);
+  the -errno flip makes SA_RESTART replay reachable for
+  clock_nanosleep — a relative sleep replays at FULL original
+  duration (Linux resumes remainder via restart_block — same
+  coarse divergence sys_nanosleep already carries). LOW test
+  gap fixed in-run: mono-abstime checks were vacuous under an
+  RT-collapse (mono-now misread as epoch-past fires at once,
+  still passing) — gettime probes now assert positive
+  remaining right after arm.
+- TOOLING FIX (audit-flagged): user.rs carried literal NUL
+  bytes inside the UTS_NODE/UTS_DOMAIN byte-string literals
+  (13276-77) — valid UTF-8, compiles, but every ripgrep on
+  the file silently went binary-blind below ~11840 (likely
+  explains past "no sites remain" survey misses). Replaced
+  with \0 escapes — byte-identical initializer.
+- Gates: 3x PASS 127 tasks zero leak, ptmtest/iotest/ft2test
+  all-ok incl. every new abstime check.

@@ -63,6 +63,12 @@ before.
   rewrite silently normalizes them to LF and turns a small diff into
   a whole-file rewrite (happened to apic.rs, run-277). Prefer the
   edit tool or preserve endings in scripts.
+- If a text search inexplicably returns zero matches partway through
+  a large file, suspect embedded NUL/other binary bytes making
+  ripgrep treat it as binary — `grep -aP '\x00' file` to check.
+  (user.rs had real NULs inside the UTS_NODE/UTS_DOMAIN byte-string
+  literals, silently blinding ~3/4 of the file until run-348
+  replaced them with \0 escapes.)
 
 ## The QEMU hdd is a test artifact — fix the media, not the disk
 
