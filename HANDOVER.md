@@ -9500,3 +9500,83 @@ scope.
   hang was a pre-existing test race (handler landing in the
   >20ms fork->pause window) — hardened to skip pause when the
   handler already ran.
+
+## run-353 — stop/cont silently resumes signal-waiting calls; sigtimedwait NULL-ts fix
+
+- Host-verified semantics: pause()/sigsuspend() do NOT return EINTR
+  across SIGSTOP/SIGTSTP->SIGCONT — the armed suspend silently
+  resumes its wait (only a caught/fatal signal ends it).
+  sigtimedwait DOES EINTR on stop/cont (asymmetric — unchanged
+  code, locked in by a check). ptrace delivery-stops differ again:
+  the signal already interrupted the wait, so resume ends it EINTR
+  rather than re-blocking.
+- pend_one CONT branch: a Stopped task still armed WaitOn::SigWait
+  re-Blocks when (a) inject==0 — a job-control stop, not a ptrace
+  delivery-stop — and (b) pend_harmless() — every unmasked-or-forced
+  pending bit is sig_ignored (the just-pended CONT counts as
+  ignorable; a caught or fatal pending signal ends the suspend via
+  the !harmless path instead). WCONTINUED reports only on a real
+  Stopped->{Blocked,Runnable} transition.
+- The wake-block tail skips the wait teardown + psel_restore +
+  Runnable transition for `stop && wait_on==SigWait` — the suspend
+  stays armed under its temp mask exactly like a wait that never
+  returned. A masked stop signal (e.g. blocked SIGTSTP) now also
+  leaves the suspend waiting — narrows the pre-existing
+  masked-wake quirk for SigWait.
+- sigwait_end() ends the armed suspend like a normal wake:
+  -EINTR deposit, frame-carried psel_mask restore (the handler's
+  sigreturn is the suspend's return point), wait teardown. Runs on
+  the !harmless CONT path, ptrace_resume (always — a delivery-stop
+  interrupted the wait already), and ptrace_release_tracer.
+- ptrace_resume resume algebra: Runnable only when Stopped &&
+  ((inject==0 && !restopped) || (traced && inject==sig)). inject is
+  now written ONLY while tracer!=0 (a DETACH-with-signal previously
+  left a stale inject that would wedge every later job-control
+  stop). restopped catches a delivered REAL stop (fresh stop_sig or
+  a reinjected stop-class sig) so a reinjected SIGTSTP stops for
+  real instead of being undone.
+- pend_exit_sweep() at pend_one's tail and after sigwait_end in
+  ptrace paths: a maybe_deliver fatal-default can Exit a task
+  inline — bookkeeping now runs immediately (NT-ledger mirror of
+  deliver_for's path) instead of leaving fds pinned and a wait4
+  parent asleep. Also sweeps the pre-existing class where the
+  wake-block's maybe_deliver Exited a task with no bookkeeping.
+- BUG FIXED (pre-existing, surfaced by the new check):
+  sigtimedwait(set, info, NULL) returned EAGAIN instead of waiting
+  indefinitely — `timed && deadline<=TICKS` fired on deadline==0
+  for ts==NULL. Now `timed && ts != 0` gates the poll-EAGAIN.
+- Tests: pgtest stop/cont x4 (sigsuspend + pause silent resume with
+  WUNTRACED|WNOHANG discrimination — a re-blocked-not-resumed child
+  fails; sigtimedwait EINTR; caught-sig-during-stop -> EINTR +
+  saved mask restored), ptrtest reinjection CONT(SIGUSR2) ->
+  WIFSIGNALED and delivery-stop-on-armed-suspend -> EINTR exit
+  (bounded WNOHANG polls — regressions fail, don't hang).
+- cve-now sweep: sigsuspend/pause/SIGCONT/sigtimedwait classes —
+  no applicable CVEs.
+- Audit (run-111, scoped quick): hunter FIX — F1 HIGH (the
+  !harmless resume leaked the owed psel_mask: frame saved the temp
+  mask, mask0 lost, stale restore popped by a later wait —
+  sigwait_end mirrors the wake-block choreography); F2 MED ptrace
+  escapes; F3/F4 LOWs. In-gate deadlock found: ptrace
+  DELIVERY-stops on armed suspends re-blocked -> ptrtest hang;
+  inject!=0 now discriminates delivery-stops (end the suspend) from
+  job-control stops (re-block). Critic FIX — C1 HIGH (ptrace_resume
+  CONT(sig) reinjection deadlocked every non-SigWait wait —
+  nothing consumed inject lazily; gate now (inject==0&&!restopped)
+  || (traced && inject==sig)), C2 MED (reinjected stop sig undid a
+  real stop), C3 MED (sigwait_end inline death skipped
+  bookkeeping — pend_exit_sweep added), C4 LOW. Verifier FIX —
+  F-1 MED (ptrace_resume wrote inject on untraced DETACH'd tasks —
+  stale marker would wedge later job-control stops; inject now
+  traced-only), F-2 MED (ptrace_resume lacked the exit sweep),
+  F-3 MED-LOW (ptrace_release_tracer Runnable'd a Stopped+SigWait
+  tracee with wait+temp-mask+owed restore still armed),
+  F-4..F-7 LOWs (WCONTINUED gating, test race doc, WUNTRACED
+  probe, explicit -EINTR deposit in sigwait_end). Known residual
+  (documented): a stray CONT on a ptrace delivery-stopped task is
+  treated as a pending delivery (consumed into inject), not a
+  Linux do_sigcont wake — bounded divergence; same-sig stop-class
+  reinjection to a released tracee can under-report a fresh stop.
+- Gates: PASS 127 tasks frames zero leak, zero FAIL; all new
+  checks green (gate-353f). gate-353c had the real ptrace-hang
+  described above; gate-353a/b/d were stale-qemu/self-pkill noise.
