@@ -8962,3 +8962,46 @@ frame-forgery class (CVE-2026-80560, CVE-2017-1000255,
 CVE-2019-13648, CVE-2026-46063) all structurally absent — cs/ss
 pinned, no privileged-bit restoration, replay gated to a real
 syscall insn.
+
+run-345 — O_TMPFILE unnamed-inode creates. O_TMPFILE_BIT (0o20000000)
+joined the open KNOWN mask; fd_open gained a dedicated arm that
+mints a born-unlinked vfile (invisible to every name op, reclaimed
+at last close like memfd) behind a generalized memfd_mint_ofd
+(now takes accmode+append; memfd_create/memfd_secret unchanged at
+O_RDWR/no-append). The interesting work was errno fidelity — the
+spec was verified against a live Linux 7.0 probe of 12 flag/target
+combos rather than docs: flag validation rides before lookup like
+build_open_flags (O_RDONLY or O_CREAT -> EINVAL, not EOPNOTSUPP;
+O_EXCL ignored; bare __O_TMPFILE without O_DIRECTORY accepted),
+O_PATH takes total precedence (no tmpfile minted — acc forced to 0
+and the named path opens read-inert, like Linux's pure-reference
+fd), NOFOLLOW on a symlinked dir answers ENOTDIR not ELOOP (the
+link dentry is no dir), and the target gates run in Linux order:
+missing -> ENOENT, file -> ENOTDIR, proc -> EACCES (procfs dirs
+aren't writable — inode_permission, not EOPNOTSUPP), ro mount ->
+EROFS on the real dir mount.
+
+Audit-driven fixes beyond the arm itself: vfile_create split into
+vfile_create_anon (skips the longest-prefix mount check — a
+synthetic "tmpfile:x"/"memfd:x" name always resolves to the root
+mount, so a ro-remounted / spuriously EROFS'd anonymous inodes
+even when the real target mount was rw; caller gates the real
+mount first — also fixes memfd under ro-root); st_ino went
+slot-indexed at all 4 stat sites (the old rank formula
+arc_n+count-of-live-below aliased an unlinked slot onto the next
+live file's ino AND shifted inos on every unlink); read/write/
+close ino_report+fano_emit are now gated on !unlinked (Linux emits
+no name events for anonymous inodes, and stale-name events for
+unlink-while-open files stop too). Recorded divergences: tmpfile
+not exec'able via /proc/self/fd (same as memfd — fd_link_target
+yields a dead name), st_nlink reads 1 not 0, O_PATH fd read/write
+answers EISDIR not EBADF (no O_PATH machinery exists — documented).
+
+run-345 audit (run-103): two hunter waves, VERDICT FINDINGS — no
+CRITICAL/HIGH; 4 LOW fixed in-run (errno fidelity vs the live-Linux
+probe, flag-mask EINVALs, spurious EROFS, st_ino aliasing) + INFO
+divergences deferred. cve-now O_TMPFILE/path_openat sweep:
+CVE-2015-5706 (path_openat UAF — no dentry/inode split),
+CVE-2026-72379 (unmapped fsuid — no idmapped mounts),
+CVE-2026-89768 (overlayfs backing — no overlayfs) all absent.
+7 gate PASSes, 127 tasks, frames zero leak; dtest 0 failures.
