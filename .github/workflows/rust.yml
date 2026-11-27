@@ -1,0 +1,86 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: klib unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        persist-credentials: false
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Run tests
+      run: cargo test -p klib --verbose
+
+  clippy:
+    name: Clippy (x86_64-unknown-uefi)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        persist-credentials: false
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Install target and clippy
+      run: |
+        rustup target add x86_64-unknown-uefi
+        rustup component add clippy
+    - name: Clippy
+      run: cargo clippy --release --target x86_64-unknown-uefi
+
+  boot:
+    name: QEMU boot test (make run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        persist-credentials: false
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-system-x86 ovmf mtools e2fsprogs genisoimage gcc-multilib
+    - name: Install Rust target
+      run: rustup target add x86_64-unknown-uefi
+    - name: Build and boot
+      run: timeout 900 make run 2>&1 | tee boot.log
+    - name: Check boot log
+      if: always()
+      run: |
+        grep -q "boot test: PASS" boot.log
+        grep -q "(zero leak)" boot.log
+        ! grep -qE ": [1-9][0-9]* failures" boot.log
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        persist-credentials: false
+    - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
