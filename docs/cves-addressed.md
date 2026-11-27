@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**486 unique CVEs recorded.**
+**487 unique CVEs recorded.**
 
 ## klib ports
 
@@ -193,6 +193,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2017-11176 | POSIX message queues (mq_open 240 / mq_unlink 241 / mq_timedsend 242 / mq_timedreceive 24… | audit run-76 scoped quick (security-audit skill): 0 confirmed, 7 in-run fixes (NR off-by-one, name ABI, abstime epoch, notify accept-set+THREAD_ID, name bound, test drains, clippy… |
 | CVE-2017-11176 | POSIX message queues (mq_open 240 / mq_unlink 241 / mq_timedsend 242 / mq_timedreceive 24… | audit run-76 scoped quick (security-audit skill): 0 confirmed, 7 in-run fixes (NR off-by-one, name ABI, abstime epoch, notify accept-set+THREAD_ID, name bound, test drains, clippy… |
 | CVE-2017-14489 | real CRT-linked MinGW .exe: STUB_DATA_VA writable thunk-state page (argv/envp/fake FILE[]… | audit run-83 quick scoped: 1 confirmed fixed pre-commit - nt_free_pages walked [base,base+size) per page with user-controlled size bounded only by USER_VA_HI: NtFreeVirtualMemory(… |
+| CVE-2017-14489 | run-342 syscall tail — msgrcv MSG_COPY + NUMA pair (move_pages 279 / migrate_pages 256) +… | audit run-100 scoped quick (security-audit skill, two hunter waves): 1 in-diff confirmed (clone_vm CLONE_SETTLS updated c.tls but not c.tls_raw -> stale raw on get_thread_area, fi… |
 | CVE-2017-14954 | waitid (247): the siginfo-reporting wait — idtype P_ALL/P_PID/P_PGID/P_PIDFD maps to wait… | kernel/src/user.rs (WaitId* WaitOn + WEXITED/WNOWAIT + waitid_report/collect/waitid + wake arms in child_change/exit_bookkeeping/setpgid), kernel/src/syscall.rs (dispatch 247, u32… |
 | CVE-2017-14954 | waitid (247): the siginfo-reporting wait — idtype P_ALL/P_PID/P_PGID/P_PIDFD maps to wait… | kernel/src/user.rs (WaitId* WaitOn + WEXITED/WNOWAIT + waitid_report/collect/waitid + wake arms in child_change/exit_bookkeeping/setpgid), kernel/src/syscall.rs (dispatch 247, u32… |
 | CVE-2017-17053 | unshare(272) + modify_ldt(154) + pkey trio (329-331): unshare dissociates shared task tab… | audit run-83 scoped quick (security-audit skill): 0 confirmed; cve-now checked: CVE-2020-29534, CVE-2017-17053, CVE-2019-13233, CVE-2014-9090, CVE-2010-3698 — absent-subsystem cla… |
@@ -290,6 +291,8 @@ by hand; append to the matrix and regenerate.
 | CVE-2022-29582 | io_uring (io_uring_setup 425 / io_uring_enter 426 / io_uring_register 427): synchronous-c… | audit run-94 scoped quick (security-audit skill): 0 confirmed; cve-now io_uring class sweep — async-lifetime/fixed-table/provide-buffer/SQE-index classes mapped, all absent-by-con… |
 | CVE-2022-4378 | TCP sockets: socket/bind/listen/connect/accept + stream send/recv over loopback | ISN = siphash(4-tuple,rdtsc,boot-key) per isn_key; accept mints a DISTINCT conn slot (no listener-clone UAF, 99116 class); listener keeps no stale conn errors (90138); data-offset… |
 | CVE-2022-48651 | af_packet rung (capture sockets): socket(AF_PACKET=17, SOCK_RAW | ring-corruption class (fixed in-run: IRQ re-entrancy guard, nested tap drops); hdr-parse class (sll parse bounded 8B+6B reads, family/ifindex gates -> EAFNOSUPPORT/ENODEV); ptr-va… |
+| CVE-2022-48797 | run-342 syscall tail — msgrcv MSG_COPY + NUMA pair (move_pages 279 / migrate_pages 256) +… | audit run-100 scoped quick (security-audit skill, two hunter waves): 1 in-diff confirmed (clone_vm CLONE_SETTLS updated c.tls but not c.tls_raw -> stale raw on get_thread_area, fi… |
+| CVE-2022-48797 | run-342 syscall tail — msgrcv MSG_COPY + NUMA pair (move_pages 279 / migrate_pages 256) +… | audit run-100 scoped quick (security-audit skill, two hunter waves): 1 in-diff confirmed (clone_vm CLONE_SETTLS updated c.tls but not c.tls_raw -> stale raw on get_thread_area, fi… |
 | CVE-2022-48832 | openat2+process_mrelease rung (437/448): sys_openat2 reads the 24B open_how {flags,mode,r… | kernel/src/user.rs (canon_beneath + fd_openat2 + fd_process_mrelease), kernel/src/syscall.rs (NR 437/448 + sys_openat2), kernel/user/oa2test.c, Makefile, lstest.S floor 60->61 |
 | CVE-2022-48832 | openat2+process_mrelease rung (437/448): sys_openat2 reads the 24B open_how {flags,mode,r… | kernel/src/user.rs (canon_beneath + fd_openat2 + fd_process_mrelease), kernel/src/syscall.rs (NR 437/448 + sys_openat2), kernel/user/oa2test.c, Makefile, lstest.S floor 60->61 |
 | CVE-2022-48839 | af_packet rung (capture sockets): socket(AF_PACKET=17, SOCK_RAW | ring-corruption class (fixed in-run: IRQ re-entrancy guard, nested tap drops); hdr-parse class (sll parse bounded 8B+6B reads, family/ifindex gates -> EAFNOSUPPORT/ENODEV); ptr-va… |

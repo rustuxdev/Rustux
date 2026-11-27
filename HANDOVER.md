@@ -8814,3 +8814,53 @@ watchdog line.
 Gate: 10 consecutive clean runs (5 fix loop + 3 stripped final +
 2 post-seg_desc-fix) — 126 tasks, frames zero leak, PASS exit 33;
 vs ~2/3 stall rate pre-fix. rung closed.
+
+run-342 — syscall tail: msgrcv MSG_COPY + NUMA pair + x86_64
+set/get_thread_area.
+
+msgrcv(70) gains MSG_COPY (0o40000): the checkpoint/restore peek —
+mtype becomes a 0-based ORDINAL over present queue messages and the
+message is copied WITHOUT dequeue. Linux's gates hold: MSG_COPY
+requires IPC_NOWAIT (copy can't block) and forbids MSG_EXCEPT;
+ordinal past end ENOMSGs; E2BIG/NOERROR rules identical to dequeue.
+msg_copy_deliver borrows the slot (no take), so senders/sleepers/
+queue accounting stay untouched. msgtest: ordinal 0/1 verified,
+past-end ENOMSG, sans-NOWAIT + EXCEPT EINVALs, queue intact after.
+
+move_pages(279) + migrate_pages(256): single-node semantics.
+move_pages query mode (nodes=NULL) fills status[] — node 0 for a
+page present in the TARGET pid's tables (translate_r through its
+pml4), -ENOENT unmapped; move mode targets node 0 only (other
+nodes ENODEV, >63 EINVAL), unmapped pages count as unmoved.
+migrate_pages validates nodemasks (old must include node 0, new
+must not include nonexistent nodes) + returns 0 unmoved. Cross-pid
+calls gate on the kcmp uid-rule (uid==0 or uid-match) — Linux's
+ptrace_may_access stand-in, so one task can't probe another's
+page residency. schtest covers query/move/flags/pid/matrix EINVALs.
+
+set_thread_area(205) + get_thread_area(211) on x86_64: real syscalls
+on both ABIs (glibc x86_64 prefers arch_prctl fs, but the GDT-TLS
+route exists — same machinery the compat 243 path uses). The
+is_compat gate came off sys_set_thread_area; Task gains tls_raw[4]
+(the verbatim 16-byte user_desc — the encoded GDT desc loses flag
+bits that can't round-trip, e.g. contents bit1) so get_thread_area
+writes the caller's struct back exactly, echoing entry_number even
+over an empty slot like Linux. ldttest asserts pick/round-trip/
+bad-entry EINVAL/empty-slot zeros on the 64-bit path.
+
+Gate: 3 clean PASSes (126 tasks, frames zero leak) + clippy clean
+on the diff. rung closed pending audit notes.
+
+run-342 audit addendum — the deep hunter's best find was
+PRE-EXISTING and adjacent: seg_desc returned Some(0) both for the
+null selector AND for a nonzero selector naming a cleared
+descriptor. Exploit: modify_ldt ldt[0]=valid desc, mov ds 0x07,
+clear ldt[0] (useable=0, ldt_n stays), next switch validated the
+saved selector via the Some(0)->null arm -> mov ds,0x07 at CPL0
+-> #GP -> halt. Any task reachable (sys_modify_ldt has no compat
+gate — correct: it's a real x86_64 syscall). Fixed in `ok`:
+Some(0) only passes for sel<=3. Same in-run fixes: clone_vm
+CLONE_SETTLS now stores tls_raw too; move_pages capped at 16384
+pages per call (non-preemptible loop bound); MOVE_ALL gated
+uid==0; cross-pid migrate/move_pages gate uid==0-or-match; ia32
+get_thread_area(211) wired.
