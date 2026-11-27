@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 121;
+const MAX_TASKS: usize = 122;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -602,6 +602,10 @@ enum FdKind {
     Epoll(usize),
     /// An eventfd counter — the semaphore lives in EVENTFDS[id].
     Eventfd(usize),
+    /// An io_uring instance — the ring bookkeeping lives in
+    /// URINGS[id]; the rings themselves are user memory (mapped
+    /// private off this fd, VA recorded at mmap time).
+    Uring(usize),
     /// A signalfd — the wait mask lives in SIGNALFDS[id]; reads
     /// dequeue the READER's pending signals in that mask.
     Signalfd(usize),
@@ -1085,12 +1089,12 @@ const CLD_STOPPED: i32 = 5;
 const CLD_CONTINUED: i32 = 6;
 /// sigaction sa_flags bits we honor.
 const SA_NODEFER: u32 = 0x4000_0000;
-const SA_RESETHAND: u32 = 0x8000_0000;
+const SA_RESETHAND: u32 = 0x0800_00000;
 const SA_ONSTACK: u32 = 0x0800_0000;
 /// sigaltstack ss_flags + minimum.
 const SS_ONSTACK: u64 = 1;
 const SS_DISABLE: u64 = 2;
-const SS_AUTODISARM: u64 = 0x8000_0000;
+const SS_AUTODISARM: u64 = 0x0800_00000;
 const MINSIGSTKSZ: u64 = 2048;
 /// The si fields attached to a pending bit. Standard signals
 /// coalesce — a second pend while the bit is set drops its info
@@ -2186,8 +2190,8 @@ pub fn sigreturn(ctx: &mut UCtx) -> u64 {
         ((saved.rflags | 0x2) & !(0x100 | 0x3000 | 0x4000)) | (ctx.rflags & 0x3000);
     // rsp == stack_top is legal (empty stack): require the byte
     // BELOW rsp — the first push target — to be writable user space.
-    if saved.rip >= 0x8000_0000_0000
-        || saved.rsp >= 0x8000_0000_0000
+    if saved.rip >= 0x0800_00000_0000
+        || saved.rsp >= 0x0800_00000_0000
         || !range_ok(saved.rip, 1)
         || !range_ok_w(saved.rsp.wrapping_sub(1), 1)
     {
@@ -3886,7 +3890,7 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
         let va1 = (p.bias + s.va + s.vsize.max(1) + 0xfff) & !0xfff;
         // IMAGE_SCN_MEM_{EXECUTE,READ,WRITE} → our page flags.
         let mut fl = USER;
-        if s.chars & 0x8000_0000 != 0 {
+        if s.chars & 0x0800_00000 != 0 {
             fl |= WRITE;
         }
         if s.chars & 0x2000_0000 == 0 {
@@ -3915,7 +3919,7 @@ fn pe_load_inner(t: &mut Task, p: &crate::pe::Pe, img: &[u8]) -> bool {
         if s.chars & 0x4000_0000 != 0 {
             rfl |= RNG_R;
         }
-        if s.chars & 0x8000_0000 != 0 {
+        if s.chars & 0x0800_00000 != 0 {
             rfl |= RNG_W;
         }
         if s.chars & 0x2000_0000 != 0 {
@@ -4093,7 +4097,7 @@ fn pe_map_image(t: &mut Task, img: &[u8], depth: u8) -> Option<(u64, u64, u32, u
             let va0 = (base + s.va) & !0xfff;
             let va1 = (base + s.va + s.vsize.max(1) + 0xfff) & !0xfff;
             let mut fl = USER;
-            if s.chars & 0x8000_0000 != 0 {
+            if s.chars & 0x0800_00000 != 0 {
                 fl |= WRITE;
             }
             if s.chars & 0x2000_0000 == 0 {
@@ -4120,7 +4124,7 @@ fn pe_map_image(t: &mut Task, img: &[u8], depth: u8) -> Option<(u64, u64, u32, u
             if s.chars & 0x4000_0000 != 0 {
                 rfl |= RNG_R;
             }
-            if s.chars & 0x8000_0000 != 0 {
+            if s.chars & 0x0800_00000 != 0 {
                 rfl |= RNG_W;
             }
             if s.chars & 0x2000_0000 != 0 {
@@ -8747,6 +8751,7 @@ pub fn sys_mmap(
     // from the fd — COW is trivially exact since nothing aliases the
     // file. Past-EOF bytes are zeros (Linux would SIGBUS — divergence).
     let mut backing: Option<(*const u8, usize)> = None;
+    let mut uring_slot: Option<usize> = None;
     if flags & MAP_ANON == 0 {
         if off & (PAGE - 1) != 0 {
             return EINVAL;
@@ -8761,6 +8766,19 @@ pub fn sys_mmap(
                 Some(v) => (v.data as *const u8, v.len),
                 None => return EBADF,
             },
+            FdKind::Uring(i) => {
+                // io_uring's three fixed offsets — the ring lives in
+                // the task's own pages: zero-length backing => zero
+                // fill; the returned VA is recorded so enter knows
+                // where the ring landed.
+                match off {
+                    0 | 0x0800_0000 | 0x1000_0000 => {
+                        uring_slot = Some(*i);
+                        (core::ptr::null(), 0)
+                    }
+                    _ => return ENODEV,
+                }
+            }
             _ => return ENODEV, // non-regular: pipes/sockets/dirs
         });
     }
@@ -8812,6 +8830,15 @@ pub fn sys_mmap(
         let Some(v) = mmap_find(t, len) else { return ENOMEM };
         v
     };
+    if let Some(ui) = uring_slot {
+        if let Some(u) = urings()[ui].as_mut() {
+            match off {
+                0 => u.sq_va = va,
+                0x0800_0000 => u.cq_va = va,
+                _ => u.sqes_va = va,
+            }
+        }
+    }
     if t.nranges >= MAX_RANGES {
         return ENOMEM;
     }
@@ -8828,6 +8855,23 @@ pub fn sys_mmap(
             return ENOMEM;
         }
         v += PAGE;
+    }
+    if let Some(ui) = uring_slot {
+        if let Some(u) = urings()[ui].as_mut() {
+            match off {
+                // sq ring: ring_mask + ring_entries are kernel-owned
+                // init fields — userspace only reads them.
+                0 => {
+                    urg_wr32(u, va + 8, u.entries - 1);
+                    urg_wr32(u, va + 12, u.entries);
+                }
+                0x0800_0000 => {
+                    urg_wr32(u, va + 8, u.entries * 2 - 1);
+                    urg_wr32(u, va + 12, u.entries * 2);
+                }
+                _ => {}
+            }
+        }
     }
     if let Some((data, dlen)) = backing {
         let avail = dlen.saturating_sub(off as usize).min(len as usize);
@@ -14250,6 +14294,7 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                     }
                 }
                 FdKind::Console => 0u64,
+                FdKind::Uring(_) => 0u64,
                 FdKind::Mount(_) | FdKind::FsCtx(_) => 0u64,
                 FdKind::File(d) => d.len().saturating_sub(o.pos) as u64,
                 FdKind::Proc { len, .. } => {
@@ -15136,6 +15181,7 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         | FdKind::Timerfd(_)
         | FdKind::Signalfd(_)
         | FdKind::Inotify(_)
+        | FdKind::Uring(_)
         | FdKind::Pidfd(_) => (0o20600, 0, 0),
         // mqds stat as fifos — the mqueue fs mints S_IFIFO inodes.
         FdKind::MQueue(_) => (0o10600, 0, 0),
@@ -22002,6 +22048,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Epoll(_) => EINVAL,
         // pidfds are poll-only endpoints — same EINVAL.
         FdKind::Pidfd(_) => EINVAL,
+        FdKind::Uring(_) => EINVAL, // io_uring fds don't carry data
         // mqds move messages through the mq_* calls — no read.
         FdKind::MQueue(_) => EINVAL,
         FdKind::Mount(_) | FdKind::FsCtx(_) => EBADF, // no data side
@@ -24318,9 +24365,9 @@ fn proc_fill(ent: &ProcEnt, s: &mut klib::seqbuf::SeqBuf) {
                     };
                 let maxext = core::arch::x86_64::__cpuid(0x80000000).eax;
                 let mut brand = [0u8; 48];
-                if maxext >= 0x8000_0004 {
+                if maxext >= 0x0800_00004 {
                     for (i, l) in
-                        [0x8000_0002u32, 0x8000_0003, 0x8000_0004]
+                        [0x0800_00002u32, 0x0800_00003, 0x0800_00004]
                             .iter()
                             .enumerate()
                     {
@@ -24721,6 +24768,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         }
         FdKind::Pidfd(_) => {
             s.puts(b"anon_inode:[pidfd]");
+        }
+        FdKind::Uring(_) => {
+            s.puts(b"anon_inode:[io_uring]");
         }
         FdKind::MQueue(_) => {
             s.puts(b"anon_inode:[mqueue]");
@@ -27241,6 +27291,9 @@ fn ofd_release(oi: usize) {
     if let FdKind::Eventfd(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(EVENTFDS))[i] = None };
     }
+    if let FdKind::Uring(i) = kind {
+        unsafe { (*core::ptr::addr_of_mut!(URINGS))[i] = None };
+    }
     if let FdKind::Timerfd(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(TIMERFDS))[i] = None };
     }
@@ -27924,6 +27977,22 @@ fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
                 None => POLLNVAL,
                 Some(s) => {
                     if pend & s.mask != 0 { POLLIN } else { 0 }
+                }
+            }
+        }
+        // uring: readable while the completion ring holds cqes.
+        FdKind::Uring(i) => {
+            let us = unsafe { &*core::ptr::addr_of!(URINGS) };
+            match us.get(*i).and_then(|s| s.as_ref()) {
+                None => POLLNVAL,
+                Some(u) => {
+                    if u.cq_va != 0
+                        && urg_rd32(u, u.cq_va) != urg_rd32(u, u.cq_va + 4)
+                    {
+                        POLLIN
+                    } else {
+                        0
+                    }
                 }
             }
         }
@@ -38282,7 +38351,7 @@ fn nt_sig_ntstatus(signo: u64) -> u64 {
         11 => 0xC000_0005, // SIGSEGV -> ACCESS_VIOLATION
         4 => 0xC000_001D,  // SIGILL  -> ILLEGAL_INSTRUCTION
         8 => 0xC000_0094,  // SIGFPE  -> INTEGER_DIVIDE_BY_ZERO
-        5 => 0x8000_0003,  // SIGTRAP -> BREAKPOINT
+        5 => 0x0800_00003,  // SIGTRAP -> BREAKPOINT
         _ => 0xC000_0000 | signo,
     }
 }
@@ -39597,7 +39666,7 @@ pub fn waitid(ctx: &mut UCtx, idtype: u64, id: u64, infop: u64, flags: u64) -> u
     // and P_PGID EINVAL a nonpositive id (kernel_waitid's upid<=0).
     let sel: i64 = match idtype {
         0 => -1,
-        1 | 2 if id == 0 || id >= 0x8000_0000 => return EINVAL,
+        1 | 2 if id == 0 || id >= 0x0800_00000 => return EINVAL,
         1 => id as i64,
         2 => -(id as i64),
         3 => {
@@ -40119,7 +40188,7 @@ fn cbpf_validate(insns: &[[u8; 8]], n: usize) -> bool {
 /// the u32 result word (action | data). Any malformed runtime
 /// condition answers KILL_PROCESS — the safe verdict.
 fn cbpf_run(insns: &[[u8; 8]], n: usize, d: &[u8; 64]) -> u32 {
-    const KILL_P: u32 = 0x8000_0000;
+    const KILL_P: u32 = 0x0800_00000;
     let rd = |o: usize| -> u32 {
         u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
     };
@@ -40370,7 +40439,7 @@ pub fn seccomp_gate(
     // Action severity for stacking — Linux's ordering.
     fn sev(ret: u32) -> u8 {
         match ret & 0x7fff_0000 {
-            0x8000_0000 => 7, // KILL_PROCESS
+            0x0800_00000 => 7, // KILL_PROCESS
             0x0000_0000 => 6, // KILL_THREAD
             0x0003_0000 => 5, // TRAP
             0x0005_0000 => 4, // ERRNO
@@ -40396,7 +40465,7 @@ pub fn seccomp_gate(
         }
     }
     match ret & 0xffff_0000 {
-        0x8000_0000 => {
+        0x0800_00000 => {
             // KILL_PROCESS — SIGKILL every task in the group.
             let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
             for s in tasks.iter_mut() {
@@ -41346,6 +41415,273 @@ pub fn sys_ptrace(req: u64, pid: u64, addr: u64, data: u64) -> u64 {
             ptrace_resume(t, data)
         }
         _ => EIO_,
+    }
+}
+
+/// ---------- io_uring(425-427): synchronous-completion subset ----------
+///
+/// The rings are user memory — io_uring_setup mints an FdKind::Uring
+/// fd, the task mmap()s the three fixed offsets (SQ 0, CQ 0x8000000,
+/// SQEs 0x10000000) as private zero-fill pages whose VAs get recorded
+/// on the Uring slot, and io_uring_enter drains SQEs through the
+/// fd layer posting CQEs inline (the aio_run discipline — nothing is
+/// ever in flight, so GETEVENTS never blocks and io_uring_register's
+/// fixed-table ops answer ENXIO honestly). Single-mapper model:
+/// rings belong to the mapping task's address space.
+const MAX_URINGS: usize = 8;
+struct Uring {
+    pml4: u64,    // owning address space
+    entries: u32, // sq entries (cq is 2x like Linux)
+    sq_va: u64,
+    cq_va: u64,
+    sqes_va: u64,
+    efd: i32, // REGISTER_EVENTFD's eventfd index, -1 none
+}
+static mut URINGS: [Option<Uring>; MAX_URINGS] = [const { None }; MAX_URINGS];
+fn urings() -> &'static mut [Option<Uring>; MAX_URINGS] {
+    unsafe { &mut *core::ptr::addr_of_mut!(URINGS) }
+}
+
+/// rd/wr helpers over the ring task's own pml4 (the rings are plain
+/// user pages — translate bounded like everywhere else).
+fn urg_rd32(u: &Uring, va: u64) -> u32 {
+    read_task_u64(u.pml4, va & !7)
+        .map(|w| (w >> ((va & 7) * 8)) as u32)
+        .unwrap_or(0)
+}
+fn urg_wr32(u: &Uring, va: u64, v: u32) {
+    write_task_u64(u.pml4, va & !7, {
+        let old = read_task_u64(u.pml4, va & !7).unwrap_or(0);
+        let sh = (va & 7) * 8;
+        (old & !(0xffff_ffffu64 << sh)) | ((v as u64) << sh)
+    });
+}
+
+/// io_uring_setup(entries, params): mint the fd + fill the ABI
+/// params block. entries must be a power of two <= 256 (Linux's
+/// IORING_MAX_ENTRIES discipline at our fixed-table scale); any
+/// setup flag (SQPOLL/IOPOLL/SHARED_WQ/...) EINVALs — nothing
+/// asynchronous exists to configure.
+pub fn sys_io_uring_setup(entries: u64, params: u64) -> u64 {
+    const ENFILE_: u64 = (-23i64) as u64;
+    if entries == 0 || entries > 256 || !entries.is_power_of_two() {
+        return EINVAL;
+    }
+    if !range_ok_w(params, 120) {
+        return EFAULT;
+    }
+    // flags (params+8) must be zero — no SQPOLL/IOPOLL family.
+    if unsafe { ((params + 8) as *const u32).read_unaligned() } != 0 {
+        return EINVAL;
+    }
+    let us = urings();
+    let Some(i) = us.iter().position(Option::is_none) else {
+        return ENFILE_;
+    };
+    let t_pml4 = cur_mut().map(|t| t.pml4).unwrap_or(0);
+    us[i] = Some(Uring {
+        pml4: t_pml4,
+        entries: entries as u32,
+        sq_va: 0,
+        cq_va: 0,
+        sqes_va: 0,
+        efd: -1,
+    });
+    let fd = anon_fd(FdKind::Uring(i), false);
+    if (fd as i64) < 0 {
+        us[i] = None;
+        return fd;
+    }
+    // io_uring_params: counts + flags+features (0) + the real
+    // sq/cq offset structs (identical to Linux's <linux/io_uring.h>).
+    let mut p = [0u8; 120];
+    p[0..4].copy_from_slice(&(entries as u32).to_le_bytes());
+    p[4..8].copy_from_slice(&(entries as u32 * 2).to_le_bytes());
+    // sq_off @ 40: head,tail,ring_mask,ring_entries,flags,dropped,array
+    let sqoff: [u32; 7] = [0, 4, 8, 12, 16, 20, 32];
+    for (j, v) in sqoff.iter().enumerate() {
+        p[40 + j * 4..44 + j * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // cq_off @ 80: head,tail,ring_mask,ring_entries,overflow,cqes
+    let cqoff: [u32; 6] = [0, 4, 8, 12, 16, 32];
+    for (j, v) in cqoff.iter().enumerate() {
+        p[80 + j * 4..84 + j * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    unsafe {
+        (params as *mut u8).copy_from_nonoverlapping(p.as_ptr(), 120)
+    };
+    fd
+}
+
+/// Run one SQE through the fd layer — the synchronous model means a
+/// cqe lands immediately with the op's result.
+fn uring_run(t: &mut Task, ctx: &mut UCtx, s: &[u8; 64]) -> i64 {
+    let (op, fd, off, addr, len, rwf, ud) = unsafe {
+        (
+            s[0],
+            (s.as_ptr().add(4) as *const i32).read_unaligned(),
+            (s.as_ptr().add(8) as *const i64).read_unaligned(),
+            (s.as_ptr().add(16) as *const u64).read_unaligned(),
+            (s.as_ptr().add(24) as *const u32).read_unaligned(),
+            (s.as_ptr().add(28) as *const u32).read_unaligned(),
+            (s.as_ptr().add(32) as *const u64).read_unaligned(),
+        )
+    };
+    let _ = ud;
+    match op {
+        0 => 0,                                                  // NOP
+        1 => fd_preadv2(fd as u64, addr, len as u64, off, 0) as i64, // READV
+        2 => fd_pwritev2(fd as u64, addr, len as u64, off, 0) as i64, // WRITEV
+        3 => fd_fsync(fd as u64) as i64,                         // FSYNC
+        6 => poll_revents(t, fd, rwf as u16) as i64,             // POLL_ADD
+        9 => fd_sendmsg(ctx, fd as u64, addr, rwf as u64) as i64, // SENDMSG
+        10 => fd_recvmsg(ctx, fd as u64, addr, rwf as u64) as i64, // RECVMSG
+        22 => {
+            if off == -1 { fd_read(ctx, fd as u64, addr, len as u64) as i64 }
+            else { fd_pread(fd as u64, addr, len as u64, off) as i64 }
+        }                                                        // READ
+        23 => {
+            if off == -1 { fd_write(ctx, fd as u64, addr, len as u64) as i64 }
+            else { fd_pwrite(fd as u64, addr, len as u64, off) as i64 }
+        }                                                        // WRITE
+        _ => EINVAL as i64, // unknown opcode completes EINVAL like Linux
+    }
+}
+
+/// io_uring_enter(fd, to_submit, min_complete, flags, sig, sz): drain
+/// up to to_submit SQEs synchronously, posting a cqe each; answer
+/// with the submitted count. GETEVENTS is a no-op — completions are
+/// always ready in a synchronous engine. sig must be absent or a
+/// valid 8-byte set (the set itself is inert — nothing blocks).
+pub fn sys_io_uring_enter(
+    ctx: &mut UCtx,
+    fd: u64,
+    to_submit: u64,
+    min_complete: u64,
+    flags: u64,
+    sig: u64,
+    sz: u64,
+) -> u64 {
+    let _ = min_complete;
+    const EBADF_: u64 = (-9i64) as u64;
+    if flags & !1 != 0 {
+        return EINVAL; // only IORING_ENTER_GETEVENTS exists
+    }
+    if sig != 0 && (sz != 8 || !range_ok(sig, 8)) {
+        return EINVAL;
+    }
+    let Some(t) = cur_mut() else { return EBADF_ };
+    let ui = match ofd(t, fd).map(|o| &o.kind) {
+        Some(FdKind::Uring(i)) => *i,
+        _ => return EBADF_,
+    };
+    let us = urings();
+    let Some(u) = us[ui].as_mut() else { return EBADF_ };
+    if u.sq_va == 0 || u.cq_va == 0 || u.sqes_va == 0 || u.pml4 != t.pml4 {
+        return EINVAL; // rings not mapped by this task yet
+    }
+    let (head, tail) = (urg_rd32(u, u.sq_va), urg_rd32(u, u.sq_va + 4));
+    // mask/entries are kernel-owned init fields — use the recorded
+    // values, never the user-writable ring words (wild-mask class).
+    let mask = u.entries - 1;
+    let avail = tail.wrapping_sub(head);
+    let n = (to_submit as u32).min(avail).min(mask + 1);
+    let cq_tail = urg_rd32(u, u.cq_va + 4);
+    let cq_mask = u.entries * 2 - 1;
+    for i in 0..n {
+        let idx = urg_rd32(u, u.sq_va + 32 + 4 * ((head + i) & mask) as u64);
+        if idx >= u.entries {
+            continue; // wild array entry — skip like Linux's sqe sanity
+        }
+        let mut sqe = [0u8; 64];
+        read_task_bytes(u.pml4, u.sqes_va + idx as u64 * 64, &mut sqe);
+        let ud = unsafe { (sqe.as_ptr().add(32) as *const u64).read_unaligned() };
+        let res = uring_run(t, ctx, &sqe);
+        // Post the cqe at cq.tail — cqe is {user_data, res, flags}.
+        let cva = u.cq_va + 32 + 16 * (cq_tail.wrapping_add(i) & cq_mask) as u64;
+        write_task_u64(u.pml4, cva, ud);
+        write_task_u64(u.pml4, cva + 8, res as u64);
+    }
+    urg_wr32(u, u.sq_va, head.wrapping_add(n));
+    urg_wr32(u, u.cq_va + 4, cq_tail.wrapping_add(n));
+    if n > 0 && u.efd >= 0 {
+        let evs = unsafe { &mut *core::ptr::addr_of_mut!(EVENTFDS) };
+        if let Some(e) = evs[u.efd as usize].as_mut() {
+            e.count = e.count.saturating_add(n as u64).min(EFD_MAX);
+            eventfd_wake_readers(u.efd as usize);
+        }
+    }
+    n as u64
+}
+
+/// io_uring_register(fd, opcode, arg, nr_args): fixed tables don't
+/// exist — buffers/files/personality ops are ENXIO. EVENTFD +
+/// UNREGISTER_EVENTFD + PROBE are real.
+pub fn sys_io_uring_register(fd: u64, opcode: u64, arg: u64, nr_args: u64) -> u64 {
+    const EBADF_: u64 = (-9i64) as u64;
+    const ENXIO_: u64 = (-6i64) as u64;
+    let Some(t) = cur_mut() else { return EBADF_ };
+    let ui = match ofd(t, fd).map(|o| &o.kind) {
+        Some(FdKind::Uring(i)) => *i,
+        _ => return EBADF_,
+    };
+    match opcode {
+        4 => {
+            // REGISTER_EVENTFD: arg names a u32 fd in our space.
+            if !range_ok(arg, 4) {
+                return EFAULT;
+            }
+            let efd = unsafe { (arg as *const u32).read_unaligned() } as usize;
+            let ei = (efd < MAX_FDS)
+                .then(|| fdt(t).fds[efd])
+                .flatten()
+                .and_then(|oi| {
+                    let os = unsafe { &*core::ptr::addr_of!(OFDS) };
+                    os[oi as usize].as_ref().and_then(|o| match &o.kind {
+                        FdKind::Eventfd(ei) => Some(*ei as i32),
+                        _ => None,
+                    })
+                });
+            match ei {
+                Some(ei) => {
+                    if let Some(u) = urings()[ui].as_mut() {
+                        u.efd = ei;
+                    }
+                    0
+                }
+                None => EINVAL,
+            }
+        }
+        5 => {
+            if let Some(u) = urings()[ui].as_mut() {
+                u.efd = -1;
+            }
+            0
+        }
+        8 => {
+            // REGISTER_PROBE: report the ops uring_run supports —
+            // NOP/READV/WRITEV/FSYNC/POLL_ADD/SENDMSG/RECVMSG/
+            // READ/WRITE flagged IO_URING_OP_SUPPORTED(1).
+            if nr_args == 0 || nr_args > 32 || !range_ok_w(arg, 8 + nr_args * 8) {
+                return EINVAL;
+            }
+            unsafe { (arg as *mut u8).add(0).write(23) }; // last_op=23 (WRITE)
+            let sup: [u8; 24] = [
+                1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 1, 1,
+            ];
+            for i in 0..nr_args as usize {
+                let f: u16 = if sup.get(i).copied().unwrap_or(0) != 0 { 1 } else { 0 };
+                unsafe {
+                    ((arg + 8 + i as u64 * 8) as *mut u8).write(i as u8);
+                    ((arg + 8 + i as u64 * 8 + 2) as *mut u16)
+                        .write_unaligned(f);
+                };
+            }
+            0
+        }
+        0 | 1 | 2 | 3 | 6 | 9 | 10 => ENXIO_, // fixed tables n/a
+        _ => EINVAL,
     }
 }
 
