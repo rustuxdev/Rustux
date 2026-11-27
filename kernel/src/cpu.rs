@@ -409,6 +409,9 @@ extern "win64" fn report_frame(f: &mut TrapFrame, regs: *mut SavedRegs) {
                         7 => (1, f.rip),  // BUS_ADRALN
                         _ => (0x80, f.rip), // SI_KERNEL
                     };
+                    if v == 14 {
+                        crate::user::note_pfault();
+                    }
                     let (rip, rsp, rdi) = crate::user::fault_signal(
                         signo,
                         code,

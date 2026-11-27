@@ -267,7 +267,7 @@ fn shm_pin_all(t: &Task) {
 /// 88 went resident-slot-tight once the initrd member count hit
 /// 85+daemons (pidfdtest was the refused 86th spawn); 96 held
 /// until shmtest became the refused 97th.
-const MAX_TASKS: usize = 125;
+const MAX_TASKS: usize = 126;
 
 /// A resumable user-mode context: the 15 GPRs in sched_dispatch's
 /// push order plus the iret frame. Every task transition — first
@@ -617,6 +617,9 @@ enum FdKind {
     /// A userfaultfd — the range set + event ring live in UFFDS[id];
     /// registration keys on the registering task's pml4.
     Uffd(usize),
+    /// A perf_event fd — the counter binding (target pid + config +
+    /// acc/base) lives in PERFS[id]; read deposits the u64 count.
+    Perf(usize),
     /// A signalfd — the wait mask lives in SIGNALFDS[id]; reads
     /// dequeue the READER's pending signals in that mask.
     Signalfd(usize),
@@ -2503,6 +2506,12 @@ pub struct Task {
     /// (Linux forks fresh accounting).
     utime: u64,
     stime: u64,
+    /// perf-event counters: #PFs billed to this task (the cpu.rs
+    /// fault path calls note_pfault) and activations — bumped when
+    /// the scheduler switches TO this task. Fresh at spawn like
+    /// utime/stime; perf_event_open's software events read them.
+    pfaults: u64,
+    nswitch: u64,
     /// setitimer/alarm state: [deadline, interval] per which — REAL
     /// counts TICKS (wall), VIRTUAL counts utime, PROF utime+stime.
     /// deadline==0 means disarmed. Fork doesn't inherit (fresh
@@ -8256,6 +8265,8 @@ fn load(img: &[u8]) -> Option<Task> {
             .load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
         stime: 0,
+        pfaults: 0,
+        nswitch: 0,
         itimers: [[0; 2]; 3],
         cmdline: [0; 256],
         cmdline_len: 0,
@@ -14329,6 +14340,7 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 FdKind::Console => 0u64,
                 FdKind::Uring(_) => 0u64,
                 FdKind::Uffd(_) => 0u64,
+                FdKind::Perf(_) => 0u64,
                 FdKind::Mount(_) | FdKind::FsCtx(_) => 0u64,
                 FdKind::File(d) => d.len().saturating_sub(o.pos) as u64,
                 FdKind::Proc { len, .. } => {
@@ -14535,6 +14547,15 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 _ => return ENOTTY_,
             };
             uffd_ioctl(t, uidx, req, arg)
+        }
+        // PERF_EVENT_IOC_* — the '$'(0x24) request type; gated on
+        // a Perf fd like Linux's file-ops check (ENOTTY else).
+        r if r >> 8 & 0xff == 0x24 => {
+            let pidx = match &o.kind {
+                FdKind::Perf(i) => *i,
+                _ => return ENOTTY_,
+            };
+            perf_ioctl(pidx, req, arg)
         }
         _ => ENOTTY_,
     }
@@ -15227,6 +15248,7 @@ fn ofd_stat_shape(kind: &FdKind) -> (u64, u64, u64) {
         | FdKind::Inotify(_)
         | FdKind::Uring(_)
         | FdKind::Uffd(_)
+        | FdKind::Perf(_)
         | FdKind::Pidfd(_) => (0o20600, 0, 0),
         // mqds stat as fifos — the mqueue fs mints S_IFIFO inodes.
         FdKind::MQueue(_) => (0o10600, 0, 0),
@@ -20561,6 +20583,8 @@ pub fn nt_thread_create(
         start_ticks: crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
         stime: 0,
+        pfaults: 0,
+        nswitch: 0,
         itimers: [[0; 2]; 3],
         cmdline: p.cmdline,
         cmdline_len: p.cmdline_len,
@@ -22097,6 +22121,7 @@ pub fn fd_read(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
         FdKind::Pidfd(_) => EINVAL,
         FdKind::Uring(_) => EINVAL, // io_uring fds don't carry data
         FdKind::Uffd(i) => uffd_read(ctx, *i, buf, len, o.nonblock),
+        FdKind::Perf(i) => perf_read(ctx, *i, buf, len),
         // mqds move messages through the mq_* calls — no read.
         FdKind::MQueue(_) => EINVAL,
         FdKind::Mount(_) | FdKind::FsCtx(_) => EBADF, // no data side
@@ -22371,6 +22396,9 @@ pub fn fd_write(ctx: &mut UCtx, fd: u64, buf: u64, len: u64) -> u64 {
     }
     if let FdKind::Uffd(_) = &o.kind {
         return EINVAL; // uffds move messages through read only
+    }
+    if let FdKind::Perf(_) = &o.kind {
+        return EINVAL; // perf fds carry no byte stream
     }
     if let FdKind::Dev(i) = &o.kind {
         if o.accmode == 0 {
@@ -24825,6 +24853,9 @@ fn fd_link_name(kind: &FdKind, out: &mut [u8]) -> usize {
         }
         FdKind::Uffd(_) => {
             s.puts(b"anon_inode:[userfaultfd]");
+        }
+        FdKind::Perf(_) => {
+            s.puts(b"anon_inode:[perf_event]");
         }
         FdKind::MQueue(_) => {
             s.puts(b"anon_inode:[mqueue]");
@@ -27364,6 +27395,9 @@ fn ofd_release(oi: usize) {
     if let FdKind::Uffd(i) = kind {
         uffd_release(i);
     }
+    if let FdKind::Perf(i) = kind {
+        perf_release(i);
+    }
     if let FdKind::Uring(i) = kind {
         unsafe { (*core::ptr::addr_of_mut!(URINGS))[i] = None };
     }
@@ -28081,6 +28115,14 @@ fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
                         0
                     }
                 }
+            }
+        }
+        // perf: a count is always read()able in counting mode.
+        FdKind::Perf(i) => {
+            let ps = unsafe { &*core::ptr::addr_of!(PERFS) };
+            match ps.get(*i).and_then(|s| s.as_ref()) {
+                None => POLLNVAL,
+                Some(_) => POLLIN,
             }
         }
         // inotify: readable with a queued event (or a pending
@@ -38386,7 +38428,8 @@ fn switch_to(n: usize) -> ! {
     }
     unsafe { *core::ptr::addr_of_mut!(CUR_I) = n };
     let (ctx, pml4, kst, gs_sel) = {
-        let t = unsafe { (*core::ptr::addr_of!(TASKS))[n].as_ref().unwrap() };
+        let t = unsafe { (*core::ptr::addr_of_mut!(TASKS))[n].as_mut().unwrap() };
+        t.nswitch += 1;
         fxrstor(&t.fx);
         // SAFETY: MSR write of a task-owned user FS base.
         unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, t.fs_base) };
@@ -38427,6 +38470,7 @@ pub fn task_exit(code: u64) -> ! {
             nt_proc_dead(t.tgid, t.pid, code & 0xffff_ffff);
         }
         t.exit_status = (code & 0xff) << 8;
+        perf_task_died(t.pid);
     }
     task_exit_inner()
 }
@@ -38752,6 +38796,7 @@ fn resume_ctx(n: usize) -> *const UCtx {
     CTXT_SW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     unsafe { *core::ptr::addr_of_mut!(CUR_I) = n };
     let t = unsafe { (*core::ptr::addr_of_mut!(TASKS))[n].as_mut().unwrap() };
+    t.nswitch += 1;
     syscall::set_kstack(t.kstack_top);
     // Switch address space before returning the new task's ctx —
     // shared kernel slots make the swap safe mid-function.
@@ -39213,6 +39258,8 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
             .load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
         stime: 0,
+        pfaults: 0,
+        nswitch: 0,
         itimers: [[0; 2]; 3],
         cmdline: p.cmdline,
         cmdline_len: p.cmdline_len,
@@ -39427,6 +39474,8 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
             .load(core::sync::atomic::Ordering::Relaxed),
         utime: 0,
         stime: 0,
+        pfaults: 0,
+        nswitch: 0,
         itimers: [[0; 2]; 3],
         cmdline: p.cmdline,
         cmdline_len: p.cmdline_len,
@@ -42423,6 +42472,267 @@ fn uffd_release(i: usize) {
             t.state = TaskState::Runnable;
         }
     }
+}
+
+/// perf_event_open(298): counting-mode subset — a perf fd reads a
+/// u64 count. Software events count real per-task state (page
+/// faults, context switches, task clock); PERF_TYPE_HARDWARE
+/// CPU_CYCLES is an rdtsc delta. Sampling (sample_type/freq/mmap
+/// rings) EINVALs — there is no ring. DISABLE freezes, RESET
+/// re-bases; a dead target freezes at task_exit via perf_task_died.
+/// cpu==-1 per-task (pid>=0) or cpu==0 system-wide (pid==-1 — sums
+/// over live tasks); NUMA/multi-cpu configs ENODEV.
+struct Perf {
+    pid: u64,    // target pid (creator's for pid==0)
+    ti: usize,   // task slot resolved at create — identity-checked
+    cfg: u64,    // PERF_COUNT_* within type
+    sw: bool,    // PERF_TYPE_SOFTWARE else HARDWARE
+    wide: bool,  // pid==-1&&cpu==0: sum over every live task
+    enabled: bool,
+    acc: u64,    // accumulated while disabled
+    base: u64,   // live() snapshot at last enable/reset
+}
+static mut PERFS: [Option<Perf>; 8] = [None, None, None, None, None, None, None, None];
+fn perfs() -> &'static mut [Option<Perf>; 8] {
+    // SAFETY: single CPU, IRQ-masked syscalls — one borrower at a time.
+    unsafe { &mut *core::ptr::addr_of_mut!(PERFS) }
+}
+
+const PERF_SW_TASK_CLOCK: u64 = 1;
+const PERF_SW_PAGE_FAULTS: u64 = 2;
+const PERF_SW_CTX_SWITCHES: u64 = 3;
+const PERF_SW_CPU_MIGRATIONS: u64 = 4;
+const PERF_HW_CYCLES: u64 = 0;
+
+/// #PF accounting hook — cpu.rs calls this on the vector-14 route.
+pub fn note_pfault() {
+    if let Some(t) = cur_mut() {
+        t.pfaults += 1;
+    }
+}
+
+/// One task's live value for a config — None when the slot is dead
+/// or recycled (pid mismatch).
+fn perf_task_live(p: &Perf) -> Option<u64> {
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    let t = tasks.get(p.ti)?.as_ref()?;
+    if t.pid != p.pid {
+        return None;
+    }
+    Some(match (p.sw, p.cfg) {
+        (true, PERF_SW_TASK_CLOCK) => (t.utime + t.stime) * 10_000_000,
+        (true, PERF_SW_PAGE_FAULTS) => t.pfaults,
+        (true, PERF_SW_CTX_SWITCHES) => t.nswitch,
+        (true, PERF_SW_CPU_MIGRATIONS) => 0,
+        (true, _) => {
+            // cfg 0 = PERF_COUNT_SW_CPU_CLOCK — wall TICKS in ns.
+            crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed) * 10_000_000
+        }
+        (false, _) => unsafe { core::arch::x86_64::_rdtsc() },
+    })
+}
+
+/// System-wide variant: same configs summed over live tasks (cpu==0
+/// is the only cpu — a superset of any single task's count).
+fn perf_wide_live(sw: bool, cfg: u64) -> u64 {
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    match (sw, cfg) {
+        (true, PERF_SW_TASK_CLOCK) => tasks
+            .iter()
+            .flatten()
+            .map(|t| (t.utime + t.stime) * 10_000_000)
+            .sum(),
+        (true, PERF_SW_PAGE_FAULTS) => tasks.iter().flatten().map(|t| t.pfaults).sum(),
+        (true, PERF_SW_CTX_SWITCHES) => tasks.iter().flatten().map(|t| t.nswitch).sum(),
+        (true, PERF_SW_CPU_MIGRATIONS) => 0,
+        (true, _) => {
+            // cfg 0 = PERF_COUNT_SW_CPU_CLOCK — wall TICKS in ns.
+            crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed) * 10_000_000
+        }
+        (false, _) => unsafe { core::arch::x86_64::_rdtsc() },
+    }
+}
+
+fn perf_live(p: &Perf) -> u64 {
+    if p.wide {
+        perf_wide_live(p.sw, p.cfg)
+    } else {
+        perf_task_live(p).unwrap_or(0)
+    }
+}
+
+/// perf_event_open(attr, pid, cpu, group_fd, flags): attr is the
+/// real perf_event_attr layout — type@0,size@4,config@8,sample_*
+/// @16-24,read_format@32,bitfield@40. Counting mode only.
+pub fn sys_perf_event_open(arg: u64, pid: u64, cpu: u64, group_fd: u64, flags: u64) -> u64 {
+    const ENOMEM_: u64 = (-12i64) as u64;
+    const ENODEV_: u64 = (-19i64) as u64;
+    const ESRCH_: u64 = (-3i64) as u64;
+    const PERF_FLAG_FD_CLOEXEC: u64 = 0x8;
+    const PERF_FLAG_FD_NO_GROUP: u64 = 0x1;
+    // pid/cpu/group_fd are C ints — they arrive zero-extended, so
+    // -1 shows up as 0xFFFFFFFF (the AT_FDCWD class). Sign-extend
+    // the low 32 bits.
+    let (pid_i, cpu_i, gfd_i) =
+        (pid as u32 as i32, cpu as u32 as i32, group_fd as u32 as i32);
+    if flags & !(PERF_FLAG_FD_CLOEXEC | PERF_FLAG_FD_NO_GROUP) != 0
+        || gfd_i != -1
+    {
+        return EINVAL;
+    }
+    if !range_ok(arg, 48) {
+        return EFAULT;
+    }
+    // SAFETY: arg is a validated user window — the header fields
+    // all live inside the first 48 bytes.
+    let (ty, size, cfg, sample_type, read_format, bits) = unsafe {
+        (
+            (arg as *const u32).read() as u64,
+            (arg as *const u32).add(1).read() as u64,
+            (arg as *const u64).add(1).read(),
+            (arg as *const u64).add(3).read(),
+            (arg as *const u64).add(4).read(),
+            (arg as *const u64).add(5).read(),
+        )
+    };
+    if !(64..=4096).contains(&size) || sample_type != 0 || read_format != 0 {
+        return EINVAL;
+    }
+    // Only attr.disabled (bit0) is honored — every other bit selects
+    // a mode this subset doesn't implement (sampling, mmap, comm,
+    // inherit, exclude_*, precise_ip...). EINVAL, not silent ignore.
+    if bits & !1 != 0 {
+        return EINVAL;
+    }
+    let (sw, ok) = match ty {
+        0 => (false, cfg == PERF_HW_CYCLES),
+        1 => (true, cfg <= PERF_SW_CPU_MIGRATIONS),
+        _ => (false, false),
+    };
+    if !ok {
+        return ENODEV_;
+    }
+    let (wide, ti, tpid) = if pid_i == -1 {
+        if cpu_i == -1 {
+            return EINVAL; // pid==-1 && cpu==-1 — Linux EINVALs
+        } else if cpu_i != 0 {
+            return ENODEV_;
+        }
+        (true, usize::MAX, 0)
+    } else {
+        if cpu_i != -1 {
+            return ENODEV_;
+        }
+        let Some(t) = cur_mut() else { return EBADF };
+        let want = if pid_i == 0 { t.pid } else { pid_i as u64 };
+        let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+        let Some(i) = tasks
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|x| x.pid == want))
+        else {
+            return ESRCH_;
+        };
+        (false, i, want)
+    };
+    let ps = perfs();
+    let Some(i) = ps.iter().position(Option::is_none) else {
+        return ENOMEM_;
+    };
+    let p = Perf {
+        pid: tpid,
+        ti,
+        cfg,
+        sw,
+        wide,
+        enabled: bits & 1 == 0,
+        acc: 0,
+        base: 0,
+    };
+    ps[i] = Some(Perf { base: perf_live(&p), ..p });
+    let fd = anon_fd(FdKind::Perf(i), flags & PERF_FLAG_FD_CLOEXEC != 0);
+    if (fd as i64) < 0 {
+        ps[i] = None;
+        return fd;
+    }
+    fd
+}
+
+/// read(perf fd): the u64 count — frozen while disabled or after
+/// target death.
+fn perf_read(_ctx: &mut UCtx, i: usize, buf: u64, len: u64) -> u64 {
+    if len < 8 {
+        return EINVAL;
+    }
+    if !range_ok_w(buf, 8) {
+        return EFAULT;
+    }
+    let ps = perfs();
+    let Some(p) = ps.get_mut(i).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    // Fold live delta into acc each read so a mid-window target
+    // death doesn't lose counted work.
+    if p.enabled {
+        let v = perf_live(p);
+        p.acc += v.saturating_sub(p.base);
+        p.base = v;
+    }
+    let n = p.acc;
+    // SAFETY: buf is a validated writable window under the
+    // current cr3.
+    unsafe { (buf as *mut u64).write(n) };
+    8
+}
+
+/// PERF_EVENT_IOC_* — '$'(0x24) type: ENABLE/DISABLE/RESET/REFRESH
+/// are the honest counting-mode verbs.
+pub fn perf_ioctl(i: usize, req: u64, _arg: u64) -> u64 {
+    const IOC_ENABLE: u64 = 0x2400;
+    const IOC_DISABLE: u64 = 0x2401;
+    const IOC_REFRESH: u64 = 0x2402;
+    const IOC_RESET: u64 = 0x2403;
+    let ps = perfs();
+    let Some(p) = ps.get_mut(i).and_then(|s| s.as_mut()) else {
+        return EBADF;
+    };
+    match req {
+        IOC_ENABLE => {
+            if !p.enabled {
+                p.base = perf_live(p);
+                p.enabled = true;
+            }
+            0
+        }
+        IOC_DISABLE => {
+            if p.enabled {
+                p.acc += perf_live(p).saturating_sub(p.base);
+                p.enabled = false;
+            }
+            0
+        }
+        IOC_RESET => {
+            p.acc = 0;
+            p.base = perf_live(p);
+            0
+        }
+        IOC_REFRESH => 0, // no groups — refresh is a no-op
+        _ => EINVAL,
+    }
+}
+
+/// Target death: freeze its counters so a stale slot can't alias.
+pub fn perf_task_died(pid: u64) {
+    for p in perfs().iter_mut().flatten() {
+        if !p.wide && p.pid == pid && p.enabled {
+            p.acc += perf_live(p).saturating_sub(p.base);
+            p.enabled = false;
+        }
+    }
+}
+
+/// fd close: drop the object.
+fn perf_release(i: usize) {
+    perfs()[i] = None;
 }
 
 /// End of the scheduling run: reap whatever tasks remain — the last
