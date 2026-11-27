@@ -1654,7 +1654,7 @@ pub fn rt_sigreturn32(ctx: &mut UCtx) -> u64 {
     ctx.rflags = (r32(64) & 0x0030_ffff) | (ctx.rflags & 0x3000) | 0x200;
     ctx.rsp = r32(68); // sp_at_signal
     ctx.ss = 0x2b | 3; // pinned
-    t.sigmask = r32(80) as u32; // oldmask
+    t.sigmask = r32(80) as u32 & !PEND_FORCE; // oldmask
     // SA_RESTART replay — the i386 sigcontext's eax is the -EINTR
     // the wake deposited, zero-extended off a u32 field.
     restart_apply(t, ctx, 0xffff_fffc);
@@ -1735,7 +1735,7 @@ pub fn rt_sigprocmask32(how: u64, set: u64, old: u64, sigsetsize: u64) -> u64 {
             return EFAULT;
         }
         // SAFETY: validated readable user range.
-        let m = unsafe { (set as *const u32).read_unaligned() };
+        let m = unsafe { (set as *const u32).read_unaligned() } & !PEND_FORCE;
         t.sigmask = match how {
             0 => t.sigmask | m,
             1 => t.sigmask & !m,
@@ -1844,7 +1844,7 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                     if fl & SA_RESETHAND != 0 {
                         sigt(t).handlers[i] = SIG_DFL;
                     }
-                    let mut add = hm;
+                    let mut add = hm & !PEND_FORCE;
                     if fl & SA_NODEFER == 0 {
                         add |= 1u32 << i;
                     }
@@ -1925,7 +1925,7 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                 if fl & SA_RESETHAND != 0 {
                     sigt(t).handlers[i] = SIG_DFL;
                 }
-                let mut add = hm;
+                let mut add = hm & !PEND_FORCE;
                 if fl & SA_NODEFER == 0 {
                     add |= 1u32 << i;
                 }
@@ -2239,7 +2239,17 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
             return contd;
         }
     }
-    if t.state == TaskState::Blocked && !ignored && !matches!(t.wait_on, WaitOn::Vfork(_)) {
+    // A signal the mask defers can't interrupt either — Linux
+    // leaves it pending and the blocked wait keeps sleeping (the
+    // pending bit delivers on the next unmask or a later deliverable
+    // post). This replaces the old masked-wake quirk where a masked
+    // post forced -EINTR. SIGSTOP is unmaskable.
+    let deliverable_now = t.sigmask & (1u32 << (sig - 1)) & !PEND_FORCE == 0;
+    if t.state == TaskState::Blocked
+        && !ignored
+        && deliverable_now
+        && !matches!(t.wait_on, WaitOn::Vfork(_))
+    {
         // A nanosleep interrupted by this signal reports the unslept
         // remainder in rem (stored in wait_ptr) — Linux semantics.
         let rax: u64 = (-4i64) as u64; // -EINTR
@@ -2273,12 +2283,10 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
                 s.handlers.get(i).copied().unwrap_or(SIG_DFL),
             )
         };
-        // A signal the mask defers can't deliver a handler or
-        // reach sigreturn — arming it would leave a stale slot
-        // (the masked-wake itself is the pre-existing !ignored
-        // wake quirk; the arm just doesn't amplify it).
-        let deliverable_now =
-            t.sigmask & (1u32 << i) == 0 || sig as usize == SIGSTOP;
+        // Only deliverable signals reach here (the wake gate
+        // already filtered masked ones) — a masked signal can't
+        // deliver a handler or reach sigreturn, so it must never
+        // hold an arm.
         let stop = h == SIG_DFL && sig_default_stop(sig as usize);
         // Untimed Futex is -ERESTARTSYS on Linux (restartable —
         // orig-args replay re-waits); only a TIMED one arms the
@@ -2286,13 +2294,12 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
         // resumes via the stash on CONT.
         let futex_untimed =
             matches!(&t.wait_on, WaitOn::Futex(_) if t.wait_deadline == 0);
-        if deliverable_now
-            && (fl & SA_RESTART != 0 || stop)
+        if (fl & SA_RESTART != 0 || stop)
             && (wait_restartable(&t.wait_on) || futex_untimed)
         {
             t.restart_nr = t.ctx.rax;
             t.restart_asite = t.ctx.rip;
-        } else if deliverable_now && stop && wait_stop_resumable(&t.wait_on) {
+        } else if stop && wait_stop_resumable(&t.wait_on) {
             t.restart_nr = t.ctx.rax;
             t.restart_asite = t.ctx.rip;
             // Only the deadline kinds need the stash — Pselect and
@@ -2688,7 +2695,7 @@ pub fn sigreturn(ctx: &mut UCtx) -> u64 {
     if let Some(t) = cur_mut() {
         // SAFETY: validated user range in the caller's space.
         let m = unsafe { ((frame + 296) as *const u64).read_unaligned() };
-        t.sigmask = m as u32;
+        t.sigmask = m as u32 & !PEND_FORCE;
         // SA_RESTART replay: the signal's handler ran; the syscall
         // the frame returns into re-executes instead of surfacing
         // the deposited -EINTR.
@@ -15751,7 +15758,7 @@ pub fn sys_rt_sigprocmask(how: u64, set: u64, old: u64, sigsetsize: u64) -> u64 
             return EFAULT;
         }
         // SAFETY: set validated readable for 8 bytes.
-        let m = unsafe { (set as *const u64).read_unaligned() } as u32;
+        let m = unsafe { (set as *const u64).read_unaligned() } as u32 & !PEND_FORCE;
         t.sigmask = match how {
             0 => t.sigmask | m,
             1 => t.sigmask & !m,
@@ -30104,7 +30111,7 @@ pub fn sys_sigsuspend(ctx: &mut UCtx, mask: u64, sigsize: u64) -> u64 {
     // SAFETY: validated user sigset under cur cr3.
     let newmask = unsafe { (mask as *const u64).read_unaligned() } as u32;
     let saved = t.sigmask;
-    t.sigmask = newmask;
+    t.sigmask = newmask & !PEND_FORCE;
     if deliverable(t) {
         // Linux runs the handler inside the suspend: deliver under
         // the temporary mask (the frame captures rax=-EINTR), then
@@ -31398,7 +31405,7 @@ pub fn fd_epoll_wait(
             return EINVAL;
         }
         // SAFETY: validated user sigset under cur cr3.
-        t.sigmask = unsafe { (sigmask as *const u64).read_unaligned() } as u32;
+        t.sigmask = unsafe { (sigmask as *const u64).read_unaligned() } as u32 & !PEND_FORCE;
     }
     let ready = epoll_scan(t, ei, events, maxevents);
     if ready > 0 {
@@ -33558,7 +33565,7 @@ pub fn fd_pselect(
                 return EINVAL;
             }
             // SAFETY: validated user sigset under cur cr3.
-            t.sigmask = unsafe { (ss as *const u64).read_unaligned() } as u32;
+            t.sigmask = unsafe { (ss as *const u64).read_unaligned() } as u32 & !PEND_FORCE;
         }
     }
     // pselect6's tsp gets the remaining-time writeback like Linux's
@@ -33897,7 +33904,7 @@ pub fn fd_ppoll(
             return EINVAL;
         }
         // SAFETY: validated user sigset under cur cr3.
-        t.sigmask = unsafe { (sigmask as *const u64).read_unaligned() } as u32;
+        t.sigmask = unsafe { (sigmask as *const u64).read_unaligned() } as u32 & !PEND_FORCE;
     }
     // Remaining-time writeback into tsp on every exit — Linux's
     // poll_select_copy_remaining. Arm after the last fallible gate
@@ -43376,7 +43383,7 @@ pub fn sys_io_getevents(
     }
     if have_mask {
         t.psel_mask = t.sigmask as u64;
-        t.sigmask = newmask as u32;
+        t.sigmask = newmask as u32 & !PEND_FORCE;
     }
     // Arm the wait; the waker (submit's aio_wake), the deadline
     // expire, or the generic signal wake writes the answer into
@@ -43489,7 +43496,7 @@ fn ptr_regs_apply(t: &mut Task, r: &[u64; 27]) {
 /// injected signal (or suppress the stopped one), unstop.
 fn ptrace_resume(t: &mut Task, sig: u64) -> u64 {
     const EIO_: u64 = (-5i64) as u64;
-    if sig > 32 {
+    if sig > 31 {
         return EIO_;
     }
     if sig == 0 && t.inject == SIGKILL as u8 {
@@ -43803,6 +43810,13 @@ pub fn sys_ptrace(req: u64, pid: u64, addr: u64, data: u64) -> u64 {
         }
         PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP
         | PTRACE_SINGLEBLOCK | PTRACE_LISTEN | PTRACE_DETACH => {
+            if data > 31 {
+                // Invalid inject must EIO BEFORE the arm/detach
+                // side-effects — Linux validates the signal first;
+                // a DETACH(32) that detached then failed would
+                // strand the tracee Stopped with no tracer.
+                return EIO_;
+            }
             if req == PTRACE_DETACH {
                 t.tracer = 0;
                 t.ptr_sys = 0;

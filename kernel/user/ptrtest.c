@@ -137,6 +137,26 @@ int main(int argc, char **argv) {
         check(ptrace(PT_GETSIGINFO, c, 0, si) == 0, "getsiginfo: ok");
         check(*(int *)si == SIGSTOP, "getsiginfo: signo=SIGSTOP");
 
+        // run-354: an out-of-range inject must EIO -- sig==32 used
+        // to slip the `> 32` bound into pend_src[31] OOB (kernel
+        // panic reachable from any tracer).
+        errno = 0;
+        check(ptrace(PT_CONT, c, 0, (void *)32) == -1 && errno == EIO,
+              "CONT sig=32 -> EIO (out-of-range inject)");
+        // no NEW wait event -> the EIO'd CONT left the stop standing
+        // (a blocking waitpid would hang on the consumed report)
+        check(waitpid(c, &st, WUNTRACED | WNOHANG) == 0,
+              "sig=32 CONT leaves tracee stopped");
+
+        // DETACH(32): the EIO must precede the detach side-effects
+        // (Linux validates the signal first) — the trace stays
+        // ours, so GETREGS still answers instead of ESRCH
+        errno = 0;
+        check(ptrace(PT_DETACH, c, 0, (void *)32) == -1 && errno == EIO,
+              "DETACH sig=32 -> EIO, no detach");
+        check(ptrace(PT_GETREGS, c, 0, &rg) == 0,
+              "sig=32 DETACH leaves the trace attached");
+
         // SINGLESTEP: two steps must advance rip (or at least each
         // stop must report SIGTRAP)
         ptrace(PT_SINGLESTEP, c, 0, 0);

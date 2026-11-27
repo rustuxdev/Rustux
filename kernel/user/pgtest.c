@@ -37,6 +37,8 @@ static void info_hit(int s, siginfo_t *i, void *u) {
     got_usr1 = 1;
 }
 static void usr1_hit(int s) { (void)s; got_usr1 = 1; }
+static volatile sig_atomic_t got_usr2;
+static void usr2_hit(int s) { (void)s; got_usr2 = 1; }
 static volatile void *fv_expect;
 static void segv_hit(int s, siginfo_t *i, void *u) {
     (void)s; (void)u;
@@ -550,6 +552,80 @@ int main(void) {
               "stop/cont+caught sig: suspend EINTRs, mask restored");
         kill(sw, SIGKILL);
         waitpid(sw, &st, 0);
+        sigprocmask(SIG_SETMASK, &pprev, NULL);
+    }
+
+    /* --- run-354: masked posts pend silently; the unblockables
+       can't be masked (host-verified: a masked signal posted to a
+       blocked wait leaves it sleeping — Linux just pends it; and
+       set_current_blocked strips SIGKILL/SIGSTOP everywhere) ------ */
+    {
+        struct timespec t3 = {0, 300000000}; /* 300ms */
+        /* masked USR1 posted to a blocked nanosleep: the sleep must
+           NOT EINTR — under the old masked-wake quirk the post broke
+           it and the child is long gone by the ~900ms probe. */
+        pid_t mw = fork();
+        if (mw == 0) {
+            sigset_t m;
+            sigemptyset(&m);
+            sigaddset(&m, SIGUSR1);
+            sigprocmask(SIG_BLOCK, &m, NULL);
+            struct timespec ts = {1, 200000000}; /* 1.2s */
+            nanosleep(&ts, NULL);
+            _exit(0);
+        }
+        nanosleep(&t3, NULL);
+        kill(mw, SIGUSR1); /* masked in the child -> pends silently */
+        nanosleep(&t3, NULL);
+        nanosleep(&t3, NULL);
+        check(waitpid(mw, &st, WNOHANG) == 0,
+              "masked post to nanosleep pends silently");
+        kill(mw, SIGKILL);
+        waitpid(mw, &st, 0);
+
+        /* masked USR2 posted to pause(): suspend holds; a later
+           unmasked USR1 ends it, and unmasking delivers the pend. */
+        got_usr1 = 0;
+        got_usr2 = 0;
+        mw = fork();
+        if (mw == 0) {
+            struct sigaction u2 = {.sa_handler = usr2_hit};
+            sigaction(SIGUSR2, &u2, NULL);
+            sigset_t m;
+            sigemptyset(&m);
+            sigaddset(&m, SIGUSR2);
+            sigprocmask(SIG_BLOCK, &m, NULL);
+            pause(); /* masked USR2 pends; USR1 EINTRs the wait */
+            sigprocmask(SIG_UNBLOCK, &m, NULL); /* pend delivers now */
+            _exit(got_usr1 && got_usr2 ? 0 : 5);
+        }
+        nanosleep(&t3, NULL);
+        nanosleep(&t3, NULL);
+        kill(mw, SIGUSR2);
+        nanosleep(&t3, NULL);
+        nanosleep(&t3, NULL);
+        check(waitpid(mw, &st, WNOHANG) == 0,
+              "masked post keeps pause suspended");
+        kill(mw, SIGUSR1);
+        int done = 0, tries = 0;
+        while (tries++ < 30 && (done = waitpid(mw, &st, WNOHANG)) == 0)
+            nanosleep(&t3, NULL);
+        check(done == mw && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+              "pended masked signal delivers after unmask");
+        kill(mw, SIGKILL);
+        waitpid(mw, &st, 0);
+
+        /* Linux strips SIGKILL/SIGSTOP at every mask install —
+           sigprocmask can never hold the unblockables. */
+        sigset_t f, cur2;
+        sigfillset(&f);
+        int sok = sigprocmask(SIG_SETMASK, &f, &pprev);
+        int sok2 = sigprocmask(SIG_SETMASK, NULL, &cur2);
+        check(sok == 0 && sok2 == 0 &&
+                  !sigismember(&cur2, SIGKILL) &&
+                  !sigismember(&cur2, SIGSTOP) &&
+                  sigismember(&cur2, SIGUSR1),
+              "sigprocmask strips SIGKILL/SIGSTOP from the mask");
         sigprocmask(SIG_SETMASK, &pprev, NULL);
     }
 

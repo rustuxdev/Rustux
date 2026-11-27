@@ -242,6 +242,35 @@ int main(void) {
         check(sc(333, ctx, 0, 1, ev, 0, &usig) < 0
               && errno == EINVAL, "usig bad size EINVAL");
     }
+
+    // ---- run-354 F-1: a KILL-bit usig mask can't wedge the wait -
+    {
+        pid_t c = fork();
+        if (c == 0) {
+            aio_context_t kc = 0;
+            sc(206, 4, &kc, 0,0,0,0);
+            unsigned long m = 1ul << (SIGKILL - 1);
+            struct { void *mask; unsigned long sz; } usig = { &m, 8 };
+            struct io_event kev[2];
+            // no submissions + NULL timeout -> blocks in Aio; only
+            // a deliverable signal ends it. If the KILL bit could
+            // install, kill -9 would pend silently forever.
+            sc(333, kc, 1, 1, kev, 0, &usig);
+            _exit(7);
+        }
+        usleep(600000);
+        kill(c, SIGKILL);
+        int st2 = 0, tries = 0;
+        while (tries++ < 30 && waitpid(c, &st2, WNOHANG) == 0)
+            usleep(300000);
+        check(WIFSIGNALED(st2) && WTERMSIG(st2) == SIGKILL,
+              "pgetevents under KILL-bit mask stays killable");
+        // bounded cleanup — under a regression the child is
+        // unkillable by construction; don't hang the gate on it
+        tries = 0;
+        while (tries++ < 10 && waitpid(c, &st2, WNOHANG) == 0)
+            usleep(300000);
+    }
     check(sc(207, ctx, 0,0,0,0,0) == 0, "destroy ok");
     check(sc(210, ctx, 0, 1, ev, 0, 0) < 0 && errno == EINVAL,
           "dead ctx EINVAL");
