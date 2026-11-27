@@ -1311,6 +1311,10 @@ fn restart_apply(t: &mut Task, c: &mut UCtx, eintr: u64) {
         return;
     }
     if (insn[0] == 0x0f && insn[1] == 0x05) || (insn[0] == 0xcd && insn[1] == 0x80) {
+        // The replay re-enters the ABI at c.rip (the insn after the
+        // syscall gate) — stash it so the nanosleep family consumes
+        // restart_at only on the actual replayed entry.
+        t.restart_rip = c.rip;
         c.rip = back;
         c.rax = core::mem::replace(&mut t.restart_nr, u64::MAX);
     }
@@ -2110,6 +2114,16 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
                     || (h == SIG_DFL && sig_default_stop(sig as usize)))
             {
                 t.restart_nr = t.ctx.rax;
+                // Timer waits carry the restart_block remainder:
+                // the replay resumes to this deadline, not the
+                // full req (relative req isn't re-read — POSIX).
+                if matches!(t.wait_on, WaitOn::Timer) {
+                    t.restart_at = t.wait_deadline;
+                    t.restart_rt = t.wait_rt;
+                } else {
+                    t.restart_at = 0;
+                    t.restart_rt = false;
+                }
             }
         }
         if !matches!(t.wait_on, WaitOn::Uffd(_)) {
@@ -2598,6 +2612,17 @@ pub struct Task {
     /// rewinds the ctx saved in the signal frame at sigreturn, or
     /// the armed ctx itself when a stopped task resumes on SIGCONT.
     restart_nr: u64,
+    /// restart_block remainder for an interrupted WaitOn::Timer —
+    /// the tick deadline the replay resumes to (0 = none). Linux's
+    /// restart_block stores the expiry so a SA_RESTART replay of
+    /// nanosleep sleeps only the unslept remainder, not the full
+    /// req again. restart_rt marks whether the deadline slides on
+    /// wall sets (RT abstime); restart_rip is the user rip the
+    /// replay re-enters at — the consume gate, so a handler's own
+    /// nanosleep can't steal the stashed deadline.
+    restart_at: u64,
+    restart_rt: bool,
+    restart_rip: u64,
     /// Pending signal bitmask — bit (sig-1), sigs 1..=31.
     pending: u32,
     /// si_code/pid/uid/aux behind each pending bit — written on the
@@ -8479,6 +8504,9 @@ fn load(img: &[u8]) -> Option<Task> {
         wait_deadline: 0,
         wait_rt: false,
         restart_nr: u64::MAX,
+        restart_at: 0,
+        restart_rt: false,
+        restart_rip: 0,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: 0,
@@ -15525,10 +15553,15 @@ pub fn sys_gettimeofday32(tv: u64, _tz: u64) -> u64 {
 /// timespec too, so it is not handed to the signal-wake filler.
 pub fn sys_nanosleep32(ctx: &mut UCtx, req: u64, rem: u64) -> u64 {
     const EINTR: u64 = (-4i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL };
+    // Replay of an interrupted compat nanosleep resumes the
+    // remainder too — rem32 stays unfilled (wait_ptr 0).
+    if let Some(r) = timer_restart(t, ctx, 0) {
+        return r;
+    }
     if !range_ok(req, 8) {
         return EFAULT;
     }
-    let Some(t) = cur_mut() else { return EINVAL };
     let sec = unsafe { (req as *const i32).read_unaligned() } as i64;
     let nsec = unsafe { (req as *const i32).add(1).read_unaligned() } as i64;
     if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
@@ -19403,16 +19436,51 @@ pub fn sys_gettimeofday(tv: u64, _tz: u64) -> u64 {
     0
 }
 
+/// restart_block consume for the nanosleep family: when this entry
+/// is the SA_RESTART replay of an interrupted Timer wait (the rip
+/// restart_apply recorded matches), re-arm to the stashed deadline
+/// — the unslept remainder — instead of re-reading req (Linux's
+/// restart_block never touches req on restart; the pointer may be
+/// unmapped or rewritten). `rem_va` is this ABI's wait_ptr shape
+/// (rem, or 0 on i386 where no remainder is written). Returns the
+/// early return value, or None for a normal call.
+fn timer_restart(t: &mut Task, ctx: &mut UCtx, rem_va: u64) -> Option<u64> {
+    if t.restart_at == 0 || ctx.rip != t.restart_rip {
+        return None;
+    }
+    let deadline = core::mem::replace(&mut t.restart_at, 0);
+    let rt = core::mem::replace(&mut t.restart_rt, false);
+    t.restart_rip = 0;
+    if deliverable(t) {
+        return Some((-4i64) as u64); // EINTR — a fresh signal pends
+    }
+    let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    if deadline <= now {
+        return Some(0); // remainder elapsed while the handler ran
+    }
+    t.wait_on = WaitOn::Timer;
+    t.wait_ptr = rem_va;
+    t.wait_ptr2 = 0;
+    t.wait_rt = rt;
+    t.wait_deadline = deadline;
+    t.ctx = *ctx;
+    t.state = TaskState::Blocked;
+    block_switch()
+}
+
 /// nanosleep(req, rem): block until the deadline — WaitOn::Timer
-/// ages in poll_expire alongside the other deadline waits. Signals
-/// interrupt it (rem is zeroed — partial-remain bookkeeping needs
-/// the deadline stored, which we keep simple).
+/// ages in poll_expire alongside the other deadline waits. A signal
+/// wake fills rem (wait_ptr) with the unslept remainder; a
+/// SA_RESTART replay resumes the remainder via timer_restart.
 pub fn sys_nanosleep(ctx: &mut UCtx, req: u64, rem: u64) -> u64 {
     const EINTR: u64 = (-4i64) as u64;
+    let Some(t) = cur_mut() else { return EINVAL };
+    if let Some(r) = timer_restart(t, ctx, rem) {
+        return r;
+    }
     if !range_ok(req, 16) {
         return EFAULT;
     }
-    let Some(t) = cur_mut() else { return EINVAL };
     let sec = unsafe { (req as *const u64).read_unaligned() };
     let nsec = unsafe { (req as *const u64).add(1).read_unaligned() };
     if nsec >= 1_000_000_000 {
@@ -19463,6 +19531,10 @@ pub fn sys_clock_nanosleep(
     if clk > 1 {
         return EINVAL_P; // REALTIME/MONOTONIC only
     }
+    let Some(t) = cur_mut() else { return EINVAL_P };
+    if let Some(r) = timer_restart(t, ctx, rem) {
+        return r;
+    }
     if !range_ok(req, 16) {
         return EFAULT_P;
     }
@@ -19492,16 +19564,17 @@ pub fn sys_clock_nanosleep(
     if rem != 0 && !range_ok_w(rem, 16) {
         return EFAULT_P;
     }
-    let Some(t) = cur_mut() else { return EINVAL_P };
     if deliverable(t) {
         return (-4i64) as u64; // EINTR
     }
     t.wait_on = WaitOn::Timer;
     t.wait_ptr = rem;
     t.wait_ptr2 = 0; // kernel-style -errno wake
-    t.wait_rt = flags & 1 != 0 && clk == 0; // RT abstime follows wall jumps
-                                            // (relative-RT sleeps not slid —
-                                            // divergence vs Linux's base rebase)
+    // RT abstime slides on wall jumps; relative-RT doesn't — POSIX
+    // requires relative RT waits unaffected by clock_settime (Linux
+    // re-bases them onto MONOTONIC in common_hrtimer_arm, same as
+    // our raw-tick arm).
+    t.wait_rt = flags & 1 != 0 && clk == 0;
     t.wait_deadline = now.saturating_add(ticks);
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
@@ -21141,6 +21214,9 @@ pub fn nt_thread_create(
         wait_deadline: 0,
         wait_rt: false,
         restart_nr: u64::MAX,
+        restart_at: 0,
+        restart_rt: false,
+        restart_rip: 0,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: p.sigmask,
@@ -39654,6 +39730,9 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     // A pending SA_RESTART replay dies with the old image — the nr
     // it held belongs to an address space that no longer exists.
     t.restart_nr = u64::MAX;
+    t.restart_at = 0;
+    t.restart_rt = false;
+    t.restart_rip = 0;
     t.did_exec = true; // pgid/sid persist; parent setpgid now EACCES
     if let Some(p) = &pe_img {
         if !pe_load_inner(t, p, img) {
@@ -40898,6 +40977,9 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         wait_deadline: 0,
         wait_rt: false,
         restart_nr: u64::MAX,
+        restart_at: 0,
+        restart_rt: false,
+        restart_rip: 0,
         // Dispositions inherit across fork (the Linux semantic);
         // the pending set does not.
         pending: 0,
@@ -41117,6 +41199,9 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         wait_deadline: 0,
         wait_rt: false,
         restart_nr: u64::MAX,
+        restart_at: 0,
+        restart_rt: false,
+        restart_rip: 0,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: p.sigmask,

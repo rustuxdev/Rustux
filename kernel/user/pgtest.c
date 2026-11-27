@@ -642,6 +642,40 @@ int main(void) {
         close(pp[1]);
     }
 
+    /* run-350: SA_RESTART nanosleep resumes the unslept REMAINDER
+       (Linux restart_block), not the full request again — a 2s
+       sleep interrupted at ~400ms must total ~2s, not ~2.4s. */
+    {
+        struct sigaction rs2;
+        memset(&rs2, 0, sizeof(rs2));
+        rs2.sa_handler = usr1_hit;
+        rs2.sa_flags = SA_RESTART;
+        check(sigaction(SIGUSR1, &rs2, NULL) == 0,
+              "restart-block arms");
+        pid_t nk = fork();
+        if (nk == 0) {
+            struct timespec a, b, rq = {2, 0};
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            nanosleep(&rq, NULL); /* replay resumes ~1.6s remainder */
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            long ms = (b.tv_sec - a.tv_sec) * 1000 +
+                      (b.tv_nsec - a.tv_nsec) / 1000000;
+            _exit(ms >= 1900 && ms < 2350 ? 0 : 1);
+        }
+        {
+            struct timespec ts = {0, 400000000};
+            nanosleep(&ts, NULL);
+        }
+        kill(nk, SIGUSR1);
+        int nst = 0;
+        check(waitpid(nk, &nst, 0) == nk && WIFEXITED(nst) &&
+              WEXITSTATUS(nst) == 0,
+              "SA_RESTART nanosleep resumes remainder");
+        rs2.sa_flags = 0;
+        check(sigaction(SIGUSR1, &rs2, NULL) == 0,
+              "restart-block disarm");
+    }
+
     /* run-344: a job-control stop resumes into a syscall replay —
        SIGSTOP/SIGCONT never surface -EINTR to the sleeper. */
     {
