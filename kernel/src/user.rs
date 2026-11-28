@@ -1331,20 +1331,62 @@ fn wait_stop_resumable(w: &WaitOn) -> bool {
 /// sigreturn carries a live rax, so the arm is consumed ONLY on a
 /// successful apply: a frame that isn't the interrupted syscall
 /// leaves it for the outer frame that is.
+/// Nested restart arms — a handler's own restartable wait must not
+/// evict the outer frame's arm (Linux carries each frame's replay
+/// in its saved regs). Bounded: an arm past the depth keeps -EINTR.
+const RESTART_DEPTH: usize = 4;
+
+/// Push the interrupted ctx's arm into the next free slot — a
+/// nested same-insn arm is a different frame's call, not an
+/// overwrite. A full stack evicts the LOWEST-seq (oldest) arm —
+/// siglongjmp-abandoned arms never recycle otherwise and would
+/// starve every later restart to -EINTR after RESTART_DEPTH
+/// abandons (bounded divergence vs Linux's unbounded frames).
+fn restart_arm(t: &mut Task) -> u64 {
+    let i = t
+        .restart_nr
+        .iter()
+        .position(|&n| n == u64::MAX)
+        .unwrap_or_else(|| {
+            let j = (0..RESTART_DEPTH)
+                .min_by_key(|&j| t.restart_seq[j])
+                .unwrap_or(0);
+            // Evicting the stash's own arm orphans its deadline —
+            // a foreign same-nr apply could then re-key restart_rip
+            // to a stale expiry (stash gate is seq-tagged, but a
+            // dead stash still slides on clock_settime).
+            if t.restart_seq[j] == t.restart_kseq {
+                t.restart_at = 0;
+                t.restart_knr = 0;
+                t.restart_kseq = 0;
+            }
+            j
+        });
+    t.restart_arm_tick = t.restart_arm_tick.wrapping_add(1);
+    t.restart_nr[i] = t.ctx.rax;
+    t.restart_asite[i] = t.ctx.rip;
+    t.restart_seq[i] = t.restart_arm_tick;
+    t.restart_arm_tick
+}
+
 fn restart_apply(t: &mut Task, c: &mut UCtx, eintr: u64) {
-    if t.restart_nr == u64::MAX || c.rax != eintr {
+    if c.rax != eintr {
         return;
     }
     // The arm belongs to the frame interrupted at restart_asite —
-    // a siglongjmp that abandons the handler's frame leaves the arm
-    // armed, and a LATER frame's sigreturn (a different interrupted
-    // syscall) would otherwise replay the stale nr onto foreign
-    // args. A same-site later frame is a same-nr call by
-    // construction (libc's per-wrapper syscall insns), so applying
-    // there is still correct.
-    if c.rip != t.restart_asite {
+    // a siglongjmp that abandons the handler's frame leaves its
+    // slot armed, and a LATER frame's sigreturn (a different
+    // interrupted syscall) would otherwise replay the stale nr
+    // onto foreign args. Same-insn frames can carry different
+    // nrs where one site serves many (libc's syscall()
+    // indirection), so the highest-seq slot — the innermost live
+    // frame's arm — is the one that applies.
+    let Some(i) = (0..RESTART_DEPTH)
+        .filter(|&i| t.restart_nr[i] != u64::MAX && t.restart_asite[i] == c.rip)
+        .max_by_key(|&i| t.restart_seq[i])
+    else {
         return;
-    }
+    };
     let back = c.rip.wrapping_sub(2);
     // The insn check reads through t's own tables — the SIGCONT
     // caller wakes a task that is usually not current, so range_ok
@@ -1361,12 +1403,19 @@ fn restart_apply(t: &mut Task, c: &mut UCtx, eintr: u64) {
         // kinds, non-deadline stop-resumable kinds, untimed waits)
         // have no consumer, so a recorded rip would sit stale until
         // the next frame push misread it as an applied stash replay.
-        if t.restart_at != 0 {
+        let n = core::mem::replace(&mut t.restart_nr[i], u64::MAX);
+        t.restart_asite[i] = 0;
+        // Key the stash record to ITS arm's replay — a foreign
+        // apply (a nested arm sharing the insn site, a forged
+        // sigreturn frame, a same-nr untimed futex replaying over
+        // an evicted timed-futex arm) must not re-key restart_rip
+        // to the wrong site; the pushed slot's seq is the arm's
+        // identity — nr equality collides across wait kinds.
+        if t.restart_at != 0 && t.restart_seq[i] == t.restart_kseq {
             t.restart_rip = c.rip;
         }
         c.rip = back;
-        c.rax = core::mem::replace(&mut t.restart_nr, u64::MAX);
-        t.restart_asite = 0;
+        c.rax = n;
     }
 }
 
@@ -1829,6 +1878,7 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                         t.restart_rt = false;
                         t.restart_rip = 0;
                         t.restart_knr = 0;
+                        t.restart_kseq = 0;
                     }
                     let Some(frame) = i386_sigframe_write(
                         t,
@@ -1904,6 +1954,7 @@ fn maybe_deliver(t: &mut Task, ctx: &mut UCtx) {
                     t.restart_rt = false;
                     t.restart_rip = 0;
                     t.restart_knr = 0;
+                    t.restart_kseq = 0;
                 }
                 let ok = write_task_bytes(t.pml4, frame, &SIGTRAMP_VA.to_le_bytes())
                     && write_task_bytes(t.pml4, frame + 8, &sig64.to_le_bytes())
@@ -2297,29 +2348,33 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
         if (fl & SA_RESTART != 0 || stop)
             && (wait_restartable(&t.wait_on) || futex_untimed)
         {
-            t.restart_nr = t.ctx.rax;
-            t.restart_asite = t.ctx.rip;
+            restart_arm(t);
         } else if stop && wait_stop_resumable(&t.wait_on) {
-            t.restart_nr = t.ctx.rax;
-            t.restart_asite = t.ctx.rip;
+            let seq = restart_arm(t);
             // Only the deadline kinds need the stash — Pselect and
             // the SysV msg waits replay orig args (their written-
             // back timeout buffers carry the remainder already).
+            // restart_kseq binds the stash to THIS slot's arm: a
+            // foreign same-nr apply (untimed futex shares nr 202
+            // with the timed kind) must not consume its deadline.
             match t.wait_on {
                 WaitOn::Timer | WaitOn::Futex(_) => {
                     t.restart_at = t.wait_deadline;
                     t.restart_rt = t.wait_rt;
                     t.restart_knr = t.ctx.rax;
+                    t.restart_kseq = seq;
                 }
                 WaitOn::Poll => {
                     t.restart_at = t.wait_deadline;
                     t.restart_rt = false;
                     t.restart_knr = t.ctx.rax;
+                    t.restart_kseq = seq;
                 }
                 _ => {
                     t.restart_at = 0;
                     t.restart_rt = false;
                     t.restart_knr = 0;
+                    t.restart_kseq = 0;
                 }
             }
             // Only a successful apply may key the consume — a stale
@@ -2827,16 +2882,32 @@ pub struct Task {
     wait_rt: bool,
     /// Syscall nr to replay when an SA_RESTART-handled (or
     /// default-stop) signal interrupted a restartable wait —
-    /// u64::MAX = none. The sleeper still gets -EINTR deposited so
-    /// every in-kernel recheck path stays unchanged; the replay
-    /// rewinds the ctx saved in the signal frame at sigreturn, or
-    /// the armed ctx itself when a stopped task resumes on SIGCONT.
-    restart_nr: u64,
+    /// u64::MAX = free slot. The sleeper still gets -EINTR
+    /// deposited so every in-kernel recheck path stays unchanged;
+    /// the replay rewinds the ctx saved in the signal frame at
+    /// sigreturn, or the armed ctx itself when a stopped task
+    /// resumes on SIGCONT. Arms STACK: a handler's own restartable
+    /// wait nests inside the outer frame's arm, and Linux keeps
+    /// the replay state in each frame's saved regs — a single slot
+    /// let the inner arm steal the outer's, answering -EINTR where
+    /// Linux replays. Bounded at RESTART_DEPTH; an arm past it just
+    /// keeps its -EINTR.
+    restart_nr: [u64; RESTART_DEPTH],
     /// The interrupted ctx's post-insn rip at arm time — binds the
     /// arm to the frame it interrupted: a siglongjmp-abandoned arm
     /// can't replay its stale nr onto a later frame's ctx
     /// (restart_apply refuses when c.rip differs).
-    restart_asite: u64,
+    restart_asite: [u64; RESTART_DEPTH],
+    /// Arm order — apply serves the innermost armed frame (highest
+    /// seq). Index order isn't arm order once slots recycle, and
+    /// two live frames CAN share a syscall-insn site (libc's
+    /// syscall() indirection serves every nr at one insn): only
+    /// the innermost arm is the right replay for that frame.
+    restart_seq: [u64; RESTART_DEPTH],
+    /// Monotonic arm counter — newest arm takes the highest tag; a
+    /// full stack evicts the LOWEST seq (oldest, likeliest a stale
+    /// siglongjmp-abandoned arm) instead of dropping the live one.
+    restart_arm_tick: u64,
     /// restart_block remainder for a stop-resumable wait —
     /// nanosleep-family Timer waits, poll()/ppoll() Poll waits and
     /// futex waits resume on SIGCONT to the stashed expiry like
@@ -2851,6 +2922,10 @@ pub struct Task {
     restart_rt: bool,
     restart_rip: u64,
     restart_knr: u64,
+    /// restart_seq of the stash's own arm slot — the apply-time
+    /// stash gate so a foreign same-nr replay can't key onto the
+    /// stash's deadline.
+    restart_kseq: u64,
     /// Pending signal bitmask — bit (sig-1), sigs 1..=31.
     pending: u32,
     /// si_code/pid/uid/aux behind each pending bit — written on the
@@ -8732,12 +8807,15 @@ fn load(img: &[u8]) -> Option<Task> {
         wait_len: 0,
         wait_deadline: 0,
         wait_rt: false,
-        restart_nr: u64::MAX,
-        restart_asite: 0,
+        restart_nr: [u64::MAX; RESTART_DEPTH],
+        restart_asite: [0; RESTART_DEPTH],
+        restart_seq: [0; RESTART_DEPTH],
+        restart_arm_tick: 0,
         restart_at: 0,
         restart_rt: false,
         restart_rip: 0,
         restart_knr: 0,
+        restart_kseq: 0,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: 0,
@@ -19695,6 +19773,7 @@ fn timer_restart(t: &mut Task, ctx: &mut UCtx, rem_va: u64) -> Option<u64> {
     let rt = core::mem::replace(&mut t.restart_rt, false);
     t.restart_rip = 0;
     t.restart_knr = 0;
+    t.restart_kseq = 0;
     let now = crate::apic::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     if deliverable(t) {
         if rem_va != 0 {
@@ -19736,6 +19815,7 @@ fn restart_deadline(t: &mut Task, ctx: &UCtx) -> Option<u64> {
     t.restart_rt = false;
     t.restart_rip = 0;
     t.restart_knr = 0;
+    t.restart_kseq = 0;
     Some(d)
 }
 
@@ -21486,12 +21566,15 @@ pub fn nt_thread_create(
         wait_len: 0,
         wait_deadline: 0,
         wait_rt: false,
-        restart_nr: u64::MAX,
-        restart_asite: 0,
+        restart_nr: [u64::MAX; RESTART_DEPTH],
+        restart_asite: [0; RESTART_DEPTH],
+        restart_seq: [0; RESTART_DEPTH],
+        restart_arm_tick: 0,
         restart_at: 0,
         restart_rt: false,
         restart_rip: 0,
         restart_knr: 0,
+        restart_kseq: 0,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: p.sigmask,
@@ -40120,12 +40203,15 @@ pub fn exec(img: &[u8], ctx: &mut UCtx, args: &ExecArgs, name: &[u8]) -> bool {
     t.rseq_va = 0; // exec implicitly unregisters rseq
     // A pending SA_RESTART replay dies with the old image — the nr
     // it held belongs to an address space that no longer exists.
-    t.restart_nr = u64::MAX;
-    t.restart_asite = 0;
+    t.restart_nr = [u64::MAX; RESTART_DEPTH];
+    t.restart_asite = [0; RESTART_DEPTH];
+    t.restart_seq = [0; RESTART_DEPTH];
+    t.restart_arm_tick = 0;
     t.restart_at = 0;
     t.restart_rt = false;
     t.restart_rip = 0;
     t.restart_knr = 0;
+    t.restart_kseq = 0;
     // Any armed tsp writeback ticket points at the old image's VA —
     // servicing it in the new space would write a stale deadline
     // into fresh .data/heap.
@@ -41376,12 +41462,15 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         wait_len: 0,
         wait_deadline: 0,
         wait_rt: false,
-        restart_nr: u64::MAX,
-        restart_asite: 0,
+        restart_nr: [u64::MAX; RESTART_DEPTH],
+        restart_asite: [0; RESTART_DEPTH],
+        restart_seq: [0; RESTART_DEPTH],
+        restart_arm_tick: 0,
         restart_at: 0,
         restart_rt: false,
         restart_rip: 0,
         restart_knr: 0,
+        restart_kseq: 0,
         // Dispositions inherit across fork (the Linux semantic);
         // the pending set does not.
         pending: 0,
@@ -41601,12 +41690,15 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         wait_len: 0,
         wait_deadline: 0,
         wait_rt: false,
-        restart_nr: u64::MAX,
-        restart_asite: 0,
+        restart_nr: [u64::MAX; RESTART_DEPTH],
+        restart_asite: [0; RESTART_DEPTH],
+        restart_seq: [0; RESTART_DEPTH],
+        restart_arm_tick: 0,
         restart_at: 0,
         restart_rt: false,
         restart_rip: 0,
         restart_knr: 0,
+        restart_kseq: 0,
         pending: 0,
         pend_src: [SIGSRC_NONE; 31],
         sigmask: p.sigmask,

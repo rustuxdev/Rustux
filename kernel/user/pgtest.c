@@ -39,6 +39,14 @@ static void info_hit(int s, siginfo_t *i, void *u) {
 static void usr1_hit(int s) { (void)s; got_usr1 = 1; }
 static volatile sig_atomic_t got_usr2;
 static void usr2_hit(int s) { (void)s; got_usr2 = 1; }
+static volatile sig_atomic_t inner_done;
+static int inner_fd;
+static void nest_usr1(int s) {
+    (void)s;
+    char b = 0;
+    if (read(inner_fd, &b, 1) == 1)
+        inner_done = b;
+}
 static volatile void *fv_expect;
 static void segv_hit(int s, siginfo_t *i, void *u) {
     (void)s; (void)u;
@@ -627,6 +635,58 @@ int main(void) {
                   sigismember(&cur2, SIGUSR1),
               "sigprocmask strips SIGKILL/SIGSTOP from the mask");
         sigprocmask(SIG_SETMASK, &pprev, NULL);
+    }
+
+    /* --- run-355: nested-handler restart arms stack -----------
+       A handler's own restartable wait must not evict the outer
+       frame's arm -- Linux carries each frame's replay in its
+       saved regs. Outer read() on pr (restartable); USR1's
+       SA_RESTART handler read()s pr2; USR2 interrupts THAT.
+       Both must replay: under the old single-slot arm the
+       outer's restart_nr is lost -> -EINTR stands. */
+    {
+        struct timespec t3 = {0, 300000000}; /* 300ms */
+        int pr[2], pr2[2], ready[2];
+        check(pipe(pr) == 0 && pipe(pr2) == 0 && pipe(ready) == 0,
+              "pipes for nested-restart check");
+        inner_fd = pr2[0]; /* before fork -- the handler reads it */
+        inner_done = 0;
+        pid_t n = fork();
+        if (n == 0) {
+            close(ready[0]);
+            struct sigaction a1 = {.sa_handler = nest_usr1};
+            a1.sa_flags = SA_RESTART;
+            sigaction(SIGUSR1, &a1, NULL);
+            struct sigaction a2 = {.sa_handler = usr2_hit};
+            a2.sa_flags = SA_RESTART;
+            sigaction(SIGUSR2, &a2, NULL);
+            char c = 0;
+            write(ready[1], "r", 1);
+            long r = read(pr[0], &c, 1);
+            _exit(r == 1 && c == 'o' && inner_done == 'i' ? 0 : 6);
+        }
+        close(ready[1]);
+        char rc;
+        read(ready[0], &rc, 1);
+        nanosleep(&t3, NULL);
+        kill(n, SIGUSR1);       /* handler blocks on read(pr2) */
+        nanosleep(&t3, NULL);
+        kill(n, SIGUSR2);       /* interrupts it -> own arm slot */
+        nanosleep(&t3, NULL);
+        write(pr2[1], "i", 1);  /* inner replayed read completes */
+        nanosleep(&t3, NULL);
+        write(pr[1], "o", 1);   /* outer replayed read completes */
+        int done = 0, tries = 0;
+        while (tries++ < 30 && (done = waitpid(n, &st, WNOHANG)) == 0)
+            nanosleep(&t3, NULL);
+        check(done == n && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+              "nested restartable waits both replay");
+        kill(n, SIGKILL);
+        waitpid(n, &st, 0);
+        close(pr[0]);
+        close(pr[1]);
+        close(pr2[0]);
+        close(pr2[1]);
     }
 
     /* --- run-101: queued signals, SA_SIGINFO, si fields -------- */
