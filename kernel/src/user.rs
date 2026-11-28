@@ -1531,7 +1531,16 @@ fn pend_exit_sweep(t: &mut Task) {
         nt_thread_dead(t.pid, code);
         nt_proc_dead(t.tgid, t.pid, code);
     }
-    if let Some(n) = task_slot_by_pid(t.pid) {
+    // Resolve by raw pid, NOT task_slot_by_pid — that gate drops
+    // tasks proc_dead sees as reaped (Exited AND orphaned-of-a-dead-
+    // parent), which is exactly the shape a just-killed orphan
+    // wears here: skipping it strands the wait4 parent, the ctid
+    // wake, the fd release, and every child it had.
+    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
+    if let Some(n) = tasks
+        .iter()
+        .position(|s| s.as_ref().is_some_and(|x| x.pid == t.pid))
+    {
         exit_bookkeeping(n);
     }
 }
@@ -2982,6 +2991,12 @@ pub struct Task {
     reqkey_mode: u8,
     /// prctl PR_SET_NO_NEW_PRIVS — sticky bit, fork-inherited.
     nnp: bool,
+    /// prctl PR_SET_PDEATHSIG — signal posted to this task when its
+    /// real parent THREAD dies (Linux forget_original_parent). 0 =
+    /// none. Cleared at fork/clone/thread-create (Linux clears it
+    /// for every new child), preserved across exec like the
+    /// non-setuid path.
+    pdeathsig: u64,
     /// seccomp mode: 0 off, 1 strict, 2 filter.
     seccomp: u8,
     /// SECFILT slot bitmask — this task's stacked filters.
@@ -8837,6 +8852,7 @@ fn load(img: &[u8]) -> Option<Task> {
         session_ring: u16::MAX,
         reqkey_mode: 0,
         nnp: false,
+        pdeathsig: 0,
         seccomp: 0,
         filtmask: 0,
         is_compat: false,
@@ -19699,6 +19715,25 @@ pub fn sys_prctl(op: u64, a2: u64, a3: u64) -> u64 {
             0
         }
         39 => t.nnp as u64, // PR_GET_NO_NEW_PRIVS
+        1 => {
+            // PR_SET_PDEATHSIG — signal posted when the parent
+            // thread dies. valid_signal + 0-to-clear like Linux;
+            // our signal space tops out at 31.
+            if a2 > 31 {
+                return EINVAL;
+            }
+            t.pdeathsig = a2;
+            0
+        }
+        2 => {
+            // PR_GET_PDEATHSIG — writes the current sig as int.
+            if !range_ok_w(a2, 4) {
+                return EFAULT;
+            }
+            // SAFETY: validated writable user range (4 bytes).
+            unsafe { (a2 as *mut u32).write_unaligned(t.pdeathsig as u32) };
+            0
+        }
         _ => EINVAL,
     }
 }
@@ -21593,6 +21628,7 @@ pub fn nt_thread_create(
         session_ring: p.session_ring,
         reqkey_mode: p.reqkey_mode,
         nnp: p.nnp,
+        pdeathsig: 0,
         seccomp: p.seccomp,
         filtmask: p.filtmask,
         is_compat: p.is_compat,
@@ -40631,6 +40667,39 @@ fn exit_bookkeeping(n: usize) {
         t.tgid,
         t.uid,
     );
+    // PR_SET_PDEATHSIG: every child whose REAL parent thread is the
+    // dying task gets its pdeathsig now (Linux forget_original_parent
+    // fires before reparenting — an orphan that outlives its tracer
+    // keeps rppid pointing here, and a traced child keys on rppid).
+    // si_pid/uid carry the dying parent like Linux's SEND_SIG_NOINFO
+    // fill — si_pid is the TGID (leader pid when a non-leader parent
+    // thread dies), si_uid the dying task's uid.
+    for s in tasks.iter_mut().flatten() {
+        if s.pid == cpid || s.state == TaskState::Exited || s.pdeathsig == 0 {
+            continue;
+        }
+        // rppid==0 while traced = PTRACE_TRACEME (tracer IS the
+        // real parent — ppid still names it); ATTACH/SEIZE keep
+        // the real parent in rppid.
+        let real_p = if s.tracer != 0 && s.rppid != 0 {
+            s.rppid
+        } else {
+            s.ppid
+        };
+        if real_p == cpid {
+            let (sig, ppid, puid) = (s.pdeathsig, ctgid as u32, cuid);
+            pend_one(
+                s,
+                sig,
+                SigSrc {
+                    code: 0,
+                    pid: ppid,
+                    uid: puid,
+                    aux: 0,
+                },
+            );
+        }
+    }
     // acct_process(): the exit-time record lands before fds drop —
     // every task accounts (threads included, AGROUP only marks the
     // last-of-group which we don't split out).
@@ -41491,6 +41560,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         session_ring: p.session_ring,
         reqkey_mode: p.reqkey_mode,
         nnp: p.nnp,
+        pdeathsig: 0,
         seccomp: p.seccomp,
         filtmask: p.filtmask,
         is_compat: p.is_compat,
@@ -41721,6 +41791,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         session_ring: p.session_ring,
         reqkey_mode: p.reqkey_mode,
         nnp: p.nnp,
+        pdeathsig: 0,
         seccomp: p.seccomp,
         filtmask: p.filtmask,
         is_compat: p.is_compat,

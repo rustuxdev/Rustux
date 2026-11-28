@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <sys/prctl.h>
 #include <time.h>
 
 static int fails;
@@ -39,6 +40,16 @@ static void info_hit(int s, siginfo_t *i, void *u) {
 static void usr1_hit(int s) { (void)s; got_usr1 = 1; }
 static volatile sig_atomic_t got_usr2;
 static void usr2_hit(int s) { (void)s; got_usr2 = 1; }
+static volatile sig_atomic_t got_pd;
+static volatile sig_atomic_t pd_code, pd_pid;
+static int pd_wfd;
+static void pd_hit(int s, siginfo_t *i, void *u) {
+    (void)s; (void)u;
+    pd_code = i->si_code; pd_pid = i->si_pid;
+    got_pd = 1;
+    char c = 'S';
+    if (write(pd_wfd, &c, 1)) {}
+}
 static volatile sig_atomic_t inner_done;
 static int inner_fd;
 static void nest_usr1(int s) {
@@ -1237,6 +1248,166 @@ int main(void) {
         waitpid(sk, &st, 0);
         close(pp2[0]);
         close(pp2[1]);
+    }
+
+    /* --- run-356: PR_SET_PDEATHSIG — posted when the real parent
+       thread dies; GET reads it back, fork clears it, 0 clears it,
+       no retrofire for an already-dead parent. ---------------- */
+    {
+        int v = -1;
+        check(prctl(PR_SET_PDEATHSIG, SIGUSR1, 0, 0, 0) == 0 &&
+              prctl(PR_GET_PDEATHSIG, &v, 0, 0, 0) == 0 &&
+              v == SIGUSR1, "pdeathsig set/get roundtrip");
+        errno = 0;
+        check(prctl(PR_SET_PDEATHSIG, 64, 0, 0, 0) == -1 &&
+              errno == EINVAL, "pdeathsig 64 -> EINVAL");
+        check(prctl(PR_SET_PDEATHSIG, 0, 0, 0) == 0 &&
+              prctl(PR_GET_PDEATHSIG, &v, 0, 0, 0) == 0 &&
+              v == 0, "pdeathsig 0 clears");
+        /* fork clears: armed parent -> child's GET reads 0. */
+        check(prctl(PR_SET_PDEATHSIG, SIGUSR1, 0, 0, 0) == 0,
+              "arm for fork-clear check");
+        pid_t fc = fork();
+        if (fc == 0) {
+            int cv = -1;
+            prctl(PR_GET_PDEATHSIG, &cv, 0, 0, 0);
+            _exit(cv == 0 ? 0 : 3);
+        }
+        check(waitpid(fc, &st, 0) == fc && WEXITSTATUS(st) == 0,
+              "fork clears child pdeathsig");
+        check(prctl(PR_SET_PDEATHSIG, 0, 0, 0) == 0,
+              "parent disarms");
+    }
+    /* Delivery + si shape: grandchild armed under a dying middle
+       parent gets the sig; si_code=SI_USER, si_pid=middle pid —
+       Linux's SEND_SIG_PRIV shape. The orphan reports over a pipe
+       (waitpid can't reap a reparented grandchild). */
+    {
+        int pd[2], arm[2];
+        check(pipe(pd) == 0 && pipe(arm) == 0, "pdeathsig pipe");
+        pd_wfd = pd[1];
+        pid_t mid = fork();
+        if (mid > 0) {
+            /* only mid reads arm[] and only outer reads pd[] — no
+               byte-steal race; EOF on a missing verdict, not a hang */
+            close(pd[1]); close(arm[0]); close(arm[1]);
+        }
+        if (mid == 0) {
+            close(pd[0]);
+            pid_t inn = fork();
+            if (inn == 0) {
+                close(arm[0]);
+                struct sigaction sa = {0};
+                sa.sa_sigaction = pd_hit;
+                sa.sa_flags = SA_SIGINFO;
+                sigaction(SIGUSR1, &sa, NULL);
+                pid_t mpid = getppid();
+                if (prctl(PR_SET_PDEATHSIG, SIGUSR1, 0, 0, 0)) _exit(2);
+                char r = 'R';
+                if (write(arm[1], &r, 1)) {}
+                for (int i = 0; i < 300 && !got_pd; i++) {
+                    struct timespec ts = {0, 10000000};
+                    nanosleep(&ts, NULL);
+                }
+                /* handler wrote 'S' on delivery; verify si fields */
+                char c = (got_pd && pd_code == SI_USER &&
+                          pd_pid == mpid) ? 'V' : 'T';
+                if (write(pd[1], &c, 1)) {}
+                _exit(0);
+            }
+            close(arm[1]);
+            char c;
+            ssize_t _r = read(arm[0], &c, 1); /* wait for armed */
+            (void)_r;
+            _exit(0); /* middle dies -> grandchild reparents+fires */
+        }
+        char c = 0;
+        check(read(pd[0], &c, 1) == 1 && c == 'S',
+              "pdeathsig fires on parent death");
+        c = 0;
+        check(read(pd[0], &c, 1) == 1 && c == 'V',
+              "pdeathsig si_code=SI_USER si_pid=parent");
+        waitpid(mid, &st, 0);
+        close(pd[0]);
+    }
+    /* No retrofire: orphan arms AFTER its parent is already dead —
+       Linux only fires on the death event. */
+    {
+        int pd[2];
+        check(pipe(pd) == 0, "no-retrofire pipe");
+        pd_wfd = pd[1];
+        pid_t mid = fork();
+        if (mid > 0) close(pd[1]);
+        if (mid == 0) {
+            pid_t inn = fork();
+            if (inn == 0) {
+                struct timespec ts = {0, 300000000};
+                nanosleep(&ts, NULL); /* middle long dead */
+                struct sigaction sa = {0};
+                sa.sa_sigaction = pd_hit;
+                sa.sa_flags = SA_SIGINFO;
+                sigaction(SIGUSR1, &sa, NULL);
+                prctl(PR_SET_PDEATHSIG, SIGUSR1, 0, 0, 0);
+                for (int i = 0; i < 80 && !got_pd; i++) {
+                    struct timespec t2 = {0, 10000000};
+                    nanosleep(&t2, NULL);
+                }
+                char c = got_pd ? 'F' : 'N';
+                if (write(pd[1], &c, 1)) {}
+                _exit(0);
+            }
+            _exit(0); /* middle dies immediately */
+        }
+        char c = 0;
+        check(read(pd[0], &c, 1) == 1 && c == 'N',
+              "no retrofire for already-dead parent");
+        waitpid(mid, &st, 0);
+        close(pd[0]);
+        close(pd[1]);
+    }
+
+    /* run-356 audit V-1: a fatal pdeathsig on a PAUSED child kills
+       it inline (maybe_deliver inside pend_one) — the dead child's
+       own exit bookkeeping must still orphan ITS children. 'p'
+       means sub's ppid is still pinned to the dead victim. */
+    {
+        int pd[2], arm[2];
+        check(pipe(pd) == 0 && pipe(arm) == 0, "v1 pipes");
+        pid_t mid = fork();
+        if (mid > 0) {
+            close(pd[1]); close(arm[0]); close(arm[1]);
+        }
+        if (mid == 0) {
+            close(pd[0]);
+            pid_t inn = fork();
+            if (inn == 0) {
+                close(arm[0]);
+                pid_t sub = fork();
+                if (sub == 0) {
+                    /* great-grandchild: outlive both parents,
+                       report ppid — 0 iff bookkeeping ran */
+                    struct timespec ts = {1, 500000000};
+                    nanosleep(&ts, NULL);
+                    char c = getppid() == 0 ? 'P' : 'p';
+                    if (write(pd[1], &c, 1)) {}
+                    _exit(0);
+                }
+                prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+                char r = 'R';
+                if (write(arm[1], &r, 1)) {}
+                for (;;) pause(); /* SigWait -> inline kill */
+            }
+            close(arm[1]);
+            char c;
+            ssize_t _r = read(arm[0], &c, 1); /* wait for armed */
+            (void)_r;
+            _exit(0); /* mid dies -> inn SIGKILL'd inline */
+        }
+        char c = 0;
+        check(read(pd[0], &c, 1) == 1 && c == 'P',
+              "fatal pdeathsig still orphans grandchildren");
+        waitpid(mid, &st, 0);
+        close(pd[0]);
     }
 
     printf("pgtest: %d failures, done\n", fails);
