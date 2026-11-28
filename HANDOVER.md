@@ -9755,3 +9755,59 @@ scope.
   bookkeeping bug via the great-grandchild's ppid readback.
 - Gates: PASS 127 tasks frames zero leak zero FAIL (356c/d);
   pgtest 0 failures incl. all pdeathsig checks.
+
+## run-357 — signal send permissions (kill_ok_by_cred)
+
+- kill() had no permission model at all — any task could signal
+  any other, and kill(pid,0) answered 0 for every live pid where
+  Linux answers EPERM. tgkill silently ignored its tgid argument
+  (a foreign tid was killed instead of ESRCH'd).
+- New kill_permitted(): the single-uid-slot reduction of
+  check_kill_permission — uid 0 passes everything, same-tgid
+  always (a process signals its own threads), same-uid passes,
+  SIGCONT to a same-session task is the one cross-uid allowance.
+  Kernel-internal posts bypass (kill_pgrp, pend_one, pdeathsig,
+  SIGCHLD); stdin_sig's blocked-reader fallback moved off kill()
+  to a direct pend_one so the ldisc keystroke is never uid-gated.
+- kill_impl pid sets now match Linux kill_something_info:
+  -1 excludes the caller's whole TGID + pid<=1 and returns 0
+  whenever any candidate exists (retval quirk: denied sends
+  don't move the result); group kills are last-error-wins like
+  __kill_pgrp_info; pid>0 is strict ESRCH/EPERM/0. sys_tgkill
+  EINVALs on either 0 id and ESRCHs a tid outside tgid.
+- sigqueue_one (rt_sigqueueinfo/tgsigqueueinfo) gets the same
+  gate: EPERM when the target exists but is denied.
+- pidfd_send_signal rides kill() — gated for free.
+- Test (credtest +4): nonroot child -> parent kill/sig0 EPERM +
+  SIGCONT same-session ok + self-probe; tgkill EINVAL/wrong-tgid
+  ESRCH/cross-uid EPERM; kill(-1) broadcast delivers to a same-uid
+  sibling but not the uid-0 parent (arm-pipe sync — the uid filter
+  is send-time, an unarmed sibling is denied not pended).
+- gate-357b also hit ptrtest's suspend-stop bounded race
+  (SIGSTOP lands before pause arms — self-documented flake);
+  clean on re-gate.
+- cve-now sweep: kill-permission class — no applicable CVEs.
+- Audit (run-115, scoped quick): hunter FIX -
+  F-1 sys_tgkill/tkill accepted negative ids straight into
+  kill_impl: tgkill(g,-1) == kill(-1) broadcast with the tgid
+  gate skipped, i64::MIN wrapped (-pid). Now pid_t-truncated
+  and <=0 EINVAL like Linux; credtest asserts -1/-2 EINVAL.
+  F-2 group-kill ret was last-member-wins; Linux
+  __kill_pgrp_info is success|=any-send-ok (ANY permitted
+  member answers 0). F-3 missing-caller-slot defaults were
+  fail-open (uid 0) -> let-else ESRCH. si_pid/si_uid
+  provenance fixed to Linux values (caller tgid/uid for
+  kill-family; verbatim user copy for queued signals).
+  Critic DOCUMENT: C-1..C-3 errno-ordering/pid_t-truncation
+  polish in sigqueue_one (EINVAL only on the tgsigqueueinfo
+  path, before the si_code check; has_tg flag replaces the
+  u64::MAX sentinel); C-4 coverage gap -> credtest gained
+  kill(-pgid) any-permitted->0 + rt_sigqueueinfo cross-uid
+  EPERM checks. Verifier PASS, zero findings; documented
+  residuals: errno precedence cosmetics (sig>31 EINVAL
+  precedes ESRCH/EFAULT/EPERM where Linux orders them
+  last), and the pre-existing soft-credential model
+  (unrestricted setuid means kill_permitted reads a
+  self-asserted uid — structural to the root model).
+- Gates: PASS 127 tasks frames zero leak zero FAIL (357d/e);
+  credtest 0 failures incl. all new checks.
