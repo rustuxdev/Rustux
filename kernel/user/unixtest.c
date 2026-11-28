@@ -11,6 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -30,6 +31,57 @@ static void check(int ok, const char *what) {
                      what, ok ? "ok" : "FAIL");
     say(buf);
     if (!ok) fails++;
+}
+
+/* CLONE_FILES thread parked in a unix op; the shared-table parent
+   closes BOTH conn ends underneath it — pre-fix unix_sock_close
+   freed the conn before unix_wake ran, whose dead-slot early-return
+   stranded the armed waiter forever. sop: 0=send->EPIPE,
+   1=recv->EOF, 2=sendmsg+rights->EPIPE, 3=poll->ready,
+   4=connect->EBADF. */
+static volatile int sfd, sop, sdone, saux, sarm;
+static volatile long sres;
+static struct sockaddr_un ssun;
+static socklen_t ssunlen;
+static int strand_thr(void *p) {
+    (void)p;
+    long r;
+    sarm = 1;        /* at the syscall boundary — parent may act */
+    if (sop == 0) {
+        char one = 's';
+        r = send(sfd, &one, 1, 0);
+    } else if (sop == 1) {
+        char one;
+        r = recv(sfd, &one, 1, 0);
+    } else if (sop == 3) {
+        struct pollfd pf;
+        pf.fd = sfd; pf.events = POLLIN; pf.revents = 0;
+        r = poll(&pf, 1, -1);
+        if (r > 0 && !pf.revents)
+            r = -77; /* claimed ready but nothing reported */
+    } else if (sop == 4) {
+        r = connect(sfd, (struct sockaddr *)&ssun, ssunlen);
+    } else {
+        struct msghdr m;
+        struct iovec io;
+        char one = 'k';
+        char ct[CMSG_SPACE(sizeof(int))];
+        memset(&m, 0, sizeof(m));
+        memset(ct, 0, sizeof(ct));
+        io.iov_base = &one; io.iov_len = 1;
+        m.msg_iov = &io; m.msg_iovlen = 1;
+        m.msg_control = ct; m.msg_controllen = sizeof(ct);
+        struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+        h->cmsg_level = SOL_SOCKET;
+        h->cmsg_type = SCM_RIGHTS;
+        h->cmsg_len = CMSG_LEN(sizeof(int));
+        int af = saux;
+        memcpy(CMSG_DATA(h), &af, sizeof(int));
+        r = sendmsg(sfd, &m, 0);
+    }
+    sres = r < 0 ? errno : r;
+    sdone = 1;
+    return 0;
 }
 
 static socklen_t unaddr(struct sockaddr_un *u, const char *path) {
@@ -143,8 +195,34 @@ int main(void) {
     check(read(sv[0], buf, 1) == 1, "pair poll drain");
     check(shutdown(sv[1], SHUT_WR) == 0, "shutdown peer wr");
     check(read(sv[0], buf, 1) == 0, "peer read EOF");
-    check(write(sv[0], "x", 1) < 0 && errno == EPIPE, "write EPIPE");
+    /* peer SHUT_WR: its READ half is still open — my write
+       succeeds on Linux (send EPIPEs only on peer close or
+       peer SHUT_RD). */
+    check(write(sv[0], "x", 1) == 1, "write to shutwr peer ok");
+    /* peer SHUT_RD: my write EPIPEs. */
+    check(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "re-pair");
+    check(shutdown(sv[1], SHUT_RD) == 0, "shutdown peer rd");
+    check(write(sv[0], "x", 1) < 0 && errno == EPIPE,
+          "write to shutrd peer EPIPE");
     close(sv[0]); close(sv[1]);
+    /* own SHUT_WR kills MY send half too — EPIPE on the same
+       socket whose peer can still read. */
+    check(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "re-pair3");
+    check(shutdown(sv[0], SHUT_WR) == 0, "own shut wr");
+    check(write(sv[0], "x", 1) < 0 && errno == EPIPE,
+          "send on own shutwr EPIPE");
+    check(read(sv[1], buf, 1) == 0, "peer reads EOF after");
+    close(sv[0]); close(sv[1]);
+    /* peer data survives: A shut(WR) + B close keeps the conn —
+       A still drains B's queued bytes before EOF. */
+    check(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "re-pair2");
+    check(write(sv[1], "q", 1) == 1, "queue byte");
+    check(shutdown(sv[0], SHUT_WR) == 0, "A shut wr");
+    check(close(sv[1]) == 0, "B close");
+    check(read(sv[0], buf, 1) == 1 && buf[0] == 'q',
+          "queued byte survives teardown");
+    check(read(sv[0], buf, 1) == 0, "then EOF");
+    close(sv[0]);
 
     // --- SOCK_STREAM via bind/listen/connect/accept ---
     int ls = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -191,6 +269,101 @@ int main(void) {
           un.sun_family == AF_UNIX, "getpeername unnamed peer");
     close(as); close(cs);
     check(read(ls, buf, 1) < 0 && errno == ENOTCONN, "listen read");
+
+    // --- backlog holds the conn: pre-accept sends + dead
+    //     connector teardown ---
+    {
+        int cb = socket(AF_UNIX, SOCK_STREAM, 0);
+        unaddr(&un, "/ux_l_test");
+        check(connect(cb, (struct sockaddr *)&un, sizeof(un)) == 0,
+              "bk connect enqueues");
+        /* send BEFORE accept — the backlog holds side 1 so the
+           peer "exists"; bytes must queue for the acceptor. */
+        check(write(cb, "b", 1) == 1, "send before accept lands");
+        int ab = accept(ls, NULL, NULL);
+        check(ab >= 0, "accept after queued send");
+        check(read(ab, buf, 1) == 1 && buf[0] == 'b',
+              "pre-accept byte delivered");
+        close(ab);
+        /* connector dies while still backlogged: the conn must
+           survive for accept (Linux: accepted fd reads EOF,
+           writes EPIPE) — and a fresh socketpair reusing the conn
+           slot must NOT splice its data into the accept. */
+        int cd = socket(AF_UNIX, SOCK_STREAM, 0);
+        check(connect(cd, (struct sockaddr *)&un, sizeof(un)) == 0,
+              "bk connect2");
+        close(cd); /* dies on the backlog */
+        int sv2[2];
+        check(socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0,
+              "slot-reuse pair");
+        check(write(sv2[0], "S", 1) == 1, "splice probe byte");
+        int ad = accept(ls, NULL, NULL);
+        check(ad >= 0, "accept dead connector");
+        /* reads EOF — if the conn index spliced into sv2's conn,
+           this would deliver 'S' instead */
+        check(read(ad, buf, 1) == 0, "dead connector EOF no splice");
+        check(read(sv2[1], buf, 1) == 1 && buf[0] == 'S',
+              "pair byte still owns conn");
+        close(ad); close(sv2[0]); close(sv2[1]);
+        close(cb);
+        /* own SHUT_RD: reads EOF even with the peer alive */
+        check(socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0,
+              "shutrd pair");
+        check(shutdown(sv2[0], SHUT_RD) == 0, "own shut rd");
+        check(read(sv2[0], buf, 1) == 0, "own shutrd reads EOF");
+        close(sv2[0]); close(sv2[1]);
+    }
+
+    // --- listener close: backlogged conns lose their side-1
+    //     prospect — connector reads EOF, sends EPIPE ---
+    {
+        int cc = socket(AF_UNIX, SOCK_STREAM, 0);
+        unaddr(&un, "/ux_l_test");
+        check(connect(cc, (struct sockaddr *)&un, sizeof(un)) == 0,
+              "lc connect backlogged");
+        check(close(ls) == 0, "listener close");
+        /* nonblocking so a regression answers EAGAIN not a hang */
+        fcntl(cc, F_SETFL, O_NONBLOCK);
+        check(read(cc, buf, 1) == 0, "lc connector reads EOF");
+        check(write(cc, "x", 1) < 0 && errno == EPIPE,
+              "lc connector sends EPIPE");
+        close(cc);
+    }
+
+    // --- parked connect whose fd dies via the shared table ---
+    {
+        int ls3 = socket(AF_UNIX, SOCK_STREAM, 0);
+        unaddr(&un, "/ux_l3_test");
+        check(bind(ls3, (struct sockaddr *)&un, sizeof(un)) == 0 &&
+              listen(ls3, 4) == 0, "lc3 listener");
+        int fill[4];
+        for (int i = 0; i < 4; i++) {
+            fill[i] = socket(AF_UNIX, SOCK_STREAM, 0);
+            check(connect(fill[i], (struct sockaddr *)&un,
+                          sizeof(un)) == 0, "fill backlog");
+        }
+        /* backlog full — this connect parks */
+        sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        memcpy(&ssun, &un, sizeof(un));
+        ssunlen = sizeof(un);
+        sop = 4; sres = -7; sdone = 0; sarm = 0;
+        static char sstk2[8192] __attribute__((aligned(16)));
+        int tp = clone(strand_thr, sstk2 + sizeof(sstk2),
+                       CLONE_VM | CLONE_SIGHAND | CLONE_THREAD
+                       | CLONE_FILES, 0);
+        check(tp > 0, "conn thread cloned");
+        struct timespec y = {0, 5 * 1000 * 1000};
+        for (int k = 0; k < 400 && !sarm; k++)
+            nanosleep(&y, NULL);     /* wait for syscall boundary */
+        nanosleep(&y, NULL);         /* let it park */
+        close(sfd);                  /* sock dies under the wait */
+        for (int k = 0; k < 400 && !sdone; k++)
+            nanosleep(&y, NULL);
+        check(sdone && sres == EBADF,
+              "parked connect dead-fd EBADF");
+        close(ls3);
+        for (int i = 0; i < 4; i++) close(fill[i]);
+    }
 
     // --- SOCK_DGRAM named + abstract ---
     int da = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -528,6 +701,86 @@ int main(void) {
         check(socketpair(AF_UNIX, SOCK_DGRAM, 0, dp) == 0,
               "ofds not exhausted");
         close(dp[0]); close(dp[1]);
+    }
+
+    // --- shared-table close resolves parked waiters ---
+    // Pre-fix the conn was taken before unix_wake, whose dead-slot
+    // early-return stranded armed waiters (and leaked the stage).
+    {
+        char fb2[1024];
+        memset(fb2, 's', sizeof(fb2));
+        static char sstk[8192] __attribute__((aligned(16)));
+        static const struct {
+            int op; long want; const char *what;
+        } cases[4] = {
+            {0, EPIPE, "shared-close parked send EPIPE"},
+            {1, 0, "shared-close parked recv EOF"},
+            {2, EPIPE, "shared-close parked sendmsg EPIPE"},
+            {3, -1, "shared-close parked poll wakes"},
+        };
+        for (int i = 0; i < 4; i++) {
+            int sp[2], aux[2];
+            check(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0 &&
+                  socketpair(AF_UNIX, SOCK_DGRAM, 0, aux) == 0,
+                  "strand pair");
+            if (cases[i].op != 1) {
+                /* fill the ring so the send parks */
+                fcntl(sp[0], F_SETFL, O_NONBLOCK);
+                ssize_t w;
+                do {
+                    w = write(sp[0], fb2, sizeof(fb2));
+                } while (w > 0);
+                fcntl(sp[0], F_SETFL, 0);
+            }
+            sfd = sp[0]; saux = aux[1];
+            sop = cases[i].op; sres = -7; sdone = 0; sarm = 0;
+            int tp = clone(strand_thr, sstk + sizeof(sstk),
+                           CLONE_VM | CLONE_SIGHAND | CLONE_THREAD
+                           | CLONE_FILES, 0);
+            check(tp > 0, "strand thread cloned");
+            struct timespec y = {0, 5 * 1000 * 1000};
+            for (int k = 0; k < 400 && !sarm; k++)
+                nanosleep(&y, NULL); /* wait for syscall boundary */
+            nanosleep(&y, NULL);         /* let it park */
+            close(sp[0]);                /* own side first... */
+            close(sp[1]);                /* ...peer frees the conn */
+            for (int k = 0; k < 400 && !sdone; k++)
+                nanosleep(&y, NULL);
+            check(sdone &&
+                  (cases[i].op == 3 ? sres >= 1
+                                    : sres == cases[i].want),
+                  cases[i].what);
+            close(aux[0]); close(aux[1]);
+        }
+    }
+
+    // --- parked poller wakes on stream data arrival ---
+    // unix_wake funnels every push; pre-fix nothing re-armed the
+    // epoll edge / re-evaled blocked pollers, so a poll(-1) on a
+    // stream fd slept until the peer closed.
+    {
+        int sp[2];
+        check(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0,
+              "wake-poll pair");
+        static char sstk3[8192] __attribute__((aligned(16)));
+        sfd = sp[0]; sop = 3; sres = -7; sdone = 0; sarm = 0;
+        int tp = clone(strand_thr, sstk3 + sizeof(sstk3),
+                       CLONE_VM | CLONE_SIGHAND | CLONE_THREAD
+                       | CLONE_FILES, 0);
+        check(tp > 0, "wake-poll thread");
+        struct timespec y = {0, 5 * 1000 * 1000};
+        for (int k = 0; k < 400 && !sarm; k++)
+            nanosleep(&y, NULL);     /* wait for syscall boundary */
+        nanosleep(&y, NULL);            /* let it park */
+        check(write(sp[1], "d", 1) == 1, "wake-poll push");
+        for (int k = 0; k < 400 && !sdone; k++)
+            nanosleep(&y, NULL);
+        check(sdone && sres >= 1,
+              "parked poll wakes on stream data");
+        char b;
+        check(read(sp[0], &b, 1) == 1 && b == 'd',
+              "wake-poll byte");
+        close(sp[0]); close(sp[1]);
     }
 
     close(ls);

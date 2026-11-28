@@ -29463,18 +29463,24 @@ fn ofd_revents(pend: u32, oi: u16, events: u16) -> u16 {
                             Some(c) => {
                                 let s2 = (*side & 1) as usize;
                                 let mut r = 0u16;
+                                let peer_gone =
+                                    !unix_side_live(*conn, 1 - s2);
                                 if c.r[s2].tail > c.r[s2].head
                                     || !c.open[1 - s2]
+                                    || c.rd_shut[s2]
                                 {
                                     r |= POLLIN;
                                 }
-                                if c.open[1 - s2]
-                                    && c.r[1 - s2].tail - c.r[1 - s2].head
+                                if c.open[s2]
+                                    && !peer_gone
+                                    && !c.rd_shut[1 - s2]
+                                    && c.r[1 - s2].tail
+                                        - c.r[1 - s2].head
                                         < UNIX_BUF
                                 {
                                     r |= POLLOUT;
                                 }
-                                if !c.open[1 - s2] {
+                                if peer_gone {
                                     r |= POLLHUP;
                                 }
                                 r
@@ -36687,12 +36693,91 @@ fn unix_dgram_push(
     true
 }
 
+/// Is conn still queued on a listener's accept backlog? The
+/// side-1 sock doesn't exist until accept mints it, but the
+/// backlog entry holds the conn — it must not die and its
+/// queued side-0 sends must land for the eventual acceptor.
+fn unix_conn_backlogged(conn: usize) -> bool {
+    unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+        .iter()
+        .flatten()
+        .any(|k| match &k.kind {
+            UnixKind::Listen { backlog, n } => {
+                backlog[..*n].contains(&conn)
+            }
+            _ => false,
+        })
+}
+
+/// True while a sock still holds `side` of conn — shutdown(WR)
+/// leaves the sock live (the half can still read); only close
+/// removes it. The peer-can-receive test senders need is
+/// `unix_side_live(conn, 1-s) && !rd_shut[1-s]` — NOT open[1-s],
+/// which conflates close with peer-SHUT_WR. Side 1 is also live
+/// while the conn sits on an accept backlog.
+fn unix_side_live(conn: usize, side: usize) -> bool {
+    let held = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+        .iter()
+        .flatten()
+        .any(|k| {
+            matches!(k.kind, UnixKind::Stream { conn: c2, side: sd }
+                if c2 == conn && sd as usize & 1 == side & 1)
+        });
+    held || (side & 1 == 1 && unix_conn_backlogged(conn))
+}
+
 /// Wake the readers/writers that new room or EOF on conn frees:
 /// data written toward side s wakes UnixRecv(conn, s); a drain by
 /// side s frees ring space that wakes UnixSend(conn, 1-s); a side
 /// closing wakes BOTH (EOF for readers, EPIPE for writers).
 fn unix_wake(conn: usize) {
     if unsafe { (*core::ptr::addr_of!(UNIXCONNS))[conn].is_none() } {
+        // Dead conn — resolve any armed stragglers instead of
+        // skipping them: a waiter left here can never fire.
+        let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+        for t in tasks.iter_mut().flatten() {
+            if t.state != TaskState::Blocked {
+                continue;
+            }
+            match t.wait_on {
+                WaitOn::UnixSend(wc, _) | WaitOn::UnixSendK(wc, _)
+                    if wc == conn =>
+                {
+                    t.ctx.rax = (-32i64) as u64; // EPIPE
+                    if let WaitOn::UnixSendK(_, _) = t.wait_on {
+                        let p = t.wait_ptr;
+                        let al = t.wait_len as usize;
+                        t.wait_on = WaitOn::None;
+                        t.wait_ptr = 0;
+                        t.wait_len = 0;
+                        let dl = unsafe {
+                            (p as *const u16).read_unaligned()
+                        } as usize;
+                        if let Some(f) = staged_fp(p, dl) {
+                            scm_release(f);
+                        }
+                        unsafe { stage_free(al, p as *mut u8) };
+                    }
+                    t.wait_on = WaitOn::None;
+                    t.wait_deadline = 0;
+                    t.state = TaskState::Runnable;
+                }
+                WaitOn::UnixRecv(wc, _) if wc == conn => {
+                    t.ctx.rax = 0; // EOF
+                    t.wait_on = WaitOn::None;
+                    t.wait_deadline = 0;
+                    t.state = TaskState::Runnable;
+                }
+                WaitOn::UnixRecvM(wc, _) if wc == conn => {
+                    t.ctx.rax = 0; // EOF
+                    umsg_set_flags(t.pml4, t.wait_ptr, 0);
+                    t.wait_on = WaitOn::None;
+                    t.wait_deadline = 0;
+                    t.state = TaskState::Runnable;
+                }
+                _ => {}
+            }
+        }
         return;
     }
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
@@ -36705,13 +36790,18 @@ fn unix_wake(conn: usize) {
             // answer EOF when the peer's write-halve is gone.
             WaitOn::UnixRecv(wc, side) if wc == conn => {
                 let s = side as usize & 1;
-                let c = unsafe {
+                let Some(c) = (unsafe {
                     (*core::ptr::addr_of_mut!(UNIXCONNS))[conn]
                         .as_mut()
-                        .unwrap()
+                }) else {
+                    t.ctx.rax = 0; // conn gone — EOF
+                    t.wait_on = WaitOn::None;
+                    t.wait_deadline = 0;
+                    t.state = TaskState::Runnable;
+                    continue;
                 };
                 let avail = c.r[s].tail - c.r[s].head;
-                if avail == 0 && c.open[1 - s] {
+                if avail == 0 && c.open[1 - s] && !c.rd_shut[s] {
                     continue;
                 }
                 if avail == 0 {
@@ -36783,14 +36873,31 @@ fn unix_wake(conn: usize) {
             // peer's close which makes it EPIPE).
             WaitOn::UnixSend(wc, side) if wc == conn => {
                 let s = side as usize & 1;
-                let c = unsafe {
+                // EPIPE iff my write-half is shut or the peer
+                // can't RECEIVE (sock gone, or peer SHUT_RD).
+                // open[1-s] is the peer's write-half flag — peer
+                // SHUT_WR must not EPIPE a sender (it still reads).
+                let peer_rx = unix_side_live(conn, 1 - s)
+                    && unsafe {
+                        (*core::ptr::addr_of!(UNIXCONNS))[conn]
+                            .as_ref()
+                            .map(|c| c.open[s] && !c.rd_shut[1 - s])
+                            .unwrap_or(false)
+                    };
+                if !peer_rx {
+                    t.ctx.rax = (-32i64) as u64; // EPIPE
+                    t.wait_on = WaitOn::None;
+                    t.wait_deadline = 0;
+                    t.state = TaskState::Runnable;
+                    continue;
+                }
+                let Some(c) = (unsafe {
                     (*core::ptr::addr_of_mut!(UNIXCONNS))[conn]
                         .as_mut()
-                        .unwrap()
+                }) else {
+                    continue;
                 };
-                if !c.open[1 - s] {
-                    t.ctx.rax = (-32i64) as u64; // EPIPE
-                } else {
+                {
                     let free = UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head);
                     // seqpacket: push only when the WHOLE framed
                     // record fits — a half record corrupts the
@@ -36882,11 +36989,14 @@ fn unix_wake(conn: usize) {
                 let dl = unsafe {
                     (t.wait_ptr as *const u16).read_unaligned()
                 } as usize;
-                let open = {
-                    let conns =
-                        unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
-                    conns[conn].as_ref().unwrap().open[1 - s]
-                };
+                // Same sendable test as UnixSend.
+                let open = unix_side_live(conn, 1 - s)
+                    && unsafe {
+                        (*core::ptr::addr_of!(UNIXCONNS))[conn]
+                            .as_ref()
+                            .map(|c| c.open[s] && !c.rd_shut[1 - s])
+                            .unwrap_or(false)
+                    };
                 if !open {
                     t.ctx.rax = (-32i64) as u64; // EPIPE
                     // Same disarm-first order — a released unix
@@ -36970,6 +37080,19 @@ fn unix_wake(conn: usize) {
             _ => {}
         }
     }
+    // Any ring-state change that funnels here (a push landing,
+    // a drain freeing space, a side dying) alters the POLLIN /
+    // POLLOUT answer for BOTH end socks — re-arm edge-triggered
+    // epoll entries on each live sock and re-eval blocked pollers.
+    let socks = unsafe { &*core::ptr::addr_of!(UNIXSOCKS) };
+    for (i, k) in socks.iter().enumerate() {
+        let Some(k) = k else { continue };
+        if matches!(k.kind, UnixKind::Stream { conn: c, .. } if c == conn)
+        {
+            epoll_edge(&FdKind::Unix(i));
+        }
+    }
+    wake_pollers();
 }
 
 /// Mint a fresh UnixSock + OFD + fd inside task `t` — accept's
@@ -37119,8 +37242,14 @@ fn unix_wake_conn(li: usize) {
         });
         backlog[*n] = conn;
         *n += 1;
+        // The sleeper's sock must still be Fresh — the
+        // close-time own-fd sweep resolves a dead-sock waiter,
+        // so an armed UnixConn's slot can't be reused; gate
+        // anyway against a slot hijack.
         if let Some(k) = socks[ui].as_mut() {
-            k.kind = UnixKind::Stream { conn, side: 0 };
+            if matches!(k.kind, UnixKind::Fresh) {
+                k.kind = UnixKind::Stream { conn, side: 0 };
+            }
         }
         t.ctx.rax = 0;
         t.wait_on = WaitOn::None;
@@ -37137,6 +37266,30 @@ fn unix_sock_close(si: usize) {
     let Some(k) = socks.get_mut(si).and_then(|s| s.take()) else {
         return;
     };
+    // A blocked syscall holds no fd ref — a shared-table close
+    // can kill the sock under a waiter armed on THIS index
+    // (parked connect/accept/dgram-recv): resolve it EBADF
+    // instead of stranding it forever. Conn-keyed waits are
+    // resolved by unix_wake in the stream arm below.
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    for t in tasks.iter_mut().flatten() {
+        if t.state != TaskState::Blocked {
+            continue;
+        }
+        let mine = match t.wait_on {
+            WaitOn::UnixConn(_, ui) => ui == si,
+            WaitOn::UnixAccept(wi)
+            | WaitOn::UnixDgram(wi)
+            | WaitOn::UnixDgramM(wi) => wi == si,
+            _ => false,
+        };
+        if mine {
+            t.ctx.rax = (-9i64) as u64; // EBADF
+            t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
+            t.state = TaskState::Runnable;
+        }
+    }
     if let UnixKind::Dgram { .. } = k.kind {
         for slot in unix_dq(si).iter_mut() {
             if let Some(d) = slot.take() {
@@ -37146,13 +37299,40 @@ fn unix_sock_close(si: usize) {
             }
         }
     }
-    if let UnixKind::Listen { .. } = k.kind {
+    if let UnixKind::Listen { backlog, n } = k.kind {
+        // Backlog conns the listener held lose their side-1
+        // prospect forever — mark it dead so connectors read EOF /
+        // send EPIPE (Linux: ECONNRESET) and parked waiters
+        // resolve through unix_wake instead of stranding; conns
+        // whose connector sock is also gone die outright.
+        for conn in backlog.iter().take(n) {
+            if let Some(c) = unsafe {
+                (*core::ptr::addr_of_mut!(UNIXCONNS))[*conn].as_mut()
+            } {
+                c.open[1] = false;
+            }
+            unix_wake(*conn);
+            if !unix_side_live(*conn, 0) {
+                if let Some(c) = unsafe {
+                    (*core::ptr::addr_of_mut!(UNIXCONNS))[*conn]
+                        .take()
+                } {
+                    for dir in c.fp.iter() {
+                        for a in dir.iter().flatten() {
+                            scm_release(a.fds);
+                        }
+                    }
+                }
+            }
+        }
         // Connectors asleep on this listener never get a slot —
         // answer ECONNREFUSED like Linux closing mid-queue.
         let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
         for t in tasks.iter_mut().flatten() {
-            if t.state == TaskState::Blocked
-                && matches!(t.wait_on, WaitOn::UnixConn(wl, _)
+            if t.state != TaskState::Blocked {
+                continue;
+            }
+            if matches!(t.wait_on, WaitOn::UnixConn(wl, _)
                     if wl == si)
             {
                 t.ctx.rax = (-111i64) as u64;
@@ -37166,8 +37346,22 @@ fn unix_sock_close(si: usize) {
         let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
         if let Some(c) = conns.get_mut(conn).and_then(|x| x.as_mut()) {
             c.open[side as usize & 1] = false;
-            if !c.open[0] && !c.open[1] {
-                let c = conns[conn].take().unwrap();
+        }
+        // Wake BEFORE freeing: a parked waiter (e.g. its own fd
+        // closed under it via a shared table) resolves through the
+        // normal arms — senders EPIPE + release their stage,
+        // readers drain or EOF — while the conn record still
+        // exists.
+        unix_wake(conn);
+        // The conn dies with its last SOCK, not its last open[]
+        // flag — shutdown(WR) clears open[] but the peer half may
+        // still hold readable data; a sock scan is the real test.
+        // A backlog slot also holds the conn (accept mints the
+        // side-1 sock later).
+        let dead =
+            !unix_side_live(conn, 0) && !unix_side_live(conn, 1);
+        if dead {
+            if let Some(c) = conns[conn].take() {
                 for dir in c.fp.iter() {
                     for a in dir.iter().flatten() {
                         scm_release(a.fds); // undelivered rights die
@@ -37175,8 +37369,8 @@ fn unix_sock_close(si: usize) {
                 }
             }
         }
-        unix_wake(conn);
     }
+    wake_pollers(); // poll/epoll waiters on this fd re-eval EOF
 }
 
 /// stream recv shared by read/recvfrom — returns the next bytes
@@ -37325,7 +37519,9 @@ fn unix_send_stream(
                     Some(c) => {
                         let s = side & 1;
                         (UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head),
-                         c.open[1 - s])
+                         unix_side_live(conn, 1 - s)
+                             && c.open[s]
+                             && !c.rd_shut[1 - s])
                     }
                     None => (0, false),
                 }
@@ -37394,7 +37590,9 @@ fn unix_send_stream(
                     Some(c) => {
                         let s2 = side & 1;
                         (UNIX_BUF - (c.r[1 - s2].tail - c.r[1 - s2].head),
-                         c.open[1 - s2])
+                         unix_side_live(conn, 1 - s2)
+                             && c.open[s2]
+                             && !c.rd_shut[1 - s2])
                     }
                     None => (0, false),
                 }
@@ -37420,7 +37618,9 @@ fn unix_send_stream(
                 Some(c) => {
                     let s = side & 1;
                     (UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head),
-                     c.open[1 - s])
+                     unix_side_live(conn, 1 - s)
+                         && c.open[s]
+                         && !c.rd_shut[1 - s])
                 }
                 None => (0, false),
             }
@@ -37457,7 +37657,9 @@ fn unix_send_stream(
                     Some(c) => {
                         let s2 = side & 1;
                         (UNIX_BUF - (c.r[1 - s2].tail - c.r[1 - s2].head),
-                         c.open[1 - s2])
+                         unix_side_live(conn, 1 - s2)
+                             && c.open[s2]
+                             && !c.rd_shut[1 - s2])
                     }
                     None => (0, false),
                 }
@@ -37532,7 +37734,10 @@ fn unix_send_stream_slice(
         match conns[conn].as_ref() {
             Some(c) => {
                 (UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head),
-                 c.open[1 - s], c.seq)
+                 unix_side_live(conn, 1 - s)
+                     && c.open[s]
+                     && !c.rd_shut[1 - s],
+                 c.seq)
             }
             None => (0, false, false),
         }
@@ -40207,6 +40412,7 @@ pub fn fd_shutdown(fd: u64, how: u64) -> u64 {
             }
         }
         unix_wake(conn);
+        wake_pollers(); // peer EOF changes readiness
         return 0;
     }
     let Some(si) = (match ofd(t, fd).map(|o| &o.kind) {
