@@ -329,6 +329,242 @@ int main(int argc, char **argv) {
             check(WEXITSTATUS(st2) == 0,
                   "rt_sigqueueinfo: cross-uid EPERM");
         }
+        /* PR_SET_CHILD_SUBREAPER: an orphaned grandchild reparents
+           to the nearest armed ancestor — its getppid lands on us
+           and wait4 collects it (an init-ward orphan would answer
+           ppid 0 and ECHILD the wait). */
+        {
+            int v = -1;
+            check(syscall(SYS_prctl, 36L, 1L, 0, 0, 0) == 0,
+                  "PR_SET_CHILD_SUBREAPER set");
+            check(syscall(SYS_prctl, 37L, &v, 0, 0, 0) == 0 && v == 1,
+                  "PR_GET_CHILD_SUBREAPER reads armed");
+            pid_t me = getpid();
+            int rdy[2];
+            check(pipe(rdy) == 0, "subreaper pipe");
+            pid_t mid = fork();
+            if (mid == 0) {
+                /* a fork'd process must NOT inherit the flag */
+                int mv = -1;
+                syscall(SYS_prctl, 37L, &mv, 0, 0, 0);
+                if (mv != 0) _exit(11);
+                close(rdy[0]);
+                pid_t g = fork();
+                if (g == 0) {
+                    close(rdy[1]);
+                    /* g may not be scheduled until after mid died
+                       and the reparent already landed — poll for
+                       the armed grandparent's pid directly. */
+                    for (int i = 0; i < 200; i++) {
+                        if (getppid() == me)
+                            _exit(0);
+                        struct timespec ts = {0, 5000000};
+                        nanosleep(&ts, NULL);
+                    }
+                    _exit(4);
+                }
+                /* record g's pid for the parent's wait, then die */
+                if (write(rdy[1], &g, sizeof g)) {}
+                close(rdy[1]);
+                _exit(0);
+            }
+            close(rdy[1]);
+            pid_t g = -1;
+            ssize_t gr = read(rdy[0], &g, sizeof g);
+            close(rdy[0]);
+            st2 = 0;
+            waitpid(mid, &st2, 0);
+            check(gr == sizeof g && WEXITSTATUS(st2) == 0,
+                  "subreaper: fork does not inherit flag");
+            st2 = 0;
+            /* g reparented to us — a bounded wait collects it.
+               Broken reparent = ECHILD now or hang-free timeout. */
+            pid_t w = -1;
+            for (int i = 0; i < 200 && w <= 0; i++) {
+                w = waitpid(-1, &st2, WNOHANG);
+                if (w <= 0) {
+                    struct timespec ts = {0, 10000000};
+                    nanosleep(&ts, NULL);
+                }
+            }
+            check(w == g && WEXITSTATUS(st2) == 0,
+                  "subreaper: grandchild wait4-collectible");
+            check(syscall(SYS_prctl, 36L, 0L, 0, 0, 0) == 0 &&
+                  syscall(SYS_prctl, 37L, &v, 0, 0, 0) == 0 && v == 0,
+                  "PR_SET_CHILD_SUBREAPER clears");
+        }
+        /* A TRACED middle ancestor must not derail the reaper
+           walk: P is PTRACE_ATTACH'd by an armed tracer T, so a
+           ppid walk lands g on T — the real-parent (rppid) walk
+           must land it on this task instead. */
+        {
+            check(syscall(SYS_prctl, 36L, 1L, 0, 0, 0) == 0,
+                  "subreaper re-arm for traced-ancestor");
+            pid_t me2 = getpid();
+            int tgo[2], tok[2], gro[2], die[2];
+            check(pipe(tgo) == 0 && pipe(tok) == 0 &&
+                  pipe(gro) == 0 && pipe(die) == 0,
+                  "traced-subreaper pipes");
+            pid_t tr = fork();
+            if (tr == 0) {
+                close(tgo[1]); close(tok[0]); close(die[0]);
+                close(die[1]);
+                /* arm the tracer so the buggy walk lands on it */
+                syscall(SYS_prctl, 36L, 1L, 0, 0, 0);
+                pid_t tp = -1;
+                char st = 'F';
+                if (read(tgo[0], &tp, sizeof tp) == sizeof tp &&
+                    syscall(SYS_ptrace, 16L, tp, 0L, 0L) == 0) {
+                    /* waitpid on a tracee stop needs WUNTRACED */
+                    int tst = 0;
+                    for (int i = 0; i < 400 && st != 'A'; i++) {
+                        if (waitpid(tp, &tst, WNOHANG | WUNTRACED)
+                                == tp &&
+                            WIFSTOPPED(tst))
+                            st = 'A';
+                        else {
+                            struct timespec ts = {0, 5000000};
+                            nanosleep(&ts, NULL);
+                        }
+                    }
+                }
+                if (write(tok[1], &st, 1)) {}
+                /* hold the attach until released below */
+                char rel;
+                if (read(tgo[0], &rel, 1)) {}
+                _exit(0);
+            }
+            pid_t pp = fork();
+            if (pp == 0) {
+                /* P — the traced middle ancestor */
+                close(tgo[0]); close(tgo[1]); close(tok[0]);
+                close(gro[0]); close(die[1]);
+                pid_t mid2 = fork();
+                if (mid2 == 0) {
+                    /* mid — the dying task; parent is traced P */
+                    close(die[1]); close(tok[1]); close(tgo[0]);
+                    close(tgo[1]); close(tok[0]);
+                    pid_t mp = getpid(); /* mid's own pid — what
+                                            g's ppid must leave */
+                    pid_t g2 = fork();
+                    if (g2 == 0) {
+                        /* g — the orphan; report the ppid the
+                           reparent sweep gives it (it may only
+                           be scheduled after mid's death, so
+                           compare against mid's pid directly) */
+                        for (int i = 0; i < 400; i++) {
+                            pid_t np2 = getppid();
+                            if (np2 != mp) {
+                                if (write(gro[1], &np2,
+                                          sizeof np2)) {}
+                                _exit(0);
+                            }
+                            struct timespec ts = {0, 5000000};
+                            nanosleep(&ts, NULL);
+                        }
+                        _exit(7);
+                    }
+                    char b;
+                    if (read(die[0], &b, 1)) {}
+                    _exit(0);
+                }
+                /* ready — hand off, then spin until killed */
+                if (write(tok[1], "R", 1)) {}
+                close(tok[1]); /* a dead tracer must not pin the
+                                  parent's read open */
+                for (;;) {
+                    struct timespec ts = {0, 20000000};
+                    nanosleep(&ts, NULL);
+                }
+            }
+            close(gro[1]); close(die[0]); close(tok[1]);
+            close(tgo[0]);
+            /* wait for P's chain, hand P to the tracer */
+            char a = 0;
+            if (read(tok[0], &a, 1) != 1 || a != 'R')
+                check(0, "traced-subreaper chain ready");
+            if (write(tgo[1], &pp, sizeof pp)) {}
+            a = 0;
+            if (read(tok[0], &a, 1) != 1 || a != 'A')
+                check(0, "tracer attached to mid-ancestor");
+            /* P attached (stopped): now mid dies */
+            if (write(die[1], "x", 1)) {}
+            pid_t np2 = -1;
+            ssize_t nr = read(gro[0], &np2, sizeof np2);
+            check(nr == sizeof np2 && np2 == me2 && np2 != tr,
+                  "subreaper: traced ancestor -> real-parent walk");
+            /* release the tracer; its exit detaches P back to us */
+            if (write(tgo[1], "x", 1)) {}
+            close(tgo[1]); close(tok[0]); close(gro[0]);
+            close(die[1]);
+            st2 = 0;
+            waitpid(tr, &st2, 0);
+            kill(pp, SIGKILL);
+            st2 = 0;
+            waitpid(pp, &st2, 0);
+            /* drain g + mid (reparented zombies) */
+            while (waitpid(-1, &st2, 0) > 0) {}
+            check(syscall(SYS_prctl, 36L, 0L, 0, 0, 0) == 0,
+                  "subreaper disarm after traced-ancestor");
+        }
+        /* A dying tracer's ZOMBIE tracee must land on its real
+           parent at the tracer's DEATH (Linux exit_ptrace), not
+           at its reap — a dead-ppid zombie is freed by the next
+           scheduler reap sweep and wait4 answers ECHILD. Checked
+           BEFORE the tracer is reaped, so it discriminates. */
+        {
+            int ch2[2], bk2[2];
+            check(pipe(ch2) == 0 && pipe(bk2) == 0,
+                  "zombie-tracee pipes");
+            pid_t tr2 = fork();
+            if (tr2 == 0) {
+                close(ch2[1]); close(bk2[0]);
+                pid_t tc = -1;
+                char st = 'F';
+                if (read(ch2[0], &tc, sizeof tc) == sizeof tc &&
+                    syscall(SYS_ptrace, 16L, tc, 0L, 0L) == 0) {
+                    int tst = 0;
+                    for (int i = 0; i < 400 && st != 'A'; i++) {
+                        if (waitpid(tc, &tst, WNOHANG | WUNTRACED)
+                                == tc &&
+                            WIFSTOPPED(tst))
+                            st = 'A';
+                        else {
+                            struct timespec ts = {0, 5000000};
+                            nanosleep(&ts, NULL);
+                        }
+                    }
+                }
+                if (write(bk2[1], &st, 1)) {}
+                for (;;) pause(); /* killed below */
+            }
+            pid_t cc = fork();
+            if (cc == 0) {
+                for (;;) pause(); /* attach-stopped, then killed */
+            }
+            close(ch2[0]); close(bk2[1]);
+            if (write(ch2[1], &cc, sizeof cc)) {}
+            char a = 0;
+            if (read(bk2[0], &a, 1) != 1 || a != 'A')
+                check(0, "tracer attached to zombie-candidate");
+            kill(cc, SIGKILL);   /* tracee -> zombie ppid=tr2 */
+            kill(tr2, SIGKILL);  /* tracer dies -> exit_ptrace */
+            pid_t wc = -1;
+            st2 = 0;
+            for (int i = 0; i < 200 && wc <= 0; i++) {
+                wc = waitpid(cc, &st2, WNOHANG);
+                if (wc <= 0) {
+                    struct timespec ts = {0, 10000000};
+                    nanosleep(&ts, NULL);
+                }
+            }
+            check(a == 'A' && wc == cc && WIFSIGNALED(st2) &&
+                  WTERMSIG(st2) == SIGKILL,
+                  "zombie tracee lands on real parent at tracer death");
+            st2 = 0;
+            waitpid(tr2, &st2, 0);
+            while (waitpid(-1, &st2, 0) > 0) {}
+        }
     }
 
     printf("credtest: %d failures\n", fails);

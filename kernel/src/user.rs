@@ -3038,6 +3038,12 @@ pub struct Task {
     /// for every new child), preserved across exec like the
     /// non-setuid path.
     pdeathsig: u64,
+    /// prctl PR_SET_CHILD_SUBREAPER — orphaned descendants reparent
+    /// to the nearest marked ancestor instead of the init-ward
+    /// ppid=0 (Linux has_child_subreaper on the signal struct: a
+    /// fork'd process starts clear, a thread shares the group
+    /// flag).
+    child_subreaper: bool,
     /// seccomp mode: 0 off, 1 strict, 2 filter.
     seccomp: u8,
     /// SECFILT slot bitmask — this task's stacked filters.
@@ -8894,6 +8900,7 @@ fn load(img: &[u8]) -> Option<Task> {
         reqkey_mode: 0,
         nnp: false,
         pdeathsig: 0,
+        child_subreaper: false,
         seccomp: 0,
         filtmask: 0,
         is_compat: false,
@@ -19793,6 +19800,34 @@ pub fn sys_prctl(op: u64, a2: u64, a3: u64) -> u64 {
             0
         }
         39 => t.nnp as u64, // PR_GET_NO_NEW_PRIVS
+        36 => {
+            // PR_SET_CHILD_SUBREAPER — any nonzero arg arms; a
+            // dying child then reparents orphaned descendants to
+            // this task instead of init-ward ppid=0. Linux keeps
+            // the flag on the shared signal_struct — propagate to
+            // every same-tgid member (clone-thread children copy
+            // it at spawn).
+            let tg = t.tgid;
+            let set = a2 != 0;
+            let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+            for s in tasks.iter_mut().flatten() {
+                if s.tgid == tg {
+                    s.child_subreaper = set;
+                }
+            }
+            0
+        }
+        37 => {
+            // PR_GET_CHILD_SUBREAPER — writes the flag as int.
+            if !range_ok_w(a2, 4) {
+                return EFAULT;
+            }
+            // SAFETY: validated writable user range (4 bytes).
+            unsafe {
+                (a2 as *mut u32).write_unaligned(t.child_subreaper as u32)
+            };
+            0
+        }
         1 => {
             // PR_SET_PDEATHSIG — signal posted when the parent
             // thread dies. valid_signal + 0-to-clear like Linux;
@@ -21707,6 +21742,7 @@ pub fn nt_thread_create(
         reqkey_mode: p.reqkey_mode,
         nnp: p.nnp,
         pdeathsig: 0,
+        child_subreaper: p.child_subreaper,
         seccomp: p.seccomp,
         filtmask: p.filtmask,
         is_compat: p.is_compat,
@@ -40730,21 +40766,205 @@ fn die_signal(signo: u64) -> ! {
 /// when a pick-time signal delivery kills a runnable task — a
 /// signal death at pick would otherwise skip the whole zombie/wake
 /// side and strand a wait4-blocked parent forever.
+/// Wake a wait-blocked parent whose target just exited — shared
+/// by the exit path and zombie reparenting (a subreaper can
+/// inherit already-dead children). Returns true when a waiter
+/// consumed the status; Vfork and WaitId-WNOWAIT peeks leave it
+/// consumable and return false.
+fn wake_waiter_for_child(
+    tasks: &mut [Option<Task>; MAX_TASKS],
+    ppid: u64,
+    cpid: u64,
+    cpgid: u64,
+    wstatus: u64,
+    cuid: u32,
+) -> bool {
+    let mut collected = false;
+    for s in tasks.iter_mut() {
+        let Some(p) = s else { continue };
+        // A waitid waiter also needs its WEXITED class bit armed —
+        // a WSTOPPED-only waitid sleeps through an exit like Linux.
+        let wid_hit = p.wait_len & WEXITED != 0
+            && (p.wait_on == WaitOn::WaitIdAny
+                || p.wait_on == WaitOn::WaitIdChild(cpid)
+                || p.wait_on == WaitOn::WaitIdGroup(cpgid));
+        if p.state == TaskState::Blocked
+            && p.pid == ppid
+            && (wid_hit
+                || p.wait_on == WaitOn::Any
+                || p.wait_on == WaitOn::Child(cpid)
+                || p.wait_on == WaitOn::Group(cpgid)
+                || p.wait_on == WaitOn::Vfork(cpid))
+        {
+            if wid_hit {
+                // waitid reports the 128-byte siginfo (validated at
+                // arm) and returns 0 — WNOWAIT peeks: the zombie
+                // stays consumable for a later wait.
+                if p.wait_ptr != 0 {
+                    let (code, st) = cld_code(wstatus);
+                    let rec = fill_sig_rec(
+                        SIGCHLD as u64,
+                        SigSrc {
+                            code,
+                            pid: cpid as u32,
+                            uid: cuid,
+                            aux: st as u64,
+                        },
+                        false,
+                    );
+                    write_task_bytes(p.pml4, p.wait_ptr, &rec);
+                }
+                p.ctx.rax = 0;
+            } else {
+                // wait4 returns the child's pid; its status was
+                // already validated writable when the parent blocked.
+                p.ctx.rax = cpid;
+                if p.wait_ptr != 0 {
+                    if let Some(pa) = translate(p.pml4, p.wait_ptr) {
+                        // SAFETY: pa is a translated, present user frame.
+                        unsafe {
+                            ((crate::mm::pmap(pa)) as *mut u32)
+                                .write_unaligned((wstatus & 0xffff) as u32)
+                        };
+                    }
+                }
+            }
+            // A Vfork wake only resumes the suspended parent — it
+            // collected no status, so the zombie stays waitable for
+            // the parent's own wait4. A waitid-WNOWAIT peek is the
+            // same kind of non-consume. Real waits mark the zombie
+            // collected so a second wait can't see it twice.
+            if !(p.wait_on == WaitOn::Vfork(cpid)
+                || (wid_hit && p.wait_len & WNOWAIT != 0))
+            {
+                collected = true;
+            }
+            p.state = TaskState::Runnable;
+            p.wait_on = WaitOn::None;
+            p.wait_ptr = 0;
+        }
+    }
+    collected
+}
+
+/// forget_original_parent: reparent a dead task's children to the
+/// nearest child-subreaper ancestor (find_subreaper; 0 = the
+/// init-ward ppid=0 orphan). Live children take ppid=reaper, a
+/// traced child keeps the tracer as parent while its real parent
+/// re-keys via rppid, and already-dead children re-key too so the
+/// reaper can collect their status — inherited zombies re-notify
+/// (SIGCHLD + the same wait-wake a fresh death runs), matching
+/// Linux's parent_notify on reparent.
+fn reparent_orphans(
+    tasks: &mut [Option<Task>; MAX_TASKS],
+    cpid: u64,
+    real_parent: u64,
+) {
+    let reaper = find_subreaper(tasks, real_parent);
+    let mut zom = [(0u64, 0u64, 0u64, 0u32); MAX_TASKS];
+    let mut nz = 0usize;
+    for s in tasks.iter_mut() {
+        if let Some(t) = s.as_mut() {
+            // A tracee still attached to the dying task is the
+            // tracer's charge, not an orphan — ptrace_release_
+            // tracer re-parents it to its real parent at reap
+            // (unless the tracer IS the real parent: rppid==cpid,
+            // or has no real parent: rppid==0).
+            let attached = t.tracer == cpid
+                && t.rppid != cpid
+                && t.rppid != 0;
+            if t.ppid == cpid && !attached {
+                if t.state == TaskState::Exited {
+                    zom[nz] = (t.pid, t.pgid, t.exit_status, t.uid);
+                    nz += 1;
+                }
+                t.ppid = reaper;
+            }
+            if t.rppid == cpid {
+                t.rppid = reaper;
+            }
+        }
+    }
+    if reaper == 0 {
+        return;
+    }
+    for &(zpid, zpgid, zst, zuid) in zom.iter().take(nz) {
+        if let Some(r) = tasks.iter_mut().flatten().find(|t| t.pid == reaper)
+        {
+            let (code, st) = cld_code(zst);
+            pend_one(
+                r,
+                SIGCHLD as u64,
+                SigSrc {
+                    code,
+                    pid: zpid as u32,
+                    uid: zuid,
+                    aux: st as u64,
+                },
+            );
+        }
+        if wake_waiter_for_child(tasks, reaper, zpid, zpgid, zst, zuid) {
+            if let Some(z) =
+                tasks.iter_mut().flatten().find(|t| t.pid == zpid)
+            {
+                z.ppid = 0;
+            }
+        }
+    }
+}
+
+/// PR_SET_CHILD_SUBREAPER: the reaper for a dead task's orphans —
+/// the nearest live ancestor carrying the flag, walked up the
+/// dying task's real-parent chain like Linux's find_new_reaper
+/// (a traced task's real parent is rppid, not the tracer it shows
+/// as ppid). 0 = none marked, the init-ward orphan marker.
+fn find_subreaper(
+    tasks: &[Option<Task>; MAX_TASKS],
+    real_parent: u64,
+) -> u64 {
+    let mut anc = real_parent;
+    // ppid chains can't cycle, but bound the walk anyway. An
+    // armed pid-1 is a valid reaper like Linux's init.
+    for _ in 0..MAX_TASKS {
+        if anc == 0 {
+            return 0;
+        }
+        let Some(t) = tasks.iter().flatten().find(|t| t.pid == anc)
+        else {
+            return 0;
+        };
+        if t.child_subreaper && t.state != TaskState::Exited {
+            return t.pid;
+        }
+        // Real-parent link: a traced ancestor's ppid names its
+        // tracer, not its parent (Linux walks real_parent).
+        anc = if t.tracer != 0 && t.rppid != 0 {
+            t.rppid
+        } else {
+            t.ppid
+        };
+    }
+    0
+}
+
 fn exit_bookkeeping(n: usize) {
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
     let Some(t) = tasks.get_mut(n).and_then(|s| s.as_mut()) else {
         return;
     };
     t.state = TaskState::Exited;
-    let (cpid, cppid, wstatus, is_thread, cpgid, ctgid, cuid) = (
-        t.pid,
-        t.ppid,
-        t.exit_status,
-        t.tgid != t.pid,
-        t.pgid,
-        t.tgid,
-        t.uid,
-    );
+    let (cpid, cppid, wstatus, is_thread, cpgid, ctgid, cuid, ctracer, crppid) =
+        (
+            t.pid,
+            t.ppid,
+            t.exit_status,
+            t.tgid != t.pid,
+            t.pgid,
+            t.tgid,
+            t.uid,
+            t.tracer,
+            t.rppid,
+        );
     // PR_SET_PDEATHSIG: every child whose REAL parent thread is the
     // dying task gets its pdeathsig now (Linux forget_original_parent
     // fires before reparenting — an orphan that outlives its tracer
@@ -40813,13 +41033,16 @@ fn exit_bookkeeping(n: usize) {
     // the sweep and skip the parent bookkeeping entirely.
     if is_thread {
         unsafe { *core::ptr::addr_of_mut!(DEAD_THREADS) = true };
-        for s in tasks.iter_mut() {
-            if let Some(t) = s.as_mut() {
-                if t.ppid == cpid && t.state != TaskState::Exited {
-                    t.ppid = 0;
-                }
-            }
-        }
+        reparent_orphans(
+            tasks,
+            cpid,
+            if ctracer != 0 && crppid != 0 { crppid } else { cppid },
+        );
+        // exit_ptrace: a dying tracer's tracees detach to their
+        // real parents AT DEATH — deferred to reap, an attached
+        // zombie's dead-pid ppid makes it reapable before the
+        // release can re-key it.
+        ptrace_release_tracer(cpid);
         if let Some(t) = tasks.get_mut(n).and_then(|s| s.as_mut()) {
             t.ppid = 0; // never a waitable zombie
         }
@@ -40863,85 +41086,29 @@ fn exit_bookkeeping(n: usize) {
         flock_sweep(true, cpid);
     }
     // Wake a wait-blocked parent whose target just exited.
-    let mut collected = false;
-    for s in tasks.iter_mut() {
-        let Some(p) = s else { continue };
-        // A waitid waiter also needs its WEXITED class bit armed —
-        // a WSTOPPED-only waitid sleeps through an exit like Linux.
-        let wid_hit = p.wait_len & WEXITED != 0
-            && (p.wait_on == WaitOn::WaitIdAny
-                || p.wait_on == WaitOn::WaitIdChild(cpid)
-                || p.wait_on == WaitOn::WaitIdGroup(cpgid));
-        if p.state == TaskState::Blocked
-            && p.pid == cppid
-            && (wid_hit
-                || p.wait_on == WaitOn::Any
-                || p.wait_on == WaitOn::Child(cpid)
-                || p.wait_on == WaitOn::Group(cpgid)
-                || p.wait_on == WaitOn::Vfork(cpid))
-        {
-            if wid_hit {
-                // waitid reports the 128-byte siginfo (validated at
-                // arm) and returns 0 — WNOWAIT peeks: the zombie
-                // stays consumable for a later wait.
-                if p.wait_ptr != 0 {
-                    let (code, st) = cld_code(wstatus);
-                    let rec = fill_sig_rec(
-                        SIGCHLD as u64,
-                        SigSrc {
-                            code,
-                            pid: cpid as u32,
-                            uid: cuid,
-                            aux: st as u64,
-                        },
-                        false,
-                    );
-                    write_task_bytes(p.pml4, p.wait_ptr, &rec);
-                }
-                p.ctx.rax = 0;
-            } else {
-                // wait4 returns the child's pid; its status was
-                // already validated writable when the parent blocked.
-                p.ctx.rax = cpid;
-                if p.wait_ptr != 0 {
-                    if let Some(pa) = translate(p.pml4, p.wait_ptr) {
-                        // SAFETY: pa is a translated, present user frame.
-                        unsafe {
-                            ((crate::mm::pmap(pa)) as *mut u32)
-                                .write_unaligned((wstatus & 0xffff) as u32)
-                        };
-                    }
-                }
-            }
-            // A Vfork wake only resumes the suspended parent — it
-            // collected no status, so the zombie stays waitable for
-            // the parent's own wait4. A waitid-WNOWAIT peek is the
-            // same kind of non-consume. Real waits mark the zombie
-            // collected so a second wait can't see it twice.
-            if !(p.wait_on == WaitOn::Vfork(cpid)
-                || (wid_hit && p.wait_len & WNOWAIT != 0))
-            {
-                collected = true;
-            }
-            p.state = TaskState::Runnable;
-            p.wait_on = WaitOn::None;
-            p.wait_ptr = 0;
-        }
-    }
+    let collected =
+        wake_waiter_for_child(tasks, cppid, cpid, cpgid, wstatus, cuid);
     // The parent collected the status — this zombie reaps free.
     if collected {
         if let Some(t) = tasks.get_mut(n).and_then(|x| x.as_mut()) {
             t.ppid = 0;
         }
     }
-    // Orphan n's children — no one can wait on them now.
-    for s in tasks.iter_mut() {
-        if let Some(t) = s.as_mut() {
-            if t.ppid == cpid && t.state != TaskState::Exited {
-                t.ppid = 0;
-            }
-        }
-    }
+    // Orphan n's children — reparent to the nearest child-
+    // subreaper ancestor (PR_SET_CHILD_SUBREAPER) so it can wait4
+    // them and gets their SIGCHLD; none marked = the init-ward
+    // ppid=0 orphan like Linux's reparent to init. A traced child
+    // keeps the tracer as parent but its real parent re-keys to
+    // the reaper (Linux updates real_parent the same way).
+    reparent_orphans(
+        tasks,
+        cpid,
+        if ctracer != 0 && crppid != 0 { crppid } else { cppid },
+    );
+    // exit_ptrace: a dying tracer's tracees detach to their real
+    // parents at death, not at the tracer's reap — a deferred
+    // release would race pick_next's dead-ppid zombie sweep.
+    ptrace_release_tracer(cpid);
     // SIGCHLD to the parent — pend_one gives a caught disposition
     // the same EINTR wake kill() gets, so a handler can break a
     // parent blocked in a non-wait4 syscall. Default disposition
@@ -41639,6 +41806,7 @@ pub fn fork(ctx: &mut UCtx, files: bool, fs: bool) -> u64 {
         reqkey_mode: p.reqkey_mode,
         nnp: p.nnp,
         pdeathsig: 0,
+        child_subreaper: false,
         seccomp: p.seccomp,
         filtmask: p.filtmask,
         is_compat: p.is_compat,
@@ -41870,6 +42038,7 @@ fn clone_vm(ctx: &mut UCtx, stack: u64, tls: u64, settls: bool, files: bool, sig
         reqkey_mode: p.reqkey_mode,
         nnp: p.nnp,
         pdeathsig: 0,
+        child_subreaper: if thread { p.child_subreaper } else { false },
         seccomp: p.seccomp,
         filtmask: p.filtmask,
         is_compat: p.is_compat,
@@ -43865,6 +44034,8 @@ pub fn ptrace_exec_stop(ctx: &mut UCtx) {
 /// orphans when rppid's owner is also gone).
 fn ptrace_release_tracer(pid: u64) {
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let mut zom = [(0u64, 0u64, 0u64, 0u64, 0u32); MAX_TASKS];
+    let mut nz = 0usize;
     for s in tasks.iter_mut().flatten() {
         if s.tracer != pid {
             continue;
@@ -43873,10 +44044,21 @@ fn ptrace_release_tracer(pid: u64) {
         s.ptr_sys = 0;
         s.sys_ph = 0;
         s.inject = 0;
-        if s.rppid != 0 {
+        // Re-key only when ppid still names the dead tracer — a
+        // zombie already reparented (or collected to ppid=0) by
+        // reparent_orphans must not be revived. rppid=0 lands the
+        // ppid=0 orphan marker like an un-reaper'd reparent.
+        if s.ppid == pid {
             s.ppid = s.rppid;
-            s.rppid = 0;
+            // A zombie tracee re-parented to a live task is waitable
+            // by it — Linux's __ptrace_unlink re-notifies the new
+            // parent or its blocked wait4 never wakes.
+            if s.state == TaskState::Exited {
+                zom[nz] = (s.pid, s.pgid, s.ppid, s.exit_status, s.uid);
+                nz += 1;
+            }
         }
+        s.rppid = 0;
         if s.state == TaskState::Stopped {
             // A delivery-stop that interrupted an armed suspend
             // ends it like CONT would — deliver any pending under
@@ -43894,6 +44076,36 @@ fn ptrace_release_tracer(pid: u64) {
             }
             if s.state != TaskState::Stopped {
                 s.cont_report = true;
+            }
+        }
+    }
+    for &(zpid, zpgid, np, zst, zuid) in zom.iter().take(nz) {
+        if np != 0 {
+            if let Some(r) = tasks
+                .iter_mut()
+                .flatten()
+                .find(|t| t.pid == np && t.state != TaskState::Exited)
+            {
+                let (code, st) = cld_code(zst);
+                pend_one(
+                    r,
+                    SIGCHLD as u64,
+                    SigSrc {
+                        code,
+                        pid: zpid as u32,
+                        uid: zuid,
+                        aux: st as u64,
+                    },
+                );
+            }
+        }
+        if np != 0
+            && wake_waiter_for_child(tasks, np, zpid, zpgid, zst, zuid)
+        {
+            if let Some(z) =
+                tasks.iter_mut().flatten().find(|t| t.pid == zpid)
+            {
+                z.ppid = 0;
             }
         }
     }
