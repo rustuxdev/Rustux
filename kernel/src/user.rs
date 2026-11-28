@@ -2593,54 +2593,90 @@ fn kill_pgrp(pgid: u64, sig: u64) {
     }
 }
 
-/// kill(pid, sig): pend a signal on the target set. pid > 0 is one
-/// task; pid == 0 the caller's own group; pid == -1 every task but
-/// the caller; pid < -1 the group -pid. sig 0 is the existence
-/// probe — 0 when a target exists, ESRCH otherwise. Zombie targets
-/// accept the signal silently like Linux.
-pub fn kill(pid: i64, sig: u64) -> u64 {
+/// Linux's kill_ok_by_cred in this kernel's uid model: uid 0 may
+/// signal everything; a task may always signal a same-tgid member
+/// (a process signals its own threads); same-uid targets pass;
+/// SIGCONT to a task in the caller's session is the one cross-uid
+/// allowance (Linux's session exception). Internal/kernel posts
+/// (SIGCHLD, SIGHUP, pdeathsig, ldisc ^C) bypass this via
+/// pend_one/kill_pgrp — the gate only wraps user-driven sends.
+fn kill_permitted(
+    my: (u64, u64, u64), // (uid, sid, tgid)
+    t: &Task,
+    sig: u64,
+) -> bool {
+    my.0 == 0
+        || my.2 == t.tgid
+        || my.0 == t.uid as u64
+        || (sig == SIGCONT as u64 && my.1 == t.sid)
+}
+
+/// kill(pid, sig) + a tgid constraint for tgkill: pend a signal on
+/// the target set. pid > 0 is one task (optionally gated to the
+/// group `tg`); pid == 0 the caller's own group; pid == -1 every
+/// permitted task but the caller and init; pid < -1 the group
+/// -pid. sig 0 is the existence probe — 0 when an allowed target
+/// exists, EPERM when found-but-denied, ESRCH otherwise. Zombie
+/// targets accept the signal silently like Linux.
+fn kill_impl(pid: i64, sig: u64, tg: u64) -> u64 {
     const ESRCH: u64 = (-3i64) as u64;
+    const EPERM_: u64 = (-1i64) as u64;
     if sig > 31 {
         return EINVAL;
     }
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
     let cur = unsafe { *core::ptr::addr_of!(CUR_I) };
-    let (my_pid, my_pgid) = tasks
+    // No caller slot fails closed rather than handing out the
+    // uid-0 identity to a default tuple.
+    let Some((my_pgid, my_uid, my_sid, my_tgid)) = tasks
         .get(cur)
         .and_then(|s| s.as_ref())
-        .map(|t| (t.pid, t.pgid))
-        .unwrap_or((0, 0));
+        .map(|t| (t.pgid, t.uid as u64, t.sid, t.tgid))
+    else {
+        return ESRCH;
+    };
+    let me = (my_uid, my_sid, my_tgid);
     let hits = |t: &Task| {
         if pid > 0 {
-            t.pid == pid as u64
+            t.pid == pid as u64 && (tg == 0 || t.tgid == tg)
         } else if pid == 0 {
             t.pgid == my_pgid
         } else if pid == -1 {
-            t.pid != my_pid
+            // Linux kill(-1): every task the caller MAY signal,
+            // skipping the caller's whole thread group and init.
+            t.tgid != my_tgid && t.pid > 1
         } else {
             t.pgid == (-pid) as u64
         }
     };
-    if sig == 0 {
-        return if tasks.iter().flatten().any(|t| hits(t)) {
-            0
-        } else {
-            ESRCH
-        };
-    }
+    let mut found = false;
+    let mut ret = ESRCH;
     let mut conts = [(0u64, 0u64, 0u64); MAX_TASKS];
     let mut ncont = 0usize;
-    let mut found = false;
     let src = SigSrc {
         code: SI_USER,
-        pid: my_pid as u32,
-        uid: 0,
+        pid: my_tgid as u32,
+        uid: my_uid as u32,
         aux: 0,
     };
     for s in tasks.iter_mut() {
         let Some(t) = s else { continue };
-        if hits(t) {
-            found = true;
+        if !hits(t) {
+            continue;
+        }
+        found = true;
+        if pid == -1 {
+            // Linux's retval quirk: a -EPERM send doesn't move the
+            // result, so any candidate existing at all answers 0.
+            ret = 0;
+        } else if kill_permitted(me, t, sig) {
+            // __kill_pgrp_info: ANY permitted member answers 0 —
+            // a denied send only moves the result when all fail.
+            ret = 0;
+        } else if ret == ESRCH {
+            ret = EPERM_;
+        }
+        if sig != 0 && kill_permitted(me, t, sig) {
             if let Some(c) = pend_one(t, sig, src) {
                 conts[ncont] = c;
                 ncont += 1;
@@ -2653,7 +2689,12 @@ pub fn kill(pid: i64, sig: u64) -> u64 {
     for c in conts.iter().take(ncont) {
         child_change(c.0, c.1, c.2, 0xffff, WCONTINUED);
     }
-    0
+    ret
+}
+
+/// kill(pid, sig): the unfiltered syscall entry — see kill_impl.
+pub fn kill(pid: i64, sig: u64) -> u64 {
+    kill_impl(pid, sig, 0)
 }
 
 /// rt_sigaction(sig, act, oldact, sigsetsize): read/swap the kernel
@@ -12475,7 +12516,11 @@ pub fn sys_readahead(fd: u64, _off: i64, _len: u64) -> u64 {
 /// tkill(tid, sig): the pre-tgid form — routes straight to kill
 /// like Linux's deprecated single-thread signal.
 pub fn sys_tkill(tid: u64, sig: u64) -> u64 {
-    kill(tid as i64, sig)
+    let tid32 = tid as u32 as i32;
+    if tid32 <= 0 {
+        return EINVAL;
+    }
+    kill(tid32 as i64, sig)
 }
 
 /// mbind(addr, len, mode, nmask, maxnode, flags): memory-policy
@@ -13870,14 +13915,18 @@ fn stdin_sig(sig: u64) {
         // Stale fg group (its last member died) — fall through to
         // the reader heuristic rather than drop the keystroke.
     }
-    let tasks = unsafe { &*core::ptr::addr_of!(TASKS) };
-    let Some(pid) = tasks.iter().flatten().find_map(|t| {
-        (t.state == TaskState::Blocked && t.wait_on == WaitOn::Stdin)
-            .then_some(t.pid)
+    let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
+    let Some(t) = tasks.iter_mut().flatten().find(|t| {
+        t.state == TaskState::Blocked && t.wait_on == WaitOn::Stdin
     }) else {
         return;
     };
-    let _ = kill(pid as i64, sig);
+    // Kernel-generated ldisc signal — pend_one directly like
+    // kill_pgrp; the user-facing kill() permission gate must not
+    // evaluate the keystroke under some random task's uid.
+    if let Some(c) = pend_one(t, sig, SIGSRC_NONE) {
+        child_change(c.0, c.1, c.2, 0xffff, WCONTINUED);
+    }
 }
 
 /// Submit the edit buffer to the ready queue — drops the excess if
@@ -15751,9 +15800,15 @@ fn wake_vfork_parent_of(child_pid: u64) {
 /// tgkill(tgid, tid, sig): no threads — tgid == tid == pid, so this
 /// is kill() with an extra ABI arg. glibc's abort() lands here.
 pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> u64 {
-    // With threads, tid names the target task; a bare tgid hits the
-    // leader (tgid == leader pid), matching Linux tgkill semantics.
-    kill(if tid != 0 { tid } else { tgid } as i64, sig)
+    // Linux tgkill: pid_t truncation then pid<=0 || tgid<=0 EINVAL,
+    // and the tid must actually live in tgid — a foreign tid ESRCHs
+    // rather than silently killing another group's task.
+    let tg32 = tgid as u32 as i32;
+    let tid32 = tid as u32 as i32;
+    if tg32 <= 0 || tid32 <= 0 {
+        return EINVAL;
+    }
+    kill_impl(tid32 as i64, sig, tg32 as u64)
 }
 
 /// Shared rt_sigqueueinfo/rt_tgsigqueueinfo body: pend `sig` on the
@@ -15761,7 +15816,7 @@ pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> u64 {
 /// send only negative si_codes (except SI_TKILL, which would fake a
 /// tkill's provenance) — anything else is EPERM, so a caller can't
 /// impersonate kernel-sourced or other-task-sourced siginfo.
-fn sigqueue_one(pid: i64, tgid: u64, sig: u64, uinfo: u64) -> u64 {
+fn sigqueue_one(pid: i64, tgid: u64, has_tg: bool, sig: u64, uinfo: u64) -> u64 {
     const ESRCH: u64 = (-3i64) as u64;
     const EPERM_: u64 = (-1i64) as u64;
     if sig == 0 || sig > 31 {
@@ -15771,45 +15826,68 @@ fn sigqueue_one(pid: i64, tgid: u64, sig: u64, uinfo: u64) -> u64 {
         return EFAULT;
     }
     // SAFETY: validated readable user range; the fields we need are
-    // si_code@8 and si_value@24.
-    let (code, val) = unsafe {
+    // si_code@8, si_pid@16, si_uid@20 and si_value@24 — Linux copies
+    // the queued si_pid/si_uid from the caller's struct verbatim.
+    let (code, si_pid, si_uid, val) = unsafe {
         (
             (uinfo as *const i32).add(2).read_unaligned(),
+            ((uinfo + 16) as *const u32).read_unaligned(),
+            ((uinfo + 20) as *const u32).read_unaligned(),
             ((uinfo + 24) as *const u64).read_unaligned(),
         )
     };
+    // Linux's do_rt_tgsigqueueinfo EINVALs pid<=0||tgid<=0 (on
+    // pid_t-truncated args) before the si_code check; the plain
+    // rt_sigqueueinfo path has no id check — a bad pid just
+    // ESRCHs in kill_proc_info.
+    let pid32 = pid as u32 as i32;
+    let tg32 = tgid as u32 as i32;
+    if has_tg && (pid32 <= 0 || tg32 <= 0) {
+        return EINVAL;
+    }
     if code >= 0 || code == SI_TKILL {
         return EPERM_;
     }
-    let sender = cur_mut().map(|t| t.pid).unwrap_or(0) as u32;
+    let Some(me) = cur_mut()
+        .map(|t| (t.uid as u64, t.sid, t.tgid))
+    else {
+        return ESRCH;
+    };
     let tasks = unsafe { &mut *core::ptr::addr_of_mut!(TASKS) };
     let hits = |t: &Task| {
-        t.pid == pid as u64 && (tgid == u64::MAX || t.tgid == tgid)
+        t.pid == pid32 as u64 && (!has_tg || t.tgid == tg32 as u64)
     };
     let mut conts = [(0u64, 0u64, 0u64); MAX_TASKS];
     let mut ncont = 0usize;
     let mut found = false;
+    let mut allowed = false;
     for s in tasks.iter_mut() {
         let Some(t) = s else { continue };
         if hits(t) {
             found = true;
-            if let Some(c) = pend_one(
-                t,
-                sig,
-                SigSrc {
-                    code,
-                    pid: sender,
-                    uid: 0,
-                    aux: val,
-                },
-            ) {
-                conts[ncont] = c;
-                ncont += 1;
+            if kill_permitted(me, t, sig) {
+                allowed = true;
+                if let Some(c) = pend_one(
+                    t,
+                    sig,
+                    SigSrc {
+                        code,
+                        pid: si_pid,
+                        uid: si_uid,
+                        aux: val,
+                    },
+                ) {
+                    conts[ncont] = c;
+                    ncont += 1;
+                }
             }
         }
     }
     if !found {
         return ESRCH;
+    }
+    if !allowed {
+        return EPERM_;
     }
     for c in conts.iter().take(ncont) {
         child_change(c.0, c.1, c.2, 0xffff, WCONTINUED);
@@ -15820,13 +15898,13 @@ fn sigqueue_one(pid: i64, tgid: u64, sig: u64, uinfo: u64) -> u64 {
 /// rt_sigqueueinfo(pid, sig, uinfo): glibc's sigqueue() — a queued
 /// signal carrying a siginfo_t whose si_value rides to the handler.
 pub fn rt_sigqueueinfo(pid: i64, sig: u64, uinfo: u64) -> u64 {
-    sigqueue_one(pid, u64::MAX, sig, uinfo)
+    sigqueue_one(pid, 0, false, sig, uinfo)
 }
 
 /// rt_tgsigqueueinfo(tgid, pid, sig, uinfo): the same but addressed
 /// to a thread inside a group — target must match both ids.
 pub fn rt_tgsigqueueinfo(tgid: u64, pid: i64, sig: u64, uinfo: u64) -> u64 {
-    sigqueue_one(pid, tgid, sig, uinfo)
+    sigqueue_one(pid, tgid, true, sig, uinfo)
 }
 
 /// rt_sigprocmask(how, set, oldset, sigsetsize): the per-task signal

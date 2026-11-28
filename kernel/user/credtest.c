@@ -10,12 +10,18 @@
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <signal.h>
+#include <time.h>
 
 /* no sys/capability.h in this toolchain — raw ABI values */
 #define CAP_V1 0x19980330u
 #define CAP_V3 0x20080522u
 
 static int fails;
+static volatile sig_atomic_t cred_pgot;
+static void cred_usr2(int s) { (void)s; cred_pgot = 1; }
+static volatile sig_atomic_t cred_cgot;
+static void cred_cusr2(int s) { (void)s; cred_cgot = 1; }
 #define check(c, msg) do { \
     if (c) printf("credtest: %-40s ok\n", msg); \
     else { printf("credtest: %-40s FAIL\n", msg); fails++; } \
@@ -159,6 +165,171 @@ int main(int argc, char **argv) {
     waitpid(p, &st, 0);
     check(WIFEXITED(st) && WEXITSTATUS(st) == 42, "execveat AT_EMPTY_PATH");
     close(fd);
+
+    /* --- run-357: signal permission checks (kill_ok_by_cred) --
+       Linux: uid0 signals all; same-uid + same-tgid pass; SIGCONT
+       to a same-session task is the one cross-uid allowance; the
+       sig0 probe answers EPERM for found-but-denied. ---------- */
+    {
+        /* nonroot child vs uid-0 parent: send + probe EPERM,
+           SIGCONT same-session allowed, self-probe ok. */
+        pid_t c = fork();
+        if (c == 0) {
+            if (syscall(SYS_setuid, 1000L) != 0) _exit(9);
+            pid_t p0 = getppid();
+            long r1, r2, r3, r4;
+            errno = 0; r1 = syscall(SYS_kill, p0, 10); int e1 = errno;
+            errno = 0; r2 = syscall(SYS_kill, p0, 0);  int e2 = errno;
+            errno = 0; r3 = syscall(SYS_kill, p0, 18); /* SIGCONT */
+            errno = 0; r4 = syscall(SYS_kill, getpid(), 0);
+            _exit(r1 == -1 && e1 == EPERM &&
+                  r2 == -1 && e2 == EPERM &&
+                  r3 == 0 && r4 == 0 ? 0 : 1);
+        }
+        int st2 = 0;
+        waitpid(c, &st2, 0);
+        check(WEXITSTATUS(st2) == 0,
+              "kill cred: cross-uid EPERM, SIGCONT same-session ok");
+        /* tgkill: 0 ids EINVAL; tid outside tgid ESRCH; cross-uid
+           EPERM. All from a nonroot child. */
+        c = fork();
+        if (c == 0) {
+            if (syscall(SYS_setuid, 1000L) != 0) _exit(9);
+            errno = 0;
+            long r1 = syscall(SYS_tgkill, 0, getpid(), 10);
+            int e1 = errno;
+            errno = 0;
+            long r2 = syscall(SYS_tgkill, getppid(), getpid(), 10);
+            int e2 = errno;
+            errno = 0;
+            long r3 = syscall(SYS_tkill, getppid(), 10);
+            int e3 = errno;
+            errno = 0;
+            long r4 = syscall(SYS_tgkill, getpid(), getpid(), 0);
+            errno = 0;
+            /* negative ids are Linux pid_t <=0 -> EINVAL, never the
+               kill() broadcast/group selectors via tgkill. */
+            long r5 = syscall(SYS_tgkill, getpid(), -1L, 10);
+            int e5 = errno;
+            errno = 0;
+            long r6 = syscall(SYS_tgkill, getpid(), -2L, 10);
+            int e6 = errno;
+            errno = 0;
+            long r7 = syscall(SYS_tkill, -1L, 10);
+            int e7 = errno;
+            _exit(r1 == -1 && e1 == EINVAL &&
+                  r2 == -1 && e2 == ESRCH &&
+                  r3 == -1 && e3 == EPERM &&
+                  r4 == 0 &&
+                  r5 == -1 && e5 == EINVAL &&
+                  r6 == -1 && e6 == EINVAL &&
+                  r7 == -1 && e7 == EINVAL ? 0 : 1);
+        }
+        st2 = 0;
+        waitpid(c, &st2, 0);
+        check(WEXITSTATUS(st2) == 0,
+              "tgkill: 0 EINVAL, wrong-tgid ESRCH, cross-uid EPERM");
+        /* kill(-1): filters per-target permission — a uid-1000
+           sibling gets the broadcast, the uid-0 parent must not. */
+        {
+            struct sigaction sa2 = {0};
+            sa2.sa_handler = cred_usr2;
+            sigaction(SIGUSR2, &sa2, NULL);
+            /* arm pipe: C1 broadcasts only after C2's setuid ran
+               — the uid filter is evaluated at SEND time, so an
+               unarmed sibling is denied, not pended. */
+            int arm[2];
+            check(pipe(arm) == 0, "kill-1 arm pipe");
+            pid_t c1 = fork(); /* sender */
+            if (c1 == 0) {
+                close(arm[1]);
+                syscall(SYS_setuid, 1000L);
+                char r;
+                ssize_t _r = read(arm[0], &r, 1);
+                (void)_r;
+                long rr = syscall(SYS_kill, -1, SIGUSR2);
+                _exit(rr == 0 ? 0 : 2);
+            }
+            close(arm[0]);
+            pid_t c2 = fork(); /* same-uid receiver */
+            if (c2 == 0) {
+                struct sigaction sc = {0};
+                sc.sa_handler = cred_cusr2;
+                sigaction(SIGUSR2, &sc, NULL);
+                syscall(SYS_setuid, 1000L);
+                char r = 'R';
+                if (write(arm[1], &r, 1)) {}
+                close(arm[1]);
+                for (int i = 0; i < 150 && !cred_cgot; i++) {
+                    struct timespec ts = {0, 10000000};
+                    nanosleep(&ts, NULL);
+                }
+                _exit(cred_cgot ? 0 : 1);
+            }
+            close(arm[1]);
+            waitpid(c1, &st2, 0);
+            check(WEXITSTATUS(st2) == 0, "kill(-1) returns 0");
+            st2 = 0;
+            waitpid(c2, &st2, 0);
+            check(WEXITSTATUS(st2) == 0, "kill(-1) reaches same-uid");
+            check(!cred_pgot, "kill(-1) skips denied uid0 task");
+        }
+        /* group-kill ret: Linux __kill_pgrp_info answers 0 when
+           ANY member is permitted — a denied uid-0 sibling in the
+           same pgid must not flip it to EPERM. */
+        {
+            int arm[2];
+            check(pipe(arm) == 0, "grpkill arm pipe");
+            pid_t s = fork(); /* nonroot sender */
+            if (s == 0) {
+                syscall(SYS_setuid, 1000L);
+                close(arm[1]);
+                char r;
+                ssize_t _r = read(arm[0], &r, 1);
+                (void)_r;
+                long rr = syscall(SYS_kill, -getpgrp(), SIGURG);
+                _exit(rr == 0 ? 0 : 2);
+            }
+            close(arm[0]);
+            pid_t b = fork(); /* uid-0 sibling, same pgid */
+            if (b == 0) {
+                char r = 'R';
+                if (write(arm[1], &r, 1)) {}
+                close(arm[1]);
+                pause();
+                _exit(0);
+            }
+            close(arm[1]);
+            st2 = 0;
+            waitpid(s, &st2, 0);
+            check(WEXITSTATUS(st2) == 0,
+                  "kill(-pgid): permitted member answers 0");
+            kill(b, SIGKILL);
+            waitpid(b, NULL, 0);
+        }
+        /* rt_sigqueueinfo rides the same cred gate: cross-uid
+           send to the uid-0 parent EPERMs. */
+        {
+            pid_t q = fork();
+            if (q == 0) {
+                if (syscall(SYS_setuid, 1000L) != 0) _exit(9);
+                siginfo_t si;
+                memset(&si, 0, sizeof si);
+                si.si_signo = SIGUSR1;
+                si.si_code = SI_QUEUE;
+                si.si_pid = getpid();
+                si.si_uid = getuid();
+                errno = 0;
+                long r = syscall(SYS_rt_sigqueueinfo,
+                                 getppid(), SIGUSR1, &si);
+                _exit(r == -1 && errno == EPERM ? 0 : 1);
+            }
+            st2 = 0;
+            waitpid(q, &st2, 0);
+            check(WEXITSTATUS(st2) == 0,
+                  "rt_sigqueueinfo: cross-uid EPERM");
+        }
+    }
 
     printf("credtest: %d failures\n", fails);
     return fails;
