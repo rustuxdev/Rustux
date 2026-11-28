@@ -9654,3 +9654,54 @@ scope.
   pgtest/ptrtest/aiotest 0 failures (354e hung on a ptrtest
   test bug — blocking stopped_at re-probe on a consumed stop,
   replaced with WNOHANG).
+
+## run-355 — nested-handler restart arms stack
+
+- The single-slot restart arm (restart_nr/restart_asite — nr +
+  post-insn rip of an interrupted restartable wait, replayed at
+  sigreturn or the SIGCONT-resume apply) was verifier-flagged in
+  run-352: a handler's own restartable wait interrupts to a
+  second arm that OVERWRITES the outer frame's — outer sigreturn
+  finds restart_nr consumed and answers -EINTR where Linux
+  replays (Linux carries the restart state in each frame's saved
+  regs, so nesting is free).
+- restart_nr/restart_asite are now [u64; RESTART_DEPTH=4] plus
+  restart_seq tags and a monotonic restart_arm_tick. restart_arm
+  pushes {ctx.rax, ctx.rip, seq} into the first free slot; a full
+  stack evicts the LOWEST-seq arm (siglongjmp-abandoned arms
+  never recycle — the old code would let four abandons starve
+  every later restart to -EINTR permanently).
+- restart_apply requires c.rax==-EINTR then applies the armed
+  slot whose asite matches the returning frame's rip at the
+  HIGHEST seq — index order isn't arm order once slots recycle,
+  and two live frames can share a syscall-insn site (libc's
+  syscall() indirection serves every nr at one insn): the
+  innermost arm is the only right replay for that frame.
+- Stash record gate: restart_rip records only when the applied
+  nr == restart_knr — the deadline stash's own arm identified by
+  the rax both recorded at arm time. A foreign apply (nested
+  same-site arm, forged sigreturn) can't re-key the stash to the
+  wrong site.
+- The deadline stash (restart_at/rt/knr/rip) stays single-slot
+  by construction: it arms only for default-stop signals, and a
+  stopped task can't run handlers — no nesting is reachable.
+- Residual (bounded, documented): a siglongjmp-abandoned deeper
+  arm sharing an asite with a different nr can out-seq the
+  returning frame's own arm and replay the wrong nr — needs a
+  multi-nr insn site + abandoned inner frame; per-frame arm
+  binding would be the full-fidelity fix.
+- Test (pgtest): outer pipe read() interrupted by SA_RESTART
+  USR1 whose handler blocks a second restartable read();
+  SA_RESTART USR2 interrupts THAT — both replays must complete
+  (old code exits 6: outer arm stolen -> EINTR stands).
+- cve-now sweep: nested-restart/SA_RESTART classes — no
+  applicable CVEs.
+- Audit (run-113, scoped quick): hunter FIX x3 (index-order
+  apply isn't LIFO under shared-insn sites -> seq tags; abandoned
+  arms starve -> lowest-seq evict; stash keyed on nr -> kseq
+  binding); critic PASS; fresh verifier PASS + RV-1 low fixed
+  (stash arm could be evicted leaving a stale deadline a same-nr
+  foreign apply would re-key -> restart_kseq tag + evict-clear);
+  residual RV-2 documented (per-frame arm binding).
+- Gates: gate-355b PASS 127 tasks frames zero leak zero FAIL;
+  pgtest 0 failures incl. nested-restart check.
