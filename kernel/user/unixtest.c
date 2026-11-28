@@ -416,6 +416,120 @@ int main(void) {
         close(dp[0]); close(dp[1]);
     }
 
+    // --- SCM_RIGHTS through a PARKED sendmsg ---
+    // Sender blocks on a full ring: the rights ride the staged
+    // record and the waker attaches them where the bytes land.
+    {
+        int sp[2], dp[2], rx = -1;
+        struct msghdr mh;
+        struct iovec io;
+        char ctrl[CMSG_SPACE(sizeof(int))];
+        char rb = 0, fb[1024], db[8192];
+        check(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0,
+              "parked sendmsg pair");
+        check(socketpair(AF_UNIX, SOCK_DGRAM, 0, dp) == 0,
+              "parked donor pair");
+        fcntl(sp[0], F_SETFL, O_NONBLOCK);
+        memset(fb, 'z', sizeof(fb));
+        ssize_t w;
+        do {
+            w = write(sp[0], fb, sizeof(fb));
+        } while (w > 0);
+        check(w == -1 && errno == EAGAIN, "ring filled");
+        fcntl(sp[0], F_SETFL, 0);
+        pid_t p3 = fork();
+        if (p3 == 0) {
+            struct msghdr cm3;
+            struct iovec io3;
+            char cc = 'm';
+            char ct3[CMSG_SPACE(sizeof(int))];
+            memset(&cm3, 0, sizeof(cm3));
+            memset(ct3, 0, sizeof(ct3));
+            io3.iov_base = &cc; io3.iov_len = 1;
+            cm3.msg_iov = &io3; cm3.msg_iovlen = 1;
+            cm3.msg_control = ct3; cm3.msg_controllen = sizeof(ct3);
+            struct cmsghdr *h3 = CMSG_FIRSTHDR(&cm3);
+            h3->cmsg_level = SOL_SOCKET;
+            h3->cmsg_type = SCM_RIGHTS;
+            h3->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(h3), &dp[1], sizeof(int));
+            _exit(sendmsg(sp[0], &cm3, 0) == 1 ? 0 : 1);
+        }
+        struct timespec tp = {0, 100 * 1000 * 1000};
+        nanosleep(&tp, NULL); /* let the child park on the ring */
+        check(read(sp[1], db, sizeof(db)) > 0, "drain frees ring");
+        memset(&mh, 0, sizeof(mh));
+        memset(ctrl, 0, sizeof(ctrl));
+        io.iov_base = &rb; io.iov_len = 1;
+        mh.msg_iov = &io; mh.msg_iovlen = 1;
+        mh.msg_control = ctrl; mh.msg_controllen = sizeof(ctrl);
+        check(recvmsg(sp[1], &mh, 0) == 1 && rb == 'm',
+              "parked sendmsg delivered byte");
+        struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+        if (cm) memcpy(&rx, CMSG_DATA(cm), sizeof(int));
+        check(rx >= 0 && write(rx, "W", 1) == 1 &&
+              read(dp[0], buf, 1) == 1 && buf[0] == 'W',
+              "staged rights delivered");
+        if (rx >= 0) close(rx);
+        int ws3; waitpid(p3, &ws3, 0);
+        check(WIFEXITED(ws3) && WEXITSTATUS(ws3) == 0,
+              "parked sendmsg returned 1");
+        close(dp[0]); close(dp[1]);
+        close(sp[0]); close(sp[1]);
+    }
+
+    // --- parked-send abort: staged rights must release ---
+    // >MAX_OFDS cycles of a parked sendmsg+rights killed by a
+    // peer close; a leaked batch ref pins one OFD per pass.
+    {
+        int ok = 1, sp[2], dp[2];
+        char fb[1024];
+        memset(fb, 'z', sizeof(fb));
+        for (int i = 0; i < 150 && ok; i++) {
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0 ||
+                socketpair(AF_UNIX, SOCK_DGRAM, 0, dp) < 0) {
+                ok = 0;
+                break;
+            }
+            fcntl(sp[0], F_SETFL, O_NONBLOCK);
+            ssize_t w;
+            do {
+                w = write(sp[0], fb, sizeof(fb));
+            } while (w > 0);
+            fcntl(sp[0], F_SETFL, 0);
+            pid_t q = fork();
+            if (q == 0) {
+                close(sp[1]); /* let the parent's close EPIPE us */
+                struct msghdr cm3;
+                struct iovec io3;
+                char cc = 'x';
+                char ct3[CMSG_SPACE(sizeof(int))];
+                memset(&cm3, 0, sizeof(cm3));
+                memset(ct3, 0, sizeof(ct3));
+                io3.iov_base = &cc; io3.iov_len = 1;
+                cm3.msg_iov = &io3; cm3.msg_iovlen = 1;
+                cm3.msg_control = ct3; cm3.msg_controllen = sizeof(ct3);
+                struct cmsghdr *h3 = CMSG_FIRSTHDR(&cm3);
+                h3->cmsg_level = SOL_SOCKET;
+                h3->cmsg_type = SCM_RIGHTS;
+                h3->cmsg_len = CMSG_LEN(sizeof(int));
+                memcpy(CMSG_DATA(h3), &dp[1], sizeof(int));
+                sendmsg(sp[0], &cm3, 0); /* parks then EPIPEs */
+                _exit(0);
+            }
+            struct timespec tp = {0, 5 * 1000 * 1000};
+            nanosleep(&tp, NULL);
+            close(sp[1]); /* peer death -> EPIPE frees staged fp */
+            int ws;
+            waitpid(q, &ws, 0);
+            close(sp[0]); close(dp[0]); close(dp[1]);
+        }
+        check(ok, "parked-send rights release x150");
+        check(socketpair(AF_UNIX, SOCK_DGRAM, 0, dp) == 0,
+              "ofds not exhausted");
+        close(dp[0]); close(dp[1]);
+    }
+
     close(ls);
 
     // --- recvmmsg (NR 299) ---

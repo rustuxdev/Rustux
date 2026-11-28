@@ -2425,10 +2425,27 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
         // wait_len is the payload bytes, SemOp's is nsops, MqSnd's
         // the staged [prio][len][data] record.
         match t.wait_on {
-            WaitOn::MsgSnd(_) | WaitOn::MqSnd(_)
-            | WaitOn::UnixSendK(..) => unsafe {
+            WaitOn::MsgSnd(_) | WaitOn::MqSnd(_) => unsafe {
                 stage_free(t.wait_len as usize, t.wait_ptr as *mut u8)
             },
+            // A parked send record dies with a signalled wait —
+            // staged rights release their refs first, but the
+            // arm comes down BEFORE scm_release: a released unix
+            // ofd can re-enter unix_wake and re-fire the arm.
+            WaitOn::UnixSendK(..) => {
+                let p = t.wait_ptr;
+                let al = t.wait_len as usize;
+                let dl = unsafe {
+                    (p as *const u16).read_unaligned()
+                } as usize;
+                t.wait_on = WaitOn::None;
+                t.wait_ptr = 0;
+                t.wait_len = 0;
+                if let Some(f) = staged_fp(p, dl) {
+                    scm_release(f);
+                }
+                unsafe { stage_free(al, p as *mut u8) };
+            }
             WaitOn::SemOp(_) => unsafe {
                 stage_free(
                     t.wait_len as usize * SEMBUF as usize,
@@ -30286,14 +30303,25 @@ fn poll_expire() {
                 // SO_SNDTIMEO expiry with a parked record — the
                 // staged payload dies with the wait so the peer
                 // never sees a phantom delivery (per-task stage
-                // like MqSnd, but EAGAIN not ETIMEDOUT).
+                // like MqSnd, but EAGAIN not ETIMEDOUT). Staged
+                // SCM rights release their bumped refs too.
                 WaitOn::UnixSendK(..) => {
-                    unsafe {
-                        stage_free(
-                            t.wait_len as usize,
-                            t.wait_ptr as *mut u8,
-                        )
-                    };
+                    // Disarm BEFORE releasing: scm_release can
+                    // reach ofd_release->unix_sock_close->
+                    // unix_wake, which would re-fire this still-
+                    // armed arm and double-free the stage.
+                    let p = t.wait_ptr;
+                    let al = t.wait_len as usize;
+                    let dl = unsafe {
+                        (p as *const u16).read_unaligned()
+                    } as usize;
+                    t.wait_on = WaitOn::None;
+                    t.wait_ptr = 0;
+                    t.wait_len = 0;
+                    if let Some(f) = staged_fp(p, dl) {
+                        scm_release(f);
+                    }
+                    unsafe { stage_free(al, p as *mut u8) };
                     t.ctx.rax = (-11i64) as u64;
                 }
                 // SO_RCVTIMEO/SO_SNDTIMEO expiry: every socket wait
@@ -35675,21 +35703,18 @@ pub fn fd_sendmsg(ctx: &mut UCtx, fd: u64, msg: u64, flags: u64) -> u64 {
                         }
                         return 0;
                     }
-                    let r = unix_send_stream_slice(
+                    // The slice owns the batch from here —
+                    // attach at its landing tail on a sent
+                    // payload, stage it into the parked record
+                    // on a block, release on any error.
+                    unix_send_stream_slice(
                         ctx, conn, side, &pay[..n],
                         flags & 0x40 != 0
                             || ofd(t, fd)
                                 .map(|o| o.nonblock)
                                 .unwrap_or(false),
-                    );
-                    if (r as i64) >= 0 {
-                        if let Some(f) = fbatch {
-                            unix_fp_attach(conn, side, at as u64, f);
-                        }
-                    } else if let Some(f) = fbatch {
-                        scm_release(f);
-                    }
-                    r
+                        fbatch,
+                    )
                 }
                 _ => {
                     if let Some(f) = fbatch {
@@ -36376,6 +36401,29 @@ fn unix_fp_attach(conn: usize, side: usize, at: u64, fds: UnixFds) {
     scm_release(fds); // attach list full — rights drop silently
 }
 
+/// The SCM_RIGHTS tail of a staged UnixSendK record —
+/// [u16 dlen][ring image][u8 n][u16 ofd × SCM_MAX]. None when
+/// the sender carried no rights.
+fn staged_fp(p: u64, dlen: usize) -> Option<UnixFds> {
+    let z = p + 2 + dlen as u64;
+    let n = unsafe { *(z as *const u8) };
+    if n == 0 {
+        return None;
+    }
+    // scm_release/scm_emit slice ofd[..n] — clamp into the
+    // array so a corrupt stage byte can't panic the bounds.
+    let mut f = UnixFds {
+        n: n.min(SCM_MAX as u8),
+        ofd: [0; SCM_MAX],
+    };
+    for (i, o) in f.ofd.iter_mut().enumerate() {
+        *o = unsafe {
+            ((z + 1 + i as u64 * 2) as *const u16).read_unaligned()
+        };
+    }
+    Some(f)
+}
+
 /// Emit due fp batches for `side` into the control buffer.
 /// Returns (bytes written, ctrunc).
 fn unix_fp_emit(
@@ -36825,51 +36873,95 @@ fn unix_wake(conn: usize) {
                 t.wait_deadline = 0;
                 t.state = TaskState::Runnable;
             }
-            // A blocked slice send: the payload lives in the
-            // sleeper's own staged buffer (wait_ptr/wait_len) —
-            // push what fits, free the stage, deposit the
-            // pushed count.
+            // A blocked slice send: the staged record is
+            // [u16 dlen][ring image][u8 n][u16 ofd×8] — push what
+            // fits, attach any rights at the landing position,
+            // free the stage, deposit the pushed count.
             WaitOn::UnixSendK(wc, side) if wc == conn => {
                 let s = side as usize & 1;
-                let c = unsafe {
-                    (*core::ptr::addr_of_mut!(UNIXCONNS))[conn]
-                        .as_mut()
-                        .unwrap()
+                let dl = unsafe {
+                    (t.wait_ptr as *const u16).read_unaligned()
+                } as usize;
+                let open = {
+                    let conns =
+                        unsafe { &*core::ptr::addr_of!(UNIXCONNS) };
+                    conns[conn].as_ref().unwrap().open[1 - s]
                 };
-                if !c.open[1 - s] {
+                if !open {
                     t.ctx.rax = (-32i64) as u64; // EPIPE
-                    unsafe {
-                        stage_free(
-                            t.wait_len as usize,
-                            t.wait_ptr as *mut u8,
-                        )
-                    };
+                    // Same disarm-first order — a released unix
+                    // ofd can re-enter unix_wake.
+                    let p = t.wait_ptr;
+                    let al = t.wait_len as usize;
+                    t.wait_on = WaitOn::None;
+                    t.wait_ptr = 0;
+                    t.wait_len = 0;
+                    // Rights that never sent release the refs
+                    // scm_parse bumped.
+                    if let Some(f) = staged_fp(p, dl) {
+                        scm_release(f);
+                    }
+                    unsafe { stage_free(al, p as *mut u8) };
                 } else {
-                    let free =
-                        UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head);
-                    if free == 0 {
-                        continue;
-                    }
-                    let len = t.wait_len as usize;
-                    // seqpacket: staging holds the whole framed
-                    // record — all or nothing, and rax answers
-                    // the payload length not the frame length.
-                    if c.seq && free < len {
-                        continue;
-                    }
-                    let n =
-                        if c.seq { len } else { core::cmp::min(len, free) };
-                    let src = t.wait_ptr as *const u8;
-                    for i in 0..n {
-                        c.r[1 - s].data[(c.r[1 - s].tail + i)
-                            % UNIX_BUF] = unsafe { *src.add(i) };
-                    }
-                    c.r[1 - s].tail += n;
-                    t.ctx.rax =
-                        if c.seq { (n - 2) as u64 } else { n as u64 };
-                    unsafe {
-                        stage_free(len, t.wait_ptr as *mut u8)
+                    // Push under the conn borrow; the fp attach
+                    // re-borrows UNIXCONNS itself, so `at` and the
+                    // count come out of the block.
+                    let (n, at, seq) = {
+                        let c = unsafe {
+                            (*core::ptr::addr_of_mut!(UNIXCONNS))
+                                [conn]
+                                .as_mut()
+                                .unwrap()
+                        };
+                        let free = UNIX_BUF
+                            - (c.r[1 - s].tail - c.r[1 - s].head);
+                        if free == 0 {
+                            continue;
+                        }
+                        // seqpacket: the staged record is one
+                        // frame — all or nothing, and rax answers
+                        // the payload length not the frame length.
+                        if c.seq && free < dl {
+                            continue;
+                        }
+                        let n = if c.seq {
+                            dl
+                        } else {
+                            core::cmp::min(dl, free)
+                        };
+                        let at = c.r[1 - s].tail;
+                        let src = t.wait_ptr + 2;
+                        for i in 0..n {
+                            c.r[1 - s].data[(c.r[1 - s].tail + i)
+                                % UNIX_BUF] = unsafe {
+                                *((src + i as u64) as *const u8)
+                            };
+                        }
+                        c.r[1 - s].tail += n;
+                        (n, at, c.seq)
                     };
+                    t.ctx.rax =
+                        if seq { (n - 2) as u64 } else { n as u64 };
+                    // Disarm BEFORE the attach — unix_fp_attach
+                    // can scm_release (missing conn / full list),
+                    // and that release can re-enter unix_wake on
+                    // this conn and re-fire a still-armed arm.
+                    let p = t.wait_ptr;
+                    let al = t.wait_len as usize;
+                    t.wait_on = WaitOn::None;
+                    t.wait_ptr = 0;
+                    t.wait_len = 0;
+                    // SCM rights anchor where the bytes landed —
+                    // the tail BEFORE this push.
+                    if let Some(f) = staged_fp(p, dl) {
+                        unix_fp_attach(
+                            conn,
+                            side as usize,
+                            at as u64,
+                            f,
+                        );
+                    }
+                    unsafe { stage_free(al, p as *mut u8) };
                 }
                 t.wait_on = WaitOn::None;
                 t.wait_deadline = 0;
@@ -37417,13 +37509,17 @@ fn unix_send_stream(
 /// Slice form of unix_send_stream for sendmsg: the payload is
 /// already gathered into kernel memory. A full ring still blocks
 /// honestly — the bytes park in a per-task staged buffer and the
-/// UnixSendK waker pushes them under the sleeper's tables.
+/// UnixSendK waker pushes them under the sleeper's tables. An
+/// SCM_RIGHTS batch rides the staged record (block_switch
+/// diverges, so a parked send could never reach the caller's
+/// post-return attach): [u16 dlen][ring image][u8 n][u16 ofd×8].
 fn unix_send_stream_slice(
     ctx: &mut UCtx,
     conn: usize,
     side: usize,
     pay: &[u8],
     dw: bool,
+    fp: Option<UnixFds>,
 ) -> u64 {
     const EAGAIN_: u64 = (-11i64) as u64;
     const EINTR_: u64 = (-4i64) as u64;
@@ -37441,13 +37537,21 @@ fn unix_send_stream_slice(
             None => (0, false, false),
         }
     };
+    // Every early return owns the batch: rights that never sent
+    // release the refs scm_parse bumped.
     if !open {
+        if let Some(f) = fp {
+            scm_release(f);
+        }
         return EPIPE_;
     }
     // seqpacket: atomic framed record — header+payload as one
     // staging unit so the waker never half-writes a record.
     let frame = if seqp {
         if pay.len() > UNIX_BUF - 2 {
+            if let Some(f) = fp {
+                scm_release(f);
+            }
             return EMSGSIZE_;
         }
         2 + pay.len()
@@ -37456,40 +37560,64 @@ fn unix_send_stream_slice(
     };
     if free < frame {
         if dw {
+            if let Some(f) = fp {
+                scm_release(f);
+            }
             return EAGAIN_;
         }
         if deliverable(t) {
+            if let Some(f) = fp {
+                scm_release(f);
+            }
             return EINTR_;
         }
-        // Park the payload in a per-task staged buffer the waker
-        // pushes under the sleeper's tables — wait_ptr/wait_len
-        // carry it like the MqSnd staging, so concurrent
-        // sleepers on one conn-direction can't clobber a
-        // shared slot. For seq the staging IS the record:
-        // [u16 len][pay].
+        // Park the payload + rights in a per-task staged buffer
+        // the waker pushes under the sleeper's tables —
+        // wait_ptr/wait_len carry it like the MqSnd staging.
+        // For seq the ring image IS the record: [u16 len][pay].
         let len = core::cmp::min(frame, 4098);
-        let p = stage_alloc(len);
+        let alloc = 2 + len + 1 + SCM_MAX * 2;
+        let p = stage_alloc(alloc);
         if p.is_null() {
+            if let Some(f) = fp {
+                scm_release(f);
+            }
             return (-12i64) as u64; // ENOMEM
         }
         unsafe {
+            (p as *mut u16).write_unaligned(len as u16);
             if seqp {
                 core::ptr::copy_nonoverlapping(
                     (pay.len() as u16).to_le_bytes().as_ptr(),
-                    p, 2,
+                    p.add(2), 2,
                 );
                 core::ptr::copy_nonoverlapping(
                     pay.as_ptr(),
-                    p.add(2),
+                    p.add(4),
                     len - 2,
                 );
             } else {
-                core::ptr::copy_nonoverlapping(pay.as_ptr(), p, len);
+                core::ptr::copy_nonoverlapping(
+                    pay.as_ptr(),
+                    p.add(2),
+                    len,
+                );
+            }
+            let fz = p.add(2 + len);
+            match fp {
+                Some(f) => {
+                    *fz = f.n;
+                    for (i, &o) in f.ofd.iter().enumerate() {
+                        (fz.add(1 + i * 2) as *mut u16)
+                            .write_unaligned(o);
+                    }
+                }
+                None => *fz = 0,
             }
         }
         t.wait_on = WaitOn::UnixSendK(conn, side as u8);
         t.wait_ptr = p as u64;
-        t.wait_len = len as u64;
+        t.wait_len = alloc as u64;
         t.wait_deadline =
             sock_deadline(unix_stream_timeo(conn, side, true));
         t.ctx = *ctx;
@@ -37497,19 +37625,28 @@ fn unix_send_stream_slice(
         block_switch()
     }
     let n = core::cmp::min(frame, free);
-    let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
-    let c = conns[conn].as_mut().unwrap();
-    if seqp {
-        let rl = (pay.len() as u16).to_le_bytes();
-        for (i, &b) in rl.iter().enumerate() {
-            c.r[1 - s].data[(c.r[1 - s].tail + i) % UNIX_BUF] = b;
+    // The rights anchor at this send's first byte — the tail
+    // BEFORE this push, same value the caller computed.
+    let at = {
+        let conns = unsafe { &mut *core::ptr::addr_of_mut!(UNIXCONNS) };
+        let c = conns[conn].as_mut().unwrap();
+        let at = c.r[1 - s].tail;
+        if seqp {
+            let rl = (pay.len() as u16).to_le_bytes();
+            for (i, &b) in rl.iter().enumerate() {
+                c.r[1 - s].data[(c.r[1 - s].tail + i) % UNIX_BUF] = b;
+            }
         }
+        let off = if seqp { 2 } else { 0 };
+        for (i, &b) in pay[..n - off].iter().enumerate() {
+            c.r[1 - s].data[(c.r[1 - s].tail + off + i) % UNIX_BUF] = b;
+        }
+        c.r[1 - s].tail += n;
+        at
+    };
+    if let Some(f) = fp {
+        unix_fp_attach(conn, side, at as u64, f);
     }
-    let off = if seqp { 2 } else { 0 };
-    for (i, &b) in pay[..n - off].iter().enumerate() {
-        c.r[1 - s].data[(c.r[1 - s].tail + off + i) % UNIX_BUF] = b;
-    }
-    c.r[1 - s].tail += n;
     unix_wake(conn); // data arrived for the peer's readers
     if seqp { pay.len() as u64 } else { n as u64 }
 }
