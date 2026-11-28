@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 
 static int fails;
 
@@ -445,6 +446,73 @@ int main(void) {
         check(recvmmsg(sv[1], mv, 1, 0, NULL) < 0 &&
               errno == EAGAIN, "recvmmsg drained EAGAIN");
         close(sv[0]); close(sv[1]);
+    }
+
+    // --- SO_RCVTIMEO / SO_SNDTIMEO ---
+    {
+        int sv2[2];
+        struct timeval tv = {0, 100000}; /* 100ms */
+        struct timespec a, z;
+        check(socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0,
+              "timeo stream pair");
+        check(setsockopt(sv2[1], SOL_SOCKET, SO_RCVTIMEO,
+                         &tv, sizeof tv) == 0,
+              "SO_RCVTIMEO set");
+        struct timeval gt = {0, 0};
+        socklen_t gl = sizeof gt;
+        check(getsockopt(sv2[1], SOL_SOCKET, SO_RCVTIMEO,
+                         &gt, &gl) == 0 && gt.tv_usec == 100000,
+              "SO_RCVTIMEO get");
+        char b;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        errno = 0;
+        ssize_t r = read(sv2[1], &b, 1);
+        clock_gettime(CLOCK_MONOTONIC, &z);
+        long ms = (z.tv_sec - a.tv_sec) * 1000 +
+                  (z.tv_nsec - a.tv_nsec) / 1000000;
+        check(r == -1 && errno == EAGAIN,
+              "SO_RCVTIMEO recv -> EAGAIN");
+        check(ms >= 20 && ms < 5000, "SO_RCVTIMEO ~100ms bound");
+        /* optlen < sizeof(timeval) EINVALs like Linux
+           sock_set_timeout, not a zero-padded apply */
+        check(setsockopt(sv2[1], SOL_SOCKET, SO_RCVTIMEO,
+                         &tv, 8) == -1 && errno == EINVAL,
+              "SO_RCVTIMEO optlen 8 EINVAL");
+        /* send side: fill the ring, then a bounded write must
+           answer EAGAIN, not park forever */
+        fcntl(sv2[0], F_SETFL, O_NONBLOCK);
+        char wb[4096];
+        memset(wb, 'w', sizeof wb);
+        ssize_t w;
+        do {
+            w = write(sv2[0], wb, sizeof wb);
+        } while (w > 0);
+        check(w == -1 && errno == EAGAIN, "stream ring filled");
+        fcntl(sv2[0], F_SETFL, 0);
+        struct timeval stv = {0, 50000}; /* 50ms */
+        check(setsockopt(sv2[0], SOL_SOCKET, SO_SNDTIMEO,
+                         &stv, sizeof stv) == 0,
+              "SO_SNDTIMEO set");
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        errno = 0;
+        w = write(sv2[0], wb, 1);
+        clock_gettime(CLOCK_MONOTONIC, &z);
+        ms = (z.tv_sec - a.tv_sec) * 1000 +
+             (z.tv_nsec - a.tv_nsec) / 1000000;
+        check(w == -1 && errno == EAGAIN && ms < 5000,
+              "SO_SNDTIMEO send -> EAGAIN");
+        close(sv2[0]); close(sv2[1]);
+        check(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv2) == 0,
+              "timeo dgram pair");
+        setsockopt(sv2[1], SOL_SOCKET, SO_RCVTIMEO,
+                   &tv, sizeof tv);
+        struct sockaddr_un su;
+        socklen_t sl = sizeof su;
+        errno = 0;
+        r = recvfrom(sv2[1], &b, 1, 0, (void *)&su, &sl);
+        check(r == -1 && errno == EAGAIN,
+              "SO_RCVTIMEO dgram -> EAGAIN");
+        close(sv2[0]); close(sv2[1]);
     }
 
     char fin[64];

@@ -426,8 +426,8 @@ enum WaitOn {
     /// write() on a full AF_UNIX stream ring — (conn, my side).
     UnixSend(usize, u8),
     /// sendmsg's stream push blocked on a full ring with the
-    /// payload in kernel staging (KSEND[conn][side]) — the user
-    /// VA is gone by then.
+    /// payload in per-task kernel staging (wait_ptr/wait_len) —
+    /// the user VA is gone by then.
     UnixSendK(usize, u8),
     /// recv on an empty netlink reply queue — wait_ptr/wait_len
     /// buf, wait_ptr2 name.
@@ -2425,7 +2425,8 @@ fn pend_one(t: &mut Task, sig: u64, src: SigSrc) -> Option<(u64, u64, u64)> {
         // wait_len is the payload bytes, SemOp's is nsops, MqSnd's
         // the staged [prio][len][data] record.
         match t.wait_on {
-            WaitOn::MsgSnd(_) | WaitOn::MqSnd(_) => unsafe {
+            WaitOn::MsgSnd(_) | WaitOn::MqSnd(_)
+            | WaitOn::UnixSendK(..) => unsafe {
                 stage_free(t.wait_len as usize, t.wait_ptr as *mut u8)
             },
             WaitOn::SemOp(_) => unsafe {
@@ -3714,7 +3715,7 @@ fn vfile_stamp(v: &mut VFile, mode: u64, umask: u16) {
 /// actual size, min 4 for int options).
 pub fn fd_getsockopt(
     fd: u64,
-    _level: u64,
+    level: u64,
     optname: u64,
     optval: u64,
     optlen: u64,
@@ -3731,6 +3732,50 @@ pub fn fd_getsockopt(
     let cap = unsafe { (optlen as *const u32).read_unaligned() } as u64;
     if optval != 0 && !range_ok_w(optval, cap.clamp(1, 4)) {
         return EFAULT;
+    }
+    // SOL_SOCKET SO_RCVTIMEO(20)/SO_SNDTIMEO(21): the stored
+    // timeval back through optval, capped like Linux's min(len).
+    if level == 1 && (optname == 20 || optname == 21) {
+        let us = match ofd(t, fd).map(|o| &o.kind) {
+            Some(FdKind::Udp(i)) => Some(udp_timeo(*i, optname == 21)),
+            Some(FdKind::Tcp(i)) => Some(tcp_timeo(*i, optname == 21)),
+            Some(FdKind::Packet(i)) => {
+                Some(pkt_timeo(*i, optname == 21))
+            }
+            Some(FdKind::Unix(i)) => {
+                Some(unix_timeo(*i, optname == 21))
+            }
+            Some(FdKind::Nl(i)) => Some(nl_timeo(*i, optname == 21)),
+            Some(_) => return ENOTSOCK,
+            None => return EBADF,
+        }
+        .unwrap_or(0);
+        let mut tv = [0u8; 16];
+        tv[..8].copy_from_slice(&(us / 1_000_000).to_le_bytes());
+        tv[8..].copy_from_slice(&(us % 1_000_000).to_le_bytes());
+        // Linux's copy_to_user(len>0) EFAULTs a NULL optval —
+        // only the len word writes for a 0-byte copy.
+        if optval == 0 && cap > 0 {
+            return EFAULT;
+        }
+        if optval != 0 && cap > 0 {
+            let n = (cap as usize).min(16);
+            if !range_ok_w(optval, n as u64) {
+                return EFAULT;
+            }
+            // SAFETY: validated writable range.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    tv.as_ptr(),
+                    optval as *mut u8,
+                    n,
+                )
+            };
+        }
+        let rl = cap.min(16) as u32;
+        // SAFETY: optlen validated writable above.
+        unsafe { (optlen as *mut u32).write_unaligned(rl) };
+        return 0;
     }
     let (v, is_tcp) = match ofd(t, fd).map(|o| &o.kind) {
         Some(FdKind::Udp(_)) => (2i64, false), // SOCK_DGRAM
@@ -30178,12 +30223,25 @@ fn poll_expire() {
                     psel_restore(t);
                 }
                 WaitOn::TcpConn(si) => {
-                    // connect() timed out: ETIMEDOUT, the socket
-                    // marked dead so further io fails fast.
-                    t.ctx.rax = (-110i64) as u64;
-                    if let Some(k) = tcp_socks()[si].as_mut() {
-                        k.dead = true;
-                        k.state = TcpState::Closed;
+                    // connect() timed out: EAGAIN when the user
+                    // SO_SNDTIMEO lapsed first, ETIMEDOUT when the
+                    // internal SYN bound did (stashed in wait_len).
+                    let sto = tcp_socks()[si]
+                        .as_ref()
+                        .map(|k| k.sndtimeo)
+                        .unwrap_or(0);
+                    let user_to = sto != 0 && now < t.wait_len;
+                    t.ctx.rax =
+                        if user_to { -11i64 } else { -110i64 } as u64;
+                    if !user_to {
+                        // The internal SYN bound kills the socket;
+                        // a user sndtimeo answers EAGAIN and the
+                        // handshake keeps running (Linux's
+                        // sock_sndtimeo only bounds the wait).
+                        if let Some(k) = tcp_socks()[si].as_mut() {
+                            k.dead = true;
+                            k.state = TcpState::Closed;
+                        }
                     }
                 }
                 WaitOn::Timer => t.ctx.rax = 0, // nanosleep elapsed
@@ -30225,6 +30283,34 @@ fn poll_expire() {
                     t.ctx.rax = n;
                     psel_restore(t); // pgetevents' usig restore
                 }
+                // SO_SNDTIMEO expiry with a parked record — the
+                // staged payload dies with the wait so the peer
+                // never sees a phantom delivery (per-task stage
+                // like MqSnd, but EAGAIN not ETIMEDOUT).
+                WaitOn::UnixSendK(..) => {
+                    unsafe {
+                        stage_free(
+                            t.wait_len as usize,
+                            t.wait_ptr as *mut u8,
+                        )
+                    };
+                    t.ctx.rax = (-11i64) as u64;
+                }
+                // SO_RCVTIMEO/SO_SNDTIMEO expiry: every socket wait
+                // answers -EAGAIN like Linux's sock_wait_err.
+                WaitOn::UdpRecv(_)
+                | WaitOn::PktRecv(_)
+                | WaitOn::NlRecv(_)
+                | WaitOn::NlRecvM(_)
+                | WaitOn::UnixDgram(_)
+                | WaitOn::UnixDgramM(_)
+                | WaitOn::UnixRecv(..)
+                | WaitOn::UnixRecvM(..)
+                | WaitOn::UnixSend(..)
+                | WaitOn::UnixConn(..)
+                | WaitOn::UnixAccept(_)
+                | WaitOn::TcpRecv(_)
+                | WaitOn::TcpAccept(_) => t.ctx.rax = (-11i64) as u64,
                 _ => continue,
             }
             t.wait_on = WaitOn::None;
@@ -34219,6 +34305,10 @@ struct UdpSock {
     /// datagram-connect semantics glibc's resolver depends on.
     peer: Option<(u16, [u8; 4])>,
     q: Option<Dgram>,
+    /// SO_RCVTIMEO usec, 0 = infinite (Linux sk_rcvtimeo).
+    rcvtimeo: u64,
+    /// SO_SNDTIMEO usec, 0 = infinite.
+    sndtimeo: u64,
 }
 
 static mut UDPSOCKS: [Option<UdpSock>; MAX_SOCKS] = [const { None }; MAX_SOCKS];
@@ -34391,6 +34481,7 @@ fn udp_recv_or_block(
     t.wait_ptr = buf;
     t.wait_len = len.min(MAX_DGRAM as u64);
     t.wait_ptr2 = sa;
+    t.wait_deadline = sock_deadline(udp_timeo(si, false));
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
@@ -34466,6 +34557,8 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
                 UnixKind::Dgram { peer: None }
             },
             seq: base == 5,
+            rcvtimeo: 0,
+            sndtimeo: 0,
         });
         FdKind::Unix(si)
     } else if domain == 16 {
@@ -34477,6 +34570,8 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
             pid: 0,
             groups: 0,
             raw: base == 3,
+            rcvtimeo: 0,
+            sndtimeo: 0,
         });
         FdKind::Nl(si)
     } else if domain == 17 {
@@ -34492,6 +34587,8 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
             rd: 0,
             n: 0,
             q: [PKT_EMPTY; PKT_QCAP],
+            rcvtimeo: 0,
+            sndtimeo: 0,
         });
         FdKind::Packet(si)
     } else if base == 2 {
@@ -34499,7 +34596,13 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
         let Some(si) = socks.iter().position(Option::is_none) else {
             return ENFILE_;
         };
-        socks[si] = Some(UdpSock { port: 0, peer: None, q: None });
+        socks[si] = Some(UdpSock {
+            port: 0,
+            peer: None,
+            q: None,
+            rcvtimeo: 0,
+            sndtimeo: 0,
+        });
         FdKind::Udp(si)
     } else {
         let socks = tcp_socks();
@@ -34524,6 +34627,8 @@ pub fn fd_socket(domain: u64, ty: u64, _proto: u64) -> u64 {
             ctl_tries: 0,
             dead: false,
             rxl: 0,
+            rcvtimeo: 0,
+            sndtimeo: 0,
         });
         tcp_rxb(si).fill(0);
         FdKind::Tcp(si)
@@ -35226,7 +35331,7 @@ pub fn fd_recvmsg(ctx: &mut UCtx, fd: u64, msg: u64, flags: u64) -> u64 {
             t.wait_on = WaitOn::NlRecvM(ni);
             t.wait_ptr = msg;
             t.wait_len = flags;
-            t.wait_deadline = 0;
+            t.wait_deadline = sock_deadline(nl_timeo(ni, false));
             t.ctx = *ctx;
             t.state = TaskState::Blocked;
             block_switch()
@@ -35267,7 +35372,7 @@ pub fn fd_recvmsg(ctx: &mut UCtx, fd: u64, msg: u64, flags: u64) -> u64 {
                     t.wait_on = WaitOn::UnixDgramM(ui);
                     t.wait_ptr = msg;
                     t.wait_len = flags;
-                    t.wait_deadline = 0;
+                    t.wait_deadline = sock_deadline(unix_timeo(ui, false));
                     t.ctx = *ctx;
                     t.state = TaskState::Blocked;
                     block_switch()
@@ -35297,7 +35402,7 @@ pub fn fd_recvmsg(ctx: &mut UCtx, fd: u64, msg: u64, flags: u64) -> u64 {
                             t.wait_on = WaitOn::UnixRecvM(conn, side as u8);
                             t.wait_ptr = msg;
                             t.wait_len = flags;
-                            t.wait_deadline = 0;
+                            t.wait_deadline = sock_deadline(unix_timeo(ui, false));
                             t.ctx = *ctx;
                             t.state = TaskState::Blocked;
                             block_switch()
@@ -35628,9 +35733,10 @@ pub fn fd_sendmmsg(ctx: &mut UCtx, fd: u64, msgvec: u64, vlen: u64, flags: u64) 
 /// recvmmsg(fd, msgvec, vlen, flags, timeout): the recv twin —
 /// per-entry recvmsg, byte count into mmsghdr.msg_len, first
 /// error after >=1 success short-stops. `timeout` is validated
-/// when passed but ignored: our recv paths have no deadline
-/// semantics (documented divergence — callers wanting a bound
-/// should use poll + MSG_DONTWAIT).
+/// when passed but ignored — the per-syscall bound is a
+/// documented divergence; SO_RCVTIMEO does bound each inner
+/// recv like Linux (callers wanting an overall cap use poll +
+/// MSG_DONTWAIT).
 pub fn fd_recvmmsg(
     ctx: &mut UCtx,
     fd: u64,
@@ -35664,6 +35770,70 @@ pub fn fd_recvmmsg(
     got
 }
 
+/// SO_RCVTIMEO/SO_SNDTIMEO arm: a usec bound becomes a tick
+/// deadline (round up to the 10ms tick, min one — Linux's
+/// sk_timeout jiffies rounding); 0 stays infinite.
+fn sock_deadline(us: u64) -> u64 {
+    if us == 0 {
+        0
+    } else {
+        // Saturating like Linux's MAX_SCHEDULE_TIMEOUT clamp —
+        // setsockopt stores a saturating usec value that can sit
+        // at u64::MAX; plain +9_999 rounding would wrap to ~0.
+        crate::apic::TICKS
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_add(
+                us / 10_000 + u64::from(!us.is_multiple_of(10_000)),
+            )
+    }
+}
+
+/// The SO_*TIMEO field of a unix stream endpoint's socket: the
+/// sock whose Stream{conn,side} IS this endpoint (snd chooses
+/// sndtimeo on the sender, else rcvtimeo on the receiver).
+fn unix_stream_timeo(conn: usize, side: usize, snd: bool) -> u64 {
+    unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+        .iter()
+        .flatten()
+        .find(|k| {
+            matches!(&k.kind, UnixKind::Stream { conn: c, side: s }
+                if *c == conn && *s as usize == side)
+        })
+        .map(|k| if snd { k.sndtimeo } else { k.rcvtimeo })
+        .unwrap_or(0)
+}
+
+fn udp_timeo(si: usize, snd: bool) -> u64 {
+    unsafe { &*core::ptr::addr_of!(UDPSOCKS) }
+        .get(si).and_then(|s| s.as_ref())
+        .map(|k| if snd { k.sndtimeo } else { k.rcvtimeo })
+        .unwrap_or(0)
+}
+fn tcp_timeo(si: usize, snd: bool) -> u64 {
+    tcp_socks()
+        .get(si).and_then(|s| s.as_ref())
+        .map(|k| if snd { k.sndtimeo } else { k.rcvtimeo })
+        .unwrap_or(0)
+}
+fn pkt_timeo(si: usize, snd: bool) -> u64 {
+    unsafe { &*core::ptr::addr_of!(PKTSOCKS) }
+        .get(si).and_then(|s| s.as_ref())
+        .map(|k| if snd { k.sndtimeo } else { k.rcvtimeo })
+        .unwrap_or(0)
+}
+fn nl_timeo(si: usize, snd: bool) -> u64 {
+    unsafe { &*core::ptr::addr_of!(NLSOCKS) }
+        .get(si).and_then(|s| s.as_ref())
+        .map(|k| if snd { k.sndtimeo } else { k.rcvtimeo })
+        .unwrap_or(0)
+}
+fn unix_timeo(si: usize, snd: bool) -> u64 {
+    unsafe { &*core::ptr::addr_of!(UNIXSOCKS) }
+        .get(si).and_then(|s| s.as_ref())
+        .map(|k| if snd { k.sndtimeo } else { k.rcvtimeo })
+        .unwrap_or(0)
+}
+
 /// setsockopt(fd, level, optname, optval, optlen): option surface
 /// the resolver and busybox probe (IP_RECVERR, SO_* flags) — the
 /// socket layer honors none of them yet, so accept-and-drop like a
@@ -35672,24 +35842,82 @@ pub fn fd_recvmmsg(
 /// Linux shapes kept.
 pub fn fd_setsockopt(
     fd: u64,
-    _level: u64,
-    _optname: u64,
+    level: u64,
+    optname: u64,
     optval: u64,
     optlen: u64,
 ) -> u64 {
     const ENOTSOCK: u64 = (-88i64) as u64;
+    const EDOM_: u64 = (-33i64) as u64;
     let Some(t) = cur_mut() else { return EBADF };
-    match ofd(t, fd).map(|o| &o.kind) {
-        Some(FdKind::Udp(_))
-        | Some(FdKind::Tcp(_))
-        | Some(FdKind::Packet(_))
-        | Some(FdKind::Unix(_))
-        | Some(FdKind::Nl(_)) => {}
+    let (tab, i) = match ofd(t, fd).map(|o| &o.kind) {
+        Some(FdKind::Udp(i)) => (0u8, *i),
+        Some(FdKind::Tcp(i)) => (1, *i),
+        Some(FdKind::Packet(i)) => (2, *i),
+        Some(FdKind::Unix(i)) => (3, *i),
+        Some(FdKind::Nl(i)) => (4, *i),
         Some(_) => return ENOTSOCK,
         None => return EBADF,
-    }
-    if optlen > 0 && !range_ok(optval, optlen) {
-        return EFAULT;
+    };
+    // SOL_SOCKET SO_RCVTIMEO(20)/SO_SNDTIMEO(21): the
+    // __kernel_sock_timeval {i64 sec, i64 usec}; Linux floors a
+    // sub-jiffy nonzero bound to one tick — we store usec and
+    // round at arm time. usec outside [0,1e6) is EDOM.
+    if level == 1 && (optname == 20 || optname == 21) {
+        // Linux sock_set_timeout EINVALs optlen < sizeof(timeval)
+        // before touching the pointer.
+        if optlen < 16 {
+            return EINVAL;
+        }
+        // Linux needs only sizeof(timeval) readable — a larger
+        // optlen doesn't widen the touched range.
+        if !range_ok(optval, 16) {
+            return EFAULT;
+        }
+        let sec = unsafe {
+            (optval as *const i64).read_unaligned()
+        };
+        let usec = unsafe {
+            (optval as *const i64).add(1).read_unaligned()
+        };
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return EDOM_;
+        }
+        let us = (sec as u64)
+            .saturating_mul(1_000_000)
+            .saturating_add(usec as u64);
+        let snd = optname == 21;
+        match tab {
+            0 => {
+                let k = unsafe { &mut *core::ptr::addr_of_mut!(UDPSOCKS) };
+                if let Some(s) = k.get_mut(i).and_then(|s| s.as_mut()) {
+                    if snd { s.sndtimeo = us } else { s.rcvtimeo = us }
+                }
+            }
+            1 => {
+                if let Some(s) = tcp_socks().get_mut(i).and_then(|s| s.as_mut()) {
+                    if snd { s.sndtimeo = us } else { s.rcvtimeo = us }
+                }
+            }
+            2 => {
+                let k = unsafe { &mut *core::ptr::addr_of_mut!(PKTSOCKS) };
+                if let Some(s) = k.get_mut(i).and_then(|s| s.as_mut()) {
+                    if snd { s.sndtimeo = us } else { s.rcvtimeo = us }
+                }
+            }
+            3 => {
+                let k = unsafe { &mut *core::ptr::addr_of_mut!(UNIXSOCKS) };
+                if let Some(s) = k.get_mut(i).and_then(|s| s.as_mut()) {
+                    if snd { s.sndtimeo = us } else { s.rcvtimeo = us }
+                }
+            }
+            _ => {
+                let k = unsafe { &mut *core::ptr::addr_of_mut!(NLSOCKS) };
+                if let Some(s) = k.get_mut(i).and_then(|s| s.as_mut()) {
+                    if snd { s.sndtimeo = us } else { s.rcvtimeo = us }
+                }
+            }
+        }
     }
     0
 }
@@ -35820,6 +36048,9 @@ struct UnixSock {
     /// SOCK_SEQPACKET — Stream-kind conns carry [u16 len][pay]
     /// records instead of a byte stream.
     seq: bool,
+    /// SO_RCVTIMEO/SO_SNDTIMEO usec, 0 = infinite.
+    rcvtimeo: u64,
+    sndtimeo: u64,
 }
 
 /// One direction of a stream connection: a plain byte ring.
@@ -35862,21 +36093,6 @@ struct UnixConn {
 
 static mut UNIXSOCKS: [Option<UnixSock>; MAX_UNIX] =
     [const { None }; MAX_UNIX];
-/// Kernel staging for a blocked slice send — sendmsg gathers into
-/// kernel memory, so a full ring can't park on the caller's VA.
-#[derive(Clone, Copy)]
-struct KSend {
-    data: [u8; 4098],
-    len: usize,
-}
-
-/// Per-conn-direction staging; Some only while a UnixSendK sleeper
-/// owns it. `const None` needs a Copy value, KSend isn't — build
-/// through the explicit array form.
-#[allow(clippy::declare_interior_mutable_const)]
-static mut KSEND: [[Option<KSend>; 2]; MAX_UNIX] =
-    [[const { None }; 2]; MAX_UNIX];
-
 static mut UNIXCONNS: [Option<UnixConn>; MAX_UNIX] =
     [const { None }; MAX_UNIX];
 /// Datagram queues — sock `si` owns the slice at si*UNIX_DQ; the
@@ -36609,9 +36825,10 @@ fn unix_wake(conn: usize) {
                 t.wait_deadline = 0;
                 t.state = TaskState::Runnable;
             }
-            // A blocked slice send: the payload lives in kernel
-            // staging KSEND[conn][side] — push what fits, drop
-            // the slot, deposit the pushed count.
+            // A blocked slice send: the payload lives in the
+            // sleeper's own staged buffer (wait_ptr/wait_len) —
+            // push what fits, free the stage, deposit the
+            // pushed count.
             WaitOn::UnixSendK(wc, side) if wc == conn => {
                 let s = side as usize & 1;
                 let c = unsafe {
@@ -36621,38 +36838,38 @@ fn unix_wake(conn: usize) {
                 };
                 if !c.open[1 - s] {
                     t.ctx.rax = (-32i64) as u64; // EPIPE
-                    unsafe { KSEND[conn][s] = None; }
+                    unsafe {
+                        stage_free(
+                            t.wait_len as usize,
+                            t.wait_ptr as *mut u8,
+                        )
+                    };
                 } else {
                     let free =
                         UNIX_BUF - (c.r[1 - s].tail - c.r[1 - s].head);
                     if free == 0 {
                         continue;
                     }
-                    let ks = unsafe {
-                        KSEND[conn][s].as_mut().unwrap()
-                    };
+                    let len = t.wait_len as usize;
                     // seqpacket: staging holds the whole framed
                     // record — all or nothing, and rax answers
                     // the payload length not the frame length.
-                    if c.seq && free < ks.len {
+                    if c.seq && free < len {
                         continue;
                     }
-                    let n = if c.seq {
-                        ks.len
-                    } else {
-                        core::cmp::min(ks.len, free)
-                    };
-                    for (i, &b) in ks.data[..n].iter().enumerate() {
-                        c.r[1 - s].data
-                            [(c.r[1 - s].tail + i) % UNIX_BUF] = b;
+                    let n =
+                        if c.seq { len } else { core::cmp::min(len, free) };
+                    let src = t.wait_ptr as *const u8;
+                    for i in 0..n {
+                        c.r[1 - s].data[(c.r[1 - s].tail + i)
+                            % UNIX_BUF] = unsafe { *src.add(i) };
                     }
                     c.r[1 - s].tail += n;
-                    t.ctx.rax = if c.seq {
-                        (n - 2) as u64
-                    } else {
-                        n as u64
+                    t.ctx.rax =
+                        if c.seq { (n - 2) as u64 } else { n as u64 };
+                    unsafe {
+                        stage_free(len, t.wait_ptr as *mut u8)
                     };
-                    unsafe { KSEND[conn][s] = None; }
                 }
                 t.wait_on = WaitOn::None;
                 t.wait_deadline = 0;
@@ -36685,7 +36902,8 @@ fn unix_mint_fd(
             ENFILE_
         });
     };
-    socks[si] = Some(UnixSock { name: None, kind, seq });
+    socks[si] =
+        Some(UnixSock { name: None, kind, seq, rcvtimeo: 0, sndtimeo: 0 });
     ofds[oi] = Some(OpenFile {
         kind: FdKind::Unix(si),
         pos: 0,
@@ -36975,7 +37193,8 @@ fn unix_recv_stream(
     t.wait_on = WaitOn::UnixRecv(conn, side as u8);
     t.wait_ptr = buf;
     t.wait_len = len.min(UNIX_BUF as u64);
-    t.wait_deadline = 0;
+    t.wait_deadline =
+        sock_deadline(unix_stream_timeo(conn, side, false));
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
@@ -37069,7 +37288,8 @@ fn unix_send_stream(
             t.wait_on = WaitOn::UnixSend(conn, side as u8);
             t.wait_ptr = buf;
             t.wait_len = len.min(UNIX_BUF as u64);
-            t.wait_deadline = 0;
+            t.wait_deadline =
+                sock_deadline(unix_stream_timeo(conn, side, true));
             t.ctx = *ctx;
             t.state = TaskState::Blocked;
             if t.state == TaskState::Runnable {
@@ -37089,6 +37309,7 @@ fn unix_send_stream(
             };
             if !open2 {
                 t.wait_on = WaitOn::None;
+                t.wait_deadline = 0;
                 t.state = TaskState::Runnable;
                 return EPIPE_;
             }
@@ -37096,6 +37317,7 @@ fn unix_send_stream(
                 block_switch();
             }
             t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
             t.state = TaskState::Runnable;
         }
     }
@@ -37127,7 +37349,8 @@ fn unix_send_stream(
             t.wait_on = WaitOn::UnixSend(conn, side as u8);
             t.wait_ptr = buf;
             t.wait_len = len.min(UNIX_BUF as u64);
-            t.wait_deadline = 0;
+            t.wait_deadline =
+                sock_deadline(unix_stream_timeo(conn, side, true));
             t.ctx = *ctx;
             t.state = TaskState::Blocked;
             if t.state == TaskState::Runnable {
@@ -37149,6 +37372,7 @@ fn unix_send_stream(
             };
             if !open2 {
                 t.wait_on = WaitOn::None;
+                t.wait_deadline = 0;
                 t.state = TaskState::Runnable;
                 return EPIPE_;
             }
@@ -37156,6 +37380,7 @@ fn unix_send_stream(
                 block_switch();
             }
             t.wait_on = WaitOn::None;
+            t.wait_deadline = 0;
             t.state = TaskState::Runnable;
             continue;
         }
@@ -37191,7 +37416,7 @@ fn unix_send_stream(
 
 /// Slice form of unix_send_stream for sendmsg: the payload is
 /// already gathered into kernel memory. A full ring still blocks
-/// honestly — the bytes park in KSEND[conn][side] and the
+/// honestly — the bytes park in a per-task staged buffer and the
 /// UnixSendK waker pushes them under the sleeper's tables.
 fn unix_send_stream_slice(
     ctx: &mut UCtx,
@@ -37236,22 +37461,37 @@ fn unix_send_stream_slice(
         if deliverable(t) {
             return EINTR_;
         }
-        // Park the payload in kernel staging — wait_ptr is dead.
-        // For seq the staging IS the record: [u16 len][pay].
-        let ks = unsafe { &mut KSEND[conn][s] };
+        // Park the payload in a per-task staged buffer the waker
+        // pushes under the sleeper's tables — wait_ptr/wait_len
+        // carry it like the MqSnd staging, so concurrent
+        // sleepers on one conn-direction can't clobber a
+        // shared slot. For seq the staging IS the record:
+        // [u16 len][pay].
         let len = core::cmp::min(frame, 4098);
-        *ks = Some(KSend { data: [0u8; 4098], len });
-        let kd = &mut ks.as_mut().unwrap().data;
-        if seqp {
-            kd[..2].copy_from_slice(
-                &(pay.len() as u16).to_le_bytes(),
-            );
-            kd[2..len].copy_from_slice(&pay[..len - 2]);
-        } else {
-            kd[..len].copy_from_slice(&pay[..len]);
+        let p = stage_alloc(len);
+        if p.is_null() {
+            return (-12i64) as u64; // ENOMEM
+        }
+        unsafe {
+            if seqp {
+                core::ptr::copy_nonoverlapping(
+                    (pay.len() as u16).to_le_bytes().as_ptr(),
+                    p, 2,
+                );
+                core::ptr::copy_nonoverlapping(
+                    pay.as_ptr(),
+                    p.add(2),
+                    len - 2,
+                );
+            } else {
+                core::ptr::copy_nonoverlapping(pay.as_ptr(), p, len);
+            }
         }
         t.wait_on = WaitOn::UnixSendK(conn, side as u8);
-        t.wait_deadline = 0;
+        t.wait_ptr = p as u64;
+        t.wait_len = len as u64;
+        t.wait_deadline =
+            sock_deadline(unix_stream_timeo(conn, side, true));
         t.ctx = *ctx;
         t.state = TaskState::Blocked;
         block_switch()
@@ -37293,6 +37533,9 @@ struct NlSock {
     pid: u32,
     groups: u32,
     raw: bool,
+    /// SO_RCVTIMEO/SO_SNDTIMEO usec, 0 = infinite.
+    rcvtimeo: u64,
+    sndtimeo: u64,
 }
 
 /// A queued reply datagram — one producer blob.
@@ -37703,7 +37946,7 @@ fn nl_recv_buf(
     t.wait_ptr = buf;
     t.wait_len = len;
     t.wait_ptr2 = sa;
-    t.wait_deadline = 0;
+    t.wait_deadline = sock_deadline(nl_timeo(si, false));
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
@@ -38055,7 +38298,7 @@ fn unix_recv_dgram(
     t.wait_ptr = buf;
     t.wait_len = len.min(1024);
     t.wait_ptr2 = sa;
-    t.wait_deadline = 0;
+    t.wait_deadline = sock_deadline(unix_timeo(si, false));
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
@@ -38256,7 +38499,7 @@ fn unix_connect(ctx: &mut UCtx, ui: usize, sa: u64, len: u64, dw: bool) -> u64 {
         return (-11i64) as u64; // EAGAIN
     }
     t.wait_on = WaitOn::UnixConn(li, ui);
-    t.wait_deadline = 0;
+    t.wait_deadline = sock_deadline(unix_timeo(ui, true));
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     if t.state == TaskState::Runnable {
@@ -38320,6 +38563,9 @@ struct PktSock {
     rd: usize,
     n: usize,
     q: [PktFrame; PKT_QCAP],
+    /// SO_RCVTIMEO/SO_SNDTIMEO usec, 0 = infinite.
+    rcvtimeo: u64,
+    sndtimeo: u64,
 }
 
 static mut PKTSOCKS: [Option<PktSock>; MAX_PKTS] =
@@ -38511,6 +38757,7 @@ fn pkt_recv_or_block(
     t.wait_ptr = buf;
     t.wait_len = len.min(PKT_FRAME as u64);
     t.wait_ptr2 = sa;
+    t.wait_deadline = sock_deadline(pkt_timeo(si, false));
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
@@ -38662,6 +38909,9 @@ struct TcpSock {
     /// RST seen — reads fail ECONNRESET, writes EPIPE.
     dead: bool,
     rxl: usize,
+    /// SO_RCVTIMEO/SO_SNDTIMEO usec, 0 = infinite.
+    rcvtimeo: u64,
+    sndtimeo: u64,
 }
 
 /// Per-connection stream buffers, separate from the socket struct so
@@ -39092,6 +39342,12 @@ pub fn tcp_rx(
             return; // backlog bound — honest drop
         }
         let isn = tcp_isn(src_ip, dport, sport);
+        // sk_clone inheritance — Linux's accepted socket keeps
+        // the listener's SO_*TIMEO (sk_rcvtimeo rides the copy).
+        let (lrcv, lsnd) = socks[li]
+            .as_ref()
+            .map(|k| (k.rcvtimeo, k.sndtimeo))
+            .unwrap_or((0, 0));
         socks[ci] = Some(TcpSock {
             port: dport,
             peer_ip: src_ip,
@@ -39110,6 +39366,8 @@ pub fn tcp_rx(
             ctl_tries: 0,
             dead: false,
             rxl: 0,
+            rcvtimeo: lrcv,
+            sndtimeo: lsnd,
         });
         tcp_rxb(ci).fill(0);
         // SYN-ACK from the child: seq=isn, ack=their seq+1.
@@ -39241,9 +39499,16 @@ pub fn fd_connect(ctx: &mut UCtx, fd: u64, sa: u64, len: u64) -> u64 {
         return EINTR_;
     }
     t.wait_on = WaitOn::TcpConn(si);
-    t.wait_deadline = crate::apic::TICKS
+    // SO_SNDTIMEO bounds connect() (Linux sk_sndtimeo) but the
+    // internal SYN bound still lapses underneath — the wait dies
+    // at whichever fires first; wait_len stashes the internal
+    // bound so the expiry arm can pick its errno.
+    let int_d = crate::apic::TICKS
         .load(core::sync::atomic::Ordering::Relaxed)
         + TCP_CONN_TICKS;
+    let snd_d = sock_deadline(tcp_timeo(si, true));
+    t.wait_deadline = if snd_d != 0 { snd_d.min(int_d) } else { int_d };
+    t.wait_len = int_d;
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
@@ -39528,7 +39793,7 @@ pub fn fd_accept(ctx: &mut UCtx, fd: u64, sa: u64, _alen: u64, flags: u64) -> u6
             t.wait_on = WaitOn::UnixAccept(li);
             t.wait_ptr2 = sa;
             t.wait_len = flags;
-            t.wait_deadline = 0;
+            t.wait_deadline = sock_deadline(unix_timeo(li, false));
             t.ctx = *ctx;
             t.state = TaskState::Blocked;
             if t.state == TaskState::Runnable {
@@ -39589,6 +39854,7 @@ pub fn fd_accept(ctx: &mut UCtx, fd: u64, sa: u64, _alen: u64, flags: u64) -> u6
     t.wait_on = WaitOn::TcpAccept(li);
     t.wait_ptr2 = sa;
     t.wait_len = flags; // accept4's SOCK_CLOEXEC rides the wake
+    t.wait_deadline = sock_deadline(tcp_timeo(li, false));
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     block_switch()
@@ -39663,6 +39929,7 @@ fn tcp_recv_or_block(
     t.wait_ptr = buf;
     t.wait_len = len.min(TCP_RX_CAP as u64);
     t.wait_ptr2 = sa;
+    t.wait_deadline = sock_deadline(tcp_timeo(si, false));
     t.ctx = *ctx;
     t.state = TaskState::Blocked;
     // Re-check under the armed wait: a timer IRQ draining the ring

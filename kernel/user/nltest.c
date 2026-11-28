@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <linux/netlink.h>
@@ -249,6 +250,20 @@ int main(void) {
     fcntl(fd, F_SETFL, O_NONBLOCK);
     check(recv(fd, blob, sizeof(blob), 0) < 0 && errno == EAGAIN,
           "drained EAGAIN");
+
+    // SO_RCVTIMEO: a blocking recv on the drained queue answers
+    // EAGAIN at the deadline, not a permanent park.
+    fcntl(fd, F_SETFL, 0);
+    struct timeval ntv = {0, 50000}; /* 50ms */
+    check(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &ntv,
+                     sizeof(ntv)) == 0,
+          "SO_RCVTIMEO set");
+    errno = 0;
+    check(recv(fd, blob, sizeof(blob), 0) < 0 && errno == EAGAIN,
+          "SO_RCVTIMEO recv -> EAGAIN");
+    // Short optlen EINVALs like Linux sock_set_timeout.
+    check(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &ntv, 8) < 0 &&
+          errno == EINVAL, "SO_RCVTIMEO optlen 8 EINVAL");
 
     // poll + FIONREAD after a fresh request.
     memset(&ii, 0, sizeof(ii));
