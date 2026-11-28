@@ -10114,3 +10114,112 @@ scope.
   reentrancy (pre-existing) + conn-teardown stranding
   parked waiters (C-3) — natural run-361.
 
+
+## run-361 — conn teardown order: wake waiters before freeing
+
+- Pre-existing stranding (run-360 critic C-3): unix_sock_close
+  took the conn out of UNIXCONNS BEFORE unix_wake(conn) when
+  both halves died; unix_wake early-returns on a dead slot,
+  so a waiter still armed on the conn was stranded forever —
+  and a parked UnixSendK leaked its staged record. Reachable
+  when a task's OWN fd is closed under it through a shared
+  CLONE_FILES table (the blocked syscall holds no fd ref, so
+  close drops the sock while the task sleeps) followed by the
+  peer close.
+- Fix 1 (stranding): unix_wake now runs BEFORE the conn
+  free — armed waiters resolve through the normal arms
+  (senders EPIPE + release their staged batch; readers drain
+  or EOF) while the record still exists.
+- Fix 2 (dead test): conn dies with its last SOCK, not its
+  last open[] flag — shutdown(WR) clears open[] but the half
+  can still read, so `dead` is a UNIXSOCKS scan for any
+  Stream sock on the conn. Was losing queued inbound data
+  when A shutdown(WR) + B closed (hunter F-3).
+- Fix 3 (flag conflation): open[s] is the WRITE-half flag
+  (close OR own SHUT_WR), but send sites used open[1-s] as
+  the peer-alive test — peer SHUT_WR spuriously EPIPEd
+  senders and peer SHUT_RD never did. Sendable is now
+  open[s] && unix_side_live(1-s) && !rd_shut[1-s] at all 5
+  sites; own SHUT_WR correctly EPIPEs sends from that side.
+- Fix 4 (dead-conn sweep): unix_wake's early-return became
+  a straggler resolver — armed waiters on a dead conn get
+  EPIPE/EOF (+ stage release) instead of being skipped.
+- Fix 5 (wake arm guard): UnixRecv arm's conn unwrap is a
+  let-else EOF resolve + gained && !rd_shut[s] parity with
+  the inline paths.
+- Fix 6 (poller stranding): unix_sock_close never called
+  wake_pollers — a poll/epoll waiter on a dying unix fd
+  could block forever (pipes already do it); added at close
+  end (all kinds) and fd_shutdown's unix arm.
+- Re-entrancy verified: releases inside the waker can
+  re-enter unix_sock_close; re-entry on this conn's socks
+  early-returns (socks taken at each close's head), and the
+  take() is let-else not unwrap. Recursion bounded by armed
+  waits (pre-existing reentrant-borrow idiom).
+- Test (unixtest +11 checks): CLONE_FILES thread parks in
+  send/recv/sendmsg+rights/poll — shared-table parent closes
+  BOTH ends -> EPIPE/EOF/EPIPE/wake (pre-fix: stranded);
+  write-to-SHUT_WR-peer succeeds, write-to-SHUT_RD-peer
+  EPIPEs, send-on-own-SHUT_WR EPIPEs, queued byte survives
+  A-shutWR+B-close then EOF.
+- cve-now sweep: unix socket close/race class — all hits are
+  af_unix GC races (CVE-2021-4083, CVE-2024-26923,
+  CVE-2024-36972, CVE-2024-39500) or bpf sockmap
+  (CVE-2024-56664, CVE-2026-23394, CVE-2026-53033): no GC
+  cycle collector, no bpf — none map.
+- Audit (run-119, scoped quick): hunter PASS on the
+  reorder — flagged pre-existing blast-radius defects,
+  all fixed in-run: H-1 HIGH re-entrant conn free
+  mid-wake could panic the arm unwraps (closed by
+  let-else guards + dead-sweep invariant + take()-
+  let-else); H-2 MED no wake_pollers on unix close —
+  poller on a dying unix fd stranded (fixed);
+  H-3 MED shutdown(WR) shared open[] with the dead
+  take — A shutWR + B close lost A's readable data
+  (fixed: dead = sock-presence + backlog scan);
+  H-4 LOW UnixRecv arm rd_shut parity (fixed).
+  Critic FIX — found the backlog hole the sock-
+  presence model introduced: the accept backlog holds
+  conn side-1 BEFORE its sock is minted, so C-1a HIGH
+  pre-accept sends wrongly EPIPEd and C-1b HIGH a
+  dead connector's freed conn left a stale backlog
+  index able to splice a REUSED conn into a later
+  accept (fixed: unix_conn_backlogged ORs into
+  side_live(1) + the dead scan); C-2 LOW dead-sweep
+  RecvM skipped umsg_set_flags(0) (fixed); C-3 LOW
+  ofd_revents + two armed-rechecks still used
+  open[1-s] (unified to the sendable predicate);
+  C-4 own-SHUT_WR didn't EPIPE own sends (fixed:
+  open[s] conjunct); listener-close stranded-conn
+  release added for the zero-sock backlog orphan edge.
+  Verifier-1 FIX — V-1 HIGH listener close left
+  backlogged conns with stale open[1] -> connector
+  reads hung / parked waiters stranded (fixed:
+  Listen arm sets open[1]=0 + unix_wake on every
+  backlog conn, takes it only when the connector
+  sock is also dead; EOF approximates Linux
+  ECONNRESET — documented); V-2 HIGH
+  unix_wake_conn could mint a conn for a dead or
+  slot-REUSED connector sock (fixed: own-fd sweep
+  right after the sock take() resolves every
+  Blocked waiter armed on the dying index —
+  UnixConn/UnixAccept/UnixDgram/UnixDgramM — with
+  EBADF + disarm, and the conn-flip gates on
+  UnixKind::Fresh); V-3 DOCUMENT residual —
+  non-own-fd stranding (a waiter parked on a conn
+  whose BOTH socks die while the waiter never held
+  either) remains reachable only through paths the
+  sweep can't see; logged.
+  Verifier-2 PASS — V-1/V-2 fixes verified
+  end-to-end; folded two same-class pre-existing
+  gaps it surfaced: ofd_revents POLLIN missed
+  rd_shut[s] (poll(-1) could sleep on a read that
+  would answer EOF) and stream data arrival never
+  woke pollers (fixed: unix_wake tail re-arms
+  epoll edges on both end socks + wake_pollers,
+  covering pushes, drains and side death).
+  Tests: strand sop 0-4 (send/recv/sendmsg+rights/
+  poll/connect) + sarm syscall-boundary sync;
+  lc listener-close EOF/EPIPE; dead-connector
+  accept; wake-poll-on-data. Gates: 127 tasks,
+  frames equal, zero FAIL.
