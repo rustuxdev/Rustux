@@ -9811,3 +9811,100 @@ scope.
   self-asserted uid — structural to the root model).
 - Gates: PASS 127 tasks frames zero leak zero FAIL (357d/e);
   credtest 0 failures incl. all new checks.
+
+## run-358 — PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER
+
+- prctl ops 36/37 absent — orphaned descendants always landed on
+  ppid=0 (auto-reap) regardless of ancestor. tmux/systemd --user
+  and daemon supervisors rely on the nearest marked ancestor
+  adopting them.
+- Task.child_subreaper: set by prctl(36, arg2!=0), read via
+  prctl(37). Inits match the Linux signal_struct model: boot,
+  fork, non-thread clone -> false; thread paths
+  (nt_thread_create, clone_vm thread) inherit the parent's flag
+  (threads share the signal_struct).
+- find_subreaper walks the real-parent chain from the dying
+  task's parent (rppid when traced — Linux find_new_reaper
+  reads real_parent) up to the nearest live flagged ancestor,
+  bounded MAX_TASKS; chain end or dead slot -> 0 = init-ward.
+- reparent_orphans replaces both inline ppid=0 sweeps in
+  exit_bookkeeping: untraced children get ppid=reaper, traced
+  children keep the tracer as ppid but re-key rppid=reaper
+  (Linux updates real_parent; detach/release later resolves
+  ppid=rppid).
+- REAL BUG found by the rung's own test: the old sweeps skipped
+  Exited children — a zombie grandchild never reparented and
+  became unwaitable (status dropped, auto-reaped on ppid=0).
+  Linux forget_original_parent re-keys zombies too and runs
+  parent_notify so the new reaper gets SIGCHLD + wait4 wake.
+  Fix: reparent_orphans handles zombies; for reaper!=0 each
+  reparented zombie posts SIGCHLD to the reaper and runs
+  wake_waiter_for_child (extracted verbatim from the ~75-line
+  wait4/waitid/WNOWAIT/Vfork wake loop) so a blocked or later
+  wait collects it.
+- Test (credtest +5): arm/GET readback; grandchild reparent —
+  mid exits after the grandchild is live, g's getppid lands on
+  the armed grandparent and waitpid(-1) collects g (the
+  wait4-collectible leg is the zombie-reparent regression);
+  fork does not inherit; prctl(36,0) clears.
+- Test bug found: inside mid's fork the grandchild saw mid==0
+  (fork's return in the child) so its p!=mid guard fired early
+  — g exited as a zombie before mid died, which is what exposed
+  the zombie-reparent hole. Guard reordered.
+- cve-now sweep: orphan-reparent/subreaper class — no applicable
+  CVEs.
+- Audit (run-116, scoped quick): hunter FIX -
+  F-1 MED find_subreaper walked t.ppid — a traced ancestor's
+  ppid names its TRACER, so the walk jumped into the tracer's
+  subtree (wrong reaper / MAX_TASKS cycle when a tracer traces
+  its own ancestor). Now walks the real-parent link
+  (rppid when traced) like Linux real_parent, matching the
+  call-site resolution. Regression: credtest traced-ancestor
+  check arms the tracer — a buggy ppid walk would land the
+  orphan on T instead of the armed grandparent.
+  F-2 LOW traced-zombie handoff lost the re-notify: a zombie
+  tracee whose real parent died kept ppid=tracer until tracer
+  reap, then silently re-keyed — a reaper blocked in wait4
+  never woke. ptrace_release_tracer now runs the same
+  SIGCHLD + wait-wake for Exited tracees landing on a live
+  parent (Linux __ptrace_unlink do_notify_parent).
+  F-3 LOW transient mis-parenting: the dying tracer's still-
+  attached tracees were swept to the tracer's subreaper while
+  the tracer link survived — exit_ptrace detaches to the real
+  parent first; reparent_orphans now skips attached tracees
+  (release owns them) unless the tracer IS the real parent or
+  rppid==0.
+  F-4 INFO find_subreaper didn't exclude an Exited flagged
+  candidate — guarded (invariant holds anyway).
+  F-5 INFO flag was per-Task vs Linux's shared signal_struct —
+  a member's PR_SET didn't arm siblings/leader and PR_GET read
+  a sibling-local bit; PR_SET now propagates same-tgid.
+  Critic FIX — all five hunter fixes verified in-tree.
+  C-1 MED the F-2 notify was largely unreachable: release ran
+  at tracer REAP but pick_next's dead-ppid sweep frees an
+  attached zombie tracee first — the real parent lost status
+  and SIGCHLD. Linux runs exit_ptrace at death;
+  ptrace_release_tracer now runs inside exit_bookkeeping right
+  after reparent_orphans at BOTH sweeps (leader + is_thread).
+  C-2 LOW consumed-zombie revival: release re-keyed
+  s.ppid=s.rppid on a zombie already collected to ppid=0 —
+  now gated s.ppid==pid (still naming the dead tracer) and
+  rppid cleared unconditionally. C-3 LOW anc<=1 barred an
+  armed init — anc==0 cutoff. C-4 LOW rppid==0 detach left
+  ppid=dead-tracer — unconditional ppid=rppid under the gate.
+  Regression: credtest zombie-tracee check kills the tracee
+  then the tracer and waits the tracee BEFORE reaping the
+  tracer — reap-only release answers ECHILD.
+  Verifier PASS — every fix confirmed in place, ordering
+  proven (reparent re-keys rppid before release reads it;
+  is_thread release precedes the ppid=0 clobber). Residual
+  V-1 LOW: nested-exit recursion (pend_one -> maybe_deliver
+  -> pend_exit_sweep -> exit_bookkeeping -> reparent/release
+  -> pend_one) now carries ~9.8KB of zom arrays per level on
+  the 48KB kstack — the cycle pre-exists (pdeathsig rode the
+  same path), this diff adds ~4-5-level depth cost; a crafted
+  fatal+SIGCHLD-handler chain could overflow. Not fixed —
+  needs a recursion bound or deferred-notify design.
+- Gates: PASS 127 tasks frames zero leak zero FAIL; credtest
+  0 failures incl. all new checks (358d clean; 358e/f the
+  hvctest feeder-starve flake recurred once, clean twice).
