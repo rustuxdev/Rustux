@@ -5,7 +5,7 @@ that covers it and the verdict. GENERATED from
 `docs/cve-matrix.md` by `tools/cve-ledger.py` — do not edit
 by hand; append to the matrix and regenerate.
 
-**496 unique CVEs recorded.**
+**497 unique CVEs recorded.**
 
 ## klib ports
 
@@ -57,6 +57,7 @@ by hand; append to the matrix and regenerate.
 | CVE-2006-6921 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
 | CVE-2006-6921 | process groups + sessions + job control: Task.pgid/sid/did_exec, TaskState::Stopped, Wait… | run-63 scoped audit: 4 confirmed all fixed — (c1) no-runnable teardown/hang: Stopped made "no runnable != run over" false, and hlt-idle kernel frames skipped poll_expire/rx_drain/… |
 | CVE-2006-7051 | POSIX per-process timers (timer_create 222 / timer_settime 223 / timer_gettime 224 / time… | audit run-75 scoped quick (security-audit skill): 0 confirmed, 4 in-run fixes (expire tgid guard vs pid reuse, orphaned-slot release at exec+reap, disarmed-gettime stale deadline,… |
+| CVE-2007-3848 | PR_SET_PDEATHSIG / PR_GET_PDEATHSIG — parent-death signal posted when the real parent THR… | audit run-114 scoped quick (security-audit skill): hunter DOCUMENT — F-1 LOW si_pid must be dying TGID (fixed, host-verified shape); critic PASS (fix verified end-to-end incl. rec… |
 | CVE-2007-4573 | ia32 compat foundation: ELFCLASS32/EM_386 static ELF32 loading + IA-32e compat-mode execu… | audit run-121 quick scoped + cve.now MCP (entities.search on ia32/compat classes — analogs above): verified int80 mask covers nr+a1..a6 (a REX-literate compat task can't smuggle h… |
 | CVE-2007-4573 | physmap rung: supervisor mirror of all phys RAM at PML4 slot 256 (0xFFFF_8000_0000_0000)… | PRESENT |
 | CVE-2007-5497 | installed-apt rung: glibc DNS/NSS chain shipped (libnss_dns/libnss_files/libresolv + etc/… | audit run-259 scoped quick (security-audit skill): cve-now e2fsprogs class — CVE-2022-1304, CVE-2019-5188, CVE-2019-5094, CVE-2015-0247, CVE-2015-1572, CVE-2007-5497 all crafted-i… |

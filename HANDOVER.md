@@ -9705,3 +9705,53 @@ scope.
   residual RV-2 documented (per-frame arm binding).
 - Gates: gate-355b PASS 127 tasks frames zero leak zero FAIL;
   pgtest 0 failures incl. nested-restart check.
+
+## run-356 — PR_SET_PDEATHSIG: parent-death signal on the real parent thread's exit
+
+- prctl ops 1/2 were EINVAL; PR_SET_PDEATHSIG is the common
+  "kill my children with me" contract real software leans on.
+  Host-verified semantics first: fires on the REAL parent
+  thread's death (reparented orphans still fire), si_code=SI_USER
+  + si_pid=dying parent (SEND_SIG_PRIV shape), GET reads it back,
+  0 clears, fork/clone clears it in the child (does NOT inherit),
+  no retrofire when the parent is already dead at set time,
+  preserved across a non-setuid exec.
+- Task.pdeathsig (0=none); prctl SET bounds sigs at our 31-signal
+  space (EINVAL above — we can't express >31 anyway); GET writes
+  an int through range_ok_w -> EFAULT.
+- exit_bookkeeping sweeps once per task death (leader or thread —
+  Linux's forget_original_parent fires on the real parent THREAD,
+  not the group): every live task whose real parent is the dying
+  pid gets pend_one(pdeathsig, si_user-shape src). Traced
+  children key on rppid (Linux still fires while ptraced).
+- CVE-2007-3848 (setuid-parent death delivering attacker sigs to
+  a privileged child) is structurally absent: no setuid-on-exec
+  exists, uid only moves via the task's own uid-0-gated setuid().
+- Test (pgtest +8): set/get roundtrip, 64->EINVAL, 0-clears,
+  fork-clear, delivery + si_code/pid shape over a pipe (orphan
+  verdict reporting), no-retrofire. The delivery check needed a
+  dedicated arm[] sync pipe — sharing the result pipe let the
+  outer reader steal the armed byte and wedge the middle (byte-
+  steal race, found in gate-356a).
+- gate-356c had a one-off busybox #PF (cr2=0xaaaa…, sig 11) that
+  failed sh-pipe — new signature, not reproducible on re-gate
+  (356d clean); recorded as a transient to watch.
+- cve-now sweep: pdeathsig class -> CVE-2007-3848 only, absent
+  per above.
+- Audit (run-114, scoped quick): hunter DOCUMENT — F-1 si_pid
+  must be the dying TGID not the thread pid (fixed: SigSrc.pid =
+  ctgid); critic PASS + verifier FIX — V-1 HIGH: pend_exit_sweep
+  resolved through task_slot_by_pid's proc_dead gate, so an
+  inline-killed child of a dead parent NEVER got exit_bookkeeping
+  (ctid wake, fd release, child orphaning all skipped; reachable
+  pre-existing hole, pdeathsig made it routine) — fixed by raw
+  pid scan; V-2 MED: PTRACE_TRACEME leaves rppid=0 so a traced
+  armed child missed the sweep — real_p falls back to ppid;
+  V-3 rejected on host evidence (si_pid is the dying pid, not 0).
+  Residuals documented: >31 sig bound, zombie-skip equivalence,
+  SIGCONT contd drop cosmetic, traced-child corner.
+- Extra check (pgtest): fatal pdeathsig on a paused child must
+  still orphan grandchildren — discriminates the V-1 skipped-
+  bookkeeping bug via the great-grandchild's ppid readback.
+- Gates: PASS 127 tasks frames zero leak zero FAIL (356c/d);
+  pgtest 0 failures incl. all pdeathsig checks.
