@@ -9908,3 +9908,115 @@ scope.
 - Gates: PASS 127 tasks frames zero leak zero FAIL; credtest
   0 failures incl. all new checks (358d clean; 358e/f the
   hvctest feeder-starve flake recurred once, clean twice).
+## run-359 — SO_RCVTIMEO / SO_SNDTIMEO
+
+- setsockopt was accept-and-drop — SOL_SOCKET opts 20/21 honored
+  nowhere; every socket block site armed wait_deadline=0
+  (infinite). A blocked recv never timed out.
+- Storage: rcvtimeo/sndtimeo usec fields on UdpSock, NlSock,
+  PktSock, UnixSock, TcpSock (0 = infinite, Linux's sk_rcvtimeo
+  model). Fresh sockets init 0 (sock_init_data); the TCP
+  SYN-child inherits the listener's pair (sk_clone); accepted
+  unix children mint fresh 0.
+- setsockopt reads the user timeval {sec,usec} -> usecs;
+  optlen<16 treats a missing usec field as 0 (Linux zero-pads
+  partial copies). getsockopt writes the timeval back capped
+  at min(cap,16) with the len word updated.
+- Arm: every block site that was wait_deadline=0 now arms
+  sock_deadline(x_timeo(...)) — TICKS + ceil(us/10ms), min one
+  tick (jiffies round-up). Recv/accept waits use rcvtimeo;
+  UnixSend/UnixSendK/UnixConn/TcpConn use sndtimeo. Unix
+  stream endpoints only carry {conn,side} so
+  unix_stream_timeo reverse-looks-up the owning UnixSock.
+- Expiry: poll_expire answers -EAGAIN for every socket wait
+  (Linux sock_wait_err). UnixSendK's staged payload dies with
+  the wait — the waker pushes staged bytes on wake, so a
+  timeout must not leave a phantom delivery. Staging is now
+  per-task (wait_ptr/wait_len via stage_alloc/stage_free, the
+  MqSnd/MsgSnd shape) — the shared per-direction KSEND slot
+  let a second blocked send clobber a displaced waiter's
+  record into a permanent park + silent loss, so the whole
+  KSEND mechanism was retired for task-local staging that
+  every cleanup path (waker push/EPIPE, expiry, signal)
+  frees exactly once.
+- TcpConn keeps the internal SYN bound: wait_deadline =
+  min(sndtimeo deadline, now+TCP_CONN_TICKS) with the internal
+  bound stashed in wait_len; expiry answers EAGAIN when the
+  user bound lapsed first, ETIMEDOUT for the SYN bound
+  (a >internal sndtimeo must not extend a dead connect).
+- Test (unixtest +9): stream pair SO_RCVTIMEO set/get readback;
+  recv -> EAGAIN with a ~100ms elapsed bound; fill the ring,
+  SO_SNDTIMEO write -> EAGAIN not a permanent park; dgram
+  recvfrom -> EAGAIN.
+- cve-now sweep: socket-timeout/setsockopt class — no
+  applicable CVEs (hits were Bluetooth ISO + af_packet
+  TPACKET_V3 internals).
+- Audit (run-117, scoped quick): hunter FIX -
+  F-1 MED sock_deadline overflow: saturating usec input hit
+  `(us + 9_999)` wrap (release) / panic (debug) — a giant
+  tv_sec armed an instantly-expired deadline. Fixed with
+  TICKS.saturating_add (Linux MAX_SCHEDULE_TIMEOUT shape).
+  F-2 MED nl_recv_buf's plain-NlRecv block still armed
+  wait_deadline=0 — a blocking recv() on netlink ignored
+  SO_RCVTIMEO entirely while recvmsg honored it. Fixed +
+  nltest regression (recv -> EAGAIN at 50ms).
+  F-3 MED UnixSendK expiry cleared KSEND[conn][side]
+  unconditionally — the slot is per-direction, so a
+  co-waiter's staged payload died and the waker's unwrap()
+  panicked on the survivor's wake. KSend now carries owner
+  pid; expiry + signal-cleanup + waker all honor it; the
+  waker tolerates None; conn-free drops the pair.
+  F-4 LOW optlen 8..15 silently applied usec=0 — Linux
+  sock_set_timeout EINVALs < sizeof(timeval); fixed EINVAL
+  before the pointer check + EINVAL regression checks.
+  F-5 LOW getsockopt reported len 4 for cap<4 — now
+  min(cap,16) matching bytes-written.
+  F-6 LOW TcpConn's EAGAIN arm still killed the socket —
+  Linux leaves the SYN attempt running on sndtimeo expiry;
+  dead/Closed now only on the internal bound.
+  F-7 LOW signal-wake cleanup skipped KSEND staging —
+  added with the same owner guard.
+  INFO unix_stream_timeo reverse lookup unambiguous by
+  construction; shared-direction KSEND clobber (two
+  simultaneous waiters) is pre-existing.
+  Critic FIX — all seven hunter fixes verified
+  in-tree.
+  C-1 MED residual: the per-direction KSEND slot still
+  let a second blocked send clobber the first's staged
+  payload — the owner-tag killed the panic but the
+  displaced waiter could park forever with silent loss.
+  Refactored to per-task staging (wait_ptr/wait_len via
+  stage_alloc/stage_free, the MqSnd/MsgSnd shape):
+  waker pushes + stage_frees, expiry + signal-cleanup
+  free it, KSend/KSEND deleted entirely.
+  C-2 LOW armed-recheck exits in unix_send_stream left
+  a stale wait_deadline (benign — re-armed on block) —
+  zeroed at both exits.
+  C-3/C-4 INFO getsockopt NULL-optval success and
+  optlen>16 full-range EFAULT — file-convention
+  divergences, documented.
+  C-5 INFO stale recvmmsg doc updated.
+  Coverage: all 15 socket wait kinds arm a deadline;
+  every expiry arm answered; KSEND sites all retired.
+  Verifier FIX+DOC — prior claims re-verified end
+  to end (per-task staging frees exactly once on every
+  exit; seq cap dead-safe; saturated deadline is
+  far-future not instant; all 16 arm sites + all expiry
+  arms covered).
+  V-1 LOW the seqpacket twin of unix_send_stream's
+  recheck exits missed the wait_deadline zero —
+  applied.
+  V-2/V-3 LOW->FIXED: setsockopt over-validated
+  optlen>16 (now range_ok 16 like Linux's single
+  timeval copy) and getsockopt returned success on a
+  NULL optval (now EFAULT when cap>0).
+  V-4 MED pre-existing adjacent: SCM_RIGHTS batch
+  refs leak when sendmsg parks on a full ring (the
+  batch attaches after block_switch, which diverges)
+  — predates the rung; logged for a follow-up.
+  V-5 LOW pre-existing: closed+reused tcp slot si
+  while TcpConn blocked can dead-mark an unrelated
+  socket — same shape as before.
+  V-6 LOW connect-retry after sndtimeo EAGAIN answers
+  EISCONN where Linux re-waits (SS_CONNECTING
+  semantics) — harmless divergence, documented.
