@@ -10020,3 +10020,97 @@ scope.
   V-6 LOW connect-retry after sndtimeo EAGAIN answers
   EISCONN where Linux re-waits (SS_CONNECTING
   semantics) — harmless divergence, documented.
+## run-360 — SCM_RIGHTS through a parked stream sendmsg
+
+- Pre-existing hole the run-359 verifier flagged: sendmsg
+  carrying SCM_RIGHTS that blocks on a full ring parks via
+  UnixSendK + block_switch (diverges — never returns to the
+  syscall frame), so the caller's post-return
+  unix_fp_attach/scm_release NEVER ran — every parked send
+  leaked the scm_parse-bumped OFD refs and silently dropped
+  the rights on every outcome (push, EPIPE, signal,
+  SO_SNDTIMEO EAGAIN).
+- The slice now owns the batch: signature takes
+  fp: Option<UnixFds>. Staged record gains an fp tail —
+  [u16 dlen][ring image][u8 n][u16 ofd x SCM_MAX] — alloc
+  tracked in wait_len so stage_free's frame/kmalloc bucket
+  always matches.
+- Immediate push attaches at the pre-push tail (unchanged
+  semantics, now inside the slice since the caller can't
+  reach past a diverged block).
+- Block path serializes fp into the record; the waker pushes
+  the image then attaches at the REAL landing tail — more
+  correct than the pre-park guess since peer sends can land
+  first.
+- Abort paths deserialize via staged_fp + scm_release before
+  stage_free: waker EPIPE, poll_expire timeout, pend_one
+  signal wake. Early exits (EPIPE/EMSGSIZE/EAGAIN/EINTR/
+  ENOMEM) each release the batch.
+- unix_fp_attach is called only outside the conn &mut borrow
+  (re-borrows UNIXCONNS internally) — push block returns
+  (n, at, seq).
+- Test (unixtest +5): fill the ring, child parks on a
+  blocking sendmsg+SCM_RIGHTS, parent drains -> waker push
+  delivers the byte + a working passed fd, child's sendmsg
+  returns 1.
+- cve-now sweep: SCM_RIGHTS/fd-passing class — CVE-2024-26923
+  is the af_unix GC embryo race; this kernel has no unix
+  garbage collector (plain ref counting), not applicable.
+- Audit (run-118, scoped quick): hunter PASS -
+  layout identical on all four consumers, alloc==wait_len
+  keeps the stage_free bucket matched (pay<=1024 so alloc
+  <=1045 always the frame path), the blocked-sender ref
+  floor makes every abort-side scm_release side-effect-
+  free, borrows scoped, `at` anchors never land behind
+  consumed bytes, exactly-one-consumer invariant. Residuals
+  INFO: staged_fp n clamped to SCM_MAX (applied); empty
+  n==0 batch attaches immediately but serializes to None
+  when staged (cosmetic); dead seqp truncation path; dead
+  `at` compute for the n!=0 caller; emit-side residue
+  release inside unix_wake's TASKS loop is pre-existing
+  reentrancy logged for a follow-up rung.
+  Critic FIX — all hunter claims re-verified
+  (dgram never blocks so no parked-dgram rights; write()
+  path carries no rights; seq offsets + emit-side struct
+  identical).
+  C-1 MED re-entrancy double-free: scm_release/
+  unix_fp_attach ran while the arm was still armed —
+  a released unix ofd reaching refs==0 re-enters
+  unix_sock_close->unix_wake, re-fires the same
+  UnixSendK arm, and both arms stage_free the record.
+  Fixed by disarm-first in all four consumers:
+  snapshot wait_ptr/wait_len, wait_on=None +
+  fields zeroed, THEN deserialize-release-free.
+  C-2 INFO abort paths had no coverage — added the
+  150-cycle (>MAX_OFDS) parked-send+rights loop
+  killed by peer close: any leaked batch ref pins an
+  OFD per pass (verifies waker-EPIPE release), and
+  the frames gate catches a leaked stage.
+  C-3 INFO pre-existing: a parked UnixSendK task
+  whose own fd dies via a shared CLONE_FILES table
+  is never woken (conn free's early-return leaves
+  the waiter stranded) — same gap for UnixSend/
+  UnixRecv; logged.
+  Hunter residuals verified: n=0 batch cosmetic,
+  clamp applied, dead seqp truncation, dead `at`
+  compute, emit-side reentrancy (pre-existing,
+  same class as C-1 — folded into follow-up note).
+  Verifier PASS — disarm-first verified at all four
+  consumers (pend_one cleanup ~2435, poll_expire
+  ~30308, waker EPIPE ~36890, waker success ~36880;
+  dl read from snapshot before clear), layout
+  self-consistent (stager/staged_fp offsets match,
+  alloc<=1045 frame-branch consistent), ownership
+  exactly-once (UnixSendK touched only at enum/6
+  sites), restart path net-zero refs, tests exercise
+  both waker-attach and abort-release paths.
+  Residuals documented: dlen trusted kernel-internal
+  (consistent with file's trust model), tests
+  timing-assisted not hermetic, re-entrant
+  tasks.iter_mut() borrow during scm_release ->
+  unix_wake is a pre-existing idiom (new trigger,
+  not new class; recursion bounded by armed waits).
+  NEXT RUNG NOTE: emit-side unix_fp_emit->scm_emit
+  reentrancy (pre-existing) + conn-teardown stranding
+  parked waiters (C-3) — natural run-361.
+
